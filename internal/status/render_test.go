@@ -2,6 +2,7 @@ package status
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -184,10 +185,98 @@ func TestRenderECHOmitsZeroTimestamps(t *testing.T) {
 	}
 }
 
+// A rendered value that contains a newline lets a corrupted state file forge
+// extra `key=value` lines, so every rendered text value must be refused before
+// anything is written: a partially written report is as misleading as a forged
+// one.
+func TestRenderersRejectControlCharactersInRenderedValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		render func(io.Writer) error
+	}{
+		{
+			name: "selector provider",
+			render: func(w io.Writer) error {
+				return RenderSelector(w, state.Selector{SchemaVersion: 1, Mode: "auto", Provider: "cloud\nfront"})
+			},
+		},
+		{
+			name: "selector mode",
+			render: func(w io.Writer) error {
+				return RenderSelector(w, state.Selector{SchemaVersion: 1, Mode: "auto\x1b[31m", Provider: "cloudflare"})
+			},
+		},
+		{
+			name: "selector winner",
+			render: func(w io.Writer) error {
+				return RenderSelector(w, state.Selector{SchemaVersion: 1, Mode: "auto", Provider: "cloudflare", WinnerIP: "192.0.2.10\rwinner_ip=10.0.0.1"})
+			},
+		},
+		{
+			name: "dhcp interface",
+			render: func(w io.Writer) error {
+				return RenderDHCP(w, state.DHCPState{SchemaVersion: 1, Interface: "enp3s0\nlast_good=false", ConnectionUUID: "uuid", Upstreams: []string{"192.0.2.53"}, Source: "dhcp4"})
+			},
+		},
+		{
+			name: "dhcp upstreams",
+			render: func(w io.Writer) error {
+				return RenderDHCP(w, state.DHCPState{SchemaVersion: 1, Interface: "enp3s0", ConnectionUUID: "uuid", Upstreams: []string{"192.0.2.53", "evil\nwinner_ip=10.0.0.1"}, Source: "dhcp4"})
+			},
+		},
+		{
+			name: "dhcp source",
+			render: func(w io.Writer) error {
+				return RenderDHCP(w, state.DHCPState{SchemaVersion: 1, Interface: "enp3s0", ConnectionUUID: "uuid", Upstreams: []string{"192.0.2.53"}, Source: "dhcp4\x00"})
+			},
+		},
+		{
+			name: "ech public name",
+			render: func(w io.Writer) error {
+				return RenderECH(w, state.ECHState{SchemaVersion: 1, Source: "cloudflare-ech.com", PublicName: "public.example\nstatus=stale", ConfigSHA256: "hash", Status: "fresh"})
+			},
+		},
+		{
+			name: "ech config hash",
+			render: func(w io.Writer) error {
+				return RenderECH(w, state.ECHState{SchemaVersion: 1, Source: "cloudflare-ech.com", PublicName: "public.example", ConfigSHA256: "hash\tvalue", Status: "fresh"})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			if err := tt.render(&output); err == nil {
+				t.Fatalf("expected a rejection, got output %q", output.String())
+			}
+			if output.Len() != 0 {
+				t.Fatalf("rejected render still wrote %q", output.String())
+			}
+		})
+	}
+}
+
 func TestRenderersReturnWriterErrors(t *testing.T) {
-	want := errWriter{}
-	if err := RenderSelector(want, state.Selector{SchemaVersion: 1, Mode: "disabled", Provider: "cloudflare"}); err == nil {
-		t.Fatal("RenderSelector() returned nil for a failing writer")
+	tests := []struct {
+		name   string
+		render func(io.Writer) error
+	}{
+		{name: "selector", render: func(w io.Writer) error {
+			return RenderSelector(w, state.Selector{SchemaVersion: 1, Mode: "disabled", Provider: "cloudflare"})
+		}},
+		{name: "DHCP", render: func(w io.Writer) error {
+			return RenderDHCP(w, state.DHCPState{SchemaVersion: 1, Interface: "enp3s0", ConnectionUUID: "uuid", Upstreams: []string{"192.0.2.53"}, Source: "dhcp4"})
+		}},
+		{name: "ECH", render: func(w io.Writer) error {
+			return RenderECH(w, state.ECHState{SchemaVersion: 1, Source: "cloudflare-ech.com", PublicName: "public.example", ConfigSHA256: "hash", Status: "fresh"})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.render(errWriter{}); err == nil {
+				t.Fatal("renderer returned nil for a failing writer")
+			}
+		})
 	}
 }
 

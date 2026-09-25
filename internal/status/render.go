@@ -93,7 +93,17 @@ func timestampField(key string, value time.Time) field {
 // writeSortedFields is a private formatting primitive shared by the three
 // typed renderers. The state-to-field allowlists remain in the typed functions
 // above; this helper never receives a runtime state through an untyped API.
+//
+// Every value is checked before anything is written. A value carrying a newline
+// or any other control character would otherwise forge extra `key=value` lines
+// in the status report, and a report that fails halfway through is as
+// misleading as a forged one, so a rejected value produces no output at all.
 func writeSortedFields(w io.Writer, fields []field) error {
+	for _, current := range fields {
+		if err := checkRenderedValue(current); err != nil {
+			return err
+		}
+	}
 	sort.Slice(fields, func(i, j int) bool {
 		return fields[i].key < fields[j].key
 	})
@@ -103,4 +113,19 @@ func writeSortedFields(w io.Writer, fields []field) error {
 		}
 	}
 	return nil
+}
+
+func checkRenderedValue(current field) error {
+	if strings.ContainsFunc(current.value, isControlCharacter) {
+		return fmt.Errorf("field %s contains a control character", current.key)
+	}
+	return nil
+}
+
+// isControlCharacter reports the bytes that can forge a `key=value` line or
+// corrupt a terminal. Only the C0 range and DEL qualify: every state value the
+// renderers accept is ASCII, so a higher code point is a real character and not
+// a control sequence.
+func isControlCharacter(character rune) bool {
+	return character < ' ' || character == 0x7f
 }
