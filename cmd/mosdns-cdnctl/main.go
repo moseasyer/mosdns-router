@@ -33,13 +33,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // runWith is run with an explicit services boundary, so a test can point the
-// update-lists command at a local origin while the lock, the publication and the
-// conversion stay the real ones.
-func runWith(args []string, stdout, stderr io.Writer, services listServices) int {
+// update-lists command at a local origin, or the render command at a temporary
+// directory, while the lock, the publication, the renderers and the conversion
+// stay the real ones.
+func runWith(args []string, stdout, stderr io.Writer, services services) int {
 	return runWithContext(context.Background(), args, stdout, stderr, services)
 }
 
-func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer, services listServices) int {
+func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -53,42 +54,48 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 
 	switch args[0] {
 	case "validate":
-		return runValidate(args[1:], stdout, stderr)
+		return runValidate(args[1:], stdout, stderr, services)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
 	case "update-lists":
 		return runUpdateLists(ctx, args[1:], stdout, stderr, services)
+	case "render":
+		return runRender(args[1:], stdout, stderr, services)
 	default:
 		writeCLIError(stderr, "unknown command %q", args[0])
 		return exitInvalidCLI
 	}
 }
 
-func runValidate(args []string, _ io.Writer, stderr io.Writer) int {
-	flags := flag.NewFlagSet("validate", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	policyPath := flags.String("policy", "", "path to the policy YAML file")
-	if err := flags.Parse(args); err != nil {
+// runValidate checks a policy and reports whether the documents the operator has
+// installed are what that policy describes.
+//
+// The exit code is the policy's: 0 when it loads and validates, 2 when it does
+// not. That contract does not change. What is added to a successful run is a
+// report, and only when there is something to report: a policy nobody applied
+// beside a document the router is running is a disagreement the policy file
+// cannot show by itself, and an operator who changed a safety switch needs to be
+// told that the running document still says something else. Exit stays 0 because
+// the policy is valid; the report is about the installation, not the file.
+func runValidate(args []string, stdout, stderr io.Writer, services services) int {
+	options, err := parseValidateOptions(args, services.documents)
+	if err != nil {
 		writeCLIError(stderr, "validate: %v", err)
 		return exitInvalidCLI
 	}
-	if flags.NArg() != 0 {
-		writeCLIError(stderr, "validate: unexpected arguments: %s", strings.Join(flags.Args(), " "))
-		return exitInvalidCLI
-	}
-	if *policyPath == "" {
-		writeCLIError(stderr, "validate: --policy PATH is required")
-		return exitInvalidCLI
-	}
 
-	policy, err := config.Load(*policyPath)
+	policy, err := config.Load(options.policy)
 	if err != nil {
 		writeCLIError(stderr, "validate: %v", err)
 		return exitInvalidCLI
 	}
 	if err := policy.Validate(); err != nil {
-		writeCLIError(stderr, "validate: %s: %v", *policyPath, err)
+		writeCLIError(stderr, "validate: %s: %v", options.policy, err)
 		return exitInvalidCLI
+	}
+	if err := reportMismatches(stdout, policy, services.documents, options); err != nil {
+		writeCLIError(stderr, "validate: %v", err)
+		return exitStateUnavailable
 	}
 	return exitSuccess
 }

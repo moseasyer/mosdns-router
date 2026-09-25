@@ -33,20 +33,29 @@ const pinRef = "HEAD"
 // slow or unresponsive origin.
 const updateListTimeout = 60 * time.Second
 
-// listServices is the boundary the update-lists command uses for everything
-// outside itself: the HTTP client that reaches the source, and the control lock
-// that keeps a publication from colliding with the rest of the control
-// operations. Everything else, conversion and publication included, is the real
-// implementation.
-type listServices struct {
+// services is the boundary the commands in this binary use for everything outside
+// themselves: the HTTP client that reaches the source, the control lock that keeps
+// a publication from colliding with the rest of the control operations, where the
+// generated documents live, and the file operations a document publication is
+// built from. Everything else, conversion, rendering and publication included, is
+// the real implementation.
+type services struct {
 	newHTTPClient func() *http.Client
 	acquireLock   func(path string) (release func() error, err error)
+	// documents is where the generated documents are published and which policy
+	// they are rendered from, so no test has to write to /etc.
+	documents documentPaths
+	// documentOps are the file operations a document publication is built from.
+	// They are a field so a test can make one of them fail and observe what the
+	// operator is left with; production uses the real ones.
+	documentOps documentFileOps
 }
 
 // productionServices is what the executable runs with: a plain client that
-// resolves names through the system resolver, and the shared control lock.
-func productionServices() listServices {
-	return listServices{
+// resolves names through the system resolver, the shared control lock, the
+// installed document layout, and the real file operations.
+func productionServices() services {
+	return services{
 		newHTTPClient: func() *http.Client { return &http.Client{Timeout: updateListTimeout} },
 		acquireLock: func(path string) (func() error, error) {
 			lock, err := filelock.Acquire(path)
@@ -55,6 +64,8 @@ func productionServices() listServices {
 			}
 			return lock.Close, nil
 		},
+		documents:   productionDocumentPaths(),
+		documentOps: defaultDocumentOps(),
 	}
 }
 
@@ -111,7 +122,7 @@ func parseUpdateListOptions(args []string) (updateListOptions, error) {
 	}, nil
 }
 
-func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer, services listServices) int {
+func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
 	options, err := parseUpdateListOptions(args)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
@@ -128,7 +139,18 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 // never disturbs a running gateway. The report is assembled first and written
 // only once it is complete, so a check that fails half way through says so
 // instead of leaving a partial report behind.
-func runCheckLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services listServices) int {
+//
+// The published pair is read without the control lock, deliberately. Holding the
+// lock is what a pin does, and a pin on the same host is a handful of writes; a
+// daily check that took the lock would have to either block that pin or be
+// skipped whenever anything else was publishing, so it would stop being the
+// check an operator can run at any time. The consequence of reading unlocked is
+// that a check can observe a half-applied pair, and it is fail-closed about
+// that: ReadPublishedPair refuses a pair whose list and lock do not describe each
+// other, the check reports the refusal on stderr and exits 3, and it never
+// concludes "up-to-date" from a pair it could not verify. A transient exit 3 is
+// the correct answer for a check that caught a publication in flight.
+func runCheckLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	published, _, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
@@ -179,7 +201,7 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 // the published pair is read again, so a pair that changed or was broken while
 // the download was in flight is refused rather than overwritten, and only then is
 // the new pair written.
-func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services listServices) int {
+func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	client := services.newHTTPClient()
 	resolved, err := rules.ResolveHEAD(ctx, client, rules.Repository)
 	if err != nil {

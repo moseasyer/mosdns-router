@@ -224,7 +224,7 @@ func publishPair(t *testing.T, paths listPaths, commit string, list []byte) {
 
 // services points the command at a fake origin and nothing else: the control
 // lock, the publication and the conversion are the real ones.
-func (o *fakeOrigin) services() listServices {
+func (o *fakeOrigin) services() services {
 	services := productionServices()
 	services.newHTTPClient = func() *http.Client { return o.client }
 	return services
@@ -281,7 +281,7 @@ func names(state map[string][]byte) []string {
 	return list
 }
 
-func runCLI(t *testing.T, services listServices, args ...string) (int, string, string) {
+func runCLI(t *testing.T, services services, args ...string) (int, string, string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := runWith(append([]string{"update-lists"}, args...), &stdout, &stderr, services)

@@ -59,17 +59,24 @@ func TestRunValidateSucceedsWithoutWriting(t *testing.T) {
 	if err := os.WriteFile(policyPath, []byte(validPolicyYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The document directory is named explicitly, so the case says what it is
+	// about -- validate writes nothing -- rather than also depending on whether
+	// this host has a /etc/mosdns to report a stale document from.
+	documents := filepath.Join(dir, "documents")
+	if err := os.Mkdir(documents, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	before, err := os.ReadFile(policyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeEntries, err := os.ReadDir(dir)
+	beforeEntries, err := os.ReadDir(documents)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"validate", "--policy", policyPath}, &stdout, &stderr); got != exitSuccess {
+	if got := run([]string{"validate", "--policy", policyPath, "--documents", documents}, &stdout, &stderr); got != exitSuccess {
 		t.Fatalf("validate exit = %d, want %d (stderr: %s)", got, exitSuccess, stderr.String())
 	}
 	if stdout.Len() != 0 || stderr.Len() != 0 {
@@ -80,7 +87,7 @@ func TestRunValidateSucceedsWithoutWriting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterEntries, err := os.ReadDir(dir)
+	afterEntries, err := os.ReadDir(documents)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +95,7 @@ func TestRunValidateSucceedsWithoutWriting(t *testing.T) {
 		t.Fatalf("validate changed policy contents: got %q, want %q", after, before)
 	}
 	if !reflect.DeepEqual(entryNames(beforeEntries), entryNames(afterEntries)) {
-		t.Fatalf("validate changed policy directory: got %v, want %v", entryNames(afterEntries), entryNames(beforeEntries))
+		t.Fatalf("validate changed the document directory: got %v, want %v", entryNames(afterEntries), entryNames(beforeEntries))
 	}
 }
 
@@ -217,6 +224,15 @@ func TestRunRejectsInvalidCLIWithExitTwo(t *testing.T) {
 		{"unknown"},
 		{"validate"},
 		{"validate", "--policy"},
+		{"validate", "--documents"},
+		{"validate", "--policy", "policy.yaml", "--documents", ""},
+		{"render"},
+		{"render", "--out"},
+		{"render", "--policy"},
+		{"render", "--out", ""},
+		{"render", "--policy", ""},
+		{"render", "--policy", "policy.yaml", "extra"},
+		{"render", "--force", "documents"},
 		{"status"},
 		{"status", "--unknown", "value"},
 		{"status", "--selector", ""},
