@@ -141,7 +141,10 @@ def publish_if_changed(
 
     Returns True when a new state was published and False when the recorded state
     already said the same thing, in which case the file is not opened for
-    writing. Raises ValueError for an input the Go state validator would refuse,
+    writing. A state that disables the branch for an interface the published
+    state does not describe is also reported unchanged and written nowhere: it
+    says nothing about the interface that is currently forwarding. Raises
+    ValueError for an input the Go state validator would refuse,
     InvalidStateError for an existing state file that is not a valid document,
     LockUnavailable when another bridge process holds the lock, and
     PublicationError when the new state could not be committed.
@@ -155,9 +158,27 @@ def publish_if_changed(
         existing = _existing_state(path)
         if existing is not None and _identity(existing[1]) == _identity(record):
             return False
+        if existing is not None and not _may_replace(existing[1], record):
+            return False
         generation = 1 if existing is None else existing[0] + 1
         _commit(path, _document(generation, record, observed_at))
     return True
+
+
+def _may_replace(existing: _Record, incoming: _Record) -> bool:
+    """Report whether ``incoming`` may take the state away from ``existing``.
+
+    One file describes one router's domestic resolvers, and a machine can run
+    several NetworkManager connections. A state that disables the branch is a
+    claim that this interface lost its lease, and a laptop interface that comes
+    up with no DNS makes no such claim about the WAN interface that is
+    forwarding every query, so it is recorded nowhere and nothing is written.
+    Only an interface that actually carries resolvers takes ownership, because
+    that is a real change of the WAN the queries go to.
+    """
+    if incoming.interface == existing.interface:
+        return True
+    return incoming.last_good
 
 
 def _new_record(

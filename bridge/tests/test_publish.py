@@ -334,6 +334,123 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(data["last_good"])
 
 
+class MultiInterfaceTests(unittest.TestCase):
+    """Which interface's event is allowed to own the single published state.
+
+    One machine can have several NetworkManager connections, and a laptop
+    interface that comes up with no DNS must not disable the WAN resolvers a
+    different interface is using. An interface that does carry resolvers is a
+    real change of WAN, and it takes ownership.
+    """
+
+    OTHER_INTERFACE = "br-lan"
+    OTHER_UUID = "22222222-2222-2222-2222-222222222222"
+
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workspace.cleanup)
+        self.directory = Path(self.workspace.name)
+        self.state_path = self.directory / "dhcp-upstreams.json"
+
+    def publish(self, upstreams, interface=INTERFACE, connection_uuid=UUID, now=NOW):
+        return publish_if_changed(
+            str(self.state_path),
+            interface=interface,
+            connection_uuid=connection_uuid,
+            upstreams=upstreams,
+            source="nm-dhcp4",
+            now=now,
+        )
+
+    def published(self):
+        return json.loads(self.state_path.read_text())
+
+    def test_a_disabled_state_for_another_interface_keeps_the_valid_one(self):
+        self.assertTrue(self.publish(["192.168.1.1"]))
+        original = self.state_path.read_bytes()
+        before = self.state_path.stat()
+
+        self.assertFalse(
+            self.publish(
+                [], interface=self.OTHER_INTERFACE, connection_uuid=self.OTHER_UUID
+            )
+        )
+        self.assertEqual(self.state_path.read_bytes(), original)
+        self.assertEqual(self.state_path.stat().st_ino, before.st_ino)
+        self.assertEqual(self.state_path.stat().st_mtime_ns, before.st_mtime_ns)
+        data = self.published()
+        self.assertEqual((data["interface"], data["upstreams"], data["generation"]), ("enp3s0", ["192.168.1.1"], 1))
+        self.assertTrue(data["last_good"])
+
+    def test_a_disabled_state_for_another_interface_keeps_a_disabled_state(self):
+        """An already disabled branch gains nothing from another empty interface."""
+        self.assertTrue(self.publish([], connection_uuid=UUID))
+        original = self.state_path.read_bytes()
+        before = self.state_path.stat()
+
+        self.assertFalse(
+            self.publish(
+                [],
+                interface=self.OTHER_INTERFACE,
+                connection_uuid=self.OTHER_UUID,
+                now=LATER,
+            )
+        )
+        self.assertEqual(self.state_path.read_bytes(), original)
+        self.assertEqual(self.state_path.stat().st_ino, before.st_ino)
+        self.assertEqual(self.published()["generation"], 1)
+
+    def test_a_disabled_state_for_the_same_interface_still_disables(self):
+        self.assertTrue(self.publish(["192.168.1.1"]))
+        self.assertTrue(
+            self.publish([], connection_uuid=self.OTHER_UUID, now=LATER)
+        )
+        data = self.published()
+        self.assertEqual((data["interface"], data["upstreams"], data["generation"]), ("enp3s0", [], 2))
+        self.assertFalse(data["last_good"])
+
+    def test_a_non_empty_state_for_another_interface_takes_ownership(self):
+        self.assertTrue(self.publish(["192.168.1.1"]))
+        self.assertTrue(
+            self.publish(
+                ["192.168.1.53"],
+                interface=self.OTHER_INTERFACE,
+                connection_uuid=self.OTHER_UUID,
+                now=LATER,
+            )
+        )
+        data = self.published()
+        self.assertEqual(
+            (data["interface"], data["connection_uuid"], data["upstreams"], data["generation"]),
+            ("br-lan", self.OTHER_UUID, ["192.168.1.53"], 2),
+        )
+
+    def test_the_cli_leaves_a_valid_state_alone_when_another_interface_goes_down(self):
+        other = MultiInterfaceTests.OTHER_INTERFACE
+        state = str(self.state_path)
+        lock = str(self.directory / "dhcp-bridge.lock")
+        argv = ["--state-file", state, "--lock-file", lock]
+        up = {
+            "NM_DISPATCHER_ACTION": "dhcp4-change",
+            "DEVICE_IP_IFACE": INTERFACE,
+            "CONNECTION_UUID": UUID,
+            "DHCP4_DOMAIN_NAME_SERVERS": "192.168.1.1",
+        }
+        down = {
+            "NM_DISPATCHER_ACTION": "down",
+            "DEVICE_IP_IFACE": other,
+            "CONNECTION_UUID": self.OTHER_UUID,
+        }
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(argv, up, RecordingRunner()), 0)
+            original = self.state_path.read_bytes()
+            self.assertEqual(cli.main(argv, down, RecordingRunner()), 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(self.state_path.read_bytes(), original)
+        self.assertEqual(self.published()["interface"], INTERFACE)
+
+
 class ExistingStateTests(unittest.TestCase):
     """What the publisher does with the state it finds already there."""
 
