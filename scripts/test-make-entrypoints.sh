@@ -2,7 +2,7 @@
 # Regression test for the Make entry points. It proves three things about the
 # real Makefile:
 #
-# 1. Every entry point runs through an exact go1.25.0 toolchain guard, so a
+# 1. Every entry point runs through an exact go1.25.8 toolchain guard, so a
 #    different or missing Go release is refused before any command runs.
 # 2. Every Go invocation the entry points plan is readonly, so building,
 #    testing, and vetting can never rewrite go.mod or go.sum.
@@ -37,12 +37,34 @@ fi
 echo "the wrong Go release must never be used for a real command" >&2
 exit 1
 EOF
+# The exact release the guard must accept, and a same-minor patch it must not:
+# dnscrypt-proxy 2.1.18 declares `go 1.25.8` in its own go.mod, so an older patch
+# of the same minor cannot build the packaged resolver. A guard that accepted the
+# minor instead of the exact release would let that build fail later, off-host.
+cat >"$work/go-required-version" <<'EOF'
+#!/bin/sh
+if [ "${1-}" = version ]; then
+	echo "go version go1.25.8 linux/amd64"
+	exit 0
+fi
+echo "the required Go release must never be used for a real command" >&2
+exit 1
+EOF
+cat >"$work/go-superseded-version" <<'EOF'
+#!/bin/sh
+if [ "${1-}" = version ]; then
+	echo "go version go1.25.0 linux/amd64"
+	exit 0
+fi
+echo "a superseded Go release must never be used for a real command" >&2
+exit 1
+EOF
 cat >"$work/go-not-go" <<'EOF'
 #!/bin/sh
 echo "not a go toolchain" >&2
 exit 127
 EOF
-chmod 0755 "$work/go-wrong-version" "$work/go-not-go"
+chmod 0755 "$work/go-wrong-version" "$work/go-required-version" "$work/go-superseded-version" "$work/go-not-go"
 
 cp go.mod "$work/go.mod.before"
 cp go.sum "$work/go.sum.before"
@@ -84,6 +106,8 @@ run_make() {
 
 # 1. The guard accepts the pinned release and refuses everything else.
 run_make ok "check-go with $real_go" check-go GO="$real_go"
+run_make ok "check-go with the pinned go1.25.8" check-go GO="$work/go-required-version"
+run_make fail "check-go with the superseded go1.25.0" check-go GO="$work/go-superseded-version"
 run_make fail "check-go with go1.24.6" check-go GO="$work/go-wrong-version"
 run_make fail "check-go with a non-Go program" check-go GO="$work/go-not-go"
 

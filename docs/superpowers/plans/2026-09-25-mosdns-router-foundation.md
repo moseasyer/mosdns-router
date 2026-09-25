@@ -17,7 +17,7 @@
 - Never generate a default Chinese public DNS address.
 - Never add a local DoH listener, custom CA, TLS MITM, SNI DPI, ClearDNS, or Docker runtime dependency.
 - All runtime state files use schema version 1, same-directory temporary files, `fsync`, validation, and atomic rename.
-- Initial pinned versions are MOSDNS v5.3.4, dnscrypt-proxy 2.1.18, and Go 1.25.0.
+- Initial pinned versions are MOSDNS v5.3.4, dnscrypt-proxy 2.1.18, and Go 1.25.8.
 - TDD is mandatory; every task ends with a focused commit.
 
 ## Review Focus
@@ -169,7 +169,7 @@ Create `go.mod`:
 ```go
 module mosdns-router
 
-go 1.25.0
+go 1.25.8
 
 require (
     github.com/IrineSistiana/mosdns/v5 v5.3.4
@@ -178,7 +178,7 @@ require (
 )
 ```
 
-A `toolchain` directive is not added: `go 1.25.0` already pins the language
+A `toolchain` directive is not added: `go 1.25.8` already pins the language
 version, `go mod tidy` strips a redundant `toolchain` line, and the Make entry
 points enforce the exact compiler instead.
 
@@ -636,7 +636,7 @@ mosdns-cdnctl status --selector PATH --dhcp PATH --ech PATH
 
 ```make
 GO ?= go
-GO_REQUIRED_VERSION := 1.25.0
+GO_REQUIRED_VERSION := 1.25.8
 LDFLAGS ?= -s -w
 BUILDINFO_PKG := mosdns-router/internal/buildinfo
 ifndef VERSION

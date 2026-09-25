@@ -462,7 +462,7 @@ world access and do not rely on a per-file `chown` from an unprivileged unit.
 
 - [ ] **Step 4: Build pinned dnscrypt-proxy**
 
-`build-deb.sh` sets `CGO_ENABLED=0` and builds dnscrypt-proxy v2.1.18 from the pinned module/source into the staging root. It must use the same Go 1.25.0 toolchain and record source SHA-256 in `/usr/share/doc/mosdns-router/BUILD-MANIFEST`.
+`build-deb.sh` sets `CGO_ENABLED=0` and builds dnscrypt-proxy v2.1.18 from the pinned module/source into the staging root. It must use the same Go 1.25.8 toolchain and record source SHA-256 in `/usr/share/doc/mosdns-router/BUILD-MANIFEST`.
 
 - [ ] **Step 5: Implement atomic package build**
 

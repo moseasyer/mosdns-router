@@ -7,8 +7,9 @@ PYTHON ?= python3
 BRIDGE_TESTS := bridge/tests
 
 # Every entry point refuses to run on a different Go release: the module pins
-# go 1.25.0 and the reproducible build metadata assumes exactly that compiler.
-GO_REQUIRED_VERSION := 1.25.0
+# go 1.25.8, the reproducible build metadata assumes exactly that compiler, and
+# the packaged dnscrypt-proxy 2.1.18 declares `go 1.25.8` in its own go.mod.
+GO_REQUIRED_VERSION := 1.25.8
 
 LDFLAGS ?= -s -w
 BUILDINFO_PKG := mosdns-router/internal/buildinfo

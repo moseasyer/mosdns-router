@@ -1,6 +1,6 @@
 module mosdns-router
 
-go 1.25.0
+go 1.25.8
 
 require (
 	github.com/IrineSistiana/mosdns/v5 v5.3.4
