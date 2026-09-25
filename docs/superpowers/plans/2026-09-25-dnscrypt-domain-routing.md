@@ -29,6 +29,7 @@
 - A SERVFAIL from the foreign resolver must not trigger the domestic branch.
 - Unsupported or cyclic `include:` entries in domain-rule data must fail without replacing the last valid list.
 - The generated MOSDNS sequence must preserve DNSSEC/EDNS behavior apart from the later explicitly synthetic response paths.
+- The `keyword:` validator is coupled to the pinned MOSDNS matcher: `KeywordMatcher.Add` normalises with `NormalizeDomain` (`ToLower` + `TrimDot`), so a keyword the normalisation would change is a rule the gateway matches on as something else. `keyword:a.` becomes `keyword:a` and matches every name containing the letter a. The guard therefore requires `NormalizeDomain(value) == value`, calling the pinned matcher rather than restating it, so a change to that normalisation reaches the guard instead of passing beside it.
 
 ---
 

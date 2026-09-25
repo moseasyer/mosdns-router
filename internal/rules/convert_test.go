@@ -252,6 +252,13 @@ func TestConvertFSRejectsUnsupportedOrMalformedRules(t *testing.T) {
 		{name: "empty regexp", line: "regexp:", wantSub: "empty domain rule"},
 		{name: "empty keyword", line: "keyword:", wantSub: "empty domain rule"},
 		{name: "invalid regexp", line: "regexp:^static[0-9+\\.cn$", wantSub: `invalid regexp "^static[0-9+\\.cn$"`},
+		// A keyword is the one rule form whose normalisation can silently
+		// broaden it: MOSDNS's KeywordMatcher.Add applies NormalizeDomain, so
+		// `a.` is published as `a` and matches every name containing the letter
+		// a. The validator below has its own case; this one is here so the
+		// refusal is a whole-conversion failure and not something a caller can
+		// route around.
+		{name: "keyword that normalisation would change", line: "keyword:a.", wantSub: `invalid keyword "a."`},
 		{name: "empty include", line: "include:", wantSub: "empty inclusion"},
 		{name: "affiliation on include", line: "include:child &other", wantSub: "affiliation is not allowed on an inclusion"},
 		{name: "unknown include field", line: "include:child @ads nonsense", wantSub: `unknown field "nonsense"`},
@@ -414,6 +421,72 @@ func TestConvertFSBoundsTheNumberOfVisitedFiles(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "2048") {
 		t.Fatalf("error = %v, want it to name the file bound", err)
+	}
+}
+
+// TestConvertFSRefusesAKeywordMOSDNSWouldNormalize covers the one rule form whose
+// value can change between review and use. A domain, a full and a regexp rule are
+// all folded to lower case here and then read as written; a keyword is
+// additionally run through NormalizeDomain by MOSDNS's own KeywordMatcher.Add, so
+// a value normalisation would alter is published as something else.
+//
+// The broadening is not a theory. This proves it against the pinned matcher, in
+// the router's own code path: the same matcher that loads the published list is
+// given `keyword:a.`, and a name nobody listed comes back matched. A China set
+// holding that rule sends most of the internet to the DHCP branch while the file
+// reads exactly as it was reviewed, so the rule has to be refused at conversion
+// rather than published and discovered.
+func TestConvertFSRefusesAKeywordMOSDNSWouldNormalize(t *testing.T) {
+	// The harm, shown first: the pinned matcher, loaded the way the router loads
+	// the list, broadens the rule the upstream wrote.
+	published := "keyword:a.\n"
+	matcher := mosdnsdomain.NewDomainMixMatcher()
+	if err := mosdnsdomain.LoadFromTextReader(matcher, strings.NewReader(published), nil); err != nil {
+		t.Fatalf("the pinned matcher refused %q: %v", published, err)
+	}
+	if _, matched := matcher.Match("a-name-nobody-listed.example."); !matched {
+		t.Fatalf("the pinned matcher did not broaden %q, so this case is not about the rule it is about", published)
+	}
+
+	// So the converter refuses it, and the refusal names the offending value.
+	fsys := convertFixture(map[string]string{"data/cn": "domain:kept.cn\nkeyword:a.\n"})
+	got, err := ConvertFS(fsys, "data/cn")
+	if err == nil {
+		t.Fatalf("ConvertFS published a keyword MOSDNS would normalise, as %q", got)
+	}
+	if !strings.Contains(err.Error(), "data/cn:2:") || !strings.Contains(err.Error(), `invalid keyword "a."`) {
+		t.Errorf("refusal = %v, want the line and the offending keyword", err)
+	}
+
+	// The control: keywords normalisation leaves alone are still published, so the
+	// guard refuses the values that change and not the keyword form. A bare dot is
+	// the second half of the same case -- NormalizeDomain reduces it to nothing,
+	// which would match every name there is.
+	survivable := convertFixture(map[string]string{"data/cn": "keyword:测试\nkeyword:cdn\nkeyword:co\n"})
+	if got, err := ConvertFS(survivable, "data/cn"); err != nil {
+		t.Fatalf("ConvertFS refused a keyword MOSDNS normalises to itself: %v", err)
+	} else if want := []string{"keyword:cdn", "keyword:co", "keyword:测试"}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ConvertFS = %q, want %q", got, want)
+	}
+	if got, err := ConvertFS(convertFixture(map[string]string{"data/cn": "keyword:.\n"}), "data/cn"); err == nil {
+		t.Errorf("ConvertFS published a keyword that normalises to nothing, as %q", got)
+	}
+}
+
+// TestConvertFSLowercasesAKeywordBecauseMOSDNSDoes is why the guard compares
+// against the normalised value rather than refusing every keyword that differs from
+// its input: case is a change normalisation makes, folding it here is what keeps
+// the published rule and the reviewed one the same rule, and an upper-case
+// keyword is valid upstream.
+func TestConvertFSLowercasesAKeywordBecauseMOSDNSDoes(t *testing.T) {
+	fsys := convertFixture(map[string]string{"data/cn": "keyword:CDN\n"})
+
+	got, err := ConvertFS(fsys, "data/cn")
+	if err != nil {
+		t.Fatalf("ConvertFS refused an upper-case keyword: %v", err)
+	}
+	if want := []string{"keyword:cdn"}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ConvertFS = %q, want %q", got, want)
 	}
 }
 

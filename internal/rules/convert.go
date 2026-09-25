@@ -26,6 +26,12 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	// The keyword validator has to agree with the matcher that will read the
+	// published list, so it calls the pinned matcher's own normalisation instead
+	// of restating it. Importing it here also means a change to that
+	// normalisation reaches this guard rather than passing beside it.
+	mosdnsdomain "github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 )
 
 const (
@@ -381,9 +387,20 @@ func validDomainName(name string) bool {
 	return true
 }
 
-// validKeyword accepts a keyword rule's value. Unlike a domain name, a keyword
-// is a substring of a name rather than a name, so it is only required to be one
+// validKeyword accepts a keyword rule's value. Unlike a domain name, a keyword is
+// a substring of a name rather than a name, so it is only required to be one
 // space-free, control-free section that fits in a domain name's length.
+//
+// It is additionally required to be what MOSDNS will store. KeywordMatcher.Add
+// normalises with the pinned matcher's own NormalizeDomain -- ToLower then
+// TrimDot -- so a value that normalisation would change is a rule the gateway
+// matches on something other than what was reviewed. `keyword:a.` is the case
+// that matters: it is published as `keyword:a` and matches every name containing
+// the letter a, which is a China set that silently captures most of the internet.
+// The normalisation is the pinned matcher's, not a copy of it, so a change
+// upstream changes this guard with it; the one form it cannot catch is a keyword
+// MOSDNS happens to normalise differently at match time, which is why the value
+// is compared rather than transformed.
 func validKeyword(value string) bool {
 	if value == "" || len(value) > maxDomainLen {
 		return false
@@ -393,7 +410,7 @@ func validKeyword(value string) bool {
 			return false
 		}
 	}
-	return true
+	return mosdnsdomain.NormalizeDomain(value) == value
 }
 
 // validAttributeName accepts the attribute charset upstream accepts, after
