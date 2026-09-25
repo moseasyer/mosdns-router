@@ -105,14 +105,52 @@ func quotedValues(message string, groups ...[]string) []string {
 	return quoted
 }
 
+// assertUsable requires that the document at path is a state the router can use,
+// and that a refusal of it names the field it refused rather than any value the
+// document carried. Both acceptance cases need the second half, because a rule that
+// grew stricter than intended fails by refusing something usable, and that refusal
+// reaches the same packaging logs as a correct one.
+func assertUsable(t *testing.T, path, body string) {
+	t.Helper()
+	err := VerifyFixture(path)
+	if err == nil {
+		return
+	}
+	if quoted := quotedValues(err.Error(), stringValues(t, body)); len(quoted) > 0 {
+		t.Fatalf("error quotes the document's own values %q: %v", quoted, err)
+	}
+	t.Fatalf("VerifyFixture refused a state the bridge publishes: %v", err)
+}
+
 // TestVerifyFixtureAcceptsTheCommittedBridgeState is the cross-language proof:
 // the bytes the Python publisher wrote are a state the router's own reader
 // accepts. A bridge that published a document this reader would refuse, or a
 // reader that tightened past the schema, both fail here.
 func TestVerifyFixtureAcceptsTheCommittedBridgeState(t *testing.T) {
-	if err := VerifyFixture(committedFixture(t)); err != nil {
-		t.Fatalf("the committed bridge fixture is not a state the router can use: %v", err)
+	payload, err := os.ReadFile(committedFixture(t))
+	if err != nil {
+		t.Fatalf("read the committed bridge fixture: %v", err)
 	}
+	assertUsable(t, committedFixture(t), string(payload))
+}
+
+// TestVerifyFixtureAcceptsADisabledState pins the other side of the last-good
+// rule. A readable lease that named no resolver, and a down event, both publish a
+// state with no upstreams and last_good false: that is the documented way to
+// disable the domestic branch, and the bridge emits it on ordinary events. The
+// rule may therefore refuse only the states that name resolvers nobody vouched
+// for. A rule that refused every not-last-known-good state would pass a suite with
+// no such case, and would stop the router from serving anything the moment a lease
+// carried no DNS.
+func TestVerifyFixtureAcceptsADisabledState(t *testing.T) {
+	// The committed document with its resolver list emptied and the marker that
+	// says the list is not vouched for, which is exactly what the publisher writes
+	// for a down event on an interface that had a lease.
+	document := decodeFixture(t)
+	document["upstreams"] = []any{}
+	document["last_good"] = false
+	body := encodeDocument(t, document)
+	assertUsable(t, writeState(t, body), body)
 }
 
 // TestVerifyFixtureRejectsADocumentTheRouterCannotUse covers every way the
