@@ -712,34 +712,48 @@ func equalStrings(got, want []string) bool {
 
 // --- the address a published state may name ---
 
-// localUnicastAddress finds a real, routable, unicast IPv4 address on a
-// non-loopback interface of this host.
+// publishableUpstream reports whether the production DHCP state decoder would
+// accept an address as an upstream: a global-unicast IPv4 with no zone, on a
+// device rather than on this machine.
 //
-// The domestic resolver cannot be on loopback. The production state decoder
-// refuses a loopback upstream -- correctly, because a resolver the user is
-// leaving is never on this machine -- and the plugin reads the published state
-// through that decoder, so a loopback mock would never be dialled. The address
-// has to be a real one for the same reason, and binding it keeps the exchange on
-// this host: the kernel routes a packet addressed to one of its own addresses
-// internally, and nothing is sent anywhere.
+// The conditions are the decoder's own, written out rather than borrowed from
+// it, because a check taken from the code under test would agree with that code
+// whatever it said. The one addition is the unmapping, because the kernel
+// reports an IPv4 interface address as a 16-byte IPv4-in-IPv6 value and the
+// decoder refuses a 4-in-6 upstream -- an address it would refuse cannot be
+// published under it.
 //
-// The interface that owns the default route is preferred, because it is the one
-// an online machine always has, and whichever address is taken is logged so a
-// case can say what it published. A host with no such address cannot run these
-// cases and says so rather than reporting a failure: a container with only
-// loopback has no address the state decoder will accept, and working around that
-// would need a bypass of the very validation these cases exist to hold to. The
-// network-namespace variant of this suite is where such a host is covered.
-func localUnicastAddress(t *testing.T) (netip.Addr, string) {
-	t.Helper()
+// This is the single list. Discovery filters with it and so does the reporter,
+// so the two cannot disagree about what a published state may name.
+func publishableUpstream(address netip.Addr) bool {
+	return address.IsValid() &&
+		address.Unmap() == address &&
+		address.Is4() &&
+		!address.IsLoopback() &&
+		!address.IsUnspecified() &&
+		!address.IsMulticast() &&
+		address.IsGlobalUnicast() &&
+		!address.IsLinkLocalUnicast() &&
+		address.Zone() == ""
+}
+
+// discoverUnicastAddress looks for an address a published DHCP state may name,
+// preferring the device that owns the default route because it is the one an
+// online machine always has. Binding such an address keeps the exchange on this
+// host: the kernel routes a packet addressed to one of its own addresses
+// internally, so nothing is sent anywhere and no route is needed.
+//
+// It returns the zero address, an empty device and the reason when there is none,
+// so the caller can report a host rather than guess at one.
+func discoverUnicastAddress() (netip.Addr, string, string) {
 	preferred := defaultRouteInterface()
 
 	interfaces, err := net.Interfaces()
 	if err != nil {
-		t.Skipf("this host's interfaces cannot be read, so no address a published DHCP state may name is known: %v", err)
+		return netip.Addr{}, "", fmt.Sprintf("this host's interfaces cannot be read, so no address is known: %v", err)
 	}
 	var fallback netip.Addr
-	var fallbackName string
+	var fallbackDevice string
 	for _, candidate := range interfaces {
 		if candidate.Flags&net.FlagUp == 0 || candidate.Flags&net.FlagLoopback != 0 {
 			continue
@@ -753,38 +767,160 @@ func localUnicastAddress(t *testing.T) (netip.Addr, string) {
 			if !ok {
 				continue
 			}
-			// The kernel reports an IPv4 address as a 16-byte IPv4-in-IPv6 value, so
-			// it is unmapped before it is judged: the state decoder refuses a
-			// 4-in-6 upstream, and an address it would refuse cannot be published
-			// under it.
 			address, ok := netip.AddrFromSlice(network.IP)
 			if !ok {
 				continue
 			}
+			// The kernel's IPv4-in-IPv6 form is unmapped first, so the value that
+			// is judged, logged and published is the one the decoder accepts.
 			address = address.Unmap()
-			// The same conditions the state decoder applies, written out rather
-			// than borrowed from it: a check taken from the code under test would
-			// agree with that code whatever it said.
-			if !address.Is4() || address.IsLoopback() ||
-				address.IsUnspecified() || address.IsMulticast() ||
-				!address.IsGlobalUnicast() || address.IsLinkLocalUnicast() {
+			if !publishableUpstream(address) {
 				continue
 			}
+			// The device that owns the default route is preferred, because it is
+			// the one an online machine always has.
 			if candidate.Name == preferred {
-				return address, candidate.Name
+				return address, candidate.Name, ""
 			}
 			if !fallback.IsValid() {
-				fallback, fallbackName = address, candidate.Name
+				fallback, fallbackDevice = address, candidate.Name
 			}
 		}
 	}
 	if !fallback.IsValid() {
-		t.Skip("this host has no global-unicast IPv4 address on a non-loopback interface, and the " +
-			"production DHCP state decoder refuses a loopback upstream, so no published state can " +
-			"name a domestic resolver here; the network-namespace variant of this suite is what covers " +
-			"such a host")
+		return netip.Addr{}, "", "no interface on this host carries a global-unicast IPv4 address on a non-loopback interface"
 	}
-	return fallback, fallbackName
+	return fallback, fallbackDevice, ""
+}
+
+// addressVerdict is what a case may do about the address a published DHCP state
+// would have to name.
+type addressVerdict int
+
+const (
+	// runWithAddress is the only verdict that lets a case proceed.
+	runWithAddress addressVerdict = iota
+	// skipThisHost is a plain run on a host that cannot be asked.
+	skipThisHost
+	// failThisHost is a strict run on the same host.
+	failThisHost
+)
+
+func (v addressVerdict) String() string {
+	switch v {
+	case runWithAddress:
+		return "run"
+	case skipThisHost:
+		return "skip"
+	case failThisHost:
+		return "fail"
+	default:
+		return fmt.Sprintf("unknown verdict %d", int(v))
+	}
+}
+
+// addressRequirement is the whole decision in one place. A host with an address a
+// published state may name runs whatever the environment says; a host without one
+// skips on a plain run and fails on a strict one; and nothing else varies.
+func addressRequirement(address netip.Addr, strict bool) addressVerdict {
+	if publishableUpstream(address) {
+		return runWithAddress
+	}
+	if strict {
+		return failThisHost
+	}
+	return skipThisHost
+}
+
+// strictnessVariable is the switch that turns "this host cannot run these cases"
+// from a skip into a failure.
+//
+// It exists because the trade is otherwise invisible. The production DHCP state
+// decoder refuses a loopback upstream, so a loopback-only host cannot be given a
+// state document naming a domestic resolver, and the only way to make one would
+// be a bypass of the validation these cases exist to hold to. Skipping is the
+// right answer for a developer on a laptop or in a loopback-only container, and a
+// silent skip is the wrong answer for an acceptance gate: it would be green with
+// no end-to-end coverage at all. So a CI job sets this and the gate can say "I
+// did not run".
+const strictnessVariable = "MOSDNS_REQUIRE_INTEGRATION"
+
+// requireIntegration reads the switch out of the environment.
+func requireIntegration() bool {
+	return requireIntegrationValue(os.Getenv(strictnessVariable))
+}
+
+// requireIntegrationValue is requireIntegration's whole decision, given the
+// value, so every value can be driven without an environment.
+//
+// Only an empty value, 0 and false are a "no". Everything else insists, on
+// purpose: a value nobody thought about, or a typo in one, must not be the thing
+// that quietly turns the gate off. Case is folded and surrounding space is
+// dropped, because a variable that reads as a boolean should be read as one and
+// FALSE meaning "insist" would be the worst possible surprise.
+func requireIntegrationValue(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "0", "false":
+		return false
+	default:
+		return true
+	}
+}
+
+// unusableAddressMessage is the report a host that cannot be asked receives. It
+// has to name what the host lacks, why a loopback address is not a substitute,
+// the plan that covers a host without the capability, and the switch that turns
+// the failure back into a skip. A report that said only "skipped" is what let
+// this gap through in the first place.
+func unusableAddressMessage(reason string) string {
+	return fmt.Sprintf(
+		"this host has no non-loopback IPv4 address a published DHCP state may name, and the end-to-end "+
+			"routing cases cannot be asked of it: %s; the production DHCP state decoder refuses a loopback "+
+			"upstream, so a loopback domestic resolver is not a substitute and working around that would "+
+			"need a bypass of the validation these cases exist to hold to; the netns variant of this suite, "+
+			"from the Podman plan, is what covers a host like this; unset %s to skip here instead of failing",
+		reason, strictnessVariable,
+	)
+}
+
+// caseOutcome is the two terminal calls a case can be given, as an interface so
+// the failure path is drivable on a host that has an address: a real Fatalf ends
+// the test and a real Skipf stops it, so neither branch could otherwise be
+// observed.
+type caseOutcome interface {
+	Helper()
+	Skipf(format string, args ...any)
+	Fatalf(format string, args ...any)
+}
+
+// A case is the outcome a real case gets, so the double that drives the two
+// branches is a stand-in for what a case actually receives rather than a shape
+// chosen to suit the test.
+var _ caseOutcome = (*testing.T)(nil)
+
+// requireUnicastAddress ends the case the way addressRequirement says, or lets
+// it proceed when this host has an address a published state may name.
+func requireUnicastAddress(outcome caseOutcome, address netip.Addr, reason string) {
+	outcome.Helper()
+	switch addressRequirement(address, requireIntegration()) {
+	case runWithAddress:
+		return
+	case skipThisHost:
+		outcome.Skipf("%s", unusableAddressMessage(reason))
+	case failThisHost:
+		outcome.Fatalf("%s", unusableAddressMessage(reason))
+	}
+}
+
+// localUnicastAddress is the address a case publishes, and it is where a host
+// that cannot be asked is reported rather than worked around: a loopback domestic
+// resolver is refused by the state decoder, and the only way past that would be a
+// bypass of the validation these cases exist to hold to.
+func localUnicastAddress(t *testing.T) (netip.Addr, string) {
+	t.Helper()
+	address, interfaceName, reason := discoverUnicastAddress()
+	requireUnicastAddress(t, address, reason)
+	return address, interfaceName
 }
 
 // defaultRouteInterface is the device the kernel's default route uses, read from
@@ -1335,4 +1471,216 @@ func TestTheForeignCacheNeverChangesWhatTheDomesticPathReturns(t *testing.T) {
 	if got := h.foreign.Count("", foreignName); got != 1 {
 		t.Errorf("the foreign resolver was asked %d times for %s, want 1: the second and third queries must be answered from the cache", got, foreignName)
 	}
+}
+
+// --- whether this host can be asked to run at all ---
+
+// TestStrictnessIsReadFromTheEnvironmentValue covers the one switch that decides
+// whether a host without a usable address is a skip or a failure. The values are
+// the ones a CI job or a developer would plausibly write, and the rule is that
+// anything a person could read as "no" is a no and everything else insists.
+//
+// The break it catches is the one that matters most for an acceptance gate: a
+// value that reads as "off" being treated as "on" would turn an offline laptop
+// red, and a value that reads as "on" being treated as "off" would let a loopback
+// container pass the gate with nothing having run. Case is folded because a
+// variable that reads as a boolean should be read as one, and `FALSE` meaning
+// "insist" would be the worst possible surprise.
+func TestStrictnessIsReadFromTheEnvironmentValue(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		value string
+		want  bool
+	}{
+		"unset":              {value: "", want: false},
+		"zero":               {value: "0", want: false},
+		"zero with a space":  {value: " 0 ", want: false},
+		"false":              {value: "false", want: false},
+		"false in capitals":  {value: "FALSE", want: false},
+		"false mixed case":   {value: "False", want: false},
+		"false with a space": {value: " false ", want: false},
+		"one":                {value: "1", want: true},
+		"one with a space":   {value: " 1 ", want: true},
+		"true":               {value: "true", want: true},
+		"true in capitals":   {value: "TRUE", want: true},
+		"no is not a value":  {value: "no", want: true},
+		"off is not a value": {value: "off", want: true},
+		"anything else asks": {value: "please", want: true},
+		// A value that is only whitespace is unset once trimmed, so it is the
+		// same "no" as an unset variable rather than a typo that insists.
+		"a blank value is unset": {value: "\t", want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := requireIntegrationValue(testCase.value); got != testCase.want {
+				t.Errorf("%s=%q reads as strict=%t, want %t", strictnessVariable, testCase.value, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestTheAddressRequirementDecidesWhetherACaseCanRun is the whole decision in one
+// table: a host with a usable address runs whatever the environment says, a host
+// without one skips on a plain run and fails on a strict one, and nothing else
+// varies. The break is a verdict that ignores the environment, which would make a
+// loopback container either red for every developer or green for CI.
+func TestTheAddressRequirementDecidesWhetherACaseCanRun(t *testing.T) {
+	usable := netip.MustParseAddr("192.168.81.153")
+	missing := netip.Addr{}
+
+	for name, testCase := range map[string]struct {
+		address netip.Addr
+		strict  bool
+		want    addressVerdict
+	}{
+		"a host with an address runs on a plain run":  {address: usable, strict: false, want: runWithAddress},
+		"a host with an address runs on a strict run": {address: usable, strict: true, want: runWithAddress},
+		"a host without one skips on a plain run":     {address: missing, strict: false, want: skipThisHost},
+		"a host without one fails on a strict run":    {address: missing, strict: true, want: failThisHost},
+		"the unspecified address is no address":       {address: netip.AddrFrom4([4]byte{0, 0, 0, 0}), strict: false, want: skipThisHost},
+		"a host with a zone is not a publishable address": {
+			address: netip.MustParseAddr("fe80::1%ens33"), strict: false, want: skipThisHost,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := addressRequirement(testCase.address, testCase.strict); got != testCase.want {
+				t.Errorf("address %q on a strict=%t run = %v, want %v", testCase.address, testCase.strict, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestAnUnusableAddressIsSkippedOrFailedAsTheEnvironmentSays is the reporter
+// itself, which is where "fails rather than skips" actually lives: a verdict that
+// is never consulted, or a reporter that always skips, would leave every table
+// above green while the gate stayed dishonest.
+//
+// The two terminal calls are recorded rather than made, because a real Fatalf
+// ends the test and a real Skipf stops it: there is no way to observe both
+// branches of one test otherwise. What is asserted is which of the two was
+// called and that exactly one was.
+func TestAnUnusableAddressIsSkippedOrFailedAsTheEnvironmentSays(t *testing.T) {
+	reason := "no interface carried a global-unicast IPv4"
+	for name, testCase := range map[string]struct {
+		// value is written into the real environment, so the reporter under test
+		// reads the switch the way a case reads it rather than through a seam
+		// only this test knows about.
+		value    string
+		wantCall string
+	}{
+		"a plain run skips":  {value: "", wantCall: "skip"},
+		"a strict run fails": {value: "1", wantCall: "fail"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(strictnessVariable, testCase.value)
+			recorded := &recordedOutcome{}
+			requireUnicastAddress(recorded, netip.Addr{}, reason)
+
+			if recorded.calls != 1 {
+				t.Fatalf("a host with no address was told %d times what to do, want exactly 1", recorded.calls)
+			}
+			if recorded.last != testCase.wantCall {
+				t.Errorf("a host with no address was told to %s, want it told to %s", recorded.last, testCase.wantCall)
+			}
+			if recorded.message == "" {
+				t.Error("the report carried no message, so a reader would not know what was missing")
+			}
+		})
+	}
+}
+
+// TestAUsableAddressIsNeverReportedAtAll is the control for the case above: a
+// reporter that reported something for a host that has an address would stop
+// every case in this suite on a machine that can run them.
+func TestAUsableAddressIsNeverReportedAtAll(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		t.Setenv(strictnessVariable, strictnessValue(strict))
+		recorded := &recordedOutcome{}
+		requireUnicastAddress(recorded, netip.MustParseAddr("192.168.81.153"), "unused")
+		if recorded.calls != 0 {
+			t.Errorf("a host with an address was told %d times what to do on a strict=%t run, want 0", recorded.calls, strict)
+		}
+	}
+}
+
+// TestAnUnusableAddressMessageNamesWhatIsMissingAndWhoCoversIt pins the text of
+// the report, because a report that only says "skipped" is what let the original
+// gap through. It has to name the capability the host lacks, why a loopback
+// address is not a substitute, the plan that covers a host without the
+// capability, and the switch that turns the failure back into a skip.
+func TestAnUnusableAddressMessageNamesWhatIsMissingAndWhoCoversIt(t *testing.T) {
+	message := unusableAddressMessage("no interface carried a global-unicast IPv4")
+
+	for name, wantMention := range map[string]string{
+		"the missing capability":     "non-loopback",
+		"why loopback will not do":   "refuses a loopback upstream",
+		"the reason it happened":     "no interface carried a global-unicast IPv4",
+		"the plan that covers it":    "netns",
+		"the switch that relaxes it": strictnessVariable,
+	} {
+		if !strings.Contains(message, wantMention) {
+			t.Errorf("the report does not mention %s (%q):\n%s", name, wantMention, message)
+		}
+	}
+}
+
+// TestAStrictRunStillExercisesTheCasesOnAHostThatHasAnAddress is the end-to-end
+// half: the switch must not cost a host that can run anything, so this asks for
+// the environment to insist and then drives a real router through a real China
+// name and a real foreign one.
+//
+// It skips, rather than fails, on a host with no usable address, and says which
+// host that is. The strict behaviour there is the reporter's, and the table above
+// covers it; a test that ran a case here on such a host would be reporting a
+// property of the machine rather than of the code.
+func TestAStrictRunStillExercisesTheCasesOnAHostThatHasAnAddress(t *testing.T) {
+	address, interfaceName, reason := discoverUnicastAddress()
+	if !address.IsValid() {
+		t.Skipf("this host has no address a published DHCP state may name (%s), so a strict end-to-end run cannot be asked of it here; the netns variant of this suite covers such a host", reason)
+	}
+	t.Logf("the strict run will use %s (%s)", address, interfaceName)
+
+	t.Setenv(strictnessVariable, "1")
+	if !requireIntegration() {
+		t.Fatalf("%s=1 does not read as strict, so the switch this case is about is not wired to the environment", strictnessVariable)
+	}
+
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+
+	if got, want := answeredAddresses(t, h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeA)), []string{"198.51.100.1"}; !equalStrings(got, want) {
+		t.Errorf("%s on a strict run = %v, want the domestic resolver's first answer %v", chinaName, got, want)
+	}
+	if got, want := answeredAddresses(t, h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)), []string{foreignAddress}; !equalStrings(got, want) {
+		t.Errorf("%s on a strict run = %v, want the foreign resolver's answer %v", foreignName, got, want)
+	}
+}
+
+// strictnessValue is the environment text that means what a bool means here.
+func strictnessValue(strict bool) string {
+	if strict {
+		return "1"
+	}
+	return "0"
+}
+
+// recordedOutcome is the double the reporter test drives. It answers both
+// questions -- which terminal call was made, and with what -- without making
+// either, because a real Skipf or Fatalf would end the test that is asking.
+type recordedOutcome struct {
+	calls   int
+	last    string
+	message string
+}
+
+func (o *recordedOutcome) Helper() {}
+
+func (o *recordedOutcome) Skipf(format string, args ...any) {
+	o.calls++
+	o.last = "skip"
+	o.message = fmt.Sprintf(format, args...)
+}
+
+func (o *recordedOutcome) Fatalf(format string, args ...any) {
+	o.calls++
+	o.last = "fail"
+	o.message = fmt.Sprintf(format, args...)
 }

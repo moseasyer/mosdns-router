@@ -247,6 +247,22 @@ elif grep -q 'tests/integration' "$work/dryrun"; then
 	sed 's/^/    /' "$work/dryrun" >&2 || true
 fi
 
+# 7b. -count=1 belongs to the test-integration recipe. This suite binds sockets
+#     and runs a child process, and neither is an input the Go test cache can
+#     see, so a cached result is a gate satisfied without a single case having
+#     been asked. The Makefile says so in a comment; this is the assertion that
+#     stops the flag and the reasoning from drifting apart, which is what happens
+#     if the flag is dropped and only the comment is left.
+status=0
+make --no-print-directory -n test-integration GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+if [ "$status" -ne 0 ]; then
+	fail "dry run of test-integration exited $status"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+elif ! grep -q 'test -mod=readonly -count=1 .*tests/integration' "$work/dryrun"; then
+	fail "test-integration does not pass -count=1, so a cached result could satisfy the gate with no case run"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+fi
+
 # 8. Nothing the test ran may change the module files.
 if ! cmp -s "$work/go.mod.before" go.mod; then
 	fail "go.mod was modified while checking the entry points"

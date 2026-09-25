@@ -66,7 +66,15 @@ test: check-go test-python
 #
 # -count=1 because this suite's work is not something the test cache can see: it
 # binds sockets and runs a child process, and a cached pass would be a gate
-# satisfied without a single case having been asked.
+# satisfied without a single case having been asked. The entry-point regression
+# asserts this flag is here, so it cannot be dropped and left as a comment.
+#
+# The suite skips on a host with no non-loopback IPv4 address, because the
+# production DHCP state decoder refuses a loopback upstream and the alternative
+# would be a bypass of the validation these cases exist to hold to. A skip is the
+# right answer on a laptop and the wrong answer in a gate, so MOSDNS_REQUIRE_INTEGRATION=1
+# turns it into a failure: set it in CI to make the gate insist, and leave it unset
+# for a local run.
 test-integration: check-go
 	@MOSDNS_ROUTER_GO='$(GO)' $(GO) test -mod=readonly -count=1 ./tests/integration
 
