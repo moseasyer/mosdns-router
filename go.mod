@@ -7,6 +7,7 @@ toolchain go1.25.0
 require (
 	github.com/IrineSistiana/mosdns/v5 v5.3.4
 	github.com/spf13/cobra v1.10.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

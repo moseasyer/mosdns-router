@@ -1,0 +1,234 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+const validPolicyYAML = `schema_version: 1
+schedule: "03:00"
+foreign:
+  default_provider: Quad9 Secure DNSCrypt v2
+  ecs: false
+cdn:
+  ip_version: IPv4
+  suppress_aaaa: true
+  cloudflare:
+    max_candidates: 512
+  latency_candidate_count: 10
+  combined:
+    latency_top: 3
+    bandwidth_top: 3
+  switch_improvement_percent: 10
+  health:
+    interval: 120
+    failure_threshold: 3
+  bandwidth:
+    daily_budget: 104857600
+    per_candidate_limit: 10485760
+    per_candidate_seconds: 3
+ech:
+  enabled: true
+  failure_policy: strict
+  stale_grace: 900
+  sources:
+    - cloudflare-ech.com
+dhcp:
+  failure_policy: disable-current
+cache:
+  persistent_dump: false
+`
+
+func TestDefaultsMatchApprovedSpec(t *testing.T) {
+	got := Defaults()
+	want := Policy{
+		SchemaVersion: 1,
+		Schedule:      "03:00",
+		Foreign: ForeignPolicy{
+			DefaultProvider: "Quad9 Secure DNSCrypt v2",
+			ECS:             false,
+		},
+		CDN: CDNPolicy{
+			IPVersion:                "IPv4",
+			SuppressAAAA:             true,
+			Cloudflare:               CloudflarePolicy{MaxCandidates: 512},
+			LatencyCandidateCount:    10,
+			Combined:                 CombinedPolicy{LatencyTop: 3, BandwidthTop: 3},
+			SwitchImprovementPercent: 10,
+			Health: HealthPolicy{
+				IntervalSeconds:  120,
+				FailureThreshold: 3,
+			},
+			Bandwidth: BandwidthPolicy{
+				DailyBytes:          100 * 1024 * 1024,
+				PerCandidateBytes:   10 * 1024 * 1024,
+				PerCandidateSeconds: 3,
+			},
+		},
+		ECH: ECHPolicy{
+			Enabled:           true,
+			FailurePolicy:     "strict",
+			StaleGraceSeconds: 900,
+			Sources:           []string{"cloudflare-ech.com"},
+		},
+		DHCP:  DHCPPolicy{FailurePolicy: "disable-current"},
+		Cache: CachePolicy{PersistentDump: false},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected defaults:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestLoadAcceptsOneDocumentAndLoadsPolicy(t *testing.T) {
+	for _, prefix := range []string{"", "---\n"} {
+		t.Run("leading_marker_"+strings.TrimSpace(prefix), func(t *testing.T) {
+			path := writeYAML(t, prefix+validPolicyYAML)
+			got, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, Defaults()) {
+				t.Fatalf("loaded policy = %#v, want defaults %#v", got, Defaults())
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnknownKey(t *testing.T) {
+	path := writeYAML(t, validPolicyYAML+"unknown_key: true\n")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected unknown key error")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("error %q does not include policy path %q", err, path)
+	}
+}
+
+func TestLoadRejectsInvalidPolicyValues(t *testing.T) {
+	tests := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{name: "negative daily budget", old: "daily_budget: 104857600", new: "daily_budget: -1"},
+		{name: "negative per candidate limit", old: "per_candidate_limit: 10485760", new: "per_candidate_limit: -1"},
+		{name: "zero daily budget", old: "daily_budget: 104857600", new: "daily_budget: 0"},
+		{name: "zero per candidate limit", old: "per_candidate_limit: 10485760", new: "per_candidate_limit: 0"},
+		{name: "invalid schedule hour", old: `schedule: "03:00"`, new: `schedule: "24:00"`},
+		{name: "invalid schedule minute", old: `schedule: "03:00"`, new: `schedule: "03:60"`},
+		{name: "schedule without zero padding", old: `schedule: "03:00"`, new: `schedule: "3:00"`},
+		{name: "unsupported ECH policy", old: "failure_policy: strict", new: "failure_policy: permissive"},
+		{name: "unsupported DHCP policy", old: "failure_policy: disable-current", new: "failure_policy: keep-stale"},
+		{name: "zero schema version", old: "schema_version: 1", new: "schema_version: 0"},
+		{name: "unsupported schema version", old: "schema_version: 1", new: "schema_version: 2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := strings.Replace(validPolicyYAML, tt.old, tt.new, 1)
+			if content == validPolicyYAML {
+				t.Fatalf("fixture replacement %q did not apply", tt.old)
+			}
+			path := writeYAML(t, content)
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsNegativeNumericValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Policy)
+	}{
+		{name: "cloudflare candidates", mutate: func(p *Policy) { p.CDN.Cloudflare.MaxCandidates = -1 }},
+		{name: "latency candidates", mutate: func(p *Policy) { p.CDN.LatencyCandidateCount = -1 }},
+		{name: "latency top", mutate: func(p *Policy) { p.CDN.Combined.LatencyTop = -1 }},
+		{name: "bandwidth top", mutate: func(p *Policy) { p.CDN.Combined.BandwidthTop = -1 }},
+		{name: "switch improvement", mutate: func(p *Policy) { p.CDN.SwitchImprovementPercent = -1 }},
+		{name: "health interval", mutate: func(p *Policy) { p.CDN.Health.IntervalSeconds = -1 }},
+		{name: "failure threshold", mutate: func(p *Policy) { p.CDN.Health.FailureThreshold = -1 }},
+		{name: "daily bytes", mutate: func(p *Policy) { p.CDN.Bandwidth.DailyBytes = -1 }},
+		{name: "per candidate bytes", mutate: func(p *Policy) { p.CDN.Bandwidth.PerCandidateBytes = -1 }},
+		{name: "per candidate seconds", mutate: func(p *Policy) { p.CDN.Bandwidth.PerCandidateSeconds = -1 }},
+		{name: "stale grace", mutate: func(p *Policy) { p.ECH.StaleGraceSeconds = -1 }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := Defaults()
+			tt.mutate(&policy)
+			if err := policy.Validate(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsBoundaryValues(t *testing.T) {
+	policy := Defaults()
+	policy.Schedule = "00:00"
+	policy.CDN.SwitchImprovementPercent = 0
+	policy.ECH.StaleGraceSeconds = 0
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("boundary values should be valid: %v", err)
+	}
+
+	policy.Schedule = "23:59"
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("latest valid schedule should be valid: %v", err)
+	}
+}
+
+func TestValidateAcceptsSupportedFailurePolicies(t *testing.T) {
+	policy := Defaults()
+	policy.ECH.FailurePolicy = "fallback"
+	policy.DHCP.FailurePolicy = "use-last-good"
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("supported failure policies should be valid: %v", err)
+	}
+}
+
+func TestLoadRejectsMultipleDocuments(t *testing.T) {
+	for _, suffix := range []string{"---\nschema_version: 1\n", "---\n"} {
+		t.Run("suffix_"+strings.TrimSpace(suffix), func(t *testing.T) {
+			path := writeYAML(t, validPolicyYAML+suffix)
+			if _, err := Load(path); err == nil {
+				t.Fatal("expected multiple-document error")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsTrailingContent(t *testing.T) {
+	path := writeYAML(t, validPolicyYAML+"trailing content\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected trailing-content error")
+	}
+}
+
+func TestLoadWrapsFileErrorsWithPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected file error")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("error %q does not include policy path %q", err, path)
+	}
+}
+
+func writeYAML(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	return path
+}
