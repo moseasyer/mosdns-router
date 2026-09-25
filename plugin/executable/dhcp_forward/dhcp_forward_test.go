@@ -3,6 +3,7 @@ package dhcp_forward
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
@@ -264,6 +266,115 @@ func TestCacheSeparatesTheAuthenticatedDataBit(t *testing.T) {
 	}
 	if count := upstream.Count(testdns.ProtocolUDP, "authenticated.example.com."); count != 2 {
 		t.Fatalf("upstream received %d queries, want 2: the ad bit is part of the cache key", count)
+	}
+}
+
+// bufferLedger counts the pooled buffers the UDP client takes and gives back.
+//
+// pool.GetBuf and pool.ReleaseBuf are package variables, so the real allocator
+// still does the real allocating and this only observes the two ends of the
+// lifecycle. That is the whole invariant: a buffer that is never returned is a
+// fresh 64 KiB allocation for every timed-out query, and a buffer returned twice
+// is one buffer owned by two exchanges.
+type bufferLedger struct {
+	mu       sync.Mutex
+	taken    int
+	returned int
+}
+
+func (l *bufferLedger) install(t *testing.T) {
+	t.Helper()
+	realGet, realRelease := pool.GetBuf, pool.ReleaseBuf
+	l.mu.Lock()
+	l.taken, l.returned = 0, 0
+	l.mu.Unlock()
+	pool.GetBuf = func(size int) *[]byte {
+		l.mu.Lock()
+		l.taken++
+		l.mu.Unlock()
+		return realGet(size)
+	}
+	pool.ReleaseBuf = func(payload *[]byte) {
+		l.mu.Lock()
+		l.returned++
+		l.mu.Unlock()
+		realRelease(payload)
+	}
+	t.Cleanup(func() {
+		pool.GetBuf, pool.ReleaseBuf = realGet, realRelease
+	})
+}
+
+func (l *bufferLedger) counts() (taken, returned int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.taken, l.returned
+}
+
+// TestUDPExchangeReturnsEveryPooledBufferItTakes covers both ends of the one
+// buffer a UDP exchange owns. The reader goroutine writes the answer into a
+// 64 KiB pooled buffer, so a context that expires while the read is outstanding
+// is the one path where the reader has produced nothing to hand over: the buffer
+// has to go back to the pool from the goroutine that was writing into it, and a
+// successful exchange has to return its buffer exactly once. A leak here is not a
+// slow path, it is an allocation per query that timed out.
+func TestUDPExchangeReturnsEveryPooledBufferItTakes(t *testing.T) {
+	ledger := &bufferLedger{}
+	ledger.install(t)
+
+	// A socket that receives the query and never answers it, so the read stays
+	// outstanding until the deadline fires.
+	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("open the black hole socket: %v", err)
+	}
+	t.Cleanup(func() { _ = blackhole.Close() })
+
+	query := new(dns.Msg)
+	query.SetQuestion("pooled.example.com.", dns.TypeA)
+	wire, err := query.Pack()
+	if err != nil {
+		t.Fatalf("pack the query: %v", err)
+	}
+
+	const abandoned = 20
+	abandoning := &udpClient{target: blackhole.LocalAddr().(*net.UDPAddr)}
+	for range abandoned {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+		payload, err := abandoning.ExchangeContext(ctx, wire)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("exchange error = %v, want the context deadline: the abandoned read was not the path taken", err)
+		}
+		if payload != nil {
+			t.Fatalf("a cancelled exchange returned %d bytes, want none", len(*payload))
+		}
+	}
+	if taken, returned := ledger.counts(); taken == 0 || returned != taken {
+		t.Fatalf("%d cancelled exchanges returned %d of the %d pooled buffers they took: "+
+			"an abandoned read buffer is never given back", abandoned, returned, taken)
+	}
+
+	// The other end: a buffer that was handed over is the caller's, and the
+	// caller gives it back once. A second release would put one buffer into the
+	// pool twice, so the next exchange would read into memory another one owns.
+	upstream := startServer(t, answerWith("192.0.2.73", 30))
+	target, err := net.ResolveUDPAddr("udp", upstream.Address())
+	if err != nil {
+		t.Fatalf("resolve the answering server: %v", err)
+	}
+	answer, err := (&udpClient{target: target}).ExchangeContext(t.Context(), wire)
+	if err != nil {
+		t.Fatalf("exchange against the answering server: %v", err)
+	}
+	response := new(dns.Msg)
+	if err := response.Unpack(*answer); err != nil {
+		t.Fatalf("the returned buffer does not hold a complete message: %v", err)
+	}
+	pool.ReleaseBuf(answer)
+	if taken, returned := ledger.counts(); returned != taken {
+		t.Fatalf("the exchanges so far returned %d of the %d pooled buffers they took: "+
+			"a buffer is released twice or not at all", returned, taken)
 	}
 }
 

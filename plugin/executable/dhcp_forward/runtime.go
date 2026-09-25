@@ -509,28 +509,43 @@ func (c *udpClient) ExchangeContext(ctx context.Context, query []byte) (*[]byte,
 	}
 
 	payload := pool.GetBuf(dns.MaxMsgSize)
+	// The reader owns the buffer until it is no longer writing into it, and the
+	// caller owns it as soon as the reader hands it over. A read that failed
+	// produced nothing to hand over, so the reader returns the buffer itself; a
+	// read that succeeded passes ownership across. A caller that stops waiting
+	// closes the socket, which ends the read, and then waits for the reader
+	// either way: a read that completed in the meantime still owns a buffer, and
+	// dropping it would leak it, while a read that failed has already returned
+	// its own and must not be released twice.
 	type readResult struct {
-		size int
-		err  error
+		payload *[]byte
+		size    int
+		err     error
 	}
 	read := make(chan readResult, 1)
 	go func() {
 		size, err := conn.Read(*payload)
-		read <- readResult{size: size, err: err}
+		if err != nil {
+			pool.ReleaseBuf(payload)
+			read <- readResult{size: size, err: err}
+			return
+		}
+		*payload = (*payload)[:size]
+		read <- readResult{payload: payload, size: size}
 	}()
 
 	select {
 	case result := <-read:
 		if result.err != nil {
-			pool.ReleaseBuf(payload)
 			return nil, result.err
 		}
-		*payload = (*payload)[:result.size]
-		return payload, nil
+		return result.payload, nil
 	case <-ctx.Done():
-		// Closing the socket is what releases the read; the goroutine then
-		// reports into a buffered channel and exits.
 		_ = conn.Close()
+		abandoned := <-read
+		if abandoned.err == nil {
+			pool.ReleaseBuf(abandoned.payload)
+		}
 		return nil, context.Cause(ctx)
 	}
 }
