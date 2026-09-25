@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "repository": "v2fly/domain-list-community",
+  "commit": "a5731758ed6bc9620b0e146ed24b07b9131893cf",
+  "sha256": "aeebf6b0643490cb8c39243ab57f81ab6c411af14238dd7e9e23409d7526ddda",
+  "list_sha256": "a865b7cb15f56edd73e8b2df37f22d0d1fe9ee0f4991c090a62ca11e495dfa9f",
+  "entry": "data/cn"
+}
