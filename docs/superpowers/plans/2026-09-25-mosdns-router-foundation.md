@@ -100,10 +100,10 @@ type Selector struct {
     Mode             string            `json:"mode"`
     Provider         string            `json:"provider"`
     WinnerIP         string            `json:"winner_ip,omitempty"`
-    WinnerProofUntil time.Time         `json:"winner_proof_until,omitempty"`
+    WinnerProofUntil time.Time         `json:"winner_proof_until,omitzero"`
     FallbackIP       string            `json:"fallback_ip,omitempty"`
     CloudFront       map[string]string `json:"cloudfront,omitempty"`
-    LastSuccess      time.Time         `json:"last_success,omitempty"`
+    LastSuccess      time.Time         `json:"last_success,omitzero"`
     LastFailure      string            `json:"last_failure,omitempty"`
     ConfigSHA256     string            `json:"config_sha256"`
 }
@@ -131,8 +131,8 @@ type HealthState struct {
     SchemaVersion       int       `json:"schema_version"`
     Healthy             bool      `json:"healthy"`
     ConsecutiveFailures int       `json:"consecutive_failures"`
-    LastSuccess         time.Time `json:"last_success,omitempty"`
-    LastFailure         time.Time `json:"last_failure,omitempty"`
+    LastSuccess         time.Time `json:"last_success,omitzero"`
+    LastFailure         time.Time `json:"last_failure,omitzero"`
 }
 
 func WriteJSONAtomic(path string, value any) error
@@ -448,6 +448,20 @@ func (s ECHState) Validate() error
 ```
 
 Require `SchemaVersion == 1`, valid IP addresses, non-empty provider, `ECHState.Status` in `fresh|stale|invalid`, RFC3339 `BandwidthBudgetState.LocalDate`, non-negative budget bytes, and non-negative health failure counters.
+
+`time.Time` fields carry `omitzero`, not `omitempty`: `omitempty` never applies to a
+struct, so it encoded a zero time as the literal year 1 instead of omitting it.
+
+DHCP upstreams must be routable unicast addresses, never loopback (including
+`127.0.0.53`/`127.0.0.54`), unspecified, multicast, IPv4 link-local, or zoned;
+a bare IPv6 link-local, ULA, or global address stays valid because the interface
+is stored in the same record. `DHCPState` also requires an interface name, a
+source token, an observation time, and at least one upstream when `LastGood` is
+set. `Selector` requires public IPv4 CloudFront values, DNS-hostname CloudFront
+keys, an optional lowercase SHA-256 `ConfigSHA256`, and a consistent
+winner/fallback/proof relationship. `ECHState` requires a DNS-hostname source and
+public name, a SHA-256 digest, and a `fetched_at` < `expires_at` <= `stale_until`
+timeline.
 
 - [ ] **Step 4: Implement atomic JSON writes**
 

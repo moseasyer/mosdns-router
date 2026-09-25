@@ -485,6 +485,83 @@ func TestReadJSONValidatesEveryStateType(t *testing.T) {
 	}
 }
 
+// `omitempty` has never applied to a struct, so a zero timestamp used to be
+// encoded as the literal year 1. A consumer that treats any present timestamp as
+// a real observation would then act on a value that never happened, so a zero
+// time must be absent from the encoded document entirely.
+func TestZeroTimestampsAreOmittedFromEncodedState(t *testing.T) {
+	t.Run("selector", func(t *testing.T) {
+		zero := Selector{SchemaVersion: SchemaVersion, Generation: 3, Mode: "disabled", Provider: "cloudflare"}
+		data, err := json.Marshal(zero)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"winner_proof_until", "last_success"} {
+			if strings.Contains(string(data), `"`+key+`"`) {
+				t.Errorf("zero timestamp was encoded as %s: %s", key, data)
+			}
+		}
+		if !strings.Contains(string(data), `"generation":3`) {
+			t.Errorf("non-time fields are missing from %s", data)
+		}
+
+		set := zero
+		set.WinnerProofUntil = time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC)
+		set.LastSuccess = time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)
+		data, err = json.Marshal(set)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{`"winner_proof_until":"2026-09-25T13:00:00Z"`, `"last_success":"2026-09-25T12:00:00Z"`} {
+			if !strings.Contains(string(data), want) {
+				t.Errorf("set timestamp %s is missing from %s", want, data)
+			}
+		}
+	})
+
+	t.Run("health", func(t *testing.T) {
+		zero := HealthState{SchemaVersion: SchemaVersion, Healthy: true}
+		data, err := json.Marshal(zero)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"last_success", "last_failure"} {
+			if strings.Contains(string(data), `"`+key+`"`) {
+				t.Errorf("zero timestamp was encoded as %s: %s", key, data)
+			}
+		}
+
+		set := zero
+		set.LastSuccess = time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)
+		set.LastFailure = time.Date(2026, time.September, 25, 12, 30, 0, 0, time.UTC)
+		data, err = json.Marshal(set)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{`"last_success":"2026-09-25T12:00:00Z"`, `"last_failure":"2026-09-25T12:30:00Z"`} {
+			if !strings.Contains(string(data), want) {
+				t.Errorf("set timestamp %s is missing from %s", want, data)
+			}
+		}
+	})
+}
+
+// A document written without the optional keys must still round-trip, so the
+// omission changes the encoding and not the meaning.
+func TestReadJSONAcceptsStateWithoutOptionalTimestampKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "selector.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version":1,"generation":4,"mode":"auto","provider":"cloudflare"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got Selector
+	if err := ReadJSON(path, &got); err != nil {
+		t.Fatalf("read state without optional timestamps: %v", err)
+	}
+	if !got.LastSuccess.IsZero() || !got.WinnerProofUntil.IsZero() {
+		t.Fatalf("omitted timestamps were not read as zero: %#v", got)
+	}
+}
+
 func TestWriteJSONAtomicCreatesParentAndUsesRequiredModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "deeper", "state.json")
 	value := NewSelector(1, "disabled", "cloudflare", time.Date(2026, time.September, 25, 9, 0, 0, 0, time.UTC))

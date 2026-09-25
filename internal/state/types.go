@@ -46,10 +46,10 @@ type Selector struct {
 	Mode             string            `json:"mode"`
 	Provider         string            `json:"provider"`
 	WinnerIP         string            `json:"winner_ip,omitempty"`
-	WinnerProofUntil time.Time         `json:"winner_proof_until,omitempty"`
+	WinnerProofUntil time.Time         `json:"winner_proof_until,omitzero"`
 	FallbackIP       string            `json:"fallback_ip,omitempty"`
 	CloudFront       map[string]string `json:"cloudfront,omitempty"`
-	LastSuccess      time.Time         `json:"last_success,omitempty"`
+	LastSuccess      time.Time         `json:"last_success,omitzero"`
 	LastFailure      string            `json:"last_failure,omitempty"`
 	ConfigSHA256     string            `json:"config_sha256"`
 }
@@ -77,8 +77,8 @@ type HealthState struct {
 	SchemaVersion       int       `json:"schema_version"`
 	Healthy             bool      `json:"healthy"`
 	ConsecutiveFailures int       `json:"consecutive_failures"`
-	LastSuccess         time.Time `json:"last_success,omitempty"`
-	LastFailure         time.Time `json:"last_failure,omitempty"`
+	LastSuccess         time.Time `json:"last_success,omitzero"`
+	LastFailure         time.Time `json:"last_failure,omitzero"`
 }
 
 func NewDHCPState(generation uint64, interfaceName, connectionUUID string, upstreams []string, observedAt time.Time, source string, lastGood bool) DHCPState {
