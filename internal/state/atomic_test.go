@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -352,6 +353,35 @@ func TestReadJSONLeavesDestinationUnchangedWhenValidationFails(t *testing.T) {
 	}
 }
 
+func TestReadJSONLeavesDestinationUnchangedWhenCloseFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	valid := NewSelector(2, "auto", "cloudflare", time.Date(2026, time.September, 25, 14, 0, 0, 0, time.UTC))
+	data, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got := NewSelector(1, "manual", "cloudflare", time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC))
+	before := got
+	injected := errors.New("injected read close failure")
+	ops := defaultReadFileOps()
+	ops.open = func(openPath string) (io.ReadCloser, error) {
+		file, openErr := os.Open(openPath)
+		if openErr != nil {
+			return nil, openErr
+		}
+		return &closeErrorReadCloser{ReadCloser: file, closeErr: injected}, nil
+	}
+	if err := readJSONWithOps(path, &got, ops); !errors.Is(err, injected) {
+		t.Fatalf("read error = %v, want injected close error", err)
+	}
+	if !reflect.DeepEqual(got, before) {
+		t.Fatalf("close failure changed destination: got %#v, want %#v", got, before)
+	}
+}
+
 func TestReadJSONRejectsUnknownFieldsTrailingDataAndInvalidState(t *testing.T) {
 	base := `{"schema_version":1,"generation":4,"mode":"auto","provider":"cloudflare"}`
 	tests := []struct {
@@ -455,6 +485,60 @@ func TestWriteJSONAtomicPropagatesDirectorySyncFailure(t *testing.T) {
 	assertOnlyTargetEntry(t, filepath.Dir(path), filepath.Base(path))
 }
 
+func TestWriteJSONAtomicRestoresExistingTargetWhenDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	old := NewSelector(5, "auto", "cloudflare", time.Date(2026, time.September, 25, 15, 0, 0, 0, time.UTC))
+	old.WinnerIP = "192.0.2.5"
+	if err := WriteJSONAtomic(path, old); err != nil {
+		t.Fatal(err)
+	}
+	before := readFileBytes(t, path)
+
+	candidate := old
+	candidate.Generation = 6
+	candidate.WinnerIP = "192.0.2.6"
+	injected := errors.New("injected replacement directory sync failure")
+	candidateRenamed := false
+	syncCalls := 0
+	ops := defaultAtomicFileOps()
+	ops.rename = func(oldPath, newPath string) error {
+		err := os.Rename(oldPath, newPath)
+		if err == nil && newPath == path {
+			candidateRenamed = true
+		}
+		return err
+	}
+	ops.syncDir = func(string) error {
+		if !candidateRenamed {
+			return errors.New("directory sync ran before candidate rename")
+		}
+		syncCalls++
+		if syncCalls == 1 {
+			return injected
+		}
+		return nil
+	}
+
+	if err := writeJSONAtomicWithOps(path, candidate, ops); !errors.Is(err, injected) {
+		t.Fatalf("write error = %v, want injected directory sync error", err)
+	}
+	if !candidateRenamed {
+		t.Fatal("test did not exercise post-rename directory sync")
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("directory-sync failure changed target: got %q, want %q", after, before)
+	}
+	var got Selector
+	if err := ReadJSON(path, &got); err != nil {
+		t.Fatalf("read restored state: %v", err)
+	}
+	if got.Generation != old.Generation || got.WinnerIP != old.WinnerIP {
+		t.Fatalf("restored state = %#v, want generation %d and winner %q", got, old.Generation, old.WinnerIP)
+	}
+	assertOnlyTargetEntry(t, dir, filepath.Base(path))
+}
+
 func TestWriteJSONAtomicPropagatesRenameFailureWithoutOverwriting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	old := NewSelector(5, "auto", "cloudflare", time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
@@ -513,6 +597,18 @@ func assertNoTempEntries(t *testing.T, dir string) {
 			t.Fatalf("temporary entry left behind: %q", entry.Name())
 		}
 	}
+}
+
+type closeErrorReadCloser struct {
+	io.ReadCloser
+	closeErr error
+}
+
+func (file *closeErrorReadCloser) Close() error {
+	if err := file.ReadCloser.Close(); err != nil {
+		return err
+	}
+	return file.closeErr
 }
 
 func readFileBytes(t *testing.T, path string) []byte {

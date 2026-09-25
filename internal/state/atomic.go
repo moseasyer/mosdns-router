@@ -25,11 +25,23 @@ type atomicFileOps struct {
 	rename   func(string, string) error
 }
 
+type readFileOps struct {
+	open func(string) (io.ReadCloser, error)
+}
+
 func defaultAtomicFileOps() atomicFileOps {
 	return atomicFileOps{
 		syncFile: func(file *os.File) error { return file.Sync() },
 		syncDir:  syncDirectory,
 		rename:   os.Rename,
+	}
+}
+
+func defaultReadFileOps() readFileOps {
+	return readFileOps{
+		open: func(path string) (io.ReadCloser, error) {
+			return os.Open(path)
+		},
 	}
 }
 
@@ -44,6 +56,66 @@ func syncDirectory(path string) error {
 		return syncErr
 	}
 	return closeErr
+}
+
+func createStateBackup(path, parent string, syncFile func(*os.File) error) (backupPath string, err error) {
+	if syncFile == nil {
+		syncFile = func(file *os.File) error { return file.Sync() }
+	}
+	source, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	sourceClosed := false
+	defer func() {
+		if !sourceClosed {
+			if closeErr := source.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}
+	}()
+
+	info, err := source.Stat()
+	if err != nil {
+		return "", err
+	}
+	backup, err := os.CreateTemp(parent, "."+filepath.Base(path)+".*.bak")
+	if err != nil {
+		return "", err
+	}
+	backupPath = backup.Name()
+	backupClosed := false
+	cleanup := true
+	defer func() {
+		if !backupClosed {
+			_ = backup.Close()
+		}
+		if cleanup {
+			_ = os.Remove(backupPath)
+		}
+	}()
+
+	if err := backup.Chmod(info.Mode().Perm()); err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(backup, source); err != nil {
+		return "", err
+	}
+	if err := syncFile(backup); err != nil {
+		return "", err
+	}
+	if err := backup.Close(); err != nil {
+		backupClosed = true
+		return "", err
+	}
+	backupClosed = true
+	if err := source.Close(); err != nil {
+		sourceClosed = true
+		return "", err
+	}
+	sourceClosed = true
+	cleanup = false
+	return backupPath, nil
 }
 
 func WriteJSONAtomic(path string, value any) error {
@@ -107,34 +179,76 @@ func writeJSONAtomicWithOps(path string, value any, ops atomicFileOps) error {
 		return fmt.Errorf("%s: close temporary file: %w", path, err)
 	}
 	temporaryClosed = true
+
+	backupPath := ""
+	keepBackup := false
+	defer func() {
+		if backupPath != "" && !keepBackup {
+			_ = os.Remove(backupPath)
+		}
+	}()
+	if exists {
+		backupPath, err = createStateBackup(path, parent, ops.syncFile)
+		if err != nil {
+			return fmt.Errorf("%s: create state backup: %w", path, err)
+		}
+	}
 	if err := ops.rename(temporaryPath, path); err != nil {
 		return fmt.Errorf("%s: rename temporary file: %w", path, err)
 	}
 	temporaryPath = ""
 	if err := ops.syncDir(parent); err != nil {
-		return fmt.Errorf("%s: sync parent directory: %w", path, err)
+		syncErr := err
+		if backupPath != "" {
+			if rollbackErr := ops.rename(backupPath, path); rollbackErr != nil {
+				keepBackup = true
+				return fmt.Errorf("%s: atomic commit failed: %w", path, errors.Join(
+					fmt.Errorf("sync parent directory: %w", syncErr),
+					fmt.Errorf("restore previous state: %w", rollbackErr),
+				))
+			}
+			backupPath = ""
+			if rollbackSyncErr := ops.syncDir(parent); rollbackSyncErr != nil {
+				return fmt.Errorf("%s: atomic commit failed: %w", path, errors.Join(
+					fmt.Errorf("sync parent directory: %w", syncErr),
+					fmt.Errorf("sync restored state: %w", rollbackSyncErr),
+				))
+			}
+		}
+		return fmt.Errorf("%s: sync parent directory: %w", path, syncErr)
+	}
+	if backupPath != "" {
+		if err := os.Remove(backupPath); err != nil {
+			return fmt.Errorf("%s: remove state backup: %w", path, err)
+		}
+		backupPath = ""
 	}
 	return nil
 }
 
-func ReadJSON(path string, destination any) (err error) {
+func ReadJSON(path string, destination any) error {
+	return readJSONWithOps(path, destination, defaultReadFileOps())
+}
+
+func readJSONWithOps(path string, destination any, ops readFileOps) error {
 	kind, err := destinationKind(destination)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 
-	file, err := os.Open(path)
+	reader, err := ops.open(path)
 	if err != nil {
 		return fmt.Errorf("%s: open state: %w", path, err)
 	}
+	closed := false
 	defer func() {
-		if closeErr := file.Close(); err == nil && closeErr != nil {
-			err = fmt.Errorf("%s: close state: %w", path, closeErr)
+		if !closed {
+			_ = reader.Close()
 		}
 	}()
 
 	decoded := newState(kind)
-	decoder := json.NewDecoder(file)
+	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(decoded); err != nil {
 		return invalidJSONError(path, "decode state")
@@ -149,6 +263,11 @@ func ReadJSON(path string, destination any) (err error) {
 	if err := validateState(decoded); err != nil {
 		return fmt.Errorf("%s: validate state: %w", path, err)
 	}
+	if err := reader.Close(); err != nil {
+		closed = true
+		return fmt.Errorf("%s: close state: %w", path, err)
+	}
+	closed = true
 	assignState(destination, decoded)
 	return nil
 }
