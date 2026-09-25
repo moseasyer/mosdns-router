@@ -116,6 +116,25 @@ func TestConvertFSLowercasesDomainAndFullValues(t *testing.T) {
 	}
 }
 
+func TestConvertFSSortsByBytesNotByCase(t *testing.T) {
+	// A regular expression is used verbatim, so a list can hold values that
+	// differ only in case. The order of the published file has to be decided by
+	// the bytes, so the same commit always produces the same file whatever the
+	// locale: `^B` sorts before `^a`, because 0x42 is below 0x61.
+	fsys := convertFixture(map[string]string{
+		"data/cn": "regexp:^a$\nregexp:^B$\nregexp:^A$\nregexp:^b$\n",
+	})
+
+	got, err := ConvertFS(fsys, "data/cn")
+	if err != nil {
+		t.Fatalf("ConvertFS: %v", err)
+	}
+	want := []string{"regexp:^A$", "regexp:^B$", "regexp:^a$", "regexp:^b$"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("ConvertFS = %q, want %q", got, want)
+	}
+}
+
 func TestConvertFSAppliesConjunctiveIncludeAttributeFilters(t *testing.T) {
 	// `include:x @a @-b` includes child rules that have @a and lack @b. An
 	// implementation that ignored the filters, ORed them, or matched a

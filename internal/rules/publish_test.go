@@ -144,48 +144,77 @@ func TestPublishWritesTheListAndTheLockThatDescribesIt(t *testing.T) {
 
 func TestPublishRestoresTheListWhenTheLockCannotBePublished(t *testing.T) {
 	// A half-published pair is worse than a failed update: the router would read
-	// a new list that no lock describes. So when the second rename fails, the
-	// first is undone and both files are left exactly as they were.
-	pair := writePublishedPair(t)
-	ops := recordingOps(&[]string{})
-	rename := ops.rename
-	failures := 0
-	ops.rename = func(from, to string) error {
-		failures++
-		if failures == 2 {
-			return errors.New("injected rename failure")
-		}
-		return rename(from, to)
+	// a new list that no lock describes. So every failure after the list rename
+	// has to undo it, whether the lock rename failed or the directory could not
+	// be flushed, and both files are left exactly as they were.
+	tests := []struct {
+		name    string
+		breakIt func(*fileOps, *int)
+	}{
+		{
+			name: "the lock rename fails",
+			breakIt: func(ops *fileOps, calls *int) {
+				rename := ops.rename
+				ops.rename = func(from, to string) error {
+					*calls++
+					if *calls == 2 {
+						return errors.New("injected rename failure")
+					}
+					return rename(from, to)
+				}
+			},
+		},
+		{
+			name: "the list directory cannot be flushed",
+			breakIt: func(ops *fileOps, calls *int) {
+				syncDir := ops.syncDir
+				ops.syncDir = func(path string) error {
+					*calls++
+					if *calls == 1 {
+						return errors.New("injected directory sync failure")
+					}
+					return syncDir(path)
+				}
+			},
+		},
 	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pair := writePublishedPair(t)
+			calls := 0
+			ops := recordingOps(&[]string{})
+			test.breakIt(&ops, &calls)
 
-	err := publishWithOps(pair.lockPath, pair.listPath, newLock, []byte(newList), ops)
-	if err == nil {
-		t.Fatal("publish reported success although the lock could not be written")
-	}
-	if !strings.Contains(err.Error(), "injected rename failure") {
-		t.Fatalf("error = %v, want it to carry the rename failure", err)
-	}
+			err := publishWithOps(pair.lockPath, pair.listPath, newLock, []byte(newList), ops)
+			if err == nil {
+				t.Fatal("publish reported success although the lock could not be published")
+			}
+			if !strings.Contains(err.Error(), "injected") {
+				t.Fatalf("error = %v, want it to carry the injected failure", err)
+			}
 
-	list, err := os.ReadFile(pair.listPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(list) != oldList {
-		t.Fatalf("list after the failed publish = %q, want the previous %q", list, oldList)
-	}
-	lock, err := os.ReadFile(pair.lockPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(lock) != oldLock {
-		t.Fatalf("lock after the failed publish =\n%s\nwant\n%s", lock, oldLock)
-	}
-	entries, err := os.ReadDir(pair.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if names := entryNames(entries); strings.Join(names, ",") != "cn-domains.txt,source-lock.json" {
-		t.Fatalf("failed publication left files behind: %v", names)
+			list, err := os.ReadFile(pair.listPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(list) != oldList {
+				t.Fatalf("list after the failed publish = %q, want the previous %q", list, oldList)
+			}
+			lock, err := os.ReadFile(pair.lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(lock) != oldLock {
+				t.Fatalf("lock after the failed publish =\n%s\nwant\n%s", lock, oldLock)
+			}
+			entries, err := os.ReadDir(pair.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if names := entryNames(entries); strings.Join(names, ",") != "cn-domains.txt,source-lock.json" {
+				t.Fatalf("failed publication left files behind: %v", names)
+			}
+		})
 	}
 }
 

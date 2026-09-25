@@ -106,27 +106,33 @@ func publishWithOps(lockPath, listPath string, lock SourceLock, list []byte, ops
 		return fmt.Errorf("%s: publish list: %w", listPath, err)
 	}
 	listStage.path = ""
-	if err := ops.syncDir(filepath.Dir(listPath)); err != nil {
+
+	// The list is published and the lock is not, so every failure from here on
+	// leaves a list no lock describes. Each of them puts the previous list back
+	// before it is reported.
+	lockPublished := false
+	defer func() {
+		if err == nil || lockPublished {
+			return
+		}
+		if rollbackErr := listBackup.restore(listPath, ops); rollbackErr != nil {
+			// The backup is then the only copy of the previous list, so it is
+			// named for the operator instead of being cleaned up.
+			listBackup.keep = true
+			err = fmt.Errorf("%w (and restoring the previous list failed: %v, the previous list is kept at %s)", err, rollbackErr, listBackup.path)
+		}
+	}()
+	if err = ops.syncDir(filepath.Dir(listPath)); err != nil {
 		return fmt.Errorf("%s: sync list directory: %w", listPath, err)
 	}
-
-	if err := ops.rename(lockStage.path, lockPath); err != nil {
-		// The lock is the record of the list, so a list published without it is a
-		// list nobody can account for. Put the previous list back before
-		// reporting the failure.
-		if rollbackErr := listBackup.restore(listPath, ops); rollbackErr != nil {
-			// The backup is then the only copy of the previous list, so it is kept
-			// for the operator instead of being cleaned up.
-			listBackup.keep = true
-			return fmt.Errorf("%s: publish lock: %w (and restoring the previous list failed: %v, the previous list is kept at %s)", lockPath, err, rollbackErr, listBackup.path)
-		}
-		listBackup.restored = true
-		return fmt.Errorf("%s: publish lock: %w (the previous list was restored)", lockPath, err)
+	if err = ops.rename(lockStage.path, lockPath); err != nil {
+		return fmt.Errorf("%s: publish lock: %w", lockPath, err)
 	}
 	lockStage.path = ""
-	if err := ops.syncDir(filepath.Dir(lockPath)); err != nil {
+	if err = ops.syncDir(filepath.Dir(lockPath)); err != nil {
 		return fmt.Errorf("%s: sync lock directory: %w", lockPath, err)
 	}
+	lockPublished = true
 	return nil
 }
 

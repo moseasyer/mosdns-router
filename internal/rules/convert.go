@@ -166,9 +166,6 @@ func (r *resolver) resolve(name string, depth int) (map[string]rule, error) {
 	if cached, ok := r.resolved[name]; ok {
 		return cached, nil
 	}
-	if r.active[name] {
-		return nil, fmt.Errorf("%s: list is already being resolved: %s", name, strings.Join(r.stack, " -> "))
-	}
 
 	r.visited[name] = true
 	if len(r.visited) > maxVisitedFiles {
