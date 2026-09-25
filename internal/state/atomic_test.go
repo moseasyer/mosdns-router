@@ -708,6 +708,94 @@ func TestWriteJSONAtomicPropagatesRenameFailureWithoutOverwriting(t *testing.T) 
 	assertOnlyTargetEntry(t, filepath.Dir(path), filepath.Base(path))
 }
 
+// A temporary file or a state backup that cannot be removed leaves a readable
+// copy of runtime state behind in the state directory, so a removal failure has
+// to reach the caller instead of being discarded by the cleanup path. The
+// original failure must still be reported.
+func TestWriteJSONAtomicReportsTemporaryFileRemovalFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	value := NewSelector(1, "auto", "cloudflare", testFetchedAt)
+	injectedSync := errors.New("injected file sync failure")
+	injectedRemove := errors.New("injected temporary removal failure")
+	ops := defaultAtomicFileOps()
+	ops.syncFile = func(*os.File) error { return injectedSync }
+	ops.remove = func(string) error { return injectedRemove }
+
+	err := writeJSONAtomicWithOps(path, value, ops)
+	if !errors.Is(err, injectedSync) {
+		t.Fatalf("write error = %v, want it to report the injected sync failure", err)
+	}
+	if !errors.Is(err, injectedRemove) {
+		t.Fatalf("write error = %v, want it to report the temporary removal failure", err)
+	}
+}
+
+func TestWriteJSONAtomicReportsBackupRemovalFailureAfterAFailedWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	old := NewSelector(5, "auto", "cloudflare", testFetchedAt)
+	if err := WriteJSONAtomic(path, old); err != nil {
+		t.Fatal(err)
+	}
+	before := readFileBytes(t, path)
+
+	candidate := old
+	candidate.Generation = 6
+	injectedRename := errors.New("injected rename failure")
+	injectedRemove := errors.New("injected backup removal failure")
+	ops := defaultAtomicFileOps()
+	ops.rename = func(string, string) error { return injectedRename }
+	ops.remove = func(name string) error {
+		if strings.Contains(name, ".bak") {
+			return injectedRemove
+		}
+		return os.Remove(name)
+	}
+
+	err := writeJSONAtomicWithOps(path, candidate, ops)
+	if !errors.Is(err, injectedRename) {
+		t.Fatalf("write error = %v, want it to report the injected rename failure", err)
+	}
+	if !errors.Is(err, injectedRemove) {
+		t.Fatalf("write error = %v, want it to report the backup removal failure", err)
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatal("failed write changed the target")
+	}
+}
+
+func TestWriteJSONAtomicReportsBackupRemovalFailureAfterASuccessfulWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	old := NewSelector(5, "auto", "cloudflare", testFetchedAt)
+	if err := WriteJSONAtomic(path, old); err != nil {
+		t.Fatal(err)
+	}
+
+	candidate := old
+	candidate.Generation = 6
+	injectedRemove := errors.New("injected backup removal failure")
+	ops := defaultAtomicFileOps()
+	ops.remove = func(name string) error {
+		if strings.Contains(name, ".bak") {
+			return injectedRemove
+		}
+		return os.Remove(name)
+	}
+
+	if err := writeJSONAtomicWithOps(path, candidate, ops); !errors.Is(err, injectedRemove) {
+		t.Fatalf("write error = %v, want it to report the backup removal failure", err)
+	}
+	var got Selector
+	if err := ReadJSON(path, &got); err != nil {
+		t.Fatalf("read state after a committed write: %v", err)
+	}
+	if got.Generation != 6 {
+		t.Fatalf("read generation = %d, want 6", got.Generation)
+	}
+}
+
 func TestWriteJSONAtomicRejectsUnsupportedValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	if err := WriteJSONAtomic(path, struct{ Value string }{Value: "not state"}); err == nil {

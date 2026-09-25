@@ -23,6 +23,7 @@ type atomicFileOps struct {
 	syncFile func(*os.File) error
 	syncDir  func(string) error
 	rename   func(string, string) error
+	remove   func(string) error
 }
 
 type readFileOps struct {
@@ -34,6 +35,7 @@ func defaultAtomicFileOps() atomicFileOps {
 		syncFile: func(file *os.File) error { return file.Sync() },
 		syncDir:  syncDirectory,
 		rename:   os.Rename,
+		remove:   os.Remove,
 	}
 }
 
@@ -122,7 +124,12 @@ func WriteJSONAtomic(path string, value any) error {
 	return writeJSONAtomicWithOps(path, value, defaultAtomicFileOps())
 }
 
-func writeJSONAtomicWithOps(path string, value any, ops atomicFileOps) error {
+// writeJSONAtomicWithOps validates the value, writes a same-directory
+// temporary file, and renames it over the target. Cleanup failures are reported
+// to the caller: a temporary file or a backup that survives in the state
+// directory leaves a stale copy of runtime state behind, which is exactly the
+// kind of leftover the atomic write exists to prevent.
+func writeJSONAtomicWithOps(path string, value any, ops atomicFileOps) (err error) {
 	kind, err := validateValue(value)
 	if err != nil {
 		return fmt.Errorf("%s: validate state: %w", path, err)
@@ -160,7 +167,9 @@ func writeJSONAtomicWithOps(path string, value any, ops atomicFileOps) error {
 		if !temporaryClosed {
 			_ = temporary.Close()
 		}
-		_ = os.Remove(temporaryPath)
+		if removeErr := ops.remove(temporaryPath); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("%s: remove temporary file: %w", path, removeErr))
+		}
 	}()
 
 	if err := temporary.Chmod(0640); err != nil {
@@ -183,8 +192,11 @@ func writeJSONAtomicWithOps(path string, value any, ops atomicFileOps) error {
 	backupPath := ""
 	keepBackup := false
 	defer func() {
-		if backupPath != "" && !keepBackup {
-			_ = os.Remove(backupPath)
+		if backupPath == "" || keepBackup {
+			return
+		}
+		if removeErr := ops.remove(backupPath); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("%s: remove state backup: %w", path, removeErr))
 		}
 	}()
 	if exists {
@@ -218,7 +230,7 @@ func writeJSONAtomicWithOps(path string, value any, ops atomicFileOps) error {
 		return fmt.Errorf("%s: sync parent directory: %w", path, syncErr)
 	}
 	if backupPath != "" {
-		if err := os.Remove(backupPath); err != nil {
+		if err := ops.remove(backupPath); err != nil {
 			return fmt.Errorf("%s: remove state backup: %w", path, err)
 		}
 		backupPath = ""
