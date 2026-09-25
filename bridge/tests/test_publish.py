@@ -1,14 +1,14 @@
-"""Tests for the DHCP DNS bridge: publication, locking, and the dispatcher CLI.
+"""Tests for the DHCP DNS bridge: collection, publication, locking, and the CLI.
 
 The published file is the only channel between a NetworkManager dispatcher event
 and the router's ``dhcp_forward`` plugin, and the CLI is the only way a
 dispatcher event reaches it, so these tests work on real files, a real advisory
 lock, and real timestamps. Each one names the break it catches: a state document
-a reader would reject, a generation that skipped or repeated a value, an
-unchanged event that still rewrote the file, an event that published the wrong
-interface or the wrong source, a lock that let two writers through, a failed
-write that left a partial or lost target behind, and a command that reached a
-shell.
+a reader would reject, a generation that skipped or repeated a value, an unchanged
+event that still rewrote the file, an event that published the wrong interface or
+the wrong source, a source that could not be read being published as an empty
+lease, a lock that let two writers through, a failed write that left a partial or
+lost target behind, and a command that reached a shell.
 """
 
 import contextlib
@@ -648,16 +648,29 @@ class RecordingRunner:
     silently tolerated.
     """
 
-    def __init__(self, answers=None):
+    def __init__(self, answers=None, failures=None):
         self._answers = dict(answers or {})
+        self._failures = dict(failures or {})
         self.calls = []
 
     def __call__(self, argv):
         if not isinstance(argv, (list, tuple)):
             raise TypeError("a command must be an argument array, not a shell string")
-        self.calls.append(tuple(argv))
-        return self._answers.get(tuple(argv), "")
+        command = tuple(argv)
+        self.calls.append(command)
+        if command in self._failures:
+            raise self._failures[command]
+        return self._answers.get(command, "")
 
+
+class BrokenRunner(RecordingRunner):
+    """A runner whose every command fails, the way a wedged D-Bus behaves."""
+
+    def __call__(self, argv):
+        if not isinstance(argv, (list, tuple)):
+            raise TypeError("a command must be an argument array, not a shell string")
+        self.calls.append(tuple(argv))
+        raise OSError("Could not connect to the system bus")
 
 class DispatcherCommandLineTests(unittest.TestCase):
     """What one NetworkManager event does to the published state."""
@@ -1047,6 +1060,139 @@ class DispatcherCommandLineTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_a_total_source_failure_preserves_the_published_state(self):
+        environment = self.event(
+            "dhcp4-change",
+            DEVICE_IP_IFACE=INTERFACE,
+            CONNECTION_UUID=UUID,
+        )
+        self.assertEqual(self.call(environment)[0], 0)
+        original = self.state_path.read_bytes()
+        before = self.state_path.stat()
+        code, stderr, runner = self.call(environment, runner=BrokenRunner())
+        self.assertEqual(code, 4)
+        self.assertEqual(self.state_path.read_bytes(), original)
+        self.assertEqual(self.state_path.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(self.state_path.stat().st_ino, before.st_ino)
+        self.assertEqual(
+            runner.calls,
+            [
+                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE),
+                ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE),
+                ("resolvectl", "dns", INTERFACE),
+            ],
+        )
+        self.assertIn("source", stderr)
+
+    def test_a_total_source_failure_on_a_first_event_writes_nothing(self):
+        code, stderr, _ = self.call(
+            self.event(
+                "dhcp4-change",
+                DEVICE_IP_IFACE=INTERFACE,
+                CONNECTION_UUID=UUID,
+            ),
+            runner=BrokenRunner(),
+        )
+        self.assertEqual(code, 4)
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(self.lock_path.exists())
+
+    def test_the_source_failure_diagnostic_leaks_no_address_or_environment_value(self):
+        code, stderr, _ = self.call(
+            self.event(
+                "dhcp4-change",
+                DEVICE_IP_IFACE=INTERFACE,
+                CONNECTION_UUID=UUID,
+                DHCP4_DOMAIN_NAME_SERVERS="127.0.0.53",
+            ),
+            runner=BrokenRunner(),
+        )
+        self.assertEqual(code, 4)
+        for secret in ["127.0.0.53", UUID, INTERFACE, "Could not connect to the system bus"]:
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, stderr)
+
+    def test_a_broken_command_is_not_a_source_failure_when_the_event_names_dns(self):
+        """The event's own variables answer without a command, so this is not 4."""
+        code, _, runner = self.call(
+            self.event(
+                "dhcp4-change",
+                DEVICE_IP_IFACE=INTERFACE,
+                CONNECTION_UUID=UUID,
+                DHCP4_DOMAIN_NAME_SERVERS="192.168.1.1",
+            ),
+            runner=BrokenRunner(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.published()["upstreams"], ["192.168.1.1"])
+        self.assertEqual(
+            runner.calls,
+            [
+                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+            ],
+        )
+
+    def test_a_readable_but_empty_source_publishes_a_disabled_generation(self):
+        code, _, _ = self.call(
+            self.event(
+                "dhcp4-change",
+                DEVICE_IP_IFACE=INTERFACE,
+                CONNECTION_UUID=UUID,
+            )
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["upstreams"], data["last_good"]), ([], False))
+        self.assertEqual(data["generation"], 1)
+
+    def test_a_failure_before_a_readable_empty_source_still_publishes_a_disabled_generation(self):
+        runner = RecordingRunner(
+            failures={
+                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): OSError(
+                    "nmcli"
+                ),
+                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): OSError(
+                    "nmcli"
+                ),
+            }
+        )
+        code, _, _ = self.call(
+            self.event("dhcp4-change", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=runner,
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["upstreams"], data["last_good"]), ([], False))
+
+    def test_a_readable_source_survives_a_later_source_failure(self):
+        runner = RecordingRunner(
+            failures={
+                ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE): OSError("nmcli"),
+                ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE): OSError("nmcli"),
+                ("resolvectl", "dns", INTERFACE): OSError("resolvectl"),
+            }
+        )
+        code, _, _ = self.call(
+            self.event("dhcp4-change", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=runner,
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["upstreams"], data["last_good"]), ([], False))
+
+    def test_a_down_event_never_consults_a_broken_source(self):
+        code, _, runner = self.call(
+            self.event("down", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=BrokenRunner(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.calls, [])
+        data = self.published()
+        self.assertEqual((data["upstreams"], data["last_good"]), ([], False))
 
     def test_the_collector_is_asked_about_the_event_interface(self):
         _, _, runner = self.call(

@@ -4,17 +4,55 @@ NetworkManager is the only authority for which resolvers the router was told to
 use, and the raw DHCP configuration is the only source that still holds those
 addresses after ``ignore-auto-dns`` hides them from resolved. The collector is
 therefore read-only and fail-closed: it runs fixed argument arrays, never a
-shell string, treats an unreadable source as unavailable instead of guessing,
-and returns only the addresses a domestic query could actually be sent to.
+shell string, returns only the addresses a domestic query could actually be sent
+to, and keeps two facts apart that look alike in a list -- a lease that named no
+usable resolver, and a NetworkManager that could not be read at all. Only the
+first is an empty answer; the second is a failure the caller must not publish as
+one.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Callable, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Callable,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
-__all__ = ["collect_dns", "is_interface_name", "normalize_upstreams", "usable_address"]
+__all__ = [
+    "SourcesUnavailable",
+    "collect_dns",
+    "is_interface_name",
+    "normalize_upstreams",
+    "usable_address",
+]
+
+
+class SourcesUnavailable(Exception):
+    """Every command the collector attempted could not be read.
+
+    Deliberately not a ValueError: a source that could not be read is a failure
+    of this machine, not a rejected request, and the caller acts on the two
+    differently. The message names no environment value and no command output,
+    because it is written to the dispatcher's log.
+    """
+
+
+class _Outcome(NamedTuple):
+    """What one source yielded, and whether any command behind it was readable."""
+
+    addresses: List[str]
+    readable: bool
+
 
 # A command runner takes one argument array and returns its standard output.
 CommandRunner = Callable[[Sequence[str]], str]
@@ -60,10 +98,15 @@ def collect_dns(env: Mapping[str, str], interface: str, run: CommandRunner) -> L
 
     The sources are consulted in a fixed order and the first one that yields a
     usable address wins outright, because a lower-priority source would
-    otherwise contribute addresses the router is not configured to use. A
-    source that cannot be read counts as unavailable. An empty list is a valid
-    answer: it means no usable address is configured for this interface right
-    now, which is not the same as a collection failure.
+    otherwise contribute addresses the router is not configured to use. A source
+    that cannot be read is skipped in favour of the next one.
+
+    An empty list is a valid answer: it means a source answered and named no
+    usable address, which is not the same as a collection failure. When every
+    command that was attempted could not be read, there is no answer at all and
+    SourcesUnavailable is raised instead, because a NetworkManager that cannot be
+    queried is not evidence that the lease lost its resolvers. Publishing an empty
+    state for that would disable a working router on one flaky query.
     """
     if not is_interface_name(interface):
         raise ValueError(
@@ -71,16 +114,22 @@ def collect_dns(env: Mapping[str, str], interface: str, run: CommandRunner) -> L
             f"{MAXIMUM_INTERFACE_NAME_LENGTH} characters, got {interface!r}"
         )
 
+    readable = False
     for source in _sources(env, interface, run):
-        addresses = source()
-        if addresses:
-            return addresses
+        outcome = source()
+        readable = readable or outcome.readable
+        if outcome.addresses:
+            return outcome.addresses
+    if not readable:
+        raise SourcesUnavailable(
+            "no NetworkManager source could be read: every nmcli and resolvectl query failed"
+        )
     return []
 
 
 def _sources(
     env: Mapping[str, str], interface: str, run: CommandRunner
-) -> Iterator[Callable[[], List[str]]]:
+) -> Iterator[Callable[[], _Outcome]]:
     """Return one collector per source, highest priority first.
 
     The raw NetworkManager DHCP configuration is ranked above the dispatcher
@@ -91,20 +140,44 @@ def _sources(
     and ``resolvectl`` is last because it reports the resolved view of the same
     facts and is filtered for local addresses in any case.
     """
-    yield lambda: _nmcli_fields(interface, run, RAW_DHCP_FIELDS)
-    yield lambda: _normalized(env.get(name, "") for name in DISPATCHER_DNS_VARIABLES)
-    yield lambda: _nmcli_fields(interface, run, EFFECTIVE_DNS_FIELDS)
-    yield lambda: _normalized([_read(run, ["resolvectl", "dns", interface])])
+    yield lambda: _device_fields(interface, run, RAW_DHCP_FIELDS)
+    yield lambda: _event_variables(env)
+    yield lambda: _device_fields(interface, run, EFFECTIVE_DNS_FIELDS)
+    yield lambda: _resolved_dns(interface, run)
 
 
-def _nmcli_fields(
-    interface: str, run: CommandRunner, fields: Iterable[str]
-) -> List[str]:
-    """Read each nmcli device field with its own argument array."""
-    return _normalized(
-        _read(run, ["nmcli", "-g", field, "device", "show", interface])
-        for field in fields
+def _event_variables(env: Mapping[str, str]) -> _Outcome:
+    """Return what this event's own variables name.
+
+    The environment is read in this process, so it can never fail to be read and
+    it is never the reason a source is unreadable. It also never stands in for a
+    successful command read: a silent environment beside a NetworkManager that
+    cannot be queried is still an unreadable machine, not an empty lease.
+    """
+    return _Outcome(
+        _normalized(env.get(name, "") for name in DISPATCHER_DNS_VARIABLES), False
     )
+
+
+def _device_fields(
+    interface: str, run: CommandRunner, fields: Iterable[str]
+) -> _Outcome:
+    """Read each nmcli device field with its own argument array.
+
+    Every field is read even when an earlier one answered, because the DHCP6
+    field is the only record of a v6 lease's resolvers, and a field that answered
+    with nothing is still a source that was read.
+    """
+    outputs = [
+        _read(run, ["nmcli", "-g", field, "device", "show", interface]) for field in fields
+    ]
+    return _Outcome(_normalized(outputs), any(output is not None for output in outputs))
+
+
+def _resolved_dns(interface: str, run: CommandRunner) -> _Outcome:
+    """Return what resolved reports for ``interface``."""
+    output = _read(run, ["resolvectl", "dns", interface])
+    return _Outcome(_normalized([output]), output is not None)
 
 
 def _normalized(outputs: Iterable[Optional[str]]) -> List[str]:
@@ -182,13 +255,20 @@ def _family_then_value(value: str) -> Tuple[int, Address]:
 
 
 def _read(run: CommandRunner, argv: Sequence[str]) -> Optional[str]:
-    """Return a command's standard output, or None when it is unavailable.
+    """Return a command's standard output, or None when it could not be read.
+
+    A returned string means the command answered and the source behind it is
+    readable, and an empty string is an answer rather than a failure: a field that
+    holds nothing is how NetworkManager reports a lease with no resolvers. Only a
+    failure makes a source unreadable.
 
     The runner owns process handling, so a missing binary, a non-zero exit
     status, and a timeout all arrive here as an exception, and a runner that
-    reports failure with no output is treated the same way. The catch is
-    deliberately broad: it is confined to the injected call, and a failure only
-    means this source could not be read, never that the interface is unusable.
+    answers with anything other than a string is treated the same way. The catch
+    is deliberately broad: it is confined to the injected call, and a failure
+    only means this source could not be read, never that the interface is
+    unusable. The distinction is what keeps an unreadable NetworkManager from
+    being reported as an empty lease.
     """
     command = list(argv)
     try:

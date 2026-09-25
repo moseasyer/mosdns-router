@@ -12,10 +12,12 @@ around two decisions:
   consulted. An action the bridge does not handle is not an error: NetworkManager
   runs this program for events that have nothing to do with DNS, and the right
   answer to those is to change nothing and succeed.
-* **Does this event change the published state?** The publisher answers that, and
+* **What did the lease say?** The publisher answers whether the state changed, and
   only the actions that collect have their address list read first. A ``down``
   event publishes no resolvers and never runs a command, because the lease those
-  resolvers came from is gone.
+  resolvers came from is gone. A source that could not be read at all is not an
+  empty lease: the event is reported and nothing is published, so a wedged D-Bus
+  leaves the last good generation in place.
 
 The module also owns the exit status the dispatcher acts on. Nothing here calls
 ``sys.exit``: ``main`` returns a code, and only the process entry point turns it
@@ -30,7 +32,7 @@ import subprocess
 import sys
 from typing import Dict, List, Mapping, Sequence, Tuple
 
-from .collect import CommandRunner, collect_dns, is_interface_name
+from .collect import CommandRunner, SourcesUnavailable, collect_dns, is_interface_name
 from .publish import (
     InvalidStateError,
     LockUnavailable,
@@ -81,6 +83,9 @@ COMMAND_TIMEOUT_SECONDS = 5.0
 EXIT_SUCCESS = 0
 EXIT_INVALID_INPUT = 2
 EXIT_LOCKED = 3
+# One status for a state that could not be published and for a lease that could
+# not be read: both leave the previous generation standing, and both mean the
+# operator has to look at this machine.
 EXIT_STATE = 4
 
 
@@ -91,7 +96,8 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     environment, and ``run`` executes one read-only command. Returns 0 when the
     state was published or was already current, 2 for a command line or
     environment the bridge cannot act on, 3 while another bridge process holds
-    the publication lock, and 4 when the state could not be published.
+    the publication lock, and 4 when the state could not be published or no
+    source that reports the lease could be read.
 
     Nothing raises out of this function. The dispatcher reads the exit status and
     nothing else, so a raised error would replace a documented status with a
@@ -120,6 +126,12 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     else:
         try:
             upstreams = collect_dns(env, interface, run)
+        except SourcesUnavailable as error:
+            # Reported before the lock is taken and before the state is opened:
+            # a NetworkManager that cannot be queried says nothing about the
+            # lease, and publishing an empty state here would disable a working
+            # router on one failed query.
+            return _fail(EXIT_STATE, str(error))
         except ValueError as error:
             return _fail(EXIT_INVALID_INPUT, str(error))
 

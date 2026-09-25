@@ -1,10 +1,11 @@
 """Tests for collecting router-supplied DHCP DNS from NetworkManager.
 
 The collector is the only component allowed to ask NetworkManager and resolved
-what DNS the router was told to use, so these tests pin the four things a
+what DNS the router was told to use, so these tests pin the five things a
 domestic query depends on: which source wins, which addresses a source may
-contribute, which interface name may be asked about, and that no command is ever
-handed a shell string.
+contribute, which interface name may be asked about, that a source that could not
+be read is reported instead of becoming an empty lease, and that no command is
+ever handed a shell string.
 """
 
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 # distribution, so the repository's bridge directory is the import root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mosdns_dhcp_bridge.collect import collect_dns
+from mosdns_dhcp_bridge.collect import SourcesUnavailable, collect_dns
 
 INTERFACE = "enp3s0"
 
@@ -153,7 +154,7 @@ class SourcePriorityTests(unittest.TestCase):
             runner.calls, [RAW_DHCP4, RAW_DHCP6, EFFECTIVE_IP4, EFFECTIVE_IP6]
         )
 
-    def test_treats_a_command_without_output_as_unavailable(self):
+    def test_a_runner_that_answers_no_string_is_not_a_readable_command(self):
         runner = FakeRunner(
             quiet_outputs(
                 {
@@ -181,6 +182,104 @@ class SourcePriorityTests(unittest.TestCase):
         )
         got = collect_dns({}, INTERFACE, runner)
         self.assertEqual(got, ["192.168.1.1", "192.168.1.2"])
+
+
+def broken():
+    """Return a runner whose every command fails, the way a wedged D-Bus does."""
+    return FakeRunner(
+        failures={command: OSError("Could not connect to the system bus") for command in ALL_COMMANDS}
+    )
+
+
+class SourceFailureTests(unittest.TestCase):
+    """An unreadable source is an operational failure, not an empty lease.
+
+    A lease with no resolvers and a NetworkManager that cannot be read are
+    different facts, and only the first one may publish an empty state. These
+    tests pin the difference, because a single flaky query behind a five second
+    timeout must never disable a working router.
+    """
+
+    def test_every_command_failing_is_not_an_empty_lease(self):
+        runner = broken()
+        with self.assertRaises(SourcesUnavailable):
+            collect_dns({}, INTERFACE, runner)
+        self.assertEqual(runner.calls, list(ALL_COMMANDS))
+
+    def test_a_total_failure_reports_neither_an_address_nor_an_environment_value(self):
+        runner = broken()
+        with self.assertRaises(SourcesUnavailable) as caught:
+            collect_dns(
+                {
+                    "DHCP4_DOMAIN_NAME_SERVERS": "127.0.0.53",
+                    "DHCP6_DOMAIN_NAME_SERVERS": "127.0.0.54",
+                    "CONNECTION_UUID": "11111111-1111-1111-1111-111111111111",
+                },
+                INTERFACE,
+                runner,
+            )
+        message = str(caught.exception)
+        for secret in [
+            "127.0.0.53",
+            "127.0.0.54",
+            "11111111-1111-1111-1111-111111111111",
+            INTERFACE,
+            "Could not connect to the system bus",
+        ]:
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, message)
+
+    def test_a_command_that_answers_no_string_is_not_a_readable_command(self):
+        for answer in [None, 42, b"192.168.1.1\n", ["192.168.1.1"]]:
+            with self.subTest(answer=answer):
+                runner = FakeRunner({command: answer for command in ALL_COMMANDS})
+                with self.assertRaises(SourcesUnavailable):
+                    collect_dns({}, INTERFACE, runner)
+                self.assertEqual(runner.calls, list(ALL_COMMANDS))
+
+    def test_a_readable_empty_field_is_an_answer_not_a_failure(self):
+        self.assertEqual(collect_dns({}, INTERFACE, FakeRunner()), [])
+
+    def test_a_failure_before_a_readable_empty_source_is_an_empty_lease(self):
+        runner = FakeRunner(
+            failures={RAW_DHCP4: OSError("nmcli"), RAW_DHCP6: OSError("nmcli")}
+        )
+        self.assertEqual(collect_dns({}, INTERFACE, runner), [])
+        self.assertEqual(runner.calls, list(ALL_COMMANDS))
+
+    def test_a_readable_source_is_not_undone_by_a_later_failure(self):
+        """The raw fields answered, so a wedged resolvectl is not a total failure."""
+        runner = FakeRunner(
+            failures={EFFECTIVE_IP4: OSError("nmcli"), EFFECTIVE_IP6: OSError("nmcli"),
+                      RESOLVECTL: OSError("resolvectl")},
+        )
+        self.assertEqual(collect_dns({}, INTERFACE, runner), [])
+        self.assertEqual(runner.calls, list(ALL_COMMANDS))
+
+    def test_a_failure_before_a_readable_source_with_addresses_keeps_them(self):
+        runner = FakeRunner(
+            quiet_outputs({EFFECTIVE_IP4: "192.168.1.1"}),
+            failures={RAW_DHCP4: OSError("nmcli"), RAW_DHCP6: OSError("nmcli")},
+        )
+        self.assertEqual(collect_dns({}, INTERFACE, runner), ["192.168.1.1"])
+        self.assertEqual(
+            runner.calls, [RAW_DHCP4, RAW_DHCP6, EFFECTIVE_IP4, EFFECTIVE_IP6]
+        )
+
+    def test_the_events_own_variables_answer_without_a_command(self):
+        runner = broken()
+        self.assertEqual(
+            collect_dns({"DHCP4_DOMAIN_NAME_SERVERS": "192.168.1.53"}, INTERFACE, runner),
+            ["192.168.1.53"],
+        )
+        self.assertEqual(runner.calls, [RAW_DHCP4, RAW_DHCP6])
+
+    def test_a_resolvectl_fallback_alone_is_a_readable_source(self):
+        runner = FakeRunner(
+            quiet_outputs({RESOLVECTL: "Link 2 (enp3s0): 192.168.1.1"}),
+            failures={command: OSError("nmcli") for command in ALL_COMMANDS if command != RESOLVECTL},
+        )
+        self.assertEqual(collect_dns({}, INTERFACE, runner), ["192.168.1.1"])
 
 
 class NormalizationTests(unittest.TestCase):
