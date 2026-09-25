@@ -82,7 +82,6 @@ const (
 	stateSource      = "nm-dhcp4"
 	stateConnection  = "6d1f0f4c-2a7b-4c3d-9e5a-0b6c8d2e1f30"
 	firstGeneration  = 1
-	publishedSource  = "the bridge"
 	corruptDocument  = `{"schema_version": 1, "generation": 1, "interface": `
 	noUpstreamReport = "dhcp_forward: no valid DHCP state is available"
 	entryFailedLog   = "entry err"
@@ -126,10 +125,9 @@ func TestMain(m *testing.M) {
 	// m.Run.
 	flag.Parse()
 
-	// The harness builds and starts a process per case, which is out of
-	// proportion to a quick unit-test run and to a cross build. The Makefile's
-	// unit-test entry point passes -short and reaches this suite through
-	// `make test-integration`.
+	// The harness builds and starts a process per case, so it is not something a
+	// quick unit run should pay for. The Makefile's unit-test entry point passes
+	// -short and reaches this suite through `make test-integration`.
 	if testing.Short() {
 		fmt.Fprintln(os.Stderr, "tests/integration: skipped under -short; run `make test-integration`")
 		os.Exit(0)
@@ -451,7 +449,7 @@ func (h *harness) publishState(t *testing.T, generation uint64) {
 		true,
 	)
 	if err := state.WriteJSONAtomic(h.stateFile, published); err != nil {
-		t.Fatalf("publish DHCP state generation %d written by %s: %v", generation, publishedSource, err)
+		t.Fatalf("publish DHCP state generation %d with this repository's own writer: %v", generation, err)
 	}
 }
 
@@ -501,6 +499,12 @@ func (c counts) since(earlier counts) counts {
 // socket rather than answered, so only a reply proves the listener is up. Both
 // transports are checked because the router binds two, and a case that only ever
 // used one would never notice the other missing.
+//
+// The two probes are the same question, so the second may well be answered from
+// the foreign cache rather than from the resolver. That is why no case asserts
+// on a grand total taken from before this point: each takes its own snapshot
+// afterwards, and every count it makes is either for its own names or a change
+// since that snapshot.
 func (h *harness) waitUntilAnswering(t *testing.T) {
 	t.Helper()
 	for _, transport := range []string{testdns.ProtocolUDP, testdns.ProtocolTCP} {
@@ -984,9 +988,9 @@ func TestAForeignQueryReachesTheResolverOnlyOverTCP(t *testing.T) {
 // the transport decision. The plugin keeps its own UDP exchange rather than
 // mosdns's pipelined one, and it retries over TCP only when a UDP answer comes
 // back truncated. A small A answer is not truncated, so the domestic resolver
-// must have seen one query, over udp, and no TCP connection at all: a plugin that
-// retried every exchange over TCP would satisfy a count of one and double every
-// query on the wire.
+// must have seen one query, over udp, and no query over tcp at all: a plugin that
+// retried every exchange over TCP would satisfy a udp count of one and double
+// every query on the wire.
 func TestASmallDomesticQueryReachesTheUpstreamOnlyOverUDP(t *testing.T) {
 	h := newHarness(t, publishedState)
 	h.waitUntilAnswering(t)
