@@ -6,12 +6,12 @@ around two decisions:
 
 * **Which event is this, and which interface is it about?** The action comes from
   ``NM_DISPATCHER_ACTION``; the interface comes from ``DEVICE_IP_IFACE``, then
-  ``INTERFACE``, then ``DEVICE`` -- the three variables NetworkManager defines
-  as an interface, in that order of specificity. ``NM_DISPLAY_NAME`` is a
-  connection profile's human-readable name, never a device name, so it is not
-  consulted. An action the bridge does not handle is not an error: NetworkManager
-  runs this program for events that have nothing to do with DNS, and the right
-  answer to those is to change nothing and succeed.
+  the dispatcher's own first positional argument -- the ``script INTERFACE ACTION``
+  form every supported release uses -- then ``INTERFACE``, then ``DEVICE``.
+  ``NM_DISPLAY_NAME`` is a connection profile's human-readable name, never a
+  device name, so it is not consulted. An action the bridge does not handle is
+  not an error: NetworkManager runs this program for events that have nothing to
+  do with DNS, and the right answer to those is to change nothing and succeed.
 * **What did the lease say?** The publisher answers whether the state changed, and
   only the actions that collect have their address list read first. The recorded
   source is the one that answered -- the raw NetworkManager DHCP field, the
@@ -53,16 +53,20 @@ from .publish import (
 
 __all__ = ["main", "console_entry", "real_runner"]
 
-USAGE = "usage: mosdns-dhcp-bridge --state-file PATH --lock-file PATH"
+USAGE = (
+    "usage: mosdns-dhcp-bridge --state-file PATH --lock-file PATH [INTERFACE [ACTION]]"
+)
 
 # The dispatcher names the event in this variable. An absent or empty one means
 # the program was not run by the dispatcher at all, which is a misconfiguration
 # worth reporting rather than ignoring.
 ACTION_VARIABLE = "NM_DISPATCHER_ACTION"
 
-# The variables NetworkManager defines as the interface, most specific first.
-# DEVICE_IP_IFACE is the interface the IP configuration is bound to, INTERFACE is
-# the dispatcher script's own interface, and DEVICE is the last resort.
+# The variables NetworkManager defines as the interface, most specific first,
+# with the dispatcher's own positional argument ranked between the first and the
+# rest. DEVICE_IP_IFACE is the interface the IP configuration is bound to,
+# INTERFACE is the dispatcher script's own interface, and DEVICE is the last
+# resort.
 INTERFACE_VARIABLES = ("DEVICE_IP_IFACE", "INTERFACE", "DEVICE")
 
 CONNECTION_UUID_VARIABLE = "CONNECTION_UUID"
@@ -81,6 +85,13 @@ DISABLING_ACTION = "down"
 DISABLING_SOURCE = "down"
 
 OPTIONS = ("--state-file", "--lock-file")
+
+# NetworkManager runs a dispatcher script as `script INTERFACE ACTION`, so two
+# positional arguments may follow the options: the interface the event is about
+# and the event itself. The action is read from NM_DISPATCHER_ACTION, which is
+# the value NetworkManager exports for it, so the echoed argument is accepted and
+# not interpreted.
+MAXIMUM_POSITIONAL_ARGUMENTS = 2
 
 # A read-only nmcli or resolvectl query against NetworkManager's own state
 # answers in milliseconds. The bound only exists so a wedged D-Bus cannot hold a
@@ -112,7 +123,7 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     traceback and leave an operator guessing which stage failed.
     """
     try:
-        state_file, lock_file = _options(argv)
+        state_file, lock_file, positionals = _options(argv)
     except ValueError as error:
         return _fail(EXIT_INVALID_INPUT, str(error))
 
@@ -125,7 +136,7 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
         return EXIT_SUCCESS
 
     try:
-        interface = _interface(env)
+        interface = _interface(env, positionals)
     except ValueError as error:
         return _fail(EXIT_INVALID_INPUT, str(error))
 
@@ -164,17 +175,24 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     return EXIT_SUCCESS
 
 
-def _options(argv: Sequence[str]) -> Tuple[str, str]:
-    """Return the state file and lock file the command line names.
+def _options(argv: Sequence[str]) -> Tuple[str, str, List[str]]:
+    """Return the state file, the lock file, and the dispatcher's arguments.
 
-    Both are required and neither may be repeated. A default would let a typo in
-    the dispatcher unit create a second, empty state file beside the real one
-    instead of failing.
+    Both options are required and neither may be repeated. A default would let a
+    typo in the dispatcher unit create a second, empty state file beside the real
+    one instead of failing. Anything that is not an option is the dispatcher's
+    own interface and action arguments, and more of them than the dispatcher
+    passes is a command line this program does not understand.
     """
     values: Dict[str, str] = {}
+    positionals: List[str] = []
     index = 0
     while index < len(argv):
         option = argv[index]
+        if not option.startswith("-"):
+            positionals.append(option)
+            index += 1
+            continue
         if option not in OPTIONS:
             raise ValueError(f"unknown argument {option!r}; {USAGE}")
         if option in values:
@@ -189,28 +207,40 @@ def _options(argv: Sequence[str]) -> Tuple[str, str]:
     missing = [option for option in OPTIONS if option not in values]
     if missing:
         raise ValueError(f"missing {', '.join(missing)}; {USAGE}")
-    return values["--state-file"], values["--lock-file"]
+    if len(positionals) > MAXIMUM_POSITIONAL_ARGUMENTS:
+        raise ValueError(
+            f"the dispatcher passes an interface and an action, got {' '.join(positionals)}"
+        )
+    return values["--state-file"], values["--lock-file"], positionals
 
 
-def _interface(env: Mapping[str, str]) -> str:
+def _interface(env: Mapping[str, str], positionals: Sequence[str]) -> str:
     """Return the interface this event is about.
+
+    The dispatcher's own first positional argument is this event's interface, so
+    it is consulted after ``DEVICE_IP_IFACE`` -- the field NetworkManager defines
+    for the same thing, and the most specific one -- and before the two older
+    names the dispatcher also exports. ``NM_DISPLAY_NAME`` is a connection
+    profile's human-readable name, never a device name, so it is not consulted.
 
     The value is validated here rather than left to the collector, because the
     down path never collects and would otherwise publish an interface name no
     kernel device could own. An event with no interface at all is rejected: the
     addresses it carries have no meaning without one.
     """
-    for variable in INTERFACE_VARIABLES:
-        value = env.get(variable, "")
-        if value:
-            if is_interface_name(value):
-                return value
-            raise ValueError(
-                f"{variable} is not a network interface name: {value!r}"
-            )
+    candidates = [(INTERFACE_VARIABLES[0], env.get(INTERFACE_VARIABLES[0], ""))]
+    candidates.append(("the dispatcher's interface argument", positionals[0] if positionals else ""))
+    candidates.extend((variable, env.get(variable, "")) for variable in INTERFACE_VARIABLES[1:])
+    for variable, value in candidates:
+        if not value:
+            continue
+        if is_interface_name(value):
+            return value
+        raise ValueError(f"{variable} is not a network interface name: {value!r}")
     raise ValueError(
-        f"no interface in {', '.join(INTERFACE_VARIABLES)}; "
-        "NM_DISPLAY_NAME is a connection name and is never used as an interface"
+        f"no interface in {INTERFACE_VARIABLES[0]}, the dispatcher's interface argument, "
+        f"{' or '.join(INTERFACE_VARIABLES[1:])}; NM_DISPLAY_NAME is a connection name and "
+        "is never used as an interface"
     )
 
 

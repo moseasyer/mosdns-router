@@ -1247,7 +1247,7 @@ class DispatcherCommandLineTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(self.published()["interface"], expected)
 
-    def test_a_display_name_is_never_used_as_an_interface(self):
+    def test_the_display_name_is_never_used_as_an_interface(self):
         for action in ["up", "down"]:
             with self.subTest(action=action):
                 code, stderr, runner = self.call(
@@ -1257,6 +1257,71 @@ class DispatcherCommandLineTests(unittest.TestCase):
                 self.assertIn("interface", stderr)
                 self.assertEqual(runner.calls, [])
                 self.assertFalse(self.state_path.exists())
+
+    def test_the_dispatchers_positional_argument_names_the_interface(self):
+        """NetworkManager runs a dispatcher script as `script INTERFACE ACTION`."""
+        code, _, _ = self.call(
+            self.event("up", CONNECTION_UUID=UUID, DHCP4_DOMAIN_NAME_SERVERS="192.168.1.1"),
+            argv=self.argv() + ["br-lan"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.published()["interface"], "br-lan")
+
+    def test_the_dispatcher_action_argument_is_accepted_beside_the_interface(self):
+        code, _, _ = self.call(
+            self.event("up", CONNECTION_UUID=UUID, DHCP4_DOMAIN_NAME_SERVERS="192.168.1.1"),
+            argv=self.argv() + ["br-lan", "up"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.published()["interface"], "br-lan")
+
+    def test_the_ip_iface_variable_still_comes_before_the_positional_argument(self):
+        code, _, _ = self.call(
+            self.event(
+                "up",
+                DEVICE_IP_IFACE=INTERFACE,
+                CONNECTION_UUID=UUID,
+                DHCP4_DOMAIN_NAME_SERVERS="192.168.1.1",
+            ),
+            argv=self.argv() + ["br-lan"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.published()["interface"], "enp3s0")
+
+    def test_the_positional_argument_comes_before_the_older_interface_variables(self):
+        code, _, _ = self.call(
+            self.event(
+                "up",
+                INTERFACE="eth9",
+                DEVICE="eth8",
+                CONNECTION_UUID=UUID,
+                DHCP4_DOMAIN_NAME_SERVERS="192.168.1.1",
+            ),
+            argv=self.argv() + ["br-lan"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.published()["interface"], "br-lan")
+
+    def test_a_positional_argument_that_is_not_an_interface_is_invalid_input(self):
+        for argument in ["br-lan:1", "enp3s0;id", "Home Wi-Fi 5G", ""]:
+            with self.subTest(argument=argument):
+                code, stderr, runner = self.call(
+                    self.event("up", CONNECTION_UUID=UUID),
+                    argv=self.argv() + [argument],
+                )
+                self.assertEqual(code, 2)
+                self.assertIn("interface", stderr)
+                self.assertEqual(runner.calls, [])
+                self.assertFalse(self.state_path.exists())
+
+    def test_more_positional_arguments_than_the_dispatcher_passes_are_invalid_input(self):
+        code, stderr, _ = self.call(
+            self.event("up", CONNECTION_UUID=UUID),
+            argv=self.argv() + ["br-lan", "up", "extra"],
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("br-lan", stderr)
+        self.assertFalse(self.state_path.exists())
 
     def test_an_unusable_interface_is_invalid_input_on_every_collecting_path(self):
         for action, variables in [
@@ -1341,7 +1406,6 @@ class DispatcherCommandLineTests(unittest.TestCase):
             ["--state-file", "", "--lock-file", str(self.lock_path)],
             ["--state-file", str(self.state_path), "--lock-file", ""],
             self.argv() + ["--verbose"],
-            self.argv() + ["extra"],
             ["-s", str(self.state_path), "-l", str(self.lock_path)],
         ]:
             with self.subTest(argv=argv):
