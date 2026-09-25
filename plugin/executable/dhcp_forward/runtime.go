@@ -54,14 +54,31 @@ func readDHCPState(path string) (state.DHCPState, error) {
 	return published, nil
 }
 
-// fileSignature is what the reload looks at before it reads the state file. The
-// bridge publishes with a same-directory rename, so a new generation always
-// arrives with a new modification time; an unchanged file is not read again on
-// every query.
+// fileSignature is what the reload looks at before it reads the state file.
+//
+// The bridge publishes with a same-directory rename, so a new generation always
+// arrives as a new file. Identity is part of the signature for exactly that
+// reason: a replacement document that happens to be the same length and to carry
+// the same modification time as the file it replaces — which a publisher with
+// coarse timestamps, or two publications inside one clock tick, can produce — is
+// still a new document. os.SameFile compares the device and inode on every
+// platform the project builds for, so no build tag is needed.
 type fileSignature struct {
 	exists  bool
 	modTime time.Time
 	size    int64
+	info    os.FileInfo
+}
+
+// sameAs reports whether two observations describe the same published document.
+func (s fileSignature) sameAs(other fileSignature) bool {
+	if s.exists != other.exists || !s.modTime.Equal(other.modTime) || s.size != other.size {
+		return false
+	}
+	if s.info == nil || other.info == nil {
+		return s.info == nil && other.info == nil
+	}
+	return os.SameFile(s.info, other.info)
 }
 
 // runtime owns the published generations. One query at a time reloads the state
@@ -259,7 +276,7 @@ func (r *runtime) reloadGeneration() (*runtimeGeneration, error) {
 		r.logger.Debug("no dhcp state file yet", zap.String("path", r.stateFile), zap.Error(err))
 		return r.current.Load(), nil
 	}
-	if signature == r.observed && !r.unreadable {
+	if signature.sameAs(r.observed) && !r.unreadable {
 		return r.current.Load(), nil
 	}
 
@@ -289,8 +306,10 @@ func (r *runtime) reloadGeneration() (*runtimeGeneration, error) {
 
 	replacement, err := newRuntimeGeneration(published, r)
 	if err != nil {
-		r.logger.Warn("keeping the current dhcp generation: its upstreams are unusable",
-			zap.String("path", r.stateFile), zap.Error(err))
+		r.logger.Warn("keeping the current dhcp generation: the published state cannot be served",
+			zap.String("path", r.stateFile),
+			zap.Uint64("published_generation", published.Generation),
+			zap.Error(err))
 		return current, nil
 	}
 
@@ -348,6 +367,17 @@ func (r *runtime) close() error {
 // newRuntimeGeneration builds the clients and the cache of one published state.
 // An empty upstream list is a valid, disabled generation.
 func newRuntimeGeneration(published state.DHCPState, r *runtime) (*runtimeGeneration, error) {
+	// A state that is not last known good must not name an upstream. The bridge
+	// publishes that combination when it cannot vouch for a set, and a set nobody
+	// vouched for is not a set a query may be forwarded to. An empty list is the
+	// documented way to disable the branch, so only the inconsistent combination
+	// is refused here.
+	if !published.LastGood && len(published.Upstreams) > 0 {
+		return nil, fmt.Errorf(
+			"dhcp_forward: generation %d is not last known good but names %d upstream(s)",
+			published.Generation, len(published.Upstreams),
+		)
+	}
 	generation := &runtimeGeneration{
 		generation: published.Generation,
 		cache:      newResponseCache(r.cacheEntries),
@@ -542,7 +572,7 @@ func statStateFile(path string) (fileSignature, error) {
 	if err != nil {
 		return fileSignature{}, err
 	}
-	return fileSignature{exists: true, modTime: info.ModTime(), size: info.Size()}, nil
+	return fileSignature{exists: true, modTime: info.ModTime(), size: info.Size(), info: info}, nil
 }
 
 // --- the generation scoped cache ---

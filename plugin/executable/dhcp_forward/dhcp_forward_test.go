@@ -82,6 +82,204 @@ func TestCachesSuccessfulResponseWithinGeneration(t *testing.T) {
 	}
 }
 
+func TestBoundedCacheEvictsWhenItIsFull(t *testing.T) {
+	upstream := startServer(t, answerWith("192.0.2.61", 300))
+	forward, _ := newTestForward(t, Args{CacheEntries: 1}, []string{hostOf(t, upstream)}, portOf(t, upstream))
+
+	first := exec(t, forward, "a.bounded.example.com.", dns.TypeA)
+	exec(t, forward, "b.bounded.example.com.", dns.TypeA)
+	again := exec(t, forward, "a.bounded.example.com.", dns.TypeA)
+
+	for name, response := range map[string]*dns.Msg{"first": first, "repeated": again} {
+		if got := answersOf(t, response); len(got) != 1 || got[0] != "192.0.2.61" {
+			t.Fatalf("%s answers = %v, want [192.0.2.61]", name, got)
+		}
+	}
+	if count := upstream.Count(testdns.ProtocolUDP, "a.bounded.example.com."); count != 2 {
+		t.Fatalf("upstream received %d queries for the first name, want 2: the single cache slot had to be given up", count)
+	}
+	if count := upstream.Count(testdns.ProtocolUDP, "b.bounded.example.com."); count != 1 {
+		t.Fatalf("upstream received %d queries for the second name, want 1", count)
+	}
+}
+
+func TestRemovedStateFileKeepsTheCurrentGeneration(t *testing.T) {
+	upstream := startServer(t, answerWith("192.0.2.62", 300))
+	forward, published := newTestForwardForServer(t, Args{}, upstream)
+
+	exec(t, forward, "before-removal.example.com.", dns.TypeA)
+	if err := os.Remove(published.path); err != nil {
+		t.Fatalf("remove the state file: %v", err)
+	}
+	after := exec(t, forward, "after-removal.example.com.", dns.TypeA)
+
+	if got := answersOf(t, after); len(got) != 1 || got[0] != "192.0.2.62" {
+		t.Fatalf("answers = %v, want the last valid generation's answer", got)
+	}
+	if count := upstream.Count(testdns.ProtocolUDP, "after-removal.example.com."); count != 1 {
+		t.Fatalf("upstream received %d queries, want 1", count)
+	}
+	if reads := published.readCount(); reads != 1 {
+		t.Fatalf("the state file was read %d times, want 1: a file that is not there is not read again", reads)
+	}
+}
+
+func TestStateFileSignatureTracksFileIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := []byte(`{"schema_version":1,"generation":1}`)
+	if err := os.WriteFile(path, document, 0o600); err != nil {
+		t.Fatalf("write the state document: %v", err)
+	}
+	before, err := statStateFile(path)
+	if err != nil {
+		t.Fatalf("stat the state file: %v", err)
+	}
+
+	// The same bytes published again at the same instant, the way a publisher
+	// that renames a fresh temporary file over its target can do.
+	replacement := path + ".next"
+	if err := os.WriteFile(replacement, document, 0o600); err != nil {
+		t.Fatalf("write the replacement document: %v", err)
+	}
+	if err := os.Chtimes(replacement, before.modTime, before.modTime); err != nil {
+		t.Fatalf("set the replacement times: %v", err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatalf("rename the replacement: %v", err)
+	}
+
+	after, err := statStateFile(path)
+	if err != nil {
+		t.Fatalf("stat the renamed state file: %v", err)
+	}
+	if after.size != before.size {
+		t.Fatalf("the setup changed the size from %d to %d, want it unchanged", before.size, after.size)
+	}
+	if !after.modTime.Equal(before.modTime) {
+		t.Fatalf("the setup changed the modification time from %s to %s, want it unchanged", before.modTime, after.modTime)
+	}
+	if before.sameAs(after) {
+		t.Fatal("a renamed file with the same size and modification time looks like the file it replaced")
+	}
+
+	unchanged, err := statStateFile(path)
+	if err != nil {
+		t.Fatalf("stat the state file again: %v", err)
+	}
+	if !after.sameAs(unchanged) {
+		t.Fatal("a file that was not touched looks changed, so every query would read it again")
+	}
+
+	// The other direction: a document rewritten in place keeps its identity, so
+	// only its timestamp distinguishes it from the one it replaced.
+	if err := os.WriteFile(path, document, 0o600); err != nil {
+		t.Fatalf("rewrite the state document: %v", err)
+	}
+	if err := os.Chtimes(path, before.modTime.Add(time.Second), before.modTime.Add(time.Second)); err != nil {
+		t.Fatalf("set the rewritten times: %v", err)
+	}
+	rewritten, err := statStateFile(path)
+	if err != nil {
+		t.Fatalf("stat the rewritten state file: %v", err)
+	}
+	if rewritten.sameAs(unchanged) {
+		t.Fatal("a document rewritten in place with the same length looks unchanged")
+	}
+}
+
+func TestGenerationReplacedByRenameWithTheSameSizeAndTimeIsObserved(t *testing.T) {
+	replaced := startServer(t, answerWith("192.0.2.63", 300))
+	replacement := samePortServer(t, replaced, "127.0.0.2", answerWith("198.51.100.63", 300))
+	forward, published := newTestForward(t, Args{}, []string{hostOf(t, replaced)}, portOf(t, replaced))
+
+	first := exec(t, forward, "renamed.example.com.", dns.TypeA)
+	publishByRename(t, published, 2, true, hostOf(t, replacement))
+	second := exec(t, forward, "renamed.example.com.", dns.TypeA)
+
+	if got := answersOf(t, first); len(got) != 1 || got[0] != "192.0.2.63" {
+		t.Fatalf("first answers = %v, want the generation 1 answer", got)
+	}
+	if got := answersOf(t, second); len(got) != 1 || got[0] != "198.51.100.63" {
+		t.Fatalf("answers = %v, want the generation 2 answer, never the cached generation 1 answer", got)
+	}
+	if count := replaced.Count(testdns.ProtocolUDP, "renamed.example.com."); count != 1 {
+		t.Fatalf("the replaced upstream received %d queries, want 1", count)
+	}
+}
+
+func TestNotLastGoodStateWithUpstreamsIsRefused(t *testing.T) {
+	current := startServer(t, answerWith("192.0.2.64", 300))
+	refused := samePortServer(t, current, "127.0.0.2", answerWith("198.51.100.64", 300))
+	forward, published := newTestForward(t, Args{}, []string{hostOf(t, current)}, portOf(t, current))
+
+	exec(t, forward, "kept.example.com.", dns.TypeA)
+	published.publishDocument(2, false, hostOf(t, refused))
+	after := exec(t, forward, "after-refusal.example.com.", dns.TypeA)
+
+	if got := answersOf(t, after); len(got) != 1 || got[0] != "192.0.2.64" {
+		t.Fatalf("answers = %v, want the last valid generation's answer", got)
+	}
+	if count := refused.Count("", ""); count != 0 {
+		t.Fatalf("the refused upstream received %d queries, want 0", count)
+	}
+	if count := current.Count(testdns.ProtocolUDP, "after-refusal.example.com."); count != 1 {
+		t.Fatalf("the current upstream received %d queries, want 1", count)
+	}
+}
+
+func TestNotLastGoodStateWithUpstreamsFailsClosedWithoutAPriorGeneration(t *testing.T) {
+	upstream := startServer(t, answerWith("192.0.2.65", 300))
+	forward, published := newTestForwardForServer(t, Args{}, upstream)
+	published.publishDocument(2, false, hostOf(t, upstream))
+
+	qCtx := newQueryContext("refused.example.com.", dns.TypeA)
+	if err := forward.Exec(t.Context(), qCtx); err == nil {
+		t.Fatal("Exec returned no error for a state that is not last known good")
+	}
+	if response := qCtx.R(); response != nil {
+		t.Fatalf("response = %v, want none", response)
+	}
+	if count := len(upstream.Queries()); count != 0 {
+		t.Fatalf("upstream received %d queries, want 0", count)
+	}
+}
+
+func TestNotLastGoodEmptyStateDisablesTheBranch(t *testing.T) {
+	upstream := startServer(t, answerWith("192.0.2.66", 300))
+	forward, published := newTestForward(t, Args{}, []string{hostOf(t, upstream)}, portOf(t, upstream))
+
+	// An empty generation that is not last known good is the documented way to
+	// disable the branch, so it has to become the current generation.
+	published.publishDocument(2, false)
+	first := newQueryContext("disabled.example.com.", dns.TypeA)
+	if err := forward.Exec(t.Context(), first); err == nil {
+		t.Fatal("Exec returned no error for an empty generation")
+	}
+	if response := first.R(); response != nil {
+		t.Fatalf("response = %v, want none", response)
+	}
+
+	// A newer valid generation is served again.
+	published.publishDocument(3, true, hostOf(t, upstream))
+	if got := answersOf(t, exec(t, forward, "enabled.example.com.", dns.TypeA)); len(got) != 1 || got[0] != "192.0.2.66" {
+		t.Fatalf("answers = %v, want [192.0.2.66]", got)
+	}
+
+	// Disabling it again takes effect, which only holds if the empty generation
+	// was adopted as the current one.
+	published.publishDocument(4, false)
+	second := newQueryContext("disabled-again.example.com.", dns.TypeA)
+	if err := forward.Exec(t.Context(), second); err == nil {
+		t.Fatal("Exec returned no error after the branch was disabled again")
+	}
+	if response := second.R(); response != nil {
+		t.Fatalf("response = %v, want none", response)
+	}
+	if count := upstream.Count("", "disabled-again.example.com."); count != 0 {
+		t.Fatalf("upstream received %d queries for a disabled branch, want 0", count)
+	}
+}
+
 func TestCacheHitAgesTTLByElapsedSeconds(t *testing.T) {
 	upstream := startServer(t, answerWith("192.0.2.12", 5))
 	forward, _ := newTestForwardForServer(t, Args{}, upstream)
@@ -876,12 +1074,25 @@ func (s *testState) generation() uint64 {
 
 func (s *testState) publish(generation uint64, upstreams ...string) {
 	s.t.Helper()
-	s.mu.Lock()
-	s.current = state.NewDHCPState(generation, testInterface, "uuid", upstreams, time.Unix(0, 0).UTC(), "dhcp4", len(upstreams) > 0)
-	current := s.current
-	s.mu.Unlock()
-	writeStateDocument(s.t, s.path, current)
+	s.publishDocument(generation, len(upstreams) > 0, upstreams...)
+}
+
+// publishDocument writes a document and gives the file a modification time no
+// earlier write used, so the plugin sees every publication as a new file.
+func (s *testState) publishDocument(generation uint64, lastGood bool, upstreams ...string) {
+	s.t.Helper()
+	published := s.note(generation, lastGood, upstreams...)
+	writeStateDocument(s.t, s.path, published)
 	s.setModified()
+}
+
+// note records what the plugin should read next, without writing it.
+func (s *testState) note(generation uint64, lastGood bool, upstreams ...string) state.DHCPState {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = state.NewDHCPState(generation, testInterface, "uuid", upstreams, time.Unix(0, 0).UTC(), "dhcp4", lastGood)
+	return s.current
 }
 
 // corrupt replaces the document with truncated JSON, keeping the generation in
@@ -916,6 +1127,52 @@ func writeStateDocument(t *testing.T, path string, published state.DHCPState) {
 	if err := os.WriteFile(path, document, 0o600); err != nil {
 		t.Fatalf("write the state document: %v", err)
 	}
+}
+
+// publishByRename writes the document the way the bridge does: a fresh file in
+// the same directory, then a rename over the target. The replacement keeps the
+// target's modification time, so only its identity is new.
+func publishByRename(t *testing.T, published *testState, generation uint64, lastGood bool, upstreams ...string) {
+	t.Helper()
+	document := newDHCPStateDocument(t, published.note(generation, lastGood, upstreams...))
+
+	before, err := os.Stat(published.path)
+	if err != nil {
+		t.Fatalf("stat the current state document: %v", err)
+	}
+	replacement := published.path + ".next"
+	if err := os.WriteFile(replacement, document, 0o600); err != nil {
+		t.Fatalf("write the replacement document: %v", err)
+	}
+	if err := os.Chtimes(replacement, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatalf("set the replacement times: %v", err)
+	}
+	if err := os.Rename(replacement, published.path); err != nil {
+		t.Fatalf("rename the replacement document: %v", err)
+	}
+
+	after, err := os.Stat(published.path)
+	if err != nil {
+		t.Fatalf("stat the renamed document: %v", err)
+	}
+	if after.Size() != before.Size() {
+		t.Fatalf("the replacement is %d bytes, was %d: the test needs two documents of the same size", after.Size(), before.Size())
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("the replacement has time %s, was %s: the test needs the same modification time", after.ModTime(), before.ModTime())
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the replacement kept the identity of the file it replaced")
+	}
+}
+
+func newDHCPStateDocument(t *testing.T, published state.DHCPState) []byte {
+	t.Helper()
+	document, err := json.Marshal(published)
+	if err != nil {
+		t.Fatalf("encode the state document: %v", err)
+	}
+	return document
 }
 
 func staticState(published state.DHCPState) readStateFunc {
