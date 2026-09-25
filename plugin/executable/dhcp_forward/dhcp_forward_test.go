@@ -1111,6 +1111,9 @@ func TestNewAppliesDocumentedDefaults(t *testing.T) {
 	if forward.rt.cacheEntries != 4096 {
 		t.Fatalf("cache entries = %d, want the documented 4096", forward.rt.cacheEntries)
 	}
+	if forward.rt.failurePolicy != "disable-current" {
+		t.Fatalf("failure policy = %q, want the documented default disable-current", forward.rt.failurePolicy)
+	}
 }
 
 func TestPluginLoadsFromMosdnsConfig(t *testing.T) {

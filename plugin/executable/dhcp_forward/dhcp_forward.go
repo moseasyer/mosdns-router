@@ -31,6 +31,19 @@ const (
 	maxConcurrency            = 2
 	defaultRetireAfterSeconds = 60
 	defaultCacheEntries       = 4096
+	defaultUpstreamPort       = 53
+	maximumUpstreamPort       = 65535
+)
+
+// The two documented failure policies. A published generation that names no
+// usable upstream is a real DHCP event, and the two policies disagree about
+// what it means: disable-current adopts it so the branch fails closed, and
+// use-last-good keeps serving the last generation that could answer. Any other
+// value is a configuration error, because a safety switch nobody implements
+// must not be treated as either of them.
+const (
+	failurePolicyDisableCurrent = "disable-current"
+	failurePolicyUseLastGood    = "use-last-good"
 )
 
 func init() {
@@ -52,6 +65,15 @@ type Args struct {
 	RetireAfterSeconds int `yaml:"retire_after_seconds"`
 	// CacheEntries bounds one generation's cache. Default 4096.
 	CacheEntries int `yaml:"cache_entries"`
+	// UpstreamPort is the port a published address is dialled on. A published
+	// state carries bare addresses, so the port is a property of this
+	// configuration. Default 53, the port a DHCP DNS server answers on.
+	UpstreamPort int `yaml:"upstream_port"`
+	// FailurePolicy decides what a newer generation without a usable upstream
+	// means: "disable-current" adopts it and fails the branch closed, and
+	// "use-last-good" keeps serving the last generation that had upstreams and
+	// reports how old it is. Default "disable-current".
+	FailurePolicy string `yaml:"failure_policy"`
 }
 
 // Init builds the plugin from a decoded configuration.
@@ -68,7 +90,14 @@ func New(args Args, bp *coremain.BP) (sequence.Executable, error) {
 	if bp == nil {
 		return nil, errors.New("dhcp_forward: a plugin base is required")
 	}
-	return newForwardWithState(args, bp.L(), readDHCPState, dnsPort)
+	// The dial port is a configuration field, so it is resolved here rather
+	// than injected by a caller: a configuration file that names no port gets
+	// the documented default instead of a hard-coded one.
+	resolved, err := args.withDefaults()
+	if err != nil {
+		return nil, err
+	}
+	return newForwardWithState(resolved, bp.L(), readDHCPState, uint16(resolved.UpstreamPort))
 }
 
 // Forward is the executable a mosdns sequence runs.
@@ -115,14 +144,15 @@ func newForwardWithState(args Args, logger *zap.Logger, read readStateFunc, port
 		return nil, errors.New("dhcp_forward: an upstream port is required")
 	}
 	return &Forward{rt: &runtime{
-		logger:       logger,
-		read:         read,
-		stateFile:    resolved.StateFile,
-		port:         port,
-		timeout:      time.Duration(resolved.UpstreamTimeoutMS) * time.Millisecond,
-		concurrency:  resolved.Concurrency,
-		retireAfter:  time.Duration(resolved.RetireAfterSeconds) * time.Second,
-		cacheEntries: resolved.CacheEntries,
+		logger:        logger,
+		read:          read,
+		stateFile:     resolved.StateFile,
+		port:          port,
+		timeout:       time.Duration(resolved.UpstreamTimeoutMS) * time.Millisecond,
+		concurrency:   resolved.Concurrency,
+		retireAfter:   time.Duration(resolved.RetireAfterSeconds) * time.Second,
+		cacheEntries:  resolved.CacheEntries,
+		failurePolicy: resolved.FailurePolicy,
 	}}, nil
 }
 
@@ -159,6 +189,24 @@ func (args Args) withDefaults() (Args, error) {
 	}
 	if resolved.CacheEntries == 0 {
 		resolved.CacheEntries = defaultCacheEntries
+	}
+	if resolved.UpstreamPort < 0 {
+		return resolved, fmt.Errorf("dhcp_forward: upstream_port must not be negative, got %d", resolved.UpstreamPort)
+	}
+	if resolved.UpstreamPort == 0 {
+		resolved.UpstreamPort = defaultUpstreamPort
+	}
+	if resolved.UpstreamPort > maximumUpstreamPort {
+		return resolved, fmt.Errorf("dhcp_forward: upstream_port must be between 1 and %d, got %d", maximumUpstreamPort, resolved.UpstreamPort)
+	}
+	if resolved.FailurePolicy == "" {
+		resolved.FailurePolicy = failurePolicyDisableCurrent
+	}
+	if resolved.FailurePolicy != failurePolicyDisableCurrent && resolved.FailurePolicy != failurePolicyUseLastGood {
+		return resolved, fmt.Errorf(
+			"dhcp_forward: failure_policy must be %s or %s, got %q",
+			failurePolicyDisableCurrent, failurePolicyUseLastGood, resolved.FailurePolicy,
+		)
 	}
 	// A replaced generation has to keep its clients for as long as an exchange
 	// that started against them can still run, otherwise a DHCP change could

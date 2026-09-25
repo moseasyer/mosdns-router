@@ -21,9 +21,6 @@ import (
 	"mosdns-router/internal/state"
 )
 
-// dnsPort is the port a DHCP DNS server answers on.
-const dnsPort uint16 = 53
-
 // truncatedResponseBit is the TC flag in the second byte of a DNS header.
 const truncatedResponseBit = 1 << 1
 
@@ -94,6 +91,10 @@ type runtime struct {
 	concurrency  int
 	retireAfter  time.Duration
 	cacheEntries int
+	// failurePolicy is what a newer generation without a usable upstream means.
+	// It is resolved at init, so a query never has to know whether the policy
+	// was configured at all.
+	failurePolicy string
 
 	reloadMu sync.Mutex
 	current  atomic.Pointer[runtimeGeneration]
@@ -109,6 +110,10 @@ type runtime struct {
 // the cache its answers live in, and the instant its clients may be released.
 type runtimeGeneration struct {
 	generation uint64
+	// observedAt is when the DHCP DNS this generation forwards to was seen. It
+	// is the only age the runtime can report about a generation it keeps
+	// serving, because a generation is adopted rather than aged by this process.
+	observedAt time.Time
 	endpoints  []*endpoint
 	cache      *responseCache
 
@@ -313,6 +318,22 @@ func (r *runtime) reloadGeneration() (*runtimeGeneration, error) {
 	}
 
 	now := time.Now()
+	// The use-last-good policy keeps a generation that can answer. With no
+	// current generation there is nothing to keep, so the empty one is adopted
+	// and the branch fails closed exactly as it does under the other policy.
+	if current != nil && len(replacement.endpoints) == 0 && r.failurePolicy == failurePolicyUseLastGood {
+		// The decision is made once, when the generation is first seen: the
+		// signature above is already recorded, so an unchanged file never
+		// reaches this point again and the report cannot repeat per query.
+		r.logger.Warn("keeping the last dhcp generation that has an upstream",
+			zap.Uint64("published_generation", published.Generation),
+			zap.Uint64("retained_generation", current.generation),
+			zap.Time("observed_at", current.observedAt),
+			zap.Duration("age", now.Sub(current.observedAt)))
+		_ = replacement.close()
+		return current, nil
+	}
+
 	if current != nil {
 		current.retireAt = now.Add(r.retireAfter)
 		r.retired = append(r.retired, current)
@@ -379,6 +400,7 @@ func newRuntimeGeneration(published state.DHCPState, r *runtime) (*runtimeGenera
 	}
 	generation := &runtimeGeneration{
 		generation: published.Generation,
+		observedAt: published.ObservedAt,
 		cache:      newResponseCache(r.cacheEntries),
 	}
 	for _, address := range published.Upstreams {
