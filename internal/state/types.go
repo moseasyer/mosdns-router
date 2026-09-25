@@ -372,6 +372,14 @@ func validDNSLabel(label string) bool {
 	return true
 }
 
+// validInterfaceName accepts exactly the device names the bridge can publish:
+// an alphanumeric first character, then alphanumerics, a dot, an underscore, or a
+// dash, up to the kernel's length limit. The first-character rule is the
+// publisher's, not an extra one here: the bridge refuses to collect for a name
+// that does not start with a letter or a digit, so a state carrying ".eth0" or
+// "_eth0" describes a document no writer of this project can have produced, and
+// a leading dot or underscore is a path element or a shell token the moment a
+// name reaches an argument array.
 func validInterfaceName(value string) bool {
 	if value == "" || len(value) > maximumInterfaceNameLength {
 		return false
@@ -381,11 +389,8 @@ func validInterfaceName(value string) bool {
 		switch {
 		case character >= 'a' && character <= 'z',
 			character >= 'A' && character <= 'Z',
-			character >= '0' && character <= '9',
-			character == '.', character == '_', character == '-':
-			if character == '-' && index == 0 {
-				return false
-			}
+			character >= '0' && character <= '9':
+		case index > 0 && (character == '.' || character == '_' || character == '-'):
 		default:
 			return false
 		}

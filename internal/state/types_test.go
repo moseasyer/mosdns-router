@@ -174,6 +174,16 @@ func TestDHCPStateValidationEnforcesLastGoodInterfaceSourceAndObservation(t *tes
 		}
 	})
 
+	// A leading digit is a legal device name the bridge collects for, so the rule
+	// that refuses a leading dot or underscore must not grow into "a letter".
+	t.Run("an interface that starts with a digit is valid", func(t *testing.T) {
+		numeric := base
+		numeric.Interface = "2eth0"
+		if err := numeric.Validate(); err != nil {
+			t.Fatalf("the interface 2eth0 was rejected: %v", err)
+		}
+	})
+
 	tests := []struct {
 		name   string
 		mutate func(*DHCPState)
@@ -183,6 +193,13 @@ func TestDHCPStateValidationEnforcesLastGoodInterfaceSourceAndObservation(t *tes
 		{name: "interface with a control character", mutate: func(s *DHCPState) { s.Interface = "enp3s0\n" }},
 		{name: "interface with a slash", mutate: func(s *DHCPState) { s.Interface = "enp3s0/0" }},
 		{name: "interface longer than the kernel limit", mutate: func(s *DHCPState) { s.Interface = "abcdefghijklmnop" }},
+		// The bridge only ever publishes a name whose first character is a letter
+		// or a digit, and it refuses to collect for a name that is not one, so a
+		// state this reader accepts but the bridge cannot produce is a state no
+		// writer of this project can have written.
+		{name: "interface starting with a dot", mutate: func(s *DHCPState) { s.Interface = ".enp3s0" }},
+		{name: "interface starting with an underscore", mutate: func(s *DHCPState) { s.Interface = "_enp3s0" }},
+		{name: "interface starting with a dash", mutate: func(s *DHCPState) { s.Interface = "-enp3s0" }},
 		{name: "empty source", mutate: func(s *DHCPState) { s.Source = "" }},
 		{name: "source with a space", mutate: func(s *DHCPState) { s.Source = "dhcp 4" }},
 		{name: "source with an uppercase letter", mutate: func(s *DHCPState) { s.Source = "DHCP4" }},
