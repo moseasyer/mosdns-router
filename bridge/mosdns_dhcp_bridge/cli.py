@@ -13,11 +13,17 @@ around two decisions:
   runs this program for events that have nothing to do with DNS, and the right
   answer to those is to change nothing and succeed.
 * **What did the lease say?** The publisher answers whether the state changed, and
-  only the actions that collect have their address list read first. A ``down``
-  event publishes no resolvers and never runs a command, because the lease those
-  resolvers came from is gone. A source that could not be read at all is not an
-  empty lease: the event is reported and nothing is published, so a wedged D-Bus
-  leaves the last good generation in place.
+  only the actions that collect have their address list read first. The recorded
+  source is the one that answered -- the raw NetworkManager DHCP field, the
+  event's own variables, the effective device DNS, or resolved -- because a
+  renewal, an interface coming up, and a DNS change that renews nothing all reach
+  the same resolvers through the same source, and a state that recorded the event
+  instead would be a new generation for each of them. A ``down`` event publishes
+  no resolvers and never runs a command, because the lease those resolvers came
+  from is gone; it is the only event whose recorded source is the event, since no
+  source answered. A source that could not be read at all is not an empty lease:
+  the event is reported and nothing is published, so a wedged D-Bus leaves the
+  last good generation in place.
 
 The module also owns the exit status the dispatcher acts on. Nothing here calls
 ``sys.exit``: ``main`` returns a code, and only the process entry point turns it
@@ -32,7 +38,12 @@ import subprocess
 import sys
 from typing import Dict, List, Mapping, Sequence, Tuple
 
-from .collect import CommandRunner, SourcesUnavailable, collect_dns, is_interface_name
+from .collect import (
+    CommandRunner,
+    SourcesUnavailable,
+    collect_dns_with_source,
+    is_interface_name,
+)
 from .publish import (
     InvalidStateError,
     LockUnavailable,
@@ -56,21 +67,18 @@ INTERFACE_VARIABLES = ("DEVICE_IP_IFACE", "INTERFACE", "DEVICE")
 
 CONNECTION_UUID_VARIABLE = "CONNECTION_UUID"
 
-# The source recorded for each action names where the addresses came from. The
-# two lease changes record the family whose lease delivered them, because that is
-# what a reader comparing two generations needs to know, and the two lifecycle
-# events record that no lease is in play right now.
-SOURCE_BY_ACTION = {
-    "up": "networkmanager",
-    "dhcp4-change": "dhcp4",
-    "dhcp6-change": "dhcp6",
-    "dns-change": "networkmanager",
-    "down": "down",
-}
+# The events whose DNS the bridge collects. Every one of them records the source
+# that answered, never the event itself: the same lease read through the same
+# source by an interface coming up, a lease renewal, and a DNS change is one
+# state, and a new generation would flush the plugin's cache for resolvers that
+# never moved.
+COLLECTING_ACTIONS = ("up", "dhcp4-change", "dhcp6-change", "dns-change")
 
 # A down event publishes an empty list instead of collecting: the addresses the
-# collector would find belong to a lease that no longer exists.
+# collector would find belong to a lease that no longer exists. It is the only
+# event whose recorded source is the event, because no source answered.
 DISABLING_ACTION = "down"
+DISABLING_SOURCE = "down"
 
 OPTIONS = ("--state-file", "--lock-file")
 
@@ -111,7 +119,7 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     action = env.get(ACTION_VARIABLE, "")
     if not isinstance(action, str) or not action:
         return _fail(EXIT_INVALID_INPUT, f"{ACTION_VARIABLE} is not set")
-    if action not in SOURCE_BY_ACTION:
+    if action != DISABLING_ACTION and action not in COLLECTING_ACTIONS:
         # An event this bridge does not act on: no command is run and no file is
         # touched, so the state keeps describing the last real lease.
         return EXIT_SUCCESS
@@ -123,9 +131,10 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
 
     if action == DISABLING_ACTION:
         upstreams: List[str] = []
+        source = DISABLING_SOURCE
     else:
         try:
-            upstreams = collect_dns(env, interface, run)
+            collected = collect_dns_with_source(env, interface, run)
         except SourcesUnavailable as error:
             # Reported before the lock is taken and before the state is opened:
             # a NetworkManager that cannot be queried says nothing about the
@@ -134,6 +143,7 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
             return _fail(EXIT_STATE, str(error))
         except ValueError as error:
             return _fail(EXIT_INVALID_INPUT, str(error))
+        upstreams, source = collected.addresses, collected.source
 
     try:
         publish_if_changed(
@@ -141,7 +151,7 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
             interface=interface,
             connection_uuid=env.get(CONNECTION_UUID_VARIABLE, ""),
             upstreams=upstreams,
-            source=SOURCE_BY_ACTION[action],
+            source=source,
             now=_observed_now(),
             lock_path=lock_file,
         )

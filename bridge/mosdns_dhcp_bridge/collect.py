@@ -29,8 +29,10 @@ from typing import (
 )
 
 __all__ = [
+    "CollectionResult",
     "SourcesUnavailable",
     "collect_dns",
+    "collect_dns_with_source",
     "is_interface_name",
     "normalize_upstreams",
     "usable_address",
@@ -47,11 +49,26 @@ class SourcesUnavailable(Exception):
     """
 
 
+class CollectionResult(NamedTuple):
+    """What the collector found, and the source that found it.
+
+    The source is the token a reader of the published state needs, and it names
+    the source that answered rather than the event that asked: a lease renewal,
+    an interface coming up, and a DNS change that renews nothing all reach the
+    same resolvers through the same source, and recording the event instead would
+    publish a new generation for each of them.
+    """
+
+    addresses: List[str]
+    source: str
+
+
 class _Outcome(NamedTuple):
-    """What one source yielded, and whether any command behind it was readable."""
+    """What one source yielded, whether any command behind it was readable, and its token."""
 
     addresses: List[str]
     readable: bool
+    source: str
 
 
 # A command runner takes one argument array and returns its standard output.
@@ -83,6 +100,15 @@ DISPATCHER_DNS_VARIABLES = ("DHCP4_DOMAIN_NAME_SERVERS", "DHCP6_DOMAIN_NAME_SERV
 RAW_DHCP_FIELDS = ("DHCP4.OPTION_DOMAIN_NAME_SERVERS", "DHCP6.OPTION_DOMAIN_NAME_SERVERS")
 EFFECTIVE_DNS_FIELDS = ("IP4.DNS", "IP6.DNS")
 
+# The token each source is recorded under. A lease that named its resolvers in
+# one family is recorded as that family, a lease that named them in both is one
+# answer from one source, and the two remaining sources have one token each.
+SOURCE_NM_DHCP = "nm-dhcp"
+SOURCE_DISPATCHER_ENV = "dispatcher-env"
+SOURCE_NM_EFFECTIVE = "nm-effective"
+SOURCE_RESOLVED = "resolved"
+RAW_DHCP_SOURCES = (("nm-dhcp4", RAW_DHCP_FIELDS[0]), ("nm-dhcp6", RAW_DHCP_FIELDS[1]))
+
 # A source separates its addresses with whitespace, commas, or semicolons, and
 # systemd-resolved reports a scoped address in brackets.
 SEPARATORS = re.compile(r"[\s,;]+")
@@ -92,6 +118,18 @@ BRACKETS = "[]"
 def collect_dns(env: Mapping[str, str], interface: str, run: CommandRunner) -> List[str]:
     """Return the DHCP DNS addresses in use on ``interface``.
 
+    A list-only view of ``collect_dns_with_source``, for a caller that has no use
+    for the source. Everything it does, including the SourcesUnavailable rule, is
+    that function's.
+    """
+    return collect_dns_with_source(env, interface, run).addresses
+
+
+def collect_dns_with_source(
+    env: Mapping[str, str], interface: str, run: CommandRunner
+) -> CollectionResult:
+    """Return the DHCP DNS addresses in use on ``interface`` and where they came from.
+
     ``env`` is the dispatcher environment of the current event, ``interface``
     the device that event is about, and ``run`` executes one read-only command
     and returns its standard output.
@@ -99,14 +137,17 @@ def collect_dns(env: Mapping[str, str], interface: str, run: CommandRunner) -> L
     The sources are consulted in a fixed order and the first one that yields a
     usable address wins outright, because a lower-priority source would
     otherwise contribute addresses the router is not configured to use. A source
-    that cannot be read is skipped in favour of the next one.
+    that cannot be read is skipped in favour of the next one. The recorded
+    source is the one that answered, so the same resolvers read twice through
+    the same source are the same state rather than a new generation.
 
     An empty list is a valid answer: it means a source answered and named no
-    usable address, which is not the same as a collection failure. When every
+    usable address, which is not the same as a collection failure, and the
+    source it is recorded under is that first readable source. When every
     command that was attempted could not be read, there is no answer at all and
-    SourcesUnavailable is raised instead, because a NetworkManager that cannot be
-    queried is not evidence that the lease lost its resolvers. Publishing an empty
-    state for that would disable a working router on one flaky query.
+    SourcesUnavailable is raised instead, because a NetworkManager that cannot
+    be queried is not evidence that the lease lost its resolvers. Publishing an
+    empty state for that would disable a working router on one flaky query.
     """
     if not is_interface_name(interface):
         raise ValueError(
@@ -115,16 +156,19 @@ def collect_dns(env: Mapping[str, str], interface: str, run: CommandRunner) -> L
         )
 
     readable = False
+    answered = ""
     for source in _sources(env, interface, run):
         outcome = source()
         readable = readable or outcome.readable
         if outcome.addresses:
-            return outcome.addresses
+            return CollectionResult(outcome.addresses, outcome.source)
+        if outcome.readable and not answered:
+            answered = outcome.source
     if not readable:
         raise SourcesUnavailable(
             "no NetworkManager source could be read: every nmcli and resolvectl query failed"
         )
-    return []
+    return CollectionResult([], answered)
 
 
 def _sources(
@@ -140,7 +184,7 @@ def _sources(
     and ``resolvectl`` is last because it reports the resolved view of the same
     facts and is filtered for local addresses in any case.
     """
-    yield lambda: _device_fields(interface, run, RAW_DHCP_FIELDS)
+    yield lambda: _raw_dhcp_fields(interface, run)
     yield lambda: _event_variables(env)
     yield lambda: _device_fields(interface, run, EFFECTIVE_DNS_FIELDS)
     yield lambda: _resolved_dns(interface, run)
@@ -155,29 +199,57 @@ def _event_variables(env: Mapping[str, str]) -> _Outcome:
     cannot be queried is still an unreadable machine, not an empty lease.
     """
     return _Outcome(
-        _normalized(env.get(name, "") for name in DISPATCHER_DNS_VARIABLES), False
+        _normalized(env.get(name, "") for name in DISPATCHER_DNS_VARIABLES),
+        False,
+        SOURCE_DISPATCHER_ENV,
+    )
+
+
+def _raw_dhcp_fields(interface: str, run: CommandRunner) -> _Outcome:
+    """Read each raw DHCP field with its own argument array and name its family.
+
+    Every field is read even when an earlier one answered, because the DHCP6
+    field is the only record of a v6 lease's resolvers, and a field that answered
+    with nothing is still a source that was read. The recorded source names the
+    family that carried the addresses, so a v4-only lease is not recorded as a
+    v6 one and a lease that named both is recorded as the single answer it is.
+    """
+    answers = [
+        (source, _read(run, ["nmcli", "-g", field, "device", "show", interface]))
+        for source, field in RAW_DHCP_SOURCES
+    ]
+    answering = [source for source, output in answers if _normalized([output])]
+    recorded = answering[0] if len(answering) == 1 else SOURCE_NM_DHCP
+    return _Outcome(
+        _normalized(output for _, output in answers),
+        any(output is not None for _, output in answers),
+        recorded,
     )
 
 
 def _device_fields(
     interface: str, run: CommandRunner, fields: Iterable[str]
 ) -> _Outcome:
-    """Read each nmcli device field with its own argument array.
+    """Read each effective device DNS field with its own argument array.
 
-    Every field is read even when an earlier one answered, because the DHCP6
-    field is the only record of a v6 lease's resolvers, and a field that answered
-    with nothing is still a source that was read.
+    Both families are one answer here: they are what NetworkManager is using
+    right now, and a state records the source that produced the set rather than
+    which field of it held each address.
     """
     outputs = [
         _read(run, ["nmcli", "-g", field, "device", "show", interface]) for field in fields
     ]
-    return _Outcome(_normalized(outputs), any(output is not None for output in outputs))
+    return _Outcome(
+        _normalized(outputs),
+        any(output is not None for output in outputs),
+        SOURCE_NM_EFFECTIVE,
+    )
 
 
 def _resolved_dns(interface: str, run: CommandRunner) -> _Outcome:
     """Return what resolved reports for ``interface``."""
     output = _read(run, ["resolvectl", "dns", interface])
-    return _Outcome(_normalized([output]), output is not None)
+    return _Outcome(_normalized([output]), output is not None, SOURCE_RESOLVED)
 
 
 def _normalized(outputs: Iterable[Optional[str]]) -> List[str]:

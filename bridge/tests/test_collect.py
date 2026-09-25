@@ -16,7 +16,11 @@ from pathlib import Path
 # distribution, so the repository's bridge directory is the import root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mosdns_dhcp_bridge.collect import SourcesUnavailable, collect_dns
+from mosdns_dhcp_bridge.collect import (
+    SourcesUnavailable,
+    collect_dns,
+    collect_dns_with_source,
+)
 
 INTERFACE = "enp3s0"
 
@@ -182,6 +186,91 @@ class SourcePriorityTests(unittest.TestCase):
         )
         got = collect_dns({}, INTERFACE, runner)
         self.assertEqual(got, ["192.168.1.1", "192.168.1.2"])
+
+
+class SourceTokenTests(unittest.TestCase):
+    """The source token names what answered, not what triggered the read.
+
+    The published state records the source beside the addresses, and only the
+    source is compared when an event decides whether it changed anything. A token
+    that named the dispatcher's action would make every routine event pair a new
+    generation and flush the plugin's cache for resolvers that never moved, so
+    the token has to describe the source that produced the addresses.
+    """
+
+    def test_the_raw_dhcp4_field_alone_is_named_nm_dhcp4(self):
+        runner = FakeRunner(quiet_outputs({RAW_DHCP4: "192.168.1.1"}))
+        result = collect_dns_with_source({}, INTERFACE, runner)
+        self.assertEqual(result.source, "nm-dhcp4")
+        self.assertEqual(result.addresses, ["192.168.1.1"])
+
+    def test_the_raw_dhcp6_field_alone_is_named_nm_dhcp6(self):
+        runner = FakeRunner(quiet_outputs({RAW_DHCP6: "fd00::1"}))
+        result = collect_dns_with_source({}, INTERFACE, runner)
+        self.assertEqual(result.source, "nm-dhcp6")
+        self.assertEqual(result.addresses, ["fd00::1"])
+
+    def test_both_raw_dhcp_families_are_named_nm_dhcp(self):
+        runner = FakeRunner(
+            quiet_outputs({RAW_DHCP4: "192.168.1.1", RAW_DHCP6: "fd00::1"})
+        )
+        result = collect_dns_with_source({}, INTERFACE, runner)
+        self.assertEqual(result.source, "nm-dhcp")
+        self.assertEqual(result.addresses, ["192.168.1.1", "fd00::1"])
+
+    def test_the_family_that_answered_is_named_when_its_sibling_could_not_be_read(self):
+        """One readable field still carries the lease's resolvers."""
+        runner = FakeRunner(
+            quiet_outputs({RAW_DHCP6: "fd00::1"}), failures={RAW_DHCP4: OSError("nmcli")}
+        )
+        result = collect_dns_with_source({}, INTERFACE, runner)
+        self.assertEqual(result.source, "nm-dhcp6")
+        self.assertEqual(result.addresses, ["fd00::1"])
+
+    def test_the_dispatcher_environment_is_named_dispatcher_env(self):
+        runner = FakeRunner()
+        result = collect_dns_with_source(
+            {"DHCP4_DOMAIN_NAME_SERVERS": "192.168.1.1"}, INTERFACE, runner
+        )
+        self.assertEqual(result.source, "dispatcher-env")
+        self.assertEqual(result.addresses, ["192.168.1.1"])
+
+    def test_the_effective_device_dns_is_named_nm_effective(self):
+        runner = FakeRunner(
+            quiet_outputs({EFFECTIVE_IP4: "192.168.1.9", EFFECTIVE_IP6: "fd00::9"})
+        )
+        result = collect_dns_with_source({}, INTERFACE, runner)
+        self.assertEqual(result.source, "nm-effective")
+        self.assertEqual(result.addresses, ["192.168.1.9", "fd00::9"])
+
+    def test_resolvectl_is_named_resolved(self):
+        runner = FakeRunner(
+            quiet_outputs({RESOLVECTL: "Link 2 (enp3s0): 192.168.1.1"})
+        )
+        result = collect_dns_with_source({}, INTERFACE, runner)
+        self.assertEqual(result.source, "resolved")
+        self.assertEqual(result.addresses, ["192.168.1.1"])
+
+    def test_an_event_naming_no_usable_resolver_falls_through_to_the_source_that_did(self):
+        runner = FakeRunner(quiet_outputs({EFFECTIVE_IP4: "192.168.1.9"}))
+        result = collect_dns_with_source(
+            {"DHCP4_DOMAIN_NAME_SERVERS": "127.0.0.53"}, INTERFACE, runner
+        )
+        self.assertEqual(result.source, "nm-effective")
+        self.assertEqual(result.addresses, ["192.168.1.9"])
+
+    def test_a_readable_but_empty_lease_names_the_source_that_answered(self):
+        result = collect_dns_with_source({}, INTERFACE, FakeRunner())
+        self.assertEqual((result.addresses, result.source), ([], "nm-dhcp"))
+
+    def test_a_total_failure_still_raises_and_names_no_source(self):
+        with self.assertRaises(SourcesUnavailable):
+            collect_dns_with_source({}, INTERFACE, broken())
+
+    def test_the_list_wrapper_still_returns_the_addresses_only(self):
+        got = collect_dns({}, INTERFACE, FakeRunner(quiet_outputs({RAW_DHCP4: "192.168.1.1"})))
+        self.assertIs(type(got), list)
+        self.assertEqual(got, ["192.168.1.1"])
 
 
 def broken():

@@ -748,11 +748,11 @@ class DispatcherCommandLineTests(unittest.TestCase):
         self.assertEqual(data["interface"], "enp3s0")
         self.assertEqual(data["connection_uuid"], UUID)
         self.assertEqual(data["upstreams"], ["192.168.1.1", "192.168.1.2"])
-        self.assertEqual(data["source"], "dhcp4")
+        self.assertEqual(data["source"], "dispatcher-env")
         self.assertEqual(data["generation"], 1)
         self.assertTrue(data["last_good"])
 
-    def test_a_dhcp6_change_records_the_dhcp6_source(self):
+    def test_a_dhcp6_change_publishes_the_resolvers_its_lease_named(self):
         code, _, _ = self.call(
             self.event(
                 "dhcp6-change",
@@ -763,9 +763,9 @@ class DispatcherCommandLineTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         data = self.published()
-        self.assertEqual((data["source"], data["upstreams"]), ("dhcp6", ["fd00::1"]))
+        self.assertEqual((data["source"], data["upstreams"]), ("dispatcher-env", ["fd00::1"]))
 
-    def test_an_up_event_records_the_networkmanager_source(self):
+    def test_an_up_event_records_the_source_that_answered(self):
         code, _, _ = self.call(
             self.event(
                 "up",
@@ -775,9 +775,9 @@ class DispatcherCommandLineTests(unittest.TestCase):
             )
         )
         self.assertEqual(code, 0)
-        self.assertEqual(self.published()["source"], "networkmanager")
+        self.assertEqual(self.published()["source"], "dispatcher-env")
 
-    def test_a_dns_change_event_collects_and_records_the_networkmanager_source(self):
+    def test_a_dns_change_event_collects_and_records_the_source_that_answered(self):
         code, _, _ = self.call(
             self.event(
                 "dns-change",
@@ -788,7 +788,105 @@ class DispatcherCommandLineTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         data = self.published()
-        self.assertEqual((data["source"], data["upstreams"]), ("networkmanager", ["192.168.1.1"]))
+        self.assertEqual((data["source"], data["upstreams"]), ("dispatcher-env", ["192.168.1.1"]))
+
+    def test_the_raw_nm_dhcp4_field_is_recorded_instead_of_the_event(self):
+        """A lease read from NetworkManager's own configuration names that source.
+
+        The event's own variables are ignored once the raw field answered, so the
+        state says where the addresses came from rather than what triggered the
+        read.
+        """
+        runner = RecordingRunner(
+            {
+                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "192.168.1.53",
+            }
+        )
+        code, _, _ = self.call(
+            self.event(
+                "dhcp4-change",
+                DEVICE_IP_IFACE=INTERFACE,
+                CONNECTION_UUID=UUID,
+                DHCP4_DOMAIN_NAME_SERVERS="192.168.1.1",
+            ),
+            runner=runner,
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["source"], data["upstreams"]), ("nm-dhcp4", ["192.168.1.53"]))
+
+    def test_both_raw_nm_dhcp_families_are_recorded_as_one_source(self):
+        runner = RecordingRunner(
+            {
+                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "192.168.1.53",
+                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "fd00::53",
+            }
+        )
+        code, _, _ = self.call(
+            self.event("dhcp4-change", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=runner,
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual(
+            (data["source"], data["upstreams"]), ("nm-dhcp", ["192.168.1.53", "fd00::53"])
+        )
+
+    def test_the_effective_device_dns_is_recorded_when_the_lease_names_nothing(self):
+        """ignore-auto-dns empties the lease, so the answer comes from the device."""
+        runner = RecordingRunner(
+            {("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE): "192.168.1.9"}
+        )
+        code, _, _ = self.call(
+            self.event("up", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID), runner=runner
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["source"], data["upstreams"]), ("nm-effective", ["192.168.1.9"]))
+
+    def test_resolvectl_is_recorded_when_it_is_the_only_readable_source(self):
+        runner = RecordingRunner(
+            {("resolvectl", "dns", INTERFACE): "Link 2 (enp3s0): 192.168.1.1"},
+            failures={
+                command: OSError("nmcli")
+                for command in [
+                    ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                    ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                    ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE),
+                    ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE),
+                ]
+            },
+        )
+        code, _, _ = self.call(
+            self.event("up", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID), runner=runner
+        )
+        self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["source"], data["upstreams"]), ("resolved", ["192.168.1.1"]))
+
+    def test_the_same_resolvers_read_through_one_source_across_actions_are_unchanged(self):
+        """A lease that renews, an interface that comes up, and a DNS change are
+        one state when the resolvers never moved.
+
+        Recording the event instead of the source gave every one of these a new
+        generation, and a new generation flushes the plugin's cache for
+        resolvers that did not change.
+        """
+        runner = RecordingRunner(
+            {
+                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "192.168.1.1",
+            }
+        )
+        for action in ["up", "dhcp4-change", "dns-change"]:
+            with self.subTest(action=action):
+                code, _, _ = self.call(
+                    self.event(action, DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+                    runner=runner,
+                )
+                self.assertEqual(code, 0)
+        data = self.published()
+        self.assertEqual((data["generation"], data["source"]), (1, "nm-dhcp4"))
+        self.assertEqual(data["upstreams"], ["192.168.1.1"])
 
     def test_a_down_event_disables_the_interface_without_running_a_command(self):
         code, _, runner = self.call(
