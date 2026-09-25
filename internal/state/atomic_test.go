@@ -165,8 +165,8 @@ func TestWriteJSONAtomicPreventsRollbackForEveryGenerationBearingType(t *testing
 	}{
 		{
 			name:    "DHCP",
-			current: NewDHCPState(5, "eth0", "uuid", []string{"192.0.2.1"}, time.Time{}, "dhcp4", true),
-			lower:   NewDHCPState(4, "eth0", "uuid", []string{"192.0.2.2"}, time.Time{}, "dhcp4", true),
+			current: NewDHCPState(5, "eth0", "uuid", []string{"192.0.2.1"}, testFetchedAt, "dhcp4", true),
+			lower:   NewDHCPState(4, "eth0", "uuid", []string{"192.0.2.2"}, testFetchedAt, "dhcp4", true),
 		},
 		{
 			name:    "selector",
@@ -175,8 +175,8 @@ func TestWriteJSONAtomicPreventsRollbackForEveryGenerationBearingType(t *testing
 		},
 		{
 			name:    "ECH",
-			current: NewECHState(5, "source", time.Time{}, time.Time{}, time.Time{}, "hash", "name", "fresh"),
-			lower:   NewECHState(4, "source", time.Time{}, time.Time{}, time.Time{}, "hash", "name", "fresh"),
+			current: NewECHState(5, "cloudflare-ech.com", testFetchedAt, testFetchedAt.Add(time.Hour), testFetchedAt.Add(2*time.Hour), testSHA256, "public.example", "fresh"),
+			lower:   NewECHState(4, "cloudflare-ech.com", testFetchedAt, testFetchedAt.Add(time.Hour), testFetchedAt.Add(2*time.Hour), testSHA256, "public.example", "fresh"),
 		},
 	}
 	for _, tt := range tests {
@@ -229,7 +229,7 @@ func TestReadJSONRoundTripsAllStateTypes(t *testing.T) {
 	wantSelector := NewSelector(12, "manual", "cloudfront", observedAt)
 	wantSelector.WinnerIP = "192.0.2.12"
 	wantSelector.FallbackIP = "198.51.100.12"
-	wantECH := NewECHState(13, "cloudflare-ech.com", observedAt, observedAt.Add(time.Hour), observedAt.Add(2*time.Hour), "sha", "public.example", "stale")
+	wantECH := NewECHState(13, "cloudflare-ech.com", observedAt, observedAt.Add(time.Hour), observedAt.Add(2*time.Hour), testSHA256, "public.example", "stale")
 	wantBudget := BandwidthBudgetState{SchemaVersion: SchemaVersion, LocalDate: "2026-09-25", LimitBytes: 1000, UsedBytes: 250}
 	wantHealth := HealthState{SchemaVersion: SchemaVersion, Healthy: true, ConsecutiveFailures: 0, LastSuccess: observedAt}
 
@@ -409,6 +409,77 @@ func TestReadJSONRejectsUnknownFieldsTrailingDataAndInvalidState(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "state-content-must-not-be-logged") {
 				t.Fatalf("error leaked file contents: %v", err)
+			}
+		})
+	}
+}
+
+// Every destination the strict reader accepts must be validated by the same
+// rules the writer enforces, so a hand-edited or truncated-on-write state file
+// cannot smuggle an unusable value into a fail-closed consumer.
+func TestReadJSONValidatesEveryStateType(t *testing.T) {
+	tests := []struct {
+		name        string
+		valid       string
+		invalid     string
+		destination func() any
+	}{
+		{
+			name: "DHCP",
+			valid: `{"schema_version":1,"generation":1,"interface":"enp3s0","connection_uuid":"connection-1",` +
+				`"upstreams":["192.0.2.53"],"observed_at":"2026-09-25T10:00:00Z","source":"dhcp4","last_good":true}`,
+			invalid: `{"schema_version":1,"generation":1,"interface":"enp3s0","connection_uuid":"connection-1",` +
+				`"upstreams":["127.0.0.53"],"observed_at":"2026-09-25T10:00:00Z","source":"dhcp4","last_good":true}`,
+			destination: func() any { return new(DHCPState) },
+		},
+		{
+			name: "selector",
+			valid: `{"schema_version":1,"generation":1,"mode":"auto","provider":"cloudfront",` +
+				`"cloudfront":{"distribution.example":"1.2.3.4"},"last_success":"2026-09-25T10:00:00Z","config_sha256":"` + testSHA256 + `"}`,
+			invalid: `{"schema_version":1,"generation":1,"mode":"auto","provider":"cloudfront",` +
+				`"cloudfront":{"distribution.example":"10.1.2.3"},"last_success":"2026-09-25T10:00:00Z"}`,
+			destination: func() any { return new(Selector) },
+		},
+		{
+			name: "ECH",
+			valid: `{"schema_version":1,"generation":1,"source":"cloudflare-ech.com","fetched_at":"2026-09-25T10:00:00Z",` +
+				`"expires_at":"2026-09-25T11:00:00Z","stale_until":"2026-09-25T12:00:00Z","config_sha256":"` + testSHA256 + `",` +
+				`"public_name":"public.example","status":"fresh"}`,
+			invalid: `{"schema_version":1,"generation":1,"source":"cloudflare-ech.com","fetched_at":"2026-09-25T12:00:00Z",` +
+				`"expires_at":"2026-09-25T11:00:00Z","stale_until":"2026-09-25T12:00:00Z","config_sha256":"` + testSHA256 + `",` +
+				`"public_name":"public.example","status":"fresh"}`,
+			destination: func() any { return new(ECHState) },
+		},
+		{
+			name:        "budget",
+			valid:       `{"schema_version":1,"local_date":"2026-09-25","limit_bytes":104857600,"used_bytes":250}`,
+			invalid:     `{"schema_version":1,"local_date":"2026-09-25","limit_bytes":104857600,"used_bytes":-1}`,
+			destination: func() any { return new(BandwidthBudgetState) },
+		},
+		{
+			name:        "health",
+			valid:       `{"schema_version":1,"healthy":true,"consecutive_failures":0,"last_success":"2026-09-25T10:00:00Z"}`,
+			invalid:     `{"schema_version":1,"healthy":true,"consecutive_failures":-1}`,
+			destination: func() any { return new(HealthState) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			validPath := filepath.Join(t.TempDir(), "valid.json")
+			if err := os.WriteFile(validPath, []byte(tt.valid), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ReadJSON(validPath, tt.destination()); err != nil {
+				t.Fatalf("valid %s document rejected: %v", tt.name, err)
+			}
+
+			invalidPath := filepath.Join(t.TempDir(), "invalid.json")
+			if err := os.WriteFile(invalidPath, []byte(tt.invalid), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ReadJSON(invalidPath, tt.destination()); err == nil {
+				t.Fatalf("invalid %s document accepted", tt.name)
 			}
 		})
 	}

@@ -13,6 +13,12 @@ import (
 	"mosdns-router/internal/state"
 )
 
+const (
+	// testSHA256 is the lowercase hex SHA-256 digest of "test", the shape state
+	// validation requires for a recorded config or ECHConfig digest.
+	testSHA256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+)
+
 const validPolicyYAML = `schema_version: 1
 schedule: "03:00"
 foreign:
@@ -134,9 +140,9 @@ func TestRunStatusOrderIsIndependentOfOptionOrder(t *testing.T) {
 	selectorPath := filepath.Join(dir, "selector.json")
 	dhcpPath := filepath.Join(dir, "dhcp.json")
 	echPath := filepath.Join(dir, "ech.json")
-	writeSelectorFixture(t, selectorPath, state.Selector{SchemaVersion: 1, Generation: 2, Mode: "manual", Provider: "cloudflare", WinnerIP: "192.0.2.10"})
+	writeSelectorFixture(t, selectorPath, state.Selector{SchemaVersion: 1, Generation: 2, Mode: "manual", Provider: "cloudflare", WinnerIP: "192.0.2.10", LastSuccess: time.Date(2026, time.September, 25, 19, 0, 0, 0, time.UTC)})
 	writeDHCPFixture(t, dhcpPath, state.DHCPState{SchemaVersion: 1, Generation: 3, Interface: "enp3s0", ConnectionUUID: "uuid", Upstreams: []string{"192.0.2.53"}, ObservedAt: time.Date(2026, time.September, 25, 18, 0, 0, 0, time.UTC), Source: "dhcp4", LastGood: true})
-	writeECHFixture(t, echPath, state.ECHState{SchemaVersion: 1, Generation: 4, Source: "cloudflare-ech.com", ExpiresAt: time.Date(2026, time.September, 25, 20, 0, 0, 0, time.UTC), ConfigSHA256: "hash", PublicName: "public.example", Status: "fresh"})
+	writeECHFixture(t, echPath, state.ECHState{SchemaVersion: 1, Generation: 4, Source: "cloudflare-ech.com", FetchedAt: time.Date(2026, time.September, 25, 19, 0, 0, 0, time.UTC), ExpiresAt: time.Date(2026, time.September, 25, 20, 0, 0, 0, time.UTC), StaleUntil: time.Date(2026, time.September, 25, 21, 0, 0, 0, time.UTC), ConfigSHA256: testSHA256, PublicName: "public.example", Status: "fresh"})
 
 	var firstOut, firstErr, secondOut, secondErr bytes.Buffer
 	first := run([]string{"status", "--ech", echPath, "--selector", selectorPath, "--dhcp", dhcpPath}, &firstOut, &firstErr)
@@ -148,14 +154,16 @@ func TestRunStatusOrderIsIndependentOfOptionOrder(t *testing.T) {
 		t.Fatalf("option order changed status output:\nfirst:  %q\nsecond: %q", firstOut.String(), secondOut.String())
 	}
 
-	want := "selector.generation=2\nselector.mode=manual\nselector.provider=cloudflare\nselector.schema_version=1\nselector.winner_ip=192.0.2.10\n" +
+	want := "selector.generation=2\nselector.last_success=2026-09-25T19:00:00Z\nselector.mode=manual\nselector.provider=cloudflare\nselector.schema_version=1\nselector.winner_ip=192.0.2.10\n" +
 		"dhcp.connection_uuid=uuid\ndhcp.generation=3\ndhcp.interface=enp3s0\ndhcp.last_good=true\ndhcp.observed_at=2026-09-25T18:00:00Z\ndhcp.schema_version=1\ndhcp.source=dhcp4\ndhcp.upstreams=192.0.2.53\n" +
-		"ech.config_sha256=hash\n" +
+		"ech.config_sha256=" + testSHA256 + "\n" +
 		"ech.expires_at=2026-09-25T20:00:00Z\n" +
+		"ech.fetched_at=2026-09-25T19:00:00Z\n" +
 		"ech.generation=4\n" +
 		"ech.public_name=public.example\n" +
 		"ech.schema_version=1\n" +
 		"ech.source=cloudflare-ech.com\n" +
+		"ech.stale_until=2026-09-25T21:00:00Z\n" +
 		"ech.status=fresh\n"
 	if got := firstOut.String(); got != want {
 		t.Fatalf("combined status output:\n got: %q\nwant: %q", got, want)

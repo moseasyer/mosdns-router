@@ -2,6 +2,7 @@ package state
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,6 +71,7 @@ func TestSelectorValidationAcceptsSupportedModesAndIPv4Addresses(t *testing.T) {
 				Provider:      "cloudflare",
 				WinnerIP:      "192.0.2.10",
 				FallbackIP:    "198.51.100.20",
+				LastSuccess:   time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC),
 			}
 			if err := state.Validate(); err != nil {
 				t.Fatalf("valid selector mode %q rejected: %v", mode, err)
@@ -106,32 +108,298 @@ func TestSelectorValidationRejectsInvalidFields(t *testing.T) {
 func TestDHCPStateValidationRequiresValidUpstreamAddresses(t *testing.T) {
 	valid := []string{"192.0.2.1", "2001:db8::1"}
 	for _, upstream := range valid {
-		state := DHCPState{SchemaVersion: SchemaVersion, Generation: 1, Upstreams: []string{upstream}}
+		state := validDHCPState(upstream)
 		if err := state.Validate(); err != nil {
 			t.Errorf("valid upstream %q rejected: %v", upstream, err)
 		}
 	}
 	for _, upstream := range []string{"", "not-an-ip", "192.0.2.999"} {
-		state := DHCPState{SchemaVersion: SchemaVersion, Generation: 1, Upstreams: []string{upstream}}
+		state := validDHCPState(upstream)
 		if err := state.Validate(); err == nil {
 			t.Errorf("invalid upstream %q accepted", upstream)
 		}
 	}
 }
 
+// A DHCP upstream has to be something the router can actually forward a query
+// to. Loopback (including the resolved stubs 127.0.0.53 and 127.0.0.54),
+// unspecified, multicast, IPv4 link-local and zoned addresses cannot. A bare
+// IPv6 link-local, ULA or global address is usable because the interface is
+// recorded in the same state record.
+func TestDHCPStateValidationRejectsUnusableUpstreamAddresses(t *testing.T) {
+	accepted := []string{
+		"192.0.2.53",
+		"198.51.100.53",
+		"203.0.113.53",
+		"2001:db8::53",
+		"fc00::53",
+		"fe80::53",
+	}
+	for _, upstream := range accepted {
+		state := validDHCPState(upstream)
+		if err := state.Validate(); err != nil {
+			t.Errorf("usable upstream %q rejected: %v", upstream, err)
+		}
+	}
+
+	rejected := []string{
+		"127.0.0.1",
+		"127.0.0.53",
+		"127.0.0.54",
+		"127.255.255.254",
+		"::1",
+		"0.0.0.0",
+		"::",
+		"224.0.0.1",
+		"239.255.255.250",
+		"ff02::1",
+		"169.254.1.1",
+		"fe80::1%eth0",
+		"::ffff:192.0.2.1",
+	}
+	for _, upstream := range rejected {
+		state := validDHCPState(upstream)
+		if err := state.Validate(); err == nil {
+			t.Errorf("unusable upstream %q accepted", upstream)
+		}
+	}
+}
+
+func TestDHCPStateValidationEnforcesLastGoodInterfaceSourceAndObservation(t *testing.T) {
+	base := validDHCPState("192.0.2.53")
+
+	t.Run("a complete record is valid", func(t *testing.T) {
+		if err := base.Validate(); err != nil {
+			t.Fatalf("complete DHCP state rejected: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*DHCPState)
+	}{
+		{name: "empty interface", mutate: func(s *DHCPState) { s.Interface = "" }},
+		{name: "interface with a space", mutate: func(s *DHCPState) { s.Interface = "enp3 s0" }},
+		{name: "interface with a control character", mutate: func(s *DHCPState) { s.Interface = "enp3s0\n" }},
+		{name: "interface with a slash", mutate: func(s *DHCPState) { s.Interface = "enp3s0/0" }},
+		{name: "interface longer than the kernel limit", mutate: func(s *DHCPState) { s.Interface = "abcdefghijklmnop" }},
+		{name: "empty source", mutate: func(s *DHCPState) { s.Source = "" }},
+		{name: "source with a space", mutate: func(s *DHCPState) { s.Source = "dhcp 4" }},
+		{name: "source with an uppercase letter", mutate: func(s *DHCPState) { s.Source = "DHCP4" }},
+		{name: "missing observation time", mutate: func(s *DHCPState) { s.ObservedAt = time.Time{} }},
+		{name: "last good without upstreams", mutate: func(s *DHCPState) { s.Upstreams = nil }},
+		{name: "last good with an empty upstream list", mutate: func(s *DHCPState) { s.Upstreams = []string{} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := base
+			state.Upstreams = append([]string(nil), base.Upstreams...)
+			tt.mutate(&state)
+			if err := state.Validate(); err == nil {
+				t.Fatalf("expected validation error for %#v", state)
+			}
+		})
+	}
+
+	t.Run("a stale state may be empty", func(t *testing.T) {
+		state := base
+		state.Upstreams = nil
+		state.LastGood = false
+		if err := state.Validate(); err != nil {
+			t.Fatalf("empty non-last-good state rejected: %v", err)
+		}
+	})
+}
+
+func TestSelectorValidationEnforcesWinnerFallbackAndProofConsistency(t *testing.T) {
+	valid := Selector{
+		SchemaVersion:    SchemaVersion,
+		Generation:       4,
+		Mode:             "auto",
+		Provider:         "cloudflare",
+		WinnerIP:         "192.0.2.10",
+		WinnerProofUntil: time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC),
+		FallbackIP:       "198.51.100.20",
+		LastSuccess:      time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC),
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("consistent selector rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Selector)
+	}{
+		{name: "winner without a success time", mutate: func(s *Selector) { s.LastSuccess = time.Time{} }},
+		{name: "proof without a winner", mutate: func(s *Selector) { s.WinnerIP = "" }},
+		{name: "proof before the last success", mutate: func(s *Selector) {
+			s.WinnerProofUntil = time.Date(2026, time.September, 25, 11, 0, 0, 0, time.UTC)
+		}},
+		{name: "proof equal to the last success", mutate: func(s *Selector) { s.WinnerProofUntil = s.LastSuccess }},
+		{name: "fallback identical to the winner", mutate: func(s *Selector) { s.FallbackIP = s.WinnerIP }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := valid
+			tt.mutate(&state)
+			if err := state.Validate(); err == nil {
+				t.Fatalf("expected validation error for %#v", state)
+			}
+		})
+	}
+
+	t.Run("a selector without a winner needs no proof", func(t *testing.T) {
+		state := valid
+		state.WinnerIP = ""
+		state.WinnerProofUntil = time.Time{}
+		if err := state.Validate(); err != nil {
+			t.Fatalf("winnerless selector rejected: %v", err)
+		}
+	})
+}
+
+func TestSelectorValidationRejectsUnsafeProviderAndConfigHash(t *testing.T) {
+	base := Selector{
+		SchemaVersion: SchemaVersion,
+		Generation:    1,
+		Mode:          "auto",
+		Provider:      "cloudflare",
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("selector without a config hash rejected: %v", err)
+	}
+	base.ConfigSHA256 = testSHA256
+	if err := base.Validate(); err != nil {
+		t.Fatalf("selector with a SHA-256 config hash rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Selector)
+	}{
+		{name: "provider with a space", mutate: func(s *Selector) { s.Provider = "cloud front" }},
+		{name: "provider with a slash", mutate: func(s *Selector) { s.Provider = "cloudflare/global" }},
+		{name: "provider with a control character", mutate: func(s *Selector) { s.Provider = "cloud\nflare" }},
+		{name: "short config hash", mutate: func(s *Selector) { s.ConfigSHA256 = "abc" }},
+		{name: "config hash with a non-hex character", mutate: func(s *Selector) { s.ConfigSHA256 = testSHA256[:63] + "z" }},
+		{name: "uppercase config hash", mutate: func(s *Selector) { s.ConfigSHA256 = strings.ToUpper(testSHA256) }},
+		{name: "config hash that is too long", mutate: func(s *Selector) { s.ConfigSHA256 = testSHA256 + "0" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := base
+			tt.mutate(&state)
+			if err := state.Validate(); err == nil {
+				t.Fatalf("expected validation error for %#v", state)
+			}
+		})
+	}
+}
+
+func TestSelectorValidationRejectsUnsafeCloudFrontMappings(t *testing.T) {
+	valid := Selector{
+		SchemaVersion: SchemaVersion,
+		Generation:    1,
+		Mode:          "auto",
+		Provider:      "cloudfront",
+		CloudFront:    map[string]string{"distribution.example": "1.2.3.4"},
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid CloudFront mapping rejected: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		cloudfront map[string]string
+	}{
+		{name: "empty hostname", cloudfront: map[string]string{"": "1.2.3.4"}},
+		{name: "hostname with a space", cloudfront: map[string]string{"distribution example": "1.2.3.4"}},
+		{name: "hostname with a wildcard", cloudfront: map[string]string{"*.example": "1.2.3.4"}},
+		{name: "hostname with a trailing dot", cloudfront: map[string]string{"distribution.example.": "1.2.3.4"}},
+		{name: "hostname with a leading hyphen label", cloudfront: map[string]string{"-bad.example": "1.2.3.4"}},
+		{name: "hostname that is an IPv4 literal", cloudfront: map[string]string{"1.2.3.4": "1.2.3.4"}},
+		{name: "hostname with an empty label", cloudfront: map[string]string{"distribution..example": "1.2.3.4"}},
+		{name: "hostname with a control character", cloudfront: map[string]string{"distribution.example\n": "1.2.3.4"}},
+		{name: "value that is not an address", cloudfront: map[string]string{"distribution.example": "not-an-ip"}},
+		{name: "IPv6 value", cloudfront: map[string]string{"distribution.example": "2001:db8::1"}},
+		{name: "loopback value", cloudfront: map[string]string{"distribution.example": "127.0.0.1"}},
+		{name: "link-local value", cloudfront: map[string]string{"distribution.example": "169.254.1.1"}},
+		{name: "multicast value", cloudfront: map[string]string{"distribution.example": "224.0.0.1"}},
+		{name: "unspecified value", cloudfront: map[string]string{"distribution.example": "0.0.0.0"}},
+		{name: "private value", cloudfront: map[string]string{"distribution.example": "10.1.2.3"}},
+		{name: "carrier NAT value", cloudfront: map[string]string{"distribution.example": "100.64.0.1"}},
+		{name: "documentation value", cloudfront: map[string]string{"distribution.example": "192.0.2.10"}},
+		{name: "broadcast value", cloudfront: map[string]string{"distribution.example": "255.255.255.255"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := valid
+			state.CloudFront = tt.cloudfront
+			if err := state.Validate(); err == nil {
+				t.Fatalf("expected validation error for %#v", tt.cloudfront)
+			}
+		})
+	}
+}
+
 func TestECHStateValidationRestrictsStatus(t *testing.T) {
 	for _, status := range []string{"fresh", "stale", "invalid"} {
-		state := ECHState{SchemaVersion: SchemaVersion, Generation: 1, Source: "source", Status: status}
+		state := validECHState(status)
 		if err := state.Validate(); err != nil {
 			t.Errorf("valid status %q rejected: %v", status, err)
 		}
 	}
 	for _, status := range []string{"", "expired", "Fresh", "unknown"} {
-		state := ECHState{SchemaVersion: SchemaVersion, Generation: 1, Source: "source", Status: status}
+		state := validECHState(status)
 		if err := state.Validate(); err == nil {
 			t.Errorf("invalid status %q accepted", status)
 		}
 	}
+}
+
+func TestECHStateValidationEnforcesMetadataAndTimestampOrdering(t *testing.T) {
+	base := validECHState("fresh")
+	if err := base.Validate(); err != nil {
+		t.Fatalf("complete ECH state rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ECHState)
+	}{
+		{name: "missing fetch time", mutate: func(s *ECHState) { s.FetchedAt = time.Time{} }},
+		{name: "missing expiry", mutate: func(s *ECHState) { s.ExpiresAt = time.Time{} }},
+		{name: "missing stale grace", mutate: func(s *ECHState) { s.StaleUntil = time.Time{} }},
+		{name: "expiry before the fetch time", mutate: func(s *ECHState) { s.ExpiresAt = s.FetchedAt.Add(-time.Second) }},
+		{name: "expiry equal to the fetch time", mutate: func(s *ECHState) { s.ExpiresAt = s.FetchedAt }},
+		{name: "stale grace before the expiry", mutate: func(s *ECHState) { s.StaleUntil = s.ExpiresAt.Add(-time.Second) }},
+		{name: "source with a URL scheme", mutate: func(s *ECHState) { s.Source = "https://cloudflare-ech.com" }},
+		{name: "source with a path", mutate: func(s *ECHState) { s.Source = "cloudflare-ech.com/hello" }},
+		{name: "source that is an address", mutate: func(s *ECHState) { s.Source = "192.0.2.1" }},
+		{name: "empty source", mutate: func(s *ECHState) { s.Source = "" }},
+		{name: "missing config hash", mutate: func(s *ECHState) { s.ConfigSHA256 = "" }},
+		{name: "short config hash", mutate: func(s *ECHState) { s.ConfigSHA256 = "abc" }},
+		{name: "missing public name", mutate: func(s *ECHState) { s.PublicName = "" }},
+		{name: "public name with a space", mutate: func(s *ECHState) { s.PublicName = "public name" }},
+		{name: "public name that is an address", mutate: func(s *ECHState) { s.PublicName = "192.0.2.1" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := base
+			tt.mutate(&state)
+			if err := state.Validate(); err == nil {
+				t.Fatalf("expected validation error for %#v", state)
+			}
+		})
+	}
+
+	t.Run("an invalid state may report no public name", func(t *testing.T) {
+		state := validECHState("invalid")
+		state.PublicName = ""
+		if err := state.Validate(); err != nil {
+			t.Fatalf("invalid ECH state without a public name rejected: %v", err)
+		}
+	})
 }
 
 func TestBandwidthBudgetStateValidationUsesCalendarDate(t *testing.T) {
@@ -195,4 +463,24 @@ func TestAllStateTypesRejectUnsupportedSchemaVersions(t *testing.T) {
 			t.Errorf("unsupported schema accepted for %T", value)
 		}
 	}
+}
+
+// testSHA256 is the lowercase hex SHA-256 digest of "test". State validation
+// requires config hashes in exactly this shape, so the fixture is a real
+// digest instead of a placeholder.
+const testSHA256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+var testFetchedAt = time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+
+// validDHCPState returns a DHCP record that satisfies every invariant except
+// the upstream address, so a test can vary one rule at a time.
+func validDHCPState(upstream string) DHCPState {
+	state := NewDHCPState(1, "enp3s0", "connection-1", []string{upstream}, testFetchedAt, "dhcp4", true)
+	return state
+}
+
+// validECHState returns an ECH record that satisfies every invariant except
+// the status value itself.
+func validECHState(status string) ECHState {
+	return NewECHState(1, "cloudflare-ech.com", testFetchedAt, testFetchedAt.Add(time.Hour), testFetchedAt.Add(2*time.Hour), testSHA256, "public.example", status)
 }
