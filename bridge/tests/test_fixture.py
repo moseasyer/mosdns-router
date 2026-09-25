@@ -1,0 +1,129 @@
+"""Prove the committed cross-language fixture is the publisher's own bytes.
+
+``bridge/tests/fixtures/dhcp-upstreams.json`` is read by the Go verifier in
+``internal/dhcpstate`` and stands in for a state file the router would read at
+runtime, so it must never be hand-maintained: a hand-written document could
+describe a state the publisher would never emit, and the Go check would then
+prove nothing about the two halves agreeing. These tests publish the canonical
+event through the real publisher with a fixed clock and compare the exact bytes
+with the committed fixture, so a change to the serialisation, the field order,
+or the field set fails here rather than in the router.
+
+The canonical event is a DHCP4 lease on ``enp3s0`` that replaced a generation 6
+state with one more resolver. Generation 7 rather than 1 is deliberate: the
+number crosses Python's ``int`` and Go's ``uint64`` on its way into the fixture,
+and a single-digit generation would not exercise that crossing.
+"""
+
+import datetime
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+# The bridge package is used from a source checkout, not from an installed
+# distribution, so the repository's bridge directory is the import root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from mosdns_dhcp_bridge.publish import publish_if_changed
+
+# The canonical facts, spelled out here rather than derived from the publisher, so
+# a fixture regenerated with different inputs fails instead of redefining itself.
+INTERFACE = "enp3s0"
+UUID = "11111111-1111-1111-1111-111111111111"
+SOURCE = "dhcp4"
+OBSERVED_AT = datetime.datetime(2026, 9, 25, 0, 0, tzinfo=datetime.timezone.utc)
+UPSTREAMS = ["192.168.1.1", "192.168.1.53"]
+GENERATION = 7
+
+# The state the canonical event replaces. It is a valid published document, so
+# the publisher accepts it as the previous generation and advances to 7.
+PREDECESSOR = {
+    "schema_version": 1,
+    "generation": GENERATION - 1,
+    "interface": INTERFACE,
+    "connection_uuid": UUID,
+    "upstreams": ["192.168.1.1"],
+    "observed_at": "2026-09-25T00:00:00Z",
+    "source": SOURCE,
+    "last_good": True,
+}
+
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "dhcp-upstreams.json"
+
+
+class CommittedFixtureTests(unittest.TestCase):
+    """What the committed cross-language fixture is and where it came from."""
+
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workspace.cleanup)
+        self.directory = Path(self.workspace.name)
+        self.state_path = self.directory / "dhcp-upstreams.json"
+
+    def publish_canonical(self):
+        """Publish the canonical event over its predecessor and return the bytes."""
+        self.state_path.write_text(json.dumps(PREDECESSOR) + "\n")
+        published = publish_if_changed(
+            str(self.state_path),
+            interface=INTERFACE,
+            connection_uuid=UUID,
+            upstreams=UPSTREAMS,
+            source=SOURCE,
+            now=OBSERVED_AT,
+        )
+        self.assertTrue(published)
+        return self.state_path.read_bytes()
+
+    def test_the_publisher_reproduces_the_committed_fixture_byte_for_byte(self):
+        """The committed bytes are the publisher's, so both languages read one document.
+
+        A serialisation change -- a different indent, a missing trailing newline, a
+        reordered or dropped field -- is a break the router would see as a document
+        the bridge never wrote, and the byte comparison is what names it.
+        """
+        self.assertEqual(self.publish_canonical(), FIXTURE.read_bytes())
+
+    def test_the_committed_fixture_records_the_canonical_dhcp_event(self):
+        """The fixture says what the ruling says, whatever generated its bytes.
+
+        The byte comparison alone cannot tell a correct document from a publisher
+        whose inputs drifted, because it compares the publisher against itself once
+        the fixture is regenerated. These literals are the canonical facts.
+        """
+        self.assertEqual(
+            json.loads(FIXTURE.read_text()),
+            {
+                "schema_version": 1,
+                "generation": GENERATION,
+                "interface": INTERFACE,
+                "connection_uuid": UUID,
+                "upstreams": UPSTREAMS,
+                "observed_at": "2026-09-25T00:00:00Z",
+                "source": SOURCE,
+                "last_good": True,
+            },
+        )
+
+    def test_the_committed_fixture_carries_exactly_the_state_fields(self):
+        """No field the Go decoder would refuse as unknown, and none it would miss.
+
+        The Go reader is strict in both directions: a field the bridge does not
+        write is missing upstream information, and one it writes that the reader
+        does not know is a document the reader refuses outright. Regenerating the
+        fixture is therefore a decision to make, not a chore.
+        """
+        self.assertEqual(
+            sorted(json.loads(FIXTURE.read_text())),
+            [
+                "connection_uuid",
+                "generation",
+                "interface",
+                "last_good",
+                "observed_at",
+                "schema_version",
+                "source",
+                "upstreams",
+            ],
+        )
