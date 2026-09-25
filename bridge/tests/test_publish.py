@@ -750,9 +750,9 @@ class AtomicWriteTests(unittest.TestCase):
         self.directory = Path(self.workspace.name)
         self.state_path = self.directory / "dhcp-upstreams.json"
 
-    def publish(self, upstreams, now=NOW):
+    def publish(self, upstreams, now=NOW, state_path=None):
         return publish_if_changed(
-            str(self.state_path),
+            str(state_path or self.state_path),
             interface=INTERFACE,
             connection_uuid=UUID,
             upstreams=upstreams,
@@ -823,6 +823,29 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertTrue(self.publish(["192.168.1.53"]))
         self.assertEqual(json.loads(self.state_path.read_text())["upstreams"], ["192.168.1.53"])
         self.assertEqual(stat.S_IMODE(self.state_path.stat().st_mode), 0o640)
+
+    def test_the_published_mode_is_already_on_the_inode_when_it_is_synced(self):
+        """The 0640 mode has to be durable, not merely written.
+
+        The rename below publishes the inode this file already is, so a mode
+        pinned after the fsync survives only in this process's page cache: a
+        power loss between the sync and the next write leaves a state file at
+        whatever the umask allowed, readable by every local account.
+        """
+        target = self.directory / "run" / "mosdns" / "dhcp-upstreams.json"
+        observed = []
+        real_fsync = os.fsync
+
+        def watched_fsync(descriptor):
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                observed.append(stat.S_IMODE(os.fstat(descriptor).st_mode))
+            return real_fsync(descriptor)
+
+        with _umask(0o077), mock.patch("os.fsync", watched_fsync):
+            self.assertTrue(self.publish(["192.168.1.1"], state_path=target))
+
+        self.assertEqual(observed, [0o640])
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
 
 
 class RecordingRunner:

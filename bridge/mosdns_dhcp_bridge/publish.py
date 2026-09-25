@@ -441,11 +441,12 @@ def _commit(path: str, document: Dict[str, Any]) -> None:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
-            os.fsync(stream.fileno())
-            # Pinned after the sync because the mode belongs to the inode this
-            # file already is; the rename below publishes that inode, so the
-            # target's mode is the one set here.
+            # The mode belongs to the inode this file already is, and the rename
+            # below publishes that inode, so it is pinned before the sync: a
+            # mode applied afterwards survives only in this process's page cache,
+            # and the umask's mode would be what a power loss left on disk.
             os.fchmod(stream.fileno(), STATE_FILE_MODE)
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
     except OSError as error:
         raise PublicationError(
