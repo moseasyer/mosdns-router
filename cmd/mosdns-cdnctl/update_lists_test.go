@@ -673,6 +673,30 @@ func TestUpdateListsTakesTheControlLockOnlyAfterTheSourceIsVerified(t *testing.T
 	}
 }
 
+func TestUpdateListsCheckWritesNoPartialReportWhenTheDriftedArchiveCannotBeRead(t *testing.T) {
+	// The remote has moved on, so the check has to read its archive to report the
+	// digest a pin would record, and the origin has no archive for the commit it
+	// just published. A report cut in half, with no verdict in it, is worse than
+	// no report: stdout either carries a complete answer or nothing.
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	before := snapshot(t, paths.dir)
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{lockedCommit: sourceArchive(t, lockedCommit, firstInstallArchive)})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--check",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+	if code != exitStateUnavailable {
+		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("failed check wrote a partial report: %q", stdout)
+	}
+	if !strings.Contains(stderr, remoteCommit) {
+		t.Errorf("refusal does not name the commit it could not read an archive for: %q", stderr)
+	}
+	assertUnchanged(t, before, paths.dir, "")
+}
+
 func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing.T) {
 	// The command takes no repository, no ref other than the literal HEAD, and
 	// no output path it was not told. Every one of those mistakes is an exit two

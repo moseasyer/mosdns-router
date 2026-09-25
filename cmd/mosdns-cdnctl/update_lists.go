@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -124,7 +125,9 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 
 // runCheckLists reports whether the source the gateway runs on is still the one
 // the remote publishes. It writes nothing and takes no lock, so a daily check
-// never disturbs a running gateway.
+// never disturbs a running gateway. The report is assembled first and written
+// only once it is complete, so a check that fails half way through says so
+// instead of leaving a partial report behind.
 func runCheckLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services listServices) int {
 	published, _, found, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
 	if err != nil {
@@ -142,18 +145,19 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
-	writeCLIErrorless(stdout, "repository: %s\n", published.Repository)
-	writeCLIErrorless(stdout, "entry: %s\n", published.Entry)
-	writeCLIErrorless(stdout, "locked-commit: %s\n", published.Commit)
-	writeCLIErrorless(stdout, "locked-archive-sha256: %s\n", published.SHA256)
-	writeCLIErrorless(stdout, "locked-list-sha256: %s\n", published.ListSHA256)
-	writeCLIErrorless(stdout, "remote-commit: %s\n", remote.Commit)
+	var report bytes.Buffer
+	writeReportLine(&report, "repository: %s\n", published.Repository)
+	writeReportLine(&report, "entry: %s\n", published.Entry)
+	writeReportLine(&report, "locked-commit: %s\n", published.Commit)
+	writeReportLine(&report, "locked-archive-sha256: %s\n", published.SHA256)
+	writeReportLine(&report, "locked-list-sha256: %s\n", published.ListSHA256)
+	writeReportLine(&report, "remote-commit: %s\n", remote.Commit)
 
 	if remote.Commit == published.Commit {
 		// The remote still publishes the commit the list was converted from, so
 		// the archive is not fetched at all.
-		writeCLIErrorless(stdout, "up-to-date: true\n")
-		return exitSuccess
+		writeReportLine(&report, "up-to-date: true\n")
+		return writeReport(stdout, stderr, report.Bytes())
 	}
 	// The remote has moved on. The archive is read in memory only to report the
 	// digest the new pin would record; nothing is accepted here.
@@ -162,9 +166,9 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
-	writeCLIErrorless(stdout, "remote-archive-sha256: %s\n", drifted.SHA256)
-	writeCLIErrorless(stdout, "up-to-date: false\n")
-	return exitSuccess
+	writeReportLine(&report, "remote-archive-sha256: %s\n", drifted.SHA256)
+	writeReportLine(&report, "up-to-date: false\n")
+	return writeReport(stdout, stderr, report.Bytes())
 }
 
 // runPinRemote accepts the current reviewed default-branch commit and publishes
@@ -208,12 +212,12 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 		return exitStateUnavailable
 	}
 
-	writeCLIErrorless(stdout, "pinned-commit: %s\n", pinned.Commit)
-	writeCLIErrorless(stdout, "pinned-archive-sha256: %s\n", pinned.SHA256)
-	writeCLIErrorless(stdout, "pinned-list-sha256: %s\n", pinned.ListSHA256)
-	writeCLIErrorless(stdout, "pinned-rules: %d\n", countListRules(list))
-	writeCLIErrorless(stdout, "published-source-lock: %s\n", options.sourceLock)
-	writeCLIErrorless(stdout, "published-list: %s\n", options.listFile)
+	writeReportLine(stdout, "pinned-commit: %s\n", pinned.Commit)
+	writeReportLine(stdout, "pinned-archive-sha256: %s\n", pinned.SHA256)
+	writeReportLine(stdout, "pinned-list-sha256: %s\n", pinned.ListSHA256)
+	writeReportLine(stdout, "pinned-rules: %d\n", countListRules(list))
+	writeReportLine(stdout, "published-source-lock: %s\n", options.sourceLock)
+	writeReportLine(stdout, "published-list: %s\n", options.listFile)
 	return exitSuccess
 }
 
@@ -227,8 +231,16 @@ func countListRules(list []byte) int {
 	return len(lines)
 }
 
-// writeCLIErrorless writes a report line, reporting a write failure the same way
-// a command boundary reports any other output failure.
-func writeCLIErrorless(output io.Writer, format string, args ...any) {
+// writeReportLine appends one line of a report.
+func writeReportLine(output io.Writer, format string, args ...any) {
 	_, _ = fmt.Fprintf(output, format, args...)
+}
+
+// writeReport hands a complete report to the caller's output.
+func writeReport(stdout, stderr io.Writer, report []byte) int {
+	if _, err := stdout.Write(report); err != nil {
+		writeCLIError(stderr, "update-lists: write report: %v", err)
+		return exitStateUnavailable
+	}
+	return exitSuccess
 }
