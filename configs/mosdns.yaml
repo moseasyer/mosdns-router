@@ -54,8 +54,8 @@ plugins:
     args:
       - matches:
           - qname $cn_domains
-        exec: $cn_path
-      - exec: $foreign_path
+        exec: goto cn_path
+      - exec: goto foreign_path
   - tag: udp_server
     type: udp_server
     args:

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,6 +203,12 @@ func TestRenderedRoutingNamesEachPluginExactlyOnceInLoadOrder(t *testing.T) {
 // whole project turns on: a name the China list matches goes to the DHCP branch,
 // and every other name goes to the foreign branch. The order is the routing, so
 // a reversed pair of rules would send China names abroad and never fail.
+//
+// Both rules are jumps, not calls. `exec: $cn_path` would *call* the sequence
+// and then resume main at the next rule, so a domestic answer would be carried
+// into the foreign branch and could be replaced there; `goto` abandons the
+// parent chain, which is what makes "no foreign fallback" a property of the
+// document rather than of an accidental response check further down.
 func TestCNDispatchRunsBeforeTheForeignDefault(t *testing.T) {
 	document, err := Render(config.Defaults(), ProductionPaths())
 	if err != nil {
@@ -215,8 +222,8 @@ func TestCNDispatchRunsBeforeTheForeignDefault(t *testing.T) {
 	}
 
 	want := []renderedRule{
-		{Matches: []string{"qname $cn_domains"}, Exec: "$cn_path"},
-		{Exec: "$foreign_path"},
+		{Matches: []string{"qname $cn_domains"}, Exec: "goto cn_path"},
+		{Exec: "goto foreign_path"},
 	}
 	if got := rulesOf(t, parsed.entry(t, "main")); !equalRules(got, want) {
 		t.Errorf("the main sequence is\n got %+v\nwant %+v", got, want)
@@ -420,6 +427,62 @@ func TestRenderRefusesAPolicyItCannotHonour(t *testing.T) {
 	}
 }
 
+// TestRenderRefusesListenersThatWouldCollide covers the one thing two addresses
+// in this document must never both be. The router binds the listen address and
+// dials the foreign listener, so a document where the two are the same endpoint
+// is a router that cannot bind, or binds the port its own foreign branch
+// forwards to. The two control cases keep the shipped shape -- both endpoints on
+// 127.0.0.1, on different ports, and the same port on two loopback addresses --
+// rendering.
+func TestRenderRefusesListenersThatWouldCollide(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		paths Paths
+		// wantRefusal is what has to be named, so a refusal raised by some other
+		// check cannot stand in for the collision check.
+		wantRefusal string
+	}{
+		"the router would bind the resolver's own address": {
+			withListen(withForeignListener(ProductionPaths(), "tcp://127.0.0.1:15353"), "127.0.0.1:15353"),
+			"127.0.0.1:15353",
+		},
+		"the resolver is named by address and the router binds the same one": {
+			// A port nothing else refuses, so the collision is the only reason
+			// left to refuse it.
+			withListen(withForeignListener(ProductionPaths(), "tcp://127.0.0.2:25353"), "127.0.0.2:25353"),
+			"127.0.0.2:25353",
+		},
+		// The control: the shipped document has both on 127.0.0.1, on different
+		// ports, and must keep rendering.
+		"two ports on the same address": {
+			withListen(withForeignListener(ProductionPaths(), "tcp://127.0.0.1:15353"), "127.0.0.1:53"),
+			"",
+		},
+		"one port on two loopback addresses": {
+			withListen(withForeignListener(ProductionPaths(), "tcp://127.0.0.2:15353"), "127.0.0.1:15353"),
+			"",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			document, err := Render(config.Defaults(), testCase.paths)
+			if testCase.wantRefusal == "" {
+				if err != nil {
+					t.Fatalf("Render refused a document with two different endpoints: %v", err)
+				}
+				if len(document) == 0 {
+					t.Fatal("Render wrote nothing")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Render accepted listeners that are the same address and wrote:\n%s", document)
+			}
+			if !strings.Contains(err.Error(), testCase.wantRefusal) {
+				t.Errorf("the refusal %q does not name the colliding address %q", err, testCase.wantRefusal)
+			}
+		})
+	}
+}
+
 // TestRenderIsAStableFunctionOfItsInputs covers the property the committed file
 // depends on. A document that varied between two renders of the same inputs
 // could not be committed and compared, and the comparison is the only thing
@@ -542,49 +605,14 @@ func TestNoAddressButLoopbackIsCommitted(t *testing.T) {
 // handed to a real mosdns instance, and queried over real sockets. Every other
 // test in this file reads bytes.
 func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
-	temporary := t.TempDir()
-
-	// The China list is the committed one, copied: a list that does not load
-	// would fail the instance, and an empty one would send every name abroad.
-	committedList, err := os.ReadFile(filepath.Clean(committedCNList))
-	if err != nil {
-		t.Fatalf("cannot read the committed %s: %v", committedCNList, err)
-	}
-	cnList := filepath.Join(temporary, "cn-domains.txt")
-	if err := os.WriteFile(cnList, committedList, 0o600); err != nil {
-		t.Fatalf("copy the China list: %v", err)
-	}
-
-	// The state document is a valid one that names no resolver. That is the
-	// fail-closed state the bridge publishes when it cannot vouch for a set, so
-	// the domestic branch answers without a network and the test stays
-	// hermetic while still going through the production state decoder.
-	stateFile := filepath.Join(temporary, "dhcp-upstreams.json")
-	published, err := json.Marshal(state.NewDHCPState(1, "enp3s0", "connection-uuid", nil, time.Unix(1750000000, 0).UTC(), "dhcp4", false))
-	if err != nil {
-		t.Fatalf("encode the state document: %v", err)
-	}
-	if err := os.WriteFile(stateFile, published, 0o600); err != nil {
-		t.Fatalf("write the state document: %v", err)
-	}
-
-	// The foreign listener is a real loopback DNS server, and the router's own
-	// listeners take a port nothing else holds.
 	foreign := startForeignMock(t)
-	listen := freeLoopbackPort(t)
-	document, err := Render(config.Defaults(), Paths{
-		Policy:          "/etc/mosdns/policy.yaml",
-		CNDomains:       cnList,
-		DHCPState:       stateFile,
-		ForeignListener: "tcp://" + foreign.Address(),
-		Listen:          net.JoinHostPort("127.0.0.1", listen),
-	})
+	paths, listenAddress := temporaryPaths(t, "tcp://"+foreign.Address())
+
+	document, err := Render(config.Defaults(), paths)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-
-	instance := loadMosdns(t, document)
-	listenAddress := net.JoinHostPort("127.0.0.1", listen)
+	instance := loadMosdns(t, decodeMosdnsConfig(t, document))
 
 	// A name the committed list matches must not reach the foreign resolver.
 	// The domestic branch is disabled, so the query fails closed here, and a
@@ -613,7 +641,9 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	// Asking again is answered by the foreign cache, and the resolver is not
 	// asked twice. The cache plugin always runs the rules after it, so this only
 	// holds because the branch ends on has_resp: without that check a cache hit
-	// would be forwarded as well and the cache would save nothing.
+	// would be forwarded as well and the cache would save nothing. That check is
+	// the cache-hit guard and nothing else; what keeps a China name out of this
+	// branch is the jump out of main.
 	if got := addressesIn(t, ask(t, listenAddress, foreignDomain)); len(got) != 1 || got[0] != "203.0.113.10" {
 		t.Errorf("the repeated %s = %v, want the cached answer [203.0.113.10]", foreignDomain, got)
 	}
@@ -625,9 +655,110 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	_ = instance.GetSafeClose().WaitClosed()
 }
 
-// loadMosdns hands the rendered document to a real mosdns instance, decoded the
-// way the router's own start command decodes a file.
-func loadMosdns(t *testing.T, document []byte) *coremain.Mosdns {
+// TestASuccessfulDomesticAnswerIsNeverReplacedByTheForeignCache is the routing
+// defect this document is built to avoid, and it is invisible to a structural
+// test: `exec: $cn_path` *calls* the domestic sequence and then resumes main at
+// the next rule, so a fresh domestic answer is carried into the foreign branch.
+// The foreign cache is not generation-scoped, and it overwrites a response it
+// already holds, so from the second query on a China name would be answered with
+// the previous domestic answer while the fresh one was fetched and discarded.
+//
+// The router's own plugin cannot be driven from a test, because the production
+// state decoder refuses the loopback address a mock listens on. So the document
+// is rendered for real and only the `dhcp_forward` entry is swapped for a
+// `forward` at a loopback mock. The swap replaces one decoded entry and touches
+// nothing else, so the sequences under test -- main, cn_path, foreign_path,
+// foreign_cache and the dispatch between them -- are the ones this renderer
+// writes, and the mock answers a different address on every call so a stale
+// answer cannot be mistaken for a fresh one.
+func TestASuccessfulDomesticAnswerIsNeverReplacedByTheForeignCache(t *testing.T) {
+	foreign := startForeignMock(t)
+	domestic := startDomesticMock(t)
+	paths, listenAddress := temporaryPaths(t, "tcp://"+foreign.Address())
+
+	document, err := Render(config.Defaults(), paths)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	instance := loadMosdns(t, swapPlugin(t, document, "dhcp_forward", coremain.PluginConfig{
+		Tag:  "dhcp_forward",
+		Type: "forward",
+		// TCP, so one exchange is one query: the stock UDP upstream re-sends a
+		// query it has not heard back from, and a re-send would shift which
+		// answer belongs to which call.
+		Args: map[string]any{"upstreams": []any{map[string]any{"addr": "tcp://" + domestic.Address()}}},
+	}))
+
+	// The same China name three times, which is what makes the foreign cache a
+	// cache hit: one question, one key, three answers. If the domestic answer
+	// ever reaches the foreign cache, the second and third queries come back with
+	// the first one.
+	var answers []string
+	for attempt := range 3 {
+		answers = append(answers, addressesIn(t, ask(t, listenAddress, chinaDomain))...)
+		if got := foreign.Count("", chinaDomain); got != 0 {
+			t.Fatalf("after %d queries the foreign resolver had received %d for %s, want none: a China name must never be forwarded abroad",
+				attempt+1, got, chinaDomain)
+		}
+	}
+	want := []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"}
+	if !equalStrings(answers, want) {
+		t.Fatalf("three %s answers = %v, want %v: every query must be answered from the domestic upstream", chinaDomain, answers, want)
+	}
+	if got := domestic.Count("", chinaDomain); got != 3 {
+		t.Errorf("the domestic upstream received %d queries for %s, want 3: the later queries came from somewhere else", got, chinaDomain)
+	}
+	if got := foreign.Count("", ""); got != 0 {
+		t.Errorf("the foreign resolver received %d queries in total, want none", got)
+	}
+
+	instance.CloseWithErr(nil)
+	_ = instance.GetSafeClose().WaitClosed()
+}
+
+// temporaryPaths builds a path set a test can load: the committed China list in
+// a temporary directory, a valid state document, a foreign listener on the
+// caller's mock, and a listen address whose port nothing else holds. The state
+// document names no resolver, which is the fail-closed state the bridge
+// publishes when it cannot vouch for a set, so a test that runs the real
+// domestic plugin answers without a network.
+func temporaryPaths(t *testing.T, foreignListener string) (Paths, string) {
+	t.Helper()
+	temporary := t.TempDir()
+
+	// The China list is the committed one, copied: a list that does not load
+	// would fail the instance, and an empty one would send every name abroad.
+	committedList, err := os.ReadFile(filepath.Clean(committedCNList))
+	if err != nil {
+		t.Fatalf("cannot read the committed %s: %v", committedCNList, err)
+	}
+	cnList := filepath.Join(temporary, "cn-domains.txt")
+	if err := os.WriteFile(cnList, committedList, 0o600); err != nil {
+		t.Fatalf("copy the China list: %v", err)
+	}
+
+	stateFile := filepath.Join(temporary, "dhcp-upstreams.json")
+	published, err := json.Marshal(state.NewDHCPState(1, "enp3s0", "connection-uuid", nil, time.Unix(1750000000, 0).UTC(), "dhcp4", false))
+	if err != nil {
+		t.Fatalf("encode the state document: %v", err)
+	}
+	if err := os.WriteFile(stateFile, published, 0o600); err != nil {
+		t.Fatalf("write the state document: %v", err)
+	}
+
+	listenAddress := net.JoinHostPort("127.0.0.1", freeLoopbackPort(t))
+	return Paths{
+		Policy:          "/etc/mosdns/policy.yaml",
+		CNDomains:       cnList,
+		DHCPState:       stateFile,
+		ForeignListener: foreignListener,
+		Listen:          listenAddress,
+	}, listenAddress
+}
+
+// decodeMosdnsConfig decodes a rendered document the way the router's own start
+// command decodes a file.
+func decodeMosdnsConfig(t *testing.T, document []byte) *coremain.Config {
 	t.Helper()
 	var loaded coremain.Config
 	decoder := yaml.NewDecoder(strings.NewReader(string(document)))
@@ -635,19 +766,41 @@ func loadMosdns(t *testing.T, document []byte) *coremain.Mosdns {
 	if err := decoder.Decode(&loaded); err != nil {
 		t.Fatalf("the rendered document does not decode as a mosdns configuration: %v\n%s", err, document)
 	}
-	// The rendered level is the shipped one; this test lowers it so the
+	// The rendered level is the shipped one; the tests lower it so the
 	// instance's own per-query reports do not fill the test output.
 	loaded.Log = mlog.LogConfig{Level: "error"}
+	return &loaded
+}
 
-	instance, err := coremain.NewMosdns(&loaded)
+// loadMosdns hands a decoded document to a real mosdns instance.
+func loadMosdns(t *testing.T, loaded *coremain.Config) *coremain.Mosdns {
+	t.Helper()
+	instance, err := coremain.NewMosdns(loaded)
 	if err != nil {
-		t.Fatalf("mosdns refused the rendered configuration: %v\n%s", err, document)
+		t.Fatalf("mosdns refused the rendered configuration: %v", err)
 	}
 	t.Cleanup(func() {
 		instance.CloseWithErr(nil)
 		_ = instance.GetSafeClose().WaitClosed()
 	})
 	return instance
+}
+
+// swapPlugin returns the document's decoded configuration with one plugin entry
+// replaced. It works on the decoded entries rather than on the bytes, so
+// replacing one entry cannot disturb any other: the sequences under test are the
+// same values the shipped document carries.
+func swapPlugin(t *testing.T, document []byte, tag string, replacement coremain.PluginConfig) *coremain.Config {
+	t.Helper()
+	loaded := decodeMosdnsConfig(t, document)
+	for index := range loaded.Plugins {
+		if loaded.Plugins[index].Tag == tag {
+			loaded.Plugins[index] = replacement
+			return loaded
+		}
+	}
+	t.Fatalf("the rendered document has no entry tagged %s:\n%s", tag, document)
+	return nil
 }
 
 // startForeignMock is the resolver the foreign path is pointed at.
@@ -664,6 +817,29 @@ func startForeignMock(t *testing.T) *testdns.Server {
 	})
 	if err != nil {
 		t.Fatalf("start the foreign resolver mock: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	return server
+}
+
+// startDomesticMock answers every query with a different address, so an answer
+// that came from an earlier call cannot be mistaken for a fresh one. The TTL is
+// long enough to be cacheable, because a cache that would not have stored the
+// answer would hide the defect.
+func startDomesticMock(t *testing.T) *testdns.Server {
+	t.Helper()
+	var answered atomic.Int64
+	server, err := testdns.Start(func(_ context.Context, request *dns.Msg) *dns.Msg {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = append(response.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.IPv4(198, 51, 100, byte(answered.Add(1))).To4(),
+		})
+		return response
+	})
+	if err != nil {
+		t.Fatalf("start the domestic resolver mock: %v", err)
 	}
 	t.Cleanup(func() { _ = server.Close() })
 	return server
@@ -732,6 +908,10 @@ func addressesIn(t *testing.T, response *dns.Msg) []string {
 }
 
 func equalTags(got, want []string) bool {
+	return equalStrings(got, want)
+}
+
+func equalStrings(got, want []string) bool {
 	if len(got) != len(want) {
 		return false
 	}

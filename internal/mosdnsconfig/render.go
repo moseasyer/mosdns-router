@@ -310,11 +310,22 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 			{
 				// The dispatch. The China list is checked first and the foreign
 				// path is the unconditional default, so no name is unrouted.
+				//
+				// Both rules jump rather than call. `exec: $cn_path` would call
+				// the sequence and then resume this chain at the next rule, so a
+				// domestic answer would be carried into the foreign branch,
+				// stored there, and later overwritten by the stored copy. That
+				// cache is not generation-scoped, so a China answer cached under
+				// one DHCP DNS set would outlive that set. `goto` abandons the
+				// parent chain instead, which is what makes "no fallback between
+				// the branches" a property of this document rather than of a
+				// response check further down it. The has_resp rule in
+				// foreign_path is only the cache-hit guard.
 				Tag:  tagMain,
 				Type: "sequence",
 				Args: []rule{
-					{Matches: []string{"qname $" + tagCNDomains}, Exec: "$" + tagCNPath},
-					{Exec: "$" + tagForeignPath},
+					{Matches: []string{"qname $" + tagCNDomains}, Exec: "goto " + tagCNPath},
+					{Exec: "goto " + tagForeignPath},
 				},
 			},
 			{
@@ -438,14 +449,29 @@ func resolve(paths Paths) (resolvedPaths, error) {
 		}
 	}
 
-	if err := checkListen(resolved.Listen); err != nil {
-		return resolvedPaths{}, err
-	}
-	listener, err := checkForeignListener(strings.TrimSpace(paths.ForeignListener))
+	listen, err := checkListen(resolved.Listen)
 	if err != nil {
 		return resolvedPaths{}, err
 	}
-	resolved.ForeignListener = listener
+	foreign, err := checkForeignListener(strings.TrimSpace(paths.ForeignListener))
+	if err != nil {
+		return resolvedPaths{}, err
+	}
+	// The router binds the listen address and dials the foreign listener, so a
+	// document where the two are the same endpoint is a router that either
+	// cannot bind, or binds the port its own foreign branch forwards to. Both are
+	// refused here, where the two addresses can still be compared, rather than by
+	// the bind that would fail. The comparison is exact because both checks
+	// require an IP address: a hostname would have to be resolved before it could
+	// be compared, and a document that needs a resolver to be loaded is a
+	// document this renderer will not produce.
+	if listen == foreign {
+		return resolvedPaths{}, fmt.Errorf(
+			"mosdnsconfig: the listen address %s is the foreign listener %s: the router would bind the port its own foreign branch forwards to",
+			listen, foreign,
+		)
+	}
+	resolved.ForeignListener = foreignURL(foreign)
 	return resolved, nil
 }
 
@@ -467,48 +493,55 @@ func under(path, root string) bool {
 
 // checkListen refuses a listen address that is not an address and a port. Both
 // servers bind it, so a value that is only half an address is a router that
-// cannot answer on the transport a client happened to use.
-func checkListen(value string) error {
+// cannot answer on the transport a client happened to use. The parsed address is
+// returned so it can be compared with the foreign listener's.
+func checkListen(value string) (netip.AddrPort, error) {
 	address, err := netip.ParseAddrPort(value)
 	if err != nil {
-		return fmt.Errorf("mosdnsconfig: the listen address %q must be an IP address and a port: %w", value, err)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the listen address %q must be an IP address and a port: %w", value, err)
 	}
 	if address.Port() == 0 {
-		return fmt.Errorf("mosdnsconfig: the listen address %q names no port, so nothing would answer on a known one", value)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the listen address %q names no port, so nothing would answer on a known one", value)
 	}
-	return nil
+	return address, nil
 }
 
 // checkForeignListener refuses anything that is not the DNSCrypt resolver's own
 // tcp://host:port URL, and refuses port 53 in particular: a foreign upstream on
 // the system resolver's port is the fallback this project refuses to build,
-// whatever a path or a scheme says about it.
-func checkForeignListener(value string) (string, error) {
+// whatever a path or a scheme says about it. The parsed address is returned so it
+// can be compared with the address the router binds.
+func checkForeignListener(value string) (netip.AddrPort, error) {
 	parsed, err := url.Parse(value)
 	if err != nil {
-		return "", fmt.Errorf("mosdnsconfig: the foreign listener %q is not a URL: %w", value, err)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the foreign listener %q is not a URL: %w", value, err)
 	}
 	if parsed.Scheme != foreignListenerScheme {
-		return "", fmt.Errorf("mosdnsconfig: the foreign listener %q must be a %s:// URL, want the DNSCrypt resolver entered over TCP", value, foreignListenerScheme)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the foreign listener %q must be a %s:// URL, want the DNSCrypt resolver entered over TCP", value, foreignListenerScheme)
 	}
 	// Anything after the host would be sent to the resolver as part of the URL
 	// mosdns dials, which is not what a listener address is.
 	if parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("mosdnsconfig: the foreign listener %q must be a bare tcp://host:port URL, with no credentials, path or query", value)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the foreign listener %q must be a bare tcp://host:port URL, with no credentials, path or query", value)
 	}
 	address, err := netip.ParseAddrPort(parsed.Host)
 	if err != nil {
-		return "", fmt.Errorf("mosdnsconfig: the foreign listener %q must name an IP address and a port: %w", value, err)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the foreign listener %q must name an IP address and a port: %w", value, err)
 	}
 	if address.Port() == systemResolverPort {
-		return "", fmt.Errorf("mosdnsconfig: the foreign listener %q is on port %d, which belongs to the system resolver", value, systemResolverPort)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the foreign listener %q is on port %d, which belongs to the system resolver", value, systemResolverPort)
 	}
 	if address.Port() == 0 {
-		return "", fmt.Errorf("mosdnsconfig: the foreign listener %q names no port", value)
+		return netip.AddrPort{}, fmt.Errorf("mosdnsconfig: the foreign listener %q names no port", value)
 	}
-	// The address is rebuilt from the parsed parts, so a listener that carried
-	// anything a URL would have to escape cannot reach the document.
-	return (&url.URL{Scheme: foreignListenerScheme, Host: address.String()}).String(), nil
+	return address, nil
+}
+
+// foreignURL is the URL the document carries for the resolver's address. It is
+// rebuilt from the parsed parts, so a listener that carried anything a URL would
+// have to escape cannot reach the document.
+func foreignURL(address netip.AddrPort) string {
+	return (&url.URL{Scheme: foreignListenerScheme, Host: address.String()}).String()
 }
 
 // scanForChinesePublicDNS is the last line of defence over the finished

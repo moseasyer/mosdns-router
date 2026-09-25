@@ -292,6 +292,8 @@ Assert both servers listen on `127.0.0.1:53`, foreign forward points only to `tc
 
 Reject empty paths, a foreign listener on port 53, a domestic state path under `/etc`, and a generated configuration containing known Chinese public DNS strings. The last check is a defense-in-depth scan, not a substitute for the data-flow tests.
 
+Also reject a relative path, a listen address that is not an IP and a port, a listen address that is the foreign listener's own endpoint, and a policy asking for a persistent cache this document has no dump path for. A relative path means something different under systemd than in a shell, a listen address has to be a whole endpoint, a listen address equal to the foreign listener is a router that cannot bind the port its own foreign branch forwards to, and a persistent cache would be thrown away on every restart.
+
 - [ ] **Step 3: Run tests and verify failure**
 
 ```bash
@@ -321,6 +323,8 @@ foreign_path:
 Render `dhcp_forward` with `cache_entries: 4096`, `upstream_port: 53` and the policy's own `dhcp.failure_policy`; its cache is generation-scoped and therefore cannot return an answer from the previous DHCP DNS set. A published DHCP state carries bare addresses, so the port is a property of this configuration and is written out rather than left to the plugin's default. Later plans insert `cdn_rewrite` around the foreign cache/forward path.
 
 The rendered document is built from typed values and marshalled once, never concatenated out of strings, and the finished bytes are scanned for the known Chinese public resolvers. A `cache.persistent_dump: true` policy is refused rather than rendered as a cache with nowhere to dump to.
+
+Both dispatch rules are the `goto` form and not a `$tag` reference. In MOSDNS v5.3.4 `exec: $cn_path` *calls* the sequence and the parent chain then resumes at its next rule, so a fresh domestic answer would be carried into `foreign_path`, where the cache would store it and later overwrite a fresh answer with it; `goto` abandons the parent chain, which is what makes the absence of a fallback structural rather than a side effect of the `has_resp` guard. Test that with three queries for one China name against a domestic upstream that answers a different address each time: all three answers must be fresh, and the foreign resolver must not see the name.
 
 - [ ] **Step 5: Add default policy and config files**
 
