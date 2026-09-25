@@ -437,15 +437,22 @@ func TestRenderIsAStableFunctionOfItsInputs(t *testing.T) {
 		t.Fatalf("two renders of the same inputs differ:\n--- first ---\n%s\n--- second ---\n%s", first, second)
 	}
 
-	// A different path has to reach the document, or the stability above would
-	// be the stability of a renderer that ignores its inputs.
-	elsewhere := withDHCPState(ProductionPaths(), "/run/mosdns/other.json")
-	elsewhereDocument, err := Render(config.Defaults(), elsewhere)
-	if err != nil {
-		t.Fatalf("Render with another state path: %v", err)
-	}
-	if string(elsewhereDocument) == string(first) {
-		t.Fatal("the state document path is rendered nowhere in the document")
+	// Every path this renderer takes has to reach the document. A renderer that
+	// ignored one would be stable in the way an empty document is stable.
+	for name, elsewhere := range map[string]Paths{
+		"the China list path":  withCNDomains(ProductionPaths(), "/var/lib/mosdns/lists/other.txt"),
+		"the state document":   withDHCPState(ProductionPaths(), "/run/mosdns/other.json"),
+		"the listen address":   withListen(ProductionPaths(), "127.0.0.1:5353"),
+		"the policy path":      withPolicy(ProductionPaths(), "/etc/mosdns/other-policy.yaml"),
+		"the foreign listener": withForeignListener(ProductionPaths(), "tcp://127.0.0.1:25353"),
+	} {
+		other, err := Render(config.Defaults(), elsewhere)
+		if err != nil {
+			t.Fatalf("Render with %s: %v", name, err)
+		}
+		if string(other) == string(first) {
+			t.Errorf("%s is rendered nowhere in the document", name)
+		}
 	}
 }
 

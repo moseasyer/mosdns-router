@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"testing"
 )
 
@@ -69,6 +70,25 @@ func TestMarshalRefusesAPolicyItWouldNotAccept(t *testing.T) {
 		t.Fatalf("Marshal accepted a policy its own loader refuses and wrote:\n%s", document)
 	}
 }
+
+// TestTheCommittedPolicyNamesNoAddress holds the committed document to the same
+// rule the routing configuration is held to. No policy field is an address
+// today, so this cannot fail until one is added -- and that is the point: a
+// policy field carrying a DHCP address would ship a machine's network to
+// everyone who cloned the repository, and nothing in the policy's own schema
+// would object.
+func TestTheCommittedPolicyNamesNoAddress(t *testing.T) {
+	committed, err := os.ReadFile(filepath.Clean(committedPolicyPath))
+	if err != nil {
+		t.Fatalf("cannot read the committed %s: %v", committedPolicyPath, err)
+	}
+	if addresses := ipv4Address.FindAllString(string(committed), -1); len(addresses) != 0 {
+		t.Errorf("the committed %s names the addresses %v, want none", committedPolicyPath, addresses)
+	}
+}
+
+// ipv4Address finds every dotted-quad in a generated document.
+var ipv4Address = regexp.MustCompile(`[0-9]{1,3}(\.[0-9]{1,3}){3}`)
 
 // updateCommitted rewrites a committed file from the code that produces it, so
 // the bytes in the repository are never hand-edited. Set MOSDNS_ROUTER_UPDATE=1
