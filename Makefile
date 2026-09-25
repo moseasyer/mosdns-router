@@ -73,10 +73,23 @@ test: check-go test-python
 # production DHCP state decoder refuses a loopback upstream and the alternative
 # would be a bypass of the validation these cases exist to hold to. A skip is the
 # right answer on a laptop and the wrong answer in a gate, so MOSDNS_REQUIRE_INTEGRATION=1
-# turns it into a failure: set it in CI to make the gate insist, and leave it unset
-# for a local run.
+# turns it into a failure. It is exported from the recipe rather than left to CI,
+# because nothing else set it: a loopback-only host passed this gate with zero
+# end-to-end coverage and said nothing about it. `?=` so a developer on such a host
+# can still run the gate and take the skip, with
+# `make verify MOSDNS_REQUIRE_INTEGRATION=0`; the entry-point regression asserts
+# both the export and the default, so neither can be dropped and left as a comment.
+#
+# The value is assigned in the recipe line rather than by a bare `export`
+# directive, so what reaches the suite is the make variable and nothing else. A
+# caller relaxes it either way -- `make verify MOSDNS_REQUIRE_INTEGRATION=0` or a
+# MOSDNS_REQUIRE_INTEGRATION=0 in the environment, since `?=` respects both -- but
+# the recipe line is what `make -n` prints, and that is the line the entry-point
+# regression asserts, so the two cannot drift apart while the recipe still works.
+MOSDNS_REQUIRE_INTEGRATION ?= 1
+
 test-integration: check-go
-	@MOSDNS_ROUTER_GO='$(GO)' $(GO) test -mod=readonly -count=1 ./tests/integration
+	@MOSDNS_REQUIRE_INTEGRATION='$(MOSDNS_REQUIRE_INTEGRATION)' MOSDNS_ROUTER_GO='$(GO)' $(GO) test -mod=readonly -count=1 ./tests/integration
 
 # A separate, non-recursive target, so the bridge suite can be run on its own
 # while it is being changed. `test` and therefore `verify` depend on it, because

@@ -263,6 +263,42 @@ elif ! grep -q 'test -mod=readonly -count=1 .*tests/integration' "$work/dryrun";
 	sed 's/^/    /' "$work/dryrun" >&2 || true
 fi
 
+# 7c. MOSDNS_REQUIRE_INTEGRATION has to be exported by the recipe, and on by
+#     default. The end-to-end suite skips on a host with no non-loopback IPv4
+#     address, because the production DHCP state decoder refuses a loopback
+#     upstream; that skip is right on a laptop and wrong in a gate, so the switch
+#     turns it into a failure. Nothing set the switch, so a loopback-only host
+#     passed `make verify` with zero end-to-end coverage and no indication of it.
+#     `?=` keeps the opt-out working: `make verify MOSDNS_REQUIRE_INTEGRATION=0`.
+#     This is the assertion that stops the export and the default from drifting
+#     apart, which is what happens if either is dropped and only the comment is
+#     left.
+for target in test-integration verify; do
+	status=0
+	make --no-print-directory -n "$target" GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "dry run of $target exited $status"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+		continue
+	fi
+	if ! grep -q "MOSDNS_REQUIRE_INTEGRATION='1' .*tests/integration" "$work/dryrun"; then
+		fail "$target does not run the end-to-end suite with MOSDNS_REQUIRE_INTEGRATION=1, so a host that skips those cases passes the gate silently"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+	fi
+done
+# The opt-out has to survive: a developer on a loopback-only host must still be
+# able to run the gate, which is what `?=` is for, and a gate that cannot be run
+# at all is a gate nobody runs.
+status=0
+make --no-print-directory -n test-integration MOSDNS_REQUIRE_INTEGRATION=0 GO="$work/go-wrong-version" >"$work/override" 2>&1 || status=$?
+if [ "$status" -ne 0 ]; then
+	fail "dry run of test-integration with MOSDNS_REQUIRE_INTEGRATION=0 exited $status"
+	sed 's/^/    /' "$work/override" >&2 || true
+elif ! grep -q "MOSDNS_REQUIRE_INTEGRATION='0' .*tests/integration" "$work/override"; then
+	fail "test-integration honours MOSDNS_REQUIRE_INTEGRATION=0, so a developer on a host without a usable address cannot run the gate at all"
+	sed 's/^/    /' "$work/override" >&2 || true
+fi
+
 # 8. Nothing the test ran may change the module files.
 if ! cmp -s "$work/go.mod.before" go.mod; then
 	fail "go.mod was modified while checking the entry points"
