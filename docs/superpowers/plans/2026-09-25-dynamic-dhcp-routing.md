@@ -66,10 +66,18 @@ type Args struct {
     Concurrency        int    `yaml:"concurrency"`
     RetireAfterSeconds int    `yaml:"retire_after_seconds"`
     CacheEntries       int    `yaml:"cache_entries"`
+    UpstreamPort       int    `yaml:"upstream_port"`
+    FailurePolicy      string `yaml:"failure_policy"`
 }
 
 func New(args Args, bp *coremain.BP) (sequence.Executable, error)
 ```
+
+`upstream_port` and `failure_policy` were added by the DNSCrypt and domain
+routing plan, which renders them: a published state carries bare addresses, and
+the policy's `dhcp.failure_policy` decides whether a generation that names no
+resolver is adopted (the default, `disable-current`) or refused in favour of the
+last generation that could answer (`use-last-good`).
 
 The JSON written by Python must validate as `state.DHCPState` from the foundation plan.
 
