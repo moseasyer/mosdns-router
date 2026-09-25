@@ -948,3 +948,364 @@ func TestRoutingSplitSendsEachNameToOnlyItsOwnBranch(t *testing.T) {
 		t.Errorf("the foreign resolver was asked %d times in total, want 1: the only query that should have reached it was for %s", after.foreign, foreignName)
 	}
 }
+
+// TestAForeignQueryReachesTheResolverOnlyOverTCP covers the transport the
+// foreign branch is entered with, and it is the reason the rendered document
+// names a tcp:// URL rather than an address. MOSDNS's stock UDP upstream re-sends
+// a query that has gone unanswered for a second and can drop an answer that
+// arrived before its exchange began waiting for it, and the foreign branch has no
+// client of its own to own that exchange. A foreign forward left on udp:// would
+// show up here as a query the resolver received over udp, so the count of zero is
+// the assertion, and the tcp count beside it says the query was not simply lost.
+func TestAForeignQueryReachesTheResolverOnlyOverTCP(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+	before := h.counts()
+
+	// Asked over udp, so the client's transport is not what decides the upstream's.
+	h.ask(t, testdns.ProtocolUDP, foreignName, dns.TypeA)
+
+	if got := h.foreign.Count(testdns.ProtocolTCP, foreignName); got != 1 {
+		t.Errorf("the foreign resolver received %d queries for %s over tcp, want 1", got, foreignName)
+	}
+	if got := h.foreign.Count(testdns.ProtocolUDP, foreignName); got != 0 {
+		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0: the foreign forward is a tcp:// upstream", got, foreignName)
+	}
+	after := h.counts().since(before)
+	if after.foreign != 1 {
+		t.Errorf("the foreign resolver was asked %d times in total, want 1", after.foreign)
+	}
+	if after.domestic != 0 {
+		t.Errorf("the domestic resolver was asked %d times, want 0", after.domestic)
+	}
+}
+
+// TestASmallDomesticQueryReachesTheUpstreamOnlyOverUDP covers the other side of
+// the transport decision. The plugin keeps its own UDP exchange rather than
+// mosdns's pipelined one, and it retries over TCP only when a UDP answer comes
+// back truncated. A small A answer is not truncated, so the domestic resolver
+// must have seen one query, over udp, and no TCP connection at all: a plugin that
+// retried every exchange over TCP would satisfy a count of one and double every
+// query on the wire.
+func TestASmallDomesticQueryReachesTheUpstreamOnlyOverUDP(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+	before := h.counts()
+
+	h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeA)
+
+	if got := h.domestic.Count(testdns.ProtocolUDP, chinaName); got != 1 {
+		t.Errorf("the domestic resolver received %d queries for %s over udp, want 1", got, chinaName)
+	}
+	if got := h.domestic.Count(testdns.ProtocolTCP, chinaName); got != 0 {
+		t.Errorf("the domestic resolver received %d queries for %s over tcp, want 0: a small answer is not truncated, so the plugin must not retry it", got, chinaName)
+	}
+	after := h.counts().since(before)
+	if after.domestic != 1 {
+		t.Errorf("the domestic resolver was asked %d times in total, want 1", after.domestic)
+	}
+	if after.foreign != 0 {
+		t.Errorf("the foreign resolver was asked %d times, want 0", after.foreign)
+	}
+}
+
+// TestAForeignFailureNeverFallsBackToTheDomesticBranch is the isolation the
+// project exists for, from the other end: with the foreign resolver gone, the
+// foreign name has to fail, and it has to fail rather than be answered from
+// inside the network the user is leaving.
+//
+// The failure mode is asserted three ways because SERVFAIL alone does not say
+// why. It must be SERVFAIL and not REFUSED, which is what an entry that returned
+// no response at all produces, so a branch that fell through unanswered would be
+// told apart from a branch that failed. It must carry no answer, so a domestic
+// answer that leaked in could not pass as a failure. And the router's own report
+// must name the foreign forward, so a SERVFAIL from some other cause cannot stand
+// in for this one. The domestic resolver's total is then compared with what it
+// was before the foreign one was stopped: unchanged is the whole claim.
+func TestAForeignFailureNeverFallsBackToTheDomesticBranch(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+	before := h.counts()
+
+	// The China name is answered first, so the domestic path is known to work
+	// before anything is taken away, and so its resolver has a total to keep.
+	h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeA)
+	domesticBefore := h.domestic.Count("", "")
+
+	if err := h.foreign.Close(); err != nil {
+		t.Fatalf("stop the foreign resolver: %v", err)
+	}
+
+	response := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)
+	if response.Rcode != dns.RcodeServerFailure {
+		t.Errorf("%s with the foreign resolver stopped = %s, want SERVFAIL", foreignName, dns.RcodeToString[response.Rcode])
+	}
+	if len(response.Answer) != 0 {
+		t.Errorf("%s with the foreign resolver stopped carried %d answer records, want none: a failed foreign query must not be answered from anywhere", foreignName, len(response.Answer))
+	}
+	if !h.router.reported(t, noUpstreamLog) {
+		t.Errorf("the router did not report %q, so this SERVFAIL came from something other than the foreign forward failing\n%s",
+			noUpstreamLog, h.router.diagnostics())
+	}
+
+	// Nothing reached the domestic branch. Its total is exactly what it was: a
+	// foreign failure that fell back would have added at least one query.
+	if got := h.domestic.Count("", ""); got != domesticBefore {
+		t.Errorf("the domestic resolver was asked %d times while the foreign one was stopped, want %d: the foreign failure reached the domestic path",
+			got, domesticBefore)
+	}
+
+	// And the branches do not share an upstream, so the dead one says nothing
+	// about the other. The second name is a different one, so the plugin's own
+	// generation cache cannot answer it and the exchange really does go out to the
+	// published resolver.
+	domestic := h.ask(t, testdns.ProtocolTCP, secondChinaName, dns.TypeA)
+	if got, want := answeredAddresses(t, domestic), []string{"198.51.100.2"}; !equalStrings(got, want) {
+		t.Errorf("%s while the foreign resolver is stopped = %v, want a fresh domestic answer %v", secondChinaName, got, want)
+	}
+	if got := h.domestic.Count("", secondChinaName); got != 1 {
+		t.Errorf("the domestic resolver was asked %d times for %s, want 1", got, secondChinaName)
+	}
+	if after := h.counts().since(before); after.domestic != 2 || after.foreign != 0 {
+		t.Errorf("resolvers were asked %+d since this case began, want the two domestic queries and nothing from the stopped foreign resolver", after)
+	}
+}
+
+// TestArbitraryQTypesRoundTripByteForByte asks for a record shape nothing in
+// this project knows how to build. Type 65 is not a type the router interprets:
+// it is a type it has to carry, and a router that rebuilt, filtered or dropped an
+// answer it did not recognise would show up here as a SERVFAIL or as a record
+// that came back different. The comparison is the packed bytes of the whole
+// record, so a byte that changed in transit fails this too.
+func TestArbitraryQTypesRoundTripByteForByte(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+
+	response := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeHTTPS)
+	if response.Rcode != dns.RcodeSuccess {
+		t.Fatalf("%s over the router = %s, want an answer: type 65 has to be carried through the router untouched",
+			dns.TypeToString[dns.TypeHTTPS], dns.RcodeToString[response.Rcode])
+	}
+	if len(response.Answer) != 1 {
+		t.Fatalf("%s over the router carried %d answer records, want 1: %+v", dns.TypeToString[dns.TypeHTTPS], len(response.Answer), response.Answer)
+	}
+	if got := response.Question[0]; got.Qtype != dns.TypeHTTPS {
+		t.Errorf("the answer echoes type %s, want %s: the query that was sent was a different type", dns.TypeToString[got.Qtype], dns.TypeToString[dns.TypeHTTPS])
+	}
+
+	// The expectation is the record the resolver was configured to answer with,
+	// rebuilt here rather than read back out of the answer.
+	want := foreignRecord(dns.Question{Name: foreignName, Qtype: dns.TypeHTTPS, Qclass: dns.ClassINET})
+	if got := recordWire(t, response.Answer[0]); !bytes.Equal(got, recordWire(t, want)) {
+		t.Errorf("the %s answer came back as\n %s\nwant\n %s",
+			dns.TypeToString[dns.TypeHTTPS], got, recordWire(t, want))
+	}
+}
+
+// TestALargeAnswerRoundTripsOverTheForeignTransport asks for an answer that will
+// not fit in a datagram. The foreign branch is a tcp:// upstream and the client
+// is on the router's TCP listener, so the whole path is sized for a large answer
+// and the record has to arrive as the resolver built it. A foreign forward left
+// on udp:// would truncate here, which is the loss the transport exists to
+// prevent.
+func TestALargeAnswerRoundTripsOverTheForeignTransport(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+
+	response := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeTXT)
+	if response.Rcode != dns.RcodeSuccess {
+		t.Fatalf("a large %s over the router = %s, want an answer: the foreign transport is sized for one",
+			dns.TypeToString[dns.TypeTXT], dns.RcodeToString[response.Rcode])
+	}
+	if response.Truncated {
+		t.Error("the router truncated a large answer on a TCP listener, want the whole record")
+	}
+	if len(response.Answer) != 1 {
+		t.Fatalf("the large answer carried %d records, want 1: %+v", len(response.Answer), response.Answer)
+	}
+
+	// The claim that the answer was too large for a datagram is checked against
+	// the record itself, so the case cannot pass on an answer that happens to be
+	// small today.
+	want := largeTXT(foreignName)
+	if size := dns.Len(want); size <= minimumUDPPayload {
+		t.Fatalf("the fixture TXT record is %d bytes, which fits a %d-byte datagram, so this case would not be testing a large answer", size, minimumUDPPayload)
+	}
+	if got := recordWire(t, response.Answer[0]); !bytes.Equal(got, recordWire(t, want)) {
+		t.Errorf("the large TXT came back as\n %s\nwant\n %s", got, recordWire(t, want))
+	}
+	if got := h.foreign.Count(testdns.ProtocolUDP, foreignName); got != 0 {
+		t.Errorf("the foreign resolver received %d queries for the large %s over udp, want 0", got, dns.TypeToString[dns.TypeTXT])
+	}
+}
+
+// TestATruncatedDomesticAnswerIsRetriedOverTCPByThePlugin covers the one case
+// where the plugin does spend its TCP retry. The mock truncates a UDP answer that
+// will not fit the datagram, exactly as a resolver does, and answers the retry in
+// full. The large record has to arrive, and both halves of the exchange have to
+// be visible: the plugin asked over udp, saw the truncated answer, and asked
+// again over tcp. A plugin that gave up on a truncated answer would fail the
+// record, and one that started on tcp would fail the counts.
+func TestATruncatedDomesticAnswerIsRetriedOverTCPByThePlugin(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+
+	response := h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeTXT)
+	if response.Rcode != dns.RcodeSuccess {
+		t.Fatalf("a large %s for %s over the router = %s, want an answer: the plugin must retry a truncated domestic answer over tcp",
+			dns.TypeToString[dns.TypeTXT], chinaName, dns.RcodeToString[response.Rcode])
+	}
+	if len(response.Answer) != 1 {
+		t.Fatalf("the large answer carried %d records, want 1: %+v", len(response.Answer), response.Answer)
+	}
+	want := largeTXT(chinaName)
+	if got := recordWire(t, response.Answer[0]); !bytes.Equal(got, recordWire(t, want)) {
+		t.Errorf("the large domestic TXT came back as\n %s\nwant\n %s", got, recordWire(t, want))
+	}
+
+	if got := h.domestic.Count(testdns.ProtocolUDP, chinaName); got != 1 {
+		t.Errorf("the domestic resolver received %d queries for %s over udp, want 1: the plugin's own exchange is a UDP one", got, chinaName)
+	}
+	if got := h.domestic.Count(testdns.ProtocolTCP, chinaName); got != 1 {
+		t.Errorf("the domestic resolver received %d queries for %s over tcp, want 1: the truncated UDP answer has to be retried", got, chinaName)
+	}
+}
+
+// TestStartupFailsClosedWithoutAPublishableState is the startup guard. A router
+// whose state document is missing or unreadable must still start, must still
+// answer foreign names, and must refuse domestic ones. The third half is the one
+// that matters: a domestic branch that fell through to the foreign branch would
+// answer the China name from the resolver the user is leaving, which is the whole
+// thing this project refuses to build.
+//
+// The two sub-cases are separate because they fail in different places, and each
+// says so. With no file at all the plugin has nothing to read and reports no
+// usable state. With a file it cannot decode, the plugin read the file, rejected
+// it, and still has no usable state -- a warning that only appears for the second
+// is what tells the two apart.
+func TestStartupFailsClosedWithoutAPublishableState(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		fixture stateFixture
+		// wantReport is what the router must have said about the state document
+		// for this fixture. It is empty where there is nothing to report.
+		wantReport string
+	}{
+		"no state document at all":          {fixture: noStateDocument},
+		"a state document that is not JSON": {fixture: corruptStateDocument, wantReport: unusableStateLog},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, testCase.fixture)
+			h.waitUntilAnswering(t)
+			before := h.counts()
+
+			// The router started. A guard that refused to start would satisfy
+			// "fails closed" for entirely the wrong reason, so the foreign path is
+			// asked first and has to answer.
+			foreign := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)
+			if got, want := answeredAddresses(t, foreign), []string{foreignAddress}; !equalStrings(got, want) {
+				t.Fatalf("%s = %v, want the foreign resolver's answer %v: the router has to keep working with no usable state",
+					foreignName, got, want)
+			}
+			// A count for this name, not a change in the grand total: the readiness
+			// poll used a different name, so only this case's own query can be
+			// carrying it.
+			if got := h.foreign.Count("", foreignName); got != 1 {
+				t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, foreignName)
+			}
+
+			// The domestic branch fails closed, and the rcode says it failed rather
+			// than fell through: an entry that returns an error is SERVFAIL, an
+			// entry that returns no response at all is REFUSED.
+			domestic := h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeA)
+			if domestic.Rcode != dns.RcodeServerFailure {
+				t.Errorf("%s = %s, want SERVFAIL: there is no usable upstream, so the branch fails closed", chinaName, dns.RcodeToString[domestic.Rcode])
+			}
+			if len(domestic.Answer) != 0 {
+				t.Errorf("%s carried %d answer records, want none: a China name must not be answered from the foreign resolver", chinaName, len(domestic.Answer))
+			}
+			if !h.router.reported(t, entryFailedLog) {
+				t.Errorf("the router did not report an entry failure, so this SERVFAIL was not the plugin refusing to answer\n%s", h.router.diagnostics())
+			}
+			if !h.router.reported(t, noUpstreamReport) {
+				t.Errorf("the router did not report %q, so the domestic branch failed for some other reason\n%s", noUpstreamReport, h.router.diagnostics())
+			}
+			if testCase.wantReport != "" && !h.router.reported(t, testCase.wantReport) {
+				t.Errorf("the router did not report %q, so the state document was not read and rejected\n%s", testCase.wantReport, h.router.diagnostics())
+			}
+
+			// The foreign resolver saw the foreign name and nothing else, and the
+			// domestic resolver -- which has no published upstream here at all --
+			// was asked nothing.
+			if got := h.foreign.Count("", chinaName); got != 0 {
+				t.Errorf("the foreign resolver was asked %d times for %s, want 0", got, chinaName)
+			}
+			if after := h.counts().since(before); after.domestic != 0 {
+				t.Errorf("the domestic resolver was asked %d times, want 0: no upstream was published", after.domestic)
+			}
+		})
+	}
+}
+
+// TestTheForeignCacheNeverChangesWhatTheDomesticPathReturns is the regression
+// guard for the jump out of the dispatch. `exec: $cn_path` would *call* the
+// domestic sequence and then resume the main chain at its next rule, so a
+// successful domestic answer would be carried into the foreign branch and stored
+// in a cache that is not generation-scoped. The second query would then be
+// answered with the first one's answer while the fresh one was fetched and
+// discarded, and that answer would outlive the DHCP DNS set it came from.
+//
+// Detecting it needs every domestic query to be a real upstream exchange, which a
+// new generation is what buys: a DHCP renewal gives the plugin a cache of its
+// own, and the foreign cache is not scoped to one. The three answers must
+// therefore be the resolver's first, second and third, in that order, and the
+// foreign resolver must never have been asked about the name at all.
+//
+// The foreign branch is stable in the other direction and is checked here too,
+// because the same fix is what makes it so: the same question asked three times
+// is answered from the resolver once and from the cache twice, so the answer set
+// is one answer rather than three.
+func TestTheForeignCacheNeverChangesWhatTheDomesticPathReturns(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+
+	answers := make([]string, 0, 3)
+	for round := range 3 {
+		if round > 0 {
+			// A renewal, which is the only way a second China question is
+			// guaranteed to be a real exchange rather than the plugin's own
+			// cached answer.
+			h.publishState(t, uint64(firstGeneration+round))
+		}
+		response := h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeA)
+		if response.Rcode != dns.RcodeSuccess {
+			t.Fatalf("%s on round %d = %s, want an answer from the domestic resolver", chinaName, round+1, dns.RcodeToString[response.Rcode])
+		}
+		answers = append(answers, answeredAddresses(t, response)...)
+	}
+	want := []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"}
+	if !equalStrings(answers, want) {
+		t.Fatalf("three %s answers across three DHCP generations = %v, want %v: a later answer has to be the fresh one",
+			chinaName, answers, want)
+	}
+	if got := h.domestic.Count("", chinaName); got != 3 {
+		t.Errorf("the domestic resolver was asked %d times for %s, want 3: one real exchange per generation", got, chinaName)
+	}
+	if got := h.foreign.Count("", chinaName); got != 0 {
+		t.Errorf("the foreign resolver was asked %d times for %s, want 0: a China name must never reach the foreign branch", got, chinaName)
+	}
+
+	foreignAnswers := make([]string, 0, 3)
+	for round := range 3 {
+		response := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)
+		if response.Rcode != dns.RcodeSuccess {
+			t.Fatalf("%s on round %d = %s, want an answer from the foreign resolver", foreignName, round+1, dns.RcodeToString[response.Rcode])
+		}
+		foreignAnswers = append(foreignAnswers, answeredAddresses(t, response)...)
+	}
+	if want := []string{foreignAddress, foreignAddress, foreignAddress}; !equalStrings(foreignAnswers, want) {
+		t.Errorf("three %s answers = %v, want %v: the answer set has to be stable", foreignName, foreignAnswers, want)
+	}
+	if got := h.foreign.Count("", foreignName); got != 1 {
+		t.Errorf("the foreign resolver was asked %d times for %s, want 1: the second and third queries must be answered from the cache", got, foreignName)
+	}
+}
