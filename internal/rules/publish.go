@@ -50,9 +50,11 @@ func syncDirectory(path string) error {
 // The two files cannot be renamed into place as one operation, so the list is
 // published first and the lock second: a crash between the two renames leaves
 // the previous lock beside a new list, which the next reader refuses because the
-// two no longer describe each other. A failure to publish the lock instead rolls
-// the list back, so a failed update leaves the previous pair byte for byte and
-// the operator is never left with a half-published source.
+// two no longer describe each other. A failure at any step restores every file
+// that step had already replaced, so a failed update leaves the previous pair
+// byte for byte and the operator is never left with a half-published source. A
+// restore that fails itself keeps its backup, which is then the only copy of what
+// the gateway was running, and names it in the error rather than cleaning it up.
 func Publish(lockPath, listPath string, lock SourceLock, list []byte) error {
 	return publishWithOps(lockPath, listPath, lock, list, defaultFileOps())
 }
@@ -102,24 +104,27 @@ func publishWithOps(lockPath, listPath string, lock SourceLock, list []byte, ops
 	}
 	defer lockBackup.discard(&err, ops)
 
+	// What each step below owes a rollback, step by step, so no branch can return
+	// without one:
+	//
+	//   the list rename fails        -> nothing was replaced: no restore is owed
+	//   the list flush fails         -> the list was replaced
+	//   the lock rename fails        -> the list was replaced
+	//   the lock flush fails         -> the list and the lock were replaced
+	//   no failure                    -> nothing is owed
+	replaced := replacedFiles{}
 	if err := ops.rename(listStage.path, listPath); err != nil {
 		return fmt.Errorf("%s: publish list: %w", listPath, err)
 	}
 	listStage.path = ""
+	replaced.list = true
 
-	// The list is published and the lock is not, so every failure from here on
-	// leaves a list no lock describes. Each of them puts the previous list back
-	// before it is reported.
-	lockPublished := false
 	defer func() {
-		if err == nil || lockPublished {
+		if err == nil {
 			return
 		}
-		if rollbackErr := listBackup.restore(listPath, ops); rollbackErr != nil {
-			// The backup is then the only copy of the previous list, so it is
-			// named for the operator instead of being cleaned up.
-			listBackup.keep = true
-			err = fmt.Errorf("%w (and restoring the previous list failed: %v, the previous list is kept at %s)", err, rollbackErr, listBackup.path)
+		if rollbackErr := rollback(replaced, &listBackup, &lockBackup, listPath, lockPath, ops); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
 		}
 	}()
 	if err = ops.syncDir(filepath.Dir(listPath)); err != nil {
@@ -129,11 +134,56 @@ func publishWithOps(lockPath, listPath string, lock SourceLock, list []byte, ops
 		return fmt.Errorf("%s: publish lock: %w", lockPath, err)
 	}
 	lockStage.path = ""
+	replaced.lock = true
 	if err = ops.syncDir(filepath.Dir(lockPath)); err != nil {
 		return fmt.Errorf("%s: sync lock directory: %w", lockPath, err)
 	}
-	lockPublished = true
 	return nil
+}
+
+// replacedFiles records which published files a rename has already replaced, so a
+// failure restores exactly those and nothing else. It is not a single flag on
+// purpose: a step that fails after the lock was renamed still owes the lock's
+// restore, and a step that fails before the list was renamed owes none.
+type replacedFiles struct {
+	list bool
+	lock bool
+}
+
+// rollback puts back every published file that has already been replaced, in the
+// reverse of the order it was replaced. Each file is restored on its own, so one
+// that cannot be restored does not stop the other from being attempted, and a
+// backup that is left behind is then the only copy of previously published data:
+// it is kept, and named in the returned error.
+func rollback(replaced replacedFiles, listBackup, lockBackup *backupFile, listPath, lockPath string, ops fileOps) error {
+	var failures []error
+	if replaced.lock {
+		if err := rollbackOne("source lock", lockPath, lockBackup, ops); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if replaced.list {
+		if err := rollbackOne("list", listPath, listBackup, ops); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// rollbackOne puts one published file back, and reports where the previous
+// contents survive when it could not.
+func rollbackOne(what, target string, backup *backupFile, ops fileOps) error {
+	err := backup.restore(target, ops)
+	if err == nil {
+		return nil
+	}
+	// Nothing may delete a backup that is now the only copy of what the gateway
+	// was running, so it is kept and the failure names it.
+	backup.keep = true
+	if backup.existed {
+		return fmt.Errorf("restore the previous %s: %w (the previous %s is kept at %s)", what, err, what, backup.path)
+	}
+	return fmt.Errorf("remove the %s this publication created: %w", what, err)
 }
 
 // stagedFile is a file written next to its target and waiting to be renamed over

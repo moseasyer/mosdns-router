@@ -81,6 +81,74 @@ func recordingOps(order *[]string) fileOps {
 	return ops
 }
 
+// mustReadDirectory returns a directory's entries, failing the test if it cannot
+// be read.
+func mustReadDirectory(t *testing.T, dir string) []os.DirEntry {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	return entries
+}
+
+// snapshotDirectory records every file in a directory with its contents, so a
+// test can prove a failed publication left it exactly as it was, leftovers
+// included.
+func snapshotDirectory(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	state := make(map[string][]byte)
+	for _, entry := range mustReadDirectory(t, dir) {
+		contents, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		state[entry.Name()] = contents
+	}
+	return state
+}
+
+// assertDirectoryMatches requires a directory to hold exactly the recorded files.
+func assertDirectoryMatches(t *testing.T, want map[string][]byte, dir string) {
+	t.Helper()
+	got := snapshotDirectory(t, dir)
+	if len(got) != len(want) {
+		t.Fatalf("%s holds %v, want exactly %v", dir, entryNames(mustReadDirectory(t, dir)), namesOf(want))
+	}
+	for name, contents := range want {
+		existing, ok := got[name]
+		if !ok {
+			t.Errorf("%s: %s is missing", dir, name)
+			continue
+		}
+		if !bytes.Equal(existing, contents) {
+			t.Errorf("%s: %s =\n%s\nwant\n%s", dir, name, existing, contents)
+		}
+	}
+}
+
+// keptBackups returns the backup files left in a directory, in name order.
+func keptBackups(t *testing.T, dir string) []string {
+	t.Helper()
+	var backups []string
+	for _, entry := range mustReadDirectory(t, dir) {
+		if strings.HasSuffix(entry.Name(), ".bak") {
+			backups = append(backups, entry.Name())
+		}
+	}
+	sort.Strings(backups)
+	return backups
+}
+
+func namesOf(state map[string][]byte) []string {
+	names := make([]string, 0, len(state))
+	for name := range state {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func TestPublishWritesTheListAndTheLockThatDescribesIt(t *testing.T) {
 	// A published pair has to be readable, self-consistent and free of leftovers:
 	// the router reads the list while the lock records what produced it, and a
@@ -215,6 +283,257 @@ func TestPublishRestoresTheListWhenTheLockCannotBePublished(t *testing.T) {
 				t.Fatalf("failed publication left files behind: %v", names)
 			}
 		})
+	}
+}
+
+func TestPublishLeavesThePairAloneWhenItFailsBeforeAnyRename(t *testing.T) {
+	// A failure while staging a file or taking a backup, and a failed list rename,
+	// all happen before a single published file has been replaced. There is
+	// nothing to restore then, and a rollback that ran anyway would be reporting a
+	// repair it never made. The published pair has to come out untouched, with no
+	// leftovers, and the number of renames attempted says whether any restore ran.
+	tests := []struct {
+		name       string
+		breakIt    func(t *testing.T, ops *fileOps, renames *int)
+		paths      func(t *testing.T) (lockPath, listPath string)
+		wantRenmes int
+		wantStep   string
+	}{
+		{
+			name: "the first backup cannot be written",
+			breakIt: func(t *testing.T, ops *fileOps, renames *int) {
+				flushes := 0
+				syncFile := ops.syncFile
+				ops.syncFile = func(file *os.File) error {
+					flushes++
+					// The two staged files are flushed first, then the backups.
+					if flushes == 3 {
+						return errors.New("injected file flush failure")
+					}
+					return syncFile(file)
+				}
+			},
+			wantRenmes: 0,
+			wantStep:   "sync backup",
+		},
+		{
+			name: "the list rename fails",
+			breakIt: func(t *testing.T, ops *fileOps, renames *int) {
+				rename := ops.rename
+				ops.rename = func(from, to string) error {
+					*renames++
+					if *renames == 1 {
+						return errors.New("injected list rename failure")
+					}
+					return rename(from, to)
+				}
+			},
+			wantRenmes: 1,
+			wantStep:   "publish list",
+		},
+		{
+			name:       "the lock cannot be staged where its directory is missing",
+			breakIt:    func(t *testing.T, ops *fileOps, renames *int) {},
+			wantRenmes: 0,
+			wantStep:   "create temporary file",
+			paths: func(t *testing.T) (lockPath, listPath string) {
+				pair := writePublishedPair(t)
+				// The list's directory exists, so the list is staged and flushed
+				// first; the lock's does not, so staging it fails.
+				return filepath.Join(t.TempDir(), "missing", "source-lock.json"), pair.listPath
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pair := writePublishedPair(t)
+			lockPath, listPath := pair.lockPath, pair.listPath
+			if test.paths != nil {
+				lockPath, listPath = test.paths(t)
+			}
+			before := snapshotDirectory(t, filepath.Dir(listPath))
+			renames := 0
+			ops := defaultFileOps()
+			test.breakIt(t, &ops, &renames)
+
+			err := publishWithOps(lockPath, listPath, newLock, []byte(newList), ops)
+			if err == nil {
+				t.Fatal("publish reported success although it failed before renaming anything")
+			}
+			if !strings.Contains(err.Error(), test.wantStep) {
+				t.Errorf("error = %v, want it to name the %q step", err, test.wantStep)
+			}
+			if renames != test.wantRenmes {
+				t.Errorf("publish attempted %d renames, want %d: a failure before a rename owes no restore", renames, test.wantRenmes)
+			}
+			assertDirectoryMatches(t, before, filepath.Dir(listPath))
+		})
+	}
+}
+
+func TestPublishRestoresBothFilesWhenTheLockDirectoryCannotBeFlushed(t *testing.T) {
+	// The last step of publication is flushing the directory the lock was renamed
+	// into, and both renames have already happened by then. Restoring only the list
+	// would leave the previous list beside the new lock: a pair
+	// ReadPublishedPair refuses forever, with the previous lock thrown away. So a
+	// failure here has to put both files back, byte for byte.
+	tests := []struct {
+		name    string
+		arrange func(t *testing.T) (lockPath, listPath string)
+	}{
+		{
+			// One directory: the second flush is the lock's.
+			name: "one directory, second flush fails",
+			arrange: func(t *testing.T) (string, string) {
+				pair := writePublishedPair(t)
+				return pair.lockPath, pair.listPath
+			},
+		},
+		{
+			// Two directories, as the CLI allows: the failure is the lock
+			// directory's flush, which cannot be mistaken for the list's.
+			name: "two directories, the lock directory flush fails",
+			arrange: func(t *testing.T) (string, string) {
+				pair := writePublishedPair(t)
+				lockPath := filepath.Join(t.TempDir(), "source-lock.json")
+				if err := os.WriteFile(lockPath, pair.lockBytes, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return lockPath, pair.listPath
+			},
+		},
+		{
+			// A first pin has no previous pair, so a rollback has to remove what
+			// the failed publication created.
+			name: "a first pin with nothing published",
+			arrange: func(t *testing.T) (string, string) {
+				dir := t.TempDir()
+				return filepath.Join(dir, "source-lock.json"), filepath.Join(dir, "cn-domains.txt")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lockPath, listPath := test.arrange(t)
+			listDir := snapshotDirectory(t, filepath.Dir(listPath))
+			lockDirectory := snapshotDirectory(t, filepath.Dir(lockPath))
+
+			flushes := 0
+			ops := defaultFileOps()
+			syncDir := ops.syncDir
+			ops.syncDir = func(path string) error {
+				flushes++
+				if flushes == 2 {
+					return errors.New("injected directory flush failure")
+				}
+				return syncDir(path)
+			}
+
+			err := publishWithOps(lockPath, listPath, newLock, []byte(newList), ops)
+			if err == nil {
+				t.Fatal("publish reported success although the lock directory could not be flushed")
+			}
+			if !strings.Contains(err.Error(), "injected directory flush failure") {
+				t.Errorf("error = %v, want it to carry the flush failure", err)
+			}
+			if !strings.Contains(err.Error(), "sync lock directory") {
+				t.Errorf("error = %v, want it to name the step that failed", err)
+			}
+			assertDirectoryMatches(t, listDir, filepath.Dir(listPath))
+			assertDirectoryMatches(t, lockDirectory, filepath.Dir(lockPath))
+		})
+	}
+}
+
+func TestPublishKeepsBothBackupsWhenNeitherRestoreWorks(t *testing.T) {
+	// The flush of the lock directory fails and so does every restore that would
+	// follow. Both backups are then the only copies of what the gateway was
+	// running, and neither may be cleaned up: one failing restore must not stop
+	// the other from being attempted, and every backup that survives has to be
+	// named so the operator can find it.
+	pair := writePublishedPair(t)
+	flushes, renames := 0, 0
+	ops := defaultFileOps()
+	syncDir := ops.syncDir
+	ops.syncDir = func(path string) error {
+		flushes++
+		if flushes == 2 {
+			return errors.New("injected directory flush failure")
+		}
+		return syncDir(path)
+	}
+	rename := ops.rename
+	ops.rename = func(from, to string) error {
+		renames++
+		if renames > 2 {
+			return errors.New("injected restore failure")
+		}
+		return rename(from, to)
+	}
+
+	err := publishWithOps(pair.lockPath, pair.listPath, newLock, []byte(newList), ops)
+	if err == nil {
+		t.Fatal("publish reported success although nothing after the renames worked")
+	}
+	kept := keptBackups(t, pair.dir)
+	if len(kept) != 2 {
+		t.Fatalf("directory holds %v, want a kept backup of both the list and the lock", entryNames(mustReadDirectory(t, pair.dir)))
+	}
+	for _, backup := range kept {
+		if !strings.Contains(err.Error(), backup) {
+			t.Errorf("error = %v, want it to name the kept backup %s", err, backup)
+		}
+	}
+	if !strings.Contains(err.Error(), "injected restore failure") {
+		t.Errorf("error = %v, want it to carry the restore failure", err)
+	}
+}
+
+func TestPublishRestoresTheListEvenWhenTheLockCannotBeRestored(t *testing.T) {
+	// The lock's restore fails first. The list is still owed a restore, and taking
+	// it leaves the gateway on the list it was running, which is recoverable from
+	// the named lock backup alone.
+	pair := writePublishedPair(t)
+	flushes, renames := 0, 0
+	ops := defaultFileOps()
+	syncDir := ops.syncDir
+	ops.syncDir = func(path string) error {
+		flushes++
+		if flushes == 2 {
+			return errors.New("injected directory flush failure")
+		}
+		return syncDir(path)
+	}
+	rename := ops.rename
+	ops.rename = func(from, to string) error {
+		renames++
+		// Renames 1 and 2 publish the pair; rename 3 restores the lock and fails.
+		if renames == 3 {
+			return errors.New("injected lock restore failure")
+		}
+		return rename(from, to)
+	}
+
+	if err := publishWithOps(pair.lockPath, pair.listPath, newLock, []byte(newList), ops); err == nil {
+		t.Fatal("publish reported success although the lock directory could not be flushed")
+	}
+	list, err := os.ReadFile(pair.listPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(list) != oldList {
+		t.Fatalf("list = %q, want the previous %q even though the lock restore failed", list, oldList)
+	}
+	kept := keptBackups(t, pair.dir)
+	if len(kept) != 1 {
+		t.Fatalf("directory holds %v, want only the lock backup to survive", entryNames(mustReadDirectory(t, pair.dir)))
+	}
+	keptLock, err := os.ReadFile(filepath.Join(pair.dir, kept[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(keptLock) != oldLock {
+		t.Fatalf("kept backup = %q, want the previous lock %q", keptLock, oldLock)
 	}
 }
 
