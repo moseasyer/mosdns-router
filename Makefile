@@ -29,7 +29,7 @@ endif
 
 METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
 
-.PHONY: check-go test test-python test-make-entrypoints build cross-build verify verify-build-info
+.PHONY: check-go test test-integration test-python test-make-entrypoints build cross-build verify verify-build-info
 
 # The guard is the only place that decides whether this host's Go is acceptable.
 check-go:
@@ -47,9 +47,28 @@ check-go:
 # implicit dependency updater: a stale go.mod or go.sum fails the command
 # instead of being silently rewritten. Run `go mod tidy` explicitly and review
 # its module-file changes as a separate step.
+#
+# -short is what makes this the unit suite. The end-to-end suite in
+# tests/integration builds the router and starts a process per case, so it
+# honours -short and skips itself. `verify` reaches it through test-integration
+# below, and the entry-point regression asserts that it does, so the acceptance
+# gate cannot pass without the end-to-end cases and cannot pay for them twice.
 test: check-go test-python
-	@$(GO) test -mod=readonly ./...
+	@$(GO) test -mod=readonly -short ./...
 	@sh scripts/test-make-entrypoints.sh
+
+# A separate, non-recursive target, so the end-to-end suite can be run on its own
+# while the routing is being changed. It builds the router itself rather than
+# reading build/mosdns-router, because `go test ./...` runs this package and
+# nothing guarantees that a `make build` has already happened. MOSDNS_ROUTER_GO
+# carries GO through, so the binary under test is built by the toolchain check-go
+# just accepted rather than by whichever go happens to be on PATH.
+#
+# -count=1 because this suite's work is not something the test cache can see: it
+# binds sockets and runs a child process, and a cached pass would be a gate
+# satisfied without a single case having been asked.
+test-integration: check-go
+	@MOSDNS_ROUTER_GO='$(GO)' $(GO) test -mod=readonly -count=1 ./tests/integration
 
 # A separate, non-recursive target, so the bridge suite can be run on its own
 # while it is being changed. `test` and therefore `verify` depend on it, because
@@ -78,5 +97,5 @@ cross-build: check-go
 verify-build-info: build
 	@$(GO) run -mod=readonly ./internal/buildinfo/cmd/check build/mosdns-router
 
-verify: test verify-build-info
+verify: test test-integration verify-build-info
 	@$(GO) vet -mod=readonly ./...

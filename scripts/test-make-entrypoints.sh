@@ -112,7 +112,7 @@ run_make fail "check-go with go1.24.6" check-go GO="$work/go-wrong-version"
 run_make fail "check-go with a non-Go program" check-go GO="$work/go-not-go"
 
 # 2. Every entry point goes through the guard and stays readonly.
-for target in test build cross-build verify verify-build-info; do
+for target in test test-integration build cross-build verify verify-build-info; do
 	status=0
 	make --no-print-directory -n "$target" GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
 	if [ "$status" -ne 0 ]; then
@@ -218,7 +218,36 @@ for target in test test-python verify; do
 	fi
 done
 
-# 7. Nothing the test ran may change the module files.
+# 7. The acceptance gate runs the end-to-end suite. tests/integration is the only
+#    place the routing promises are checked at all -- a document-level test cannot
+#    see where a query was sent -- and `go test -short ./...` skips it, so a gate
+#    that stopped depending on it would quietly stop proving anything end to end.
+status=0
+make --no-print-directory -n verify GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+if [ "$status" -ne 0 ]; then
+	fail "dry run of verify exited $status"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+elif ! grep -q 'test -mod=readonly.*tests/integration' "$work/dryrun"; then
+	fail "verify does not run the end-to-end suite in tests/integration"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+fi
+# The unit-test entry point must not run it either: it is the -short suite, and
+# running the same cases twice in one gate would double the gate's cost for
+# nothing.
+status=0
+make --no-print-directory -n test GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+if [ "$status" -ne 0 ]; then
+	fail "dry run of test exited $status"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+elif ! grep -q 'test -mod=readonly -short' "$work/dryrun"; then
+	fail "test does not run the unit suites with -short, so the end-to-end suite runs twice per gate"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+elif grep -q 'tests/integration' "$work/dryrun"; then
+	fail "test runs the end-to-end suite, which belongs to test-integration"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+fi
+
+# 8. Nothing the test ran may change the module files.
 if ! cmp -s "$work/go.mod.before" go.mod; then
 	fail "go.mod was modified while checking the entry points"
 fi
