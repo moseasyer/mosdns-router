@@ -842,29 +842,52 @@ func inCommittedChinaList(t *testing.T, listPath, name string) bool {
 	return matched
 }
 
+// reserveAttempts is how often a free port is chosen again when the transport
+// beside it cannot be bound. A port that is free for UDP can still be taken for
+// TCP by a socket that has not finished closing -- the router of the case before
+// this one is a plausible owner -- so one refusal is a reason to ask again
+// rather than a failure.
+const reserveAttempts = 16
+
 // reserveLoopbackAddress returns an address whose port is free on both transports
 // right now. The router has to bind it, so the sockets that chose the port are
 // given up first; nothing else in this process holds it, and a port that is free
 // stays free for the moment between the release and the bind.
 func reserveLoopbackAddress(t *testing.T) string {
 	t.Helper()
+	var refusal error
+	for range reserveAttempts {
+		address, err := reserveLoopbackAddressOnce()
+		if err == nil {
+			return address
+		}
+		refusal = err
+	}
+	t.Fatalf("no port was free on both transports after %d attempts: %v", reserveAttempts, refusal)
+	return ""
+}
+
+// reserveLoopbackAddressOnce takes one candidate port, checks that both
+// transports accept it, and gives both up again.
+func reserveLoopbackAddressOnce() (string, error) {
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve a udp port for the router to listen on: %v", err)
+		return "", fmt.Errorf("reserve a udp port for the router to listen on: %w", err)
 	}
 	address := packetConn.LocalAddr().String()
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		_ = packetConn.Close()
-		t.Fatalf("reserve a tcp port for the router to listen on: %v", err)
+		return "", fmt.Errorf("reserve the tcp port beside %s: %w", address, err)
 	}
 	if err := listener.Close(); err != nil {
-		t.Fatalf("release the reserved tcp port: %v", err)
+		_ = packetConn.Close()
+		return "", fmt.Errorf("release the reserved tcp port: %w", err)
 	}
 	if err := packetConn.Close(); err != nil {
-		t.Fatalf("release the reserved udp port: %v", err)
+		return "", fmt.Errorf("release the reserved udp port: %w", err)
 	}
-	return address
+	return address, nil
 }
 
 // counter is the domestic resolver's per-call counter. It is guarded because the
