@@ -44,21 +44,25 @@ type Stamp struct {
 // anycast addresses plus one more, all three authenticating the same provider
 // certificate key.
 //
-// The third stamp differs from Quad9's published `dnscrypt-ip4-filter-alt2` in
-// its provider name, and in nothing else that authenticates anything. The
-// published stamp declares a 25-byte provider name, which is the right length
-// for `2.dnscrypt-cert.quad9.net`, but the 25 bytes it carries are
-// `2.dnscrypt.dnscrypt-cert.` with a spurious `dnscrypt.` inserted, and 9 further
-// bytes (`quad9.net`) are left over. The pinned decoder reads the declared name,
-// finds the leftovers, and refuses the stamp with "garbage after end";
-// dnscrypt-proxy 2.1.18 then exits 255 with "Stamp error for the static
-// [quad9-dnscrypt-ip4-filter-3] definition", which is checked against a real
-// 2.1.18 build. The stamp below carries the correct 25-byte name, so it is 9
-// bytes shorter and 15 of its bytes differ. Its protocol byte, property word,
-// length bytes, address `149.112.112.112:8443` and 32-byte provider public key
-// are byte-for-byte Quad9's, so the endpoint and the key it must prove are
-// unchanged. Keeping the published bytes would leave a foreign configuration no
-// dnscrypt-proxy release can load.
+// The third stamp is Quad9's published `dnscrypt-ip4-filter-alt2` value, taken
+// from https://quad9.net/dnscrypt/quad9-resolvers.md and byte-for-byte identical
+// to what that list serves as of 2026-09-26, as are the first two. Nothing here
+// is a locally doctored stamp, and a diff against upstream should come back empty.
+//
+// An earlier copy of that list, and the plan text derived from it, carried a
+// corrupt string instead. Both declare the same 25-byte provider name, but the
+// stale one fills those 25 bytes with `2.dnscrypt.dnscrypt-cert.` rather than
+// `2.dnscrypt-cert.quad9.net` and then appends nine leftover bytes (`quad9.net`).
+// So the stale string differs in 15 contiguous bytes at offsets 74-88 and is nine
+// bytes longer, while its protocol byte, property word, every length byte, its
+// address `149.112.112.112:8443` and its 32-byte provider public key are
+// byte-for-byte identical to the published stamp's and to the other two
+// defaults'. The pinned decoder reads the declared name, finds the leftovers, and
+// refuses the stale stamp with "garbage after end"; dnscrypt-proxy 2.1.18 then
+// exits 255 with "Stamp error for the static [quad9-dnscrypt-ip4-filter-3]
+// definition", checked against a real 2.1.18 build. That stale string is kept
+// only as a test fixture, because a stamp that does not decode is a mistake this
+// renderer has to refuse.
 func Defaults() []Stamp {
 	return []Stamp{
 		{

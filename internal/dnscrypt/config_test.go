@@ -46,19 +46,17 @@ var chinesePublicDNSAddresses = []string{
 // client's subnet to the resolver, so no stamp may point at them.
 var quad9ECSAddresses = []string{"9.9.9.11", "149.112.112.11"}
 
-// publishedAlt2Stamp is Quad9's published `dnscrypt-ip4-filter-alt2` stamp,
-// copied verbatim from https://quad9.net/dnscrypt/quad9-resolvers.md. It declares
-// a 25-byte provider name but carries `2.dnscrypt.dnscrypt-cert.` in those 25
-// bytes, leaving `quad9.net` over, so the pinned decoder refuses it ("garbage
-// after end") and dnscrypt-proxy 2.1.18 exits 255 on it. It is kept here as the
-// fixture that proves a stamp which does not decode is refused.
-//
-// The third default carries the same address and the same 32-byte provider public
-// key as this published stamp -- the literals asserted by
-// TestDefaultsDecodeToThePublishedQuad9IPv4Endpoints and
-// TestDefaultsShareOneAuthenticatedProviderKey are Quad9's own -- so correcting
-// the provider name re-points nothing that authenticates anything.
-const publishedAlt2Stamp = "sdns://AQMAAAAAAAAAFDE0OS4xMTIuMTEyLjExMjo4NDQzIGfIR7jIdYzRICRVQ751Z0bfNN8dhMALjEcDaN-CHYY-GTIuZG5zY3J5cHQuZG5zY3J5cHQtY2VydC5xdWFkOS5uZXQ"
+// staleCorruptAlt2Stamp is the corrupt `dnscrypt-ip4-filter-alt2` string that an
+// earlier copy of https://quad9.net/dnscrypt/quad9-resolvers.md, and the plan
+// text derived from it, carried. It is NOT what that list serves as of
+// 2026-09-26: the live value is the third default in Defaults(), and the two are
+// byte-for-byte apart in 15 contiguous bytes at offsets 74-88 plus nine appended
+// bytes. This one declares a 25-byte provider name but fills it with
+// `2.dnscrypt.dnscrypt-cert.` and then appends `quad9.net`, so the pinned decoder
+// refuses it ("garbage after end") and dnscrypt-proxy 2.1.18 exits 255 on it. It
+// is kept as the fixture that proves a stamp which does not decode is refused --
+// not as a source for the shipped value, which is upstream's.
+const staleCorruptAlt2Stamp = "sdns://AQMAAAAAAAAAFDE0OS4xMTIuMTEyLjExMjo4NDQzIGfIR7jIdYzRICRVQ751Z0bfNN8dhMALjEcDaN-CHYY-GTIuZG5zY3J5cHQuZG5zY3J5cHQtY2VydC5xdWFkOS5uZXQ"
 
 // foreignConfig is the exact document shape dnscrypt-proxy 2.1.18 reads. It
 // declares every key the renderer may emit, so the strict-decode test can prove
@@ -479,7 +477,8 @@ func TestRenderUsesOnlyTheSuppliedStamps(t *testing.T) {
 
 // TestRenderRefusesUnusableStampSets proves a stamp set that would produce a
 // configuration dnscrypt-proxy cannot serve is refused at render time. The
-// fixtures are real Quad9 and real published stamps, so each case is a mistake
+// fixtures are real Quad9 stamps from the published resolver list, plus the one
+// string that list used to serve and no longer does, so each case is a mistake
 // this renderer is meant to stop rather than a value invented to fail.
 //
 // Each case also names the refusal it expects. Several of these stamps would
@@ -517,7 +516,7 @@ func TestRenderRefusesUnusableStampSets(t *testing.T) {
 		{"two stamps sharing one name", []Stamp{{Name: "quad9", Value: quad9Filtered}, {Name: "quad9", Value: quad9Filtered}}, "used more than once"},
 		{"a value that is not a stamp", []Stamp{{Name: "quad9", Value: "https://dns.quad9.net/dns-query"}}, `must start with "sdns://"`},
 		{"a bare address instead of a stamp", []Stamp{{Name: "quad9", Value: "9.9.9.9"}}, `must start with "sdns://"`},
-		{"a stamp that does not decode", []Stamp{{Name: "quad9", Value: publishedAlt2Stamp}}, "does not decode"},
+		{"a stamp that does not decode", []Stamp{{Name: "quad9", Value: staleCorruptAlt2Stamp}}, "does not decode"},
 		{"a truncated stamp", []Stamp{{Name: "quad9", Value: "sdns://AQMAAAAAAAAADDkuOS45Ljk6ODQ0"}}, "does not decode"},
 		{"a plain-DNS stamp", []Stamp{{Name: "plain", Value: "sdns://AAAAAAAAAAAABzEuMS4xLjE"}}, "protocol is Plain"},
 		{"a DoH stamp", []Stamp{{Name: "doh", Value: quad9DoH}}, "protocol is DoH"},

@@ -132,10 +132,28 @@ Use these current Quad9 Secure DNSCrypt v2 IPv4 endpoints:
 ```go
 {Name: "quad9-dnscrypt-ip4-filter-1", Value: "sdns://AQMAAAAAAAAADDkuOS45Ljk6ODQ0MyBnyEe4yHWM0SAkVUO-dWdG3zTfHYTAC4xHA2jfgh2GPhkyLmRuc2NyeXB0LWNlcnQucXVhZDkubmV0"},
 {Name: "quad9-dnscrypt-ip4-filter-2", Value: "sdns://AQMAAAAAAAAAEjE0OS4xMTIuMTEyLjk6ODQ0MyBnyEe4yHWM0SAkVUO-dWdG3zTfHYTAC4xHA2jfgh2GPhkyLmRuc2NyeXB0LWNlcnQucXVhZDkubmV0"},
-{Name: "quad9-dnscrypt-ip4-filter-3", Value: "sdns://AQMAAAAAAAAAFDE0OS4xMTIuMTEyLjExMjo4NDQzIGfIR7jIdYzRICRVQ751Z0bfNN8dhMALjEcDaN-CHYY-GTIuZG5zY3J5cHQuZG5zY3J5cHQtY2VydC5xdWFkOS5uZXQ"},
+{Name: "quad9-dnscrypt-ip4-filter-3", Value: "sdns://AQMAAAAAAAAAFDE0OS4xMTIuMTEyLjExMjo4NDQzIGfIR7jIdYzRICRVQ751Z0bfNN8dhMALjEcDaN-CHYY-GTIuZG5zY3J5cHQtY2VydC5xdWFkOS5uZXQ"},
 ```
 
-The third historical stamp uses a different provider-name encoding; preserve it exactly as published rather than rewriting its embedded bytes. A later validation test must decode the stamp and confirm the same provider key across all three.
+The third value is not a local correction. It is byte-for-byte what
+`https://quad9.net/dnscrypt/quad9-resolvers.md` serves for
+`dnscrypt-ip4-filter-alt2` as of 2026-09-26, as are the first two, and a diff
+against that list must come back empty.
+
+An earlier copy of the list, and this plan's first draft, carried a corrupt string
+for that endpoint. Both forms declare the same 25-byte provider name, but the stale
+one fills those 25 bytes with `2.dnscrypt.dnscrypt-cert.` instead of
+`2.dnscrypt-cert.quad9.net` and then appends nine leftover bytes (`quad9.net`). The
+stale string therefore differs in 15 contiguous bytes at offsets 74-88 and is nine
+bytes longer, while its protocol byte, property word, every length byte, its
+address `149.112.112.112:8443` and its 32-byte provider public key are
+byte-for-byte identical to the live value's and to the other two endpoints'. The
+pinned decoder reads the declared name, finds the leftovers, and refuses the stale
+stamp with `Invalid stamp (garbage after end)`; dnscrypt-proxy 2.1.18 then exits
+255 with `Stamp error for the static [quad9-dnscrypt-ip4-filter-3] definition`,
+checked against a real 2.1.18 build. The stale string is retained only as a test
+fixture, because a stamp that does not decode is a mistake the renderer has to
+refuse.
 
 - [ ] **Step 5: Implement deterministic TOML rendering**
 
