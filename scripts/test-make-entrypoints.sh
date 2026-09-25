@@ -86,7 +86,7 @@ run_make fail "check-go with go1.24.6" check-go GO="$work/go-wrong-version"
 run_make fail "check-go with a non-Go program" check-go GO="$work/go-not-go"
 
 # 2. Every entry point goes through the guard and stays readonly.
-for target in test build cross-build verify; do
+for target in test build cross-build verify verify-build-info; do
 	status=0
 	make --no-print-directory -n "$target" GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
 	if [ "$status" -ne 0 ]; then
@@ -117,7 +117,65 @@ for target in test build cross-build verify; do
 	fi
 done
 
-# 3. Nothing the test ran may change the module files.
+# 3. Every produced binary carries the version, revision, and build time, and a
+#    verification step parses them back out of the built router.
+for target in build cross-build verify-build-info; do
+	status=0
+	make --no-print-directory -n "$target" GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "dry run of $target exited $status"
+		continue
+	fi
+	builds=0
+	while IFS= read -r line; do
+		case "$line" in
+		*' build '*)
+			builds=$((builds + 1))
+			for variable in Version Revision BuildTime; do
+				case "$line" in
+				*"-X mosdns-router/internal/buildinfo.$variable="*) ;;
+				*) fail "$target does not inject buildinfo.$variable: $line" ;;
+				esac
+			done
+			;;
+		esac
+	done <"$work/dryrun"
+	if [ "$builds" -eq 0 ]; then
+		fail "$target plans no Go build command"
+	fi
+done
+
+status=0
+make --no-print-directory -n verify-build-info GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+if ! grep -q 'internal/buildinfo/cmd/check' "$work/dryrun"; then
+	fail "verify-build-info does not parse the built router's build-info output"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+fi
+
+# 4. The overridable metadata variables must reach the linker.
+for override in "VERSION 1.2.3" "REVISION cafebabe" "BUILD_TIME 2026-09-25T00:00:00Z"; do
+	set -- $override
+	variable=$1
+	value=$2
+	case "$variable" in
+	VERSION) field=Version ;;
+	REVISION) field=Revision ;;
+	BUILD_TIME) field=BuildTime ;;
+	*) fail "internal error: unknown override $variable" ;;
+	esac
+	status=0
+	make --no-print-directory -n build GO="$work/go-wrong-version" "$variable=$value" >"$work/override" 2>&1 || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "dry run of build $variable=$value exited $status"
+		continue
+	fi
+	if ! grep -q -- "-X mosdns-router/internal/buildinfo.$field=$value" "$work/override"; then
+		fail "build does not honour the $variable override"
+		sed 's/^/    /' "$work/override" >&2 || true
+	fi
+done
+
+# 5. Nothing the test ran may change the module files.
 if ! cmp -s "$work/go.mod.before" go.mod; then
 	fail "go.mod was modified while checking the entry points"
 fi

@@ -41,6 +41,9 @@ cmd/mosdns-router/main.go
 cmd/mosdns-cdnctl/main.go
 internal/buildinfo/buildinfo.go
 internal/buildinfo/buildinfo_test.go
+internal/buildinfo/check.go
+internal/buildinfo/cmd/check/main.go
+internal/buildinfo/cmd/check/main_test.go
 internal/config/policy.go
 internal/config/defaults.go
 internal/config/load.go
@@ -594,27 +597,46 @@ mosdns-cdnctl status --selector PATH --dhcp PATH --ech PATH
 GO ?= go
 GO_REQUIRED_VERSION := 1.25.0
 LDFLAGS ?= -s -w
-.PHONY: check-go test build cross-build verify
+BUILDINFO_PKG := mosdns-router/internal/buildinfo
+ifndef VERSION
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+endif
+ifndef REVISION
+REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+endif
+ifndef BUILD_TIME
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+endif
+METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
+.PHONY: check-go test build cross-build verify verify-build-info
 check-go:
 	@# refuse any Go release other than $(GO_REQUIRED_VERSION)
 test:
 	@$(GO) test -mod=readonly ./...
 	@sh scripts/test-make-entrypoints.sh
 build:
-	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
-	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
 cross-build:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
-verify: test
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+verify-build-info: build
+	@$(GO) run -mod=readonly ./internal/buildinfo/cmd/check build/mosdns-router
+verify: test verify-build-info
 	@$(GO) vet -mod=readonly ./...
 ```
 
 Every entry point depends on `check-go`, and every Go command uses
 `-mod=readonly`, so no build target can act as an implicit dependency updater.
 `scripts/test-make-entrypoints.sh` proves the guard and the readonly flag on
-every entry point; a missing or missing-version `go.mod` fix therefore has to be
-applied by an explicit `go mod tidy` that a developer reviews.
+every entry point; a stale `go.mod` or `go.sum` therefore has to be fixed by an
+explicit `go mod tidy` that a developer reviews.
+
+`VERSION`, `REVISION`, and `BUILD_TIME` are overridable, so a release build is
+described by the caller instead of by whatever this checkout happens to say.
+`verify-build-info` parses the metadata back out of the built router and fails
+on `dev`/`unknown`/`unknown`, so a build that forgot the injection cannot pass
+verification.
 
 - [ ] **Step 6: Run complete local verification**
 

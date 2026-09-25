@@ -5,8 +5,24 @@ GO ?= go
 GO_REQUIRED_VERSION := 1.25.0
 
 LDFLAGS ?= -s -w
+BUILDINFO_PKG := mosdns-router/internal/buildinfo
 
-.PHONY: check-go test test-make-entrypoints build cross-build verify
+# The build identity is supplied by the caller, or derived from this checkout.
+# `ifndef` keeps an explicit VERSION=, REVISION=, or BUILD_TIME= override
+# authoritative while still freezing the derived value once.
+ifndef VERSION
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+endif
+ifndef REVISION
+REVISION := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+endif
+ifndef BUILD_TIME
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+endif
+
+METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
+
+.PHONY: check-go test test-make-entrypoints build cross-build verify verify-build-info
 
 # The guard is the only place that decides whether this host's Go is acceptable.
 check-go:
@@ -35,13 +51,19 @@ test-make-entrypoints:
 
 build: check-go
 	@mkdir -p build
-	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
-	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS) $(METADATA_LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
 
 cross-build: check-go
 	@mkdir -p build/linux-amd64 build/linux-arm64
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -ldflags '$(METADATA_LDFLAGS)' -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
 
-verify: test
+# A build that forgot the metadata injection would otherwise ship a binary that
+# reports dev/unknown/unknown, so verification reads the metadata back out of
+# the built router instead of trusting the linker flags.
+verify-build-info: build
+	@$(GO) run -mod=readonly ./internal/buildinfo/cmd/check build/mosdns-router
+
+verify: test verify-build-info
 	@$(GO) vet -mod=readonly ./...
