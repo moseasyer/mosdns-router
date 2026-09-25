@@ -3,7 +3,9 @@ module mosdns-router
 go 1.25.8
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/IrineSistiana/mosdns/v5 v5.3.4
+	github.com/jedisct1/go-dnsstamps v0.0.0-20260518121737-6579dc73e4a2
 	github.com/miekg/dns v1.1.70
 	github.com/spf13/cobra v1.10.2
 	go.uber.org/zap v1.27.1
