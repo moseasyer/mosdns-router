@@ -4,7 +4,9 @@ go 1.25.0
 
 require (
 	github.com/IrineSistiana/mosdns/v5 v5.3.4
+	github.com/miekg/dns v1.1.70
 	github.com/spf13/cobra v1.10.2
+	go.uber.org/zap v1.27.1
 	golang.org/x/sys v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -23,7 +25,6 @@ require (
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/mdlayher/netlink v1.8.0 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
-	github.com/miekg/dns v1.1.70 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nadoo/ipset v0.5.0 // indirect
@@ -41,7 +42,6 @@ require (
 	github.com/spf13/viper v1.21.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect

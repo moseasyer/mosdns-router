@@ -9,6 +9,10 @@ import (
 	_ "github.com/IrineSistiana/mosdns/v5/plugin"
 	"github.com/spf13/cobra"
 	"mosdns-router/internal/buildinfo"
+
+	// The router's own plugin: it forwards a query to the DNS servers the DHCP
+	// client is currently configured with, swapping them while mosdns runs.
+	_ "mosdns-router/plugin/executable/dhcp_forward"
 )
 
 func init() {
