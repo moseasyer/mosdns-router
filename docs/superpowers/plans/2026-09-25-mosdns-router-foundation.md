@@ -384,7 +384,17 @@ type CachePolicy struct { PersistentDump bool `yaml:"persistent_dump"` }
 
 - [ ] **Step 5: Implement strict YAML loading and validation**
 
-Use `yaml.NewDecoder`, call `KnownFields(true)`, reject multiple documents, require exactly one `---` document, and return path-wrapped errors. `Validate()` must enforce every numeric lower bound and the exact enums `strict|fallback` and `disable-current|use-last-good`.
+Use `yaml.NewDecoder`, call `KnownFields(true)`, reject multiple documents, require exactly one `---` document, and return path-wrapped errors. `Validate()` must enforce every numeric lower bound, the approved upper bounds, and the exact enums `strict|fallback` and `disable-current|use-last-good`.
+
+`Validate()` also enforces the spec's hard limits, because a policy above them would
+make a later optimizer exceed the approved budget:
+
+- `cdn.ip_version` must be exactly `IPv4`; the design selects IPv4 only;
+- `cdn.bandwidth.daily_budget` must not exceed 100 MiB;
+- `cdn.bandwidth.per_candidate_limit` must not exceed 10 MiB;
+- `cdn.bandwidth.per_candidate_seconds` must not exceed 3;
+- every `ech.sources` entry must be a DNS hostname, so a URL scheme, a path, an
+  address literal, or a wildcard cannot be configured as an ECH source.
 
 - [ ] **Step 6: Run focused and package tests**
 

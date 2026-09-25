@@ -9,7 +9,7 @@ func Defaults() Policy {
 			ECS:             false,
 		},
 		CDN: CDNPolicy{
-			IPVersion:                "IPv4",
+			IPVersion:                requiredIPVersion,
 			SuppressAAAA:             true,
 			Cloudflare:               CloudflarePolicy{MaxCandidates: 512},
 			LatencyCandidateCount:    10,
@@ -20,9 +20,9 @@ func Defaults() Policy {
 				FailureThreshold: 3,
 			},
 			Bandwidth: BandwidthPolicy{
-				DailyBytes:          100 * 1024 * 1024,
-				PerCandidateBytes:   10 * 1024 * 1024,
-				PerCandidateSeconds: 3,
+				DailyBytes:          maximumDailyBudgetBytes,
+				PerCandidateBytes:   maximumPerCandidateBytes,
+				PerCandidateSeconds: maximumPerCandidateSeconds,
 			},
 		},
 		ECH: ECHPolicy{

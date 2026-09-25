@@ -171,6 +171,84 @@ func TestValidateRejectsNegativeNumericValues(t *testing.T) {
 	}
 }
 
+// The design is IPv4-only, so a policy that asks for anything else would make
+// every later response-rewrite decision unsafe.
+func TestValidateAcceptsOnlyIPv4Selection(t *testing.T) {
+	policy := Defaults()
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("default ip_version rejected: %v", err)
+	}
+	for _, value := range []string{"IPv6", "ipv4", "both", ""} {
+		policy := Defaults()
+		policy.CDN.IPVersion = value
+		if err := policy.Validate(); err == nil {
+			t.Errorf("ip_version %q accepted", value)
+		}
+	}
+}
+
+// The spec fixes hard upper bounds on measurement traffic. A policy above them
+// would let a later optimizer exceed the daily budget or hold one candidate
+// open longer than the approved limit, so the caps are enforced here.
+func TestValidateEnforcesApprovedBandwidthCaps(t *testing.T) {
+	atCap := Defaults()
+	atCap.CDN.Bandwidth.DailyBytes = 100 * 1024 * 1024
+	atCap.CDN.Bandwidth.PerCandidateBytes = 10 * 1024 * 1024
+	atCap.CDN.Bandwidth.PerCandidateSeconds = 3
+	if err := atCap.Validate(); err != nil {
+		t.Fatalf("budgets exactly at the approved caps rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Policy)
+	}{
+		{name: "daily budget one byte over", mutate: func(p *Policy) { p.CDN.Bandwidth.DailyBytes = 100*1024*1024 + 1 }},
+		{name: "daily budget doubled", mutate: func(p *Policy) { p.CDN.Bandwidth.DailyBytes = 200 * 1024 * 1024 }},
+		{name: "per-candidate limit one byte over", mutate: func(p *Policy) { p.CDN.Bandwidth.PerCandidateBytes = 10*1024*1024 + 1 }},
+		{name: "per-candidate seconds over", mutate: func(p *Policy) { p.CDN.Bandwidth.PerCandidateSeconds = 4 }},
+		{name: "per-candidate seconds far over", mutate: func(p *Policy) { p.CDN.Bandwidth.PerCandidateSeconds = 60 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := Defaults()
+			tt.mutate(&policy)
+			if err := policy.Validate(); err == nil {
+				t.Fatal("expected a validation error above the approved cap")
+			}
+		})
+	}
+}
+
+// An ECH source is queried as a DNS name over the foreign path, so a URL, an
+// address, or a wildcard cannot be a valid source.
+func TestValidateRejectsNonHostnameECHSources(t *testing.T) {
+	invalid := []string{
+		"https://cloudflare-ech.com",
+		"cloudflare-ech.com/ech.txt",
+		"192.0.2.1",
+		"::1",
+		"cloudflare ech.com",
+		"*.example",
+		"-cloudflare-ech.com",
+		"cloudflare-ech.com.",
+		"",
+	}
+	for _, source := range invalid {
+		policy := Defaults()
+		policy.ECH.Sources = []string{source}
+		if err := policy.Validate(); err == nil {
+			t.Errorf("ECH source %q accepted", source)
+		}
+	}
+
+	policy := Defaults()
+	policy.ECH.Sources = []string{"cloudflare-ech.com", "ech.example.org"}
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("hostname ECH sources rejected: %v", err)
+	}
+}
+
 func TestValidateAcceptsBoundaryValues(t *testing.T) {
 	policy := Defaults()
 	policy.Schedule = "00:00"
