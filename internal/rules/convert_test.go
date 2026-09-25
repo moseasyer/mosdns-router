@@ -415,12 +415,18 @@ func TestConvertFSRefusesAnEntryThatResolvesToNoRules(t *testing.T) {
 }
 
 func TestConvertFSRefusesAnEntryOutsideThePinnedArchive(t *testing.T) {
-	// The entry path reaches ConvertFS from a lock file, so it is validated
-	// before it is opened rather than trusted.
+	// The entry path reaches ConvertFS from a lock file, so it is refused with a
+	// diagnostic that says what was wrong with it, before the filesystem is asked
+	// to open anything.
 	fsys := convertFixture(map[string]string{"data/cn": "domain:example.cn\n"})
 	for _, entry := range []string{"", "/data/cn", "../data/cn", "data/../data/cn", "./data/cn"} {
-		if _, err := ConvertFS(fsys, entry); err == nil {
+		_, err := ConvertFS(fsys, entry)
+		if err == nil {
 			t.Errorf("ConvertFS accepted entry %q", entry)
+			continue
+		}
+		if !strings.Contains(err.Error(), "is not a path inside the source archive") {
+			t.Errorf("ConvertFS refused entry %q without saying why: %v", entry, err)
 		}
 	}
 	if _, err := ConvertFS(nil, "data/cn"); err == nil {

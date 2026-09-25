@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -547,6 +548,16 @@ func TestUpdateListsPinRemoteKeepsTheInstalledPairOnEveryFailure(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "the published list does not match its lock",
+			arrange: func(t *testing.T, paths listPaths, origin *fakeOrigin) {
+				publishPair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+				// Somebody edited the list the router is running without re-pinning.
+				if err := os.WriteFile(paths.listFile, []byte("domain:edited-by-hand.cn\n"), 0o640); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -573,6 +584,34 @@ func TestUpdateListsPinRemoteKeepsTheInstalledPairOnEveryFailure(t *testing.T) {
 			}
 			assertUnchanged(t, before, paths.dir, filepath.Base(paths.controlLock))
 		})
+	}
+}
+
+func TestUpdateListsPinRemoteReportsAPublicationFailureInsteadOfSuccess(t *testing.T) {
+	// A pin that verified its source and then could not write the pair has to say
+	// so. Reporting an accepted commit for a list that was never published is the
+	// one outcome an operator cannot recover from, because the next check would
+	// compare a lock nobody wrote against a list nobody installed.
+	paths := newListPaths(t)
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive)})
+	listFile := filepath.Join(paths.dir, "not-installed", "cn-domains.txt")
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", listFile, "--control-lock", paths.controlLock)
+	if code != exitStateUnavailable {
+		t.Fatalf("pin with an unwritable list exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
+	}
+	if strings.Contains(stdout, "pinned-commit") {
+		t.Errorf("pin reported an accepted commit although it published nothing:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, listFile) {
+		t.Errorf("refusal does not name the list path: %q", stderr)
+	}
+	if _, err := os.Stat(filepath.Dir(listFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("pin created the missing list directory: %v", err)
+	}
+	if _, err := os.Stat(paths.sourceLock); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("pin published a lock without a list: %v", err)
 	}
 }
 
