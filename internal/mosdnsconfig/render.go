@@ -72,9 +72,10 @@ const (
 	// nothing in this project has measured one yet.
 	foreignCacheEntries = 1024
 
-	// logLevel is rendered because mosdns refuses to start without one, and
-	// because the reports an operator needs when the domestic branch stops
-	// answering are written at this level or above.
+	// logLevel is the level the reports an operator reads are written at: the
+	// plugin logs every generation it adopts at info, and the reports that a
+	// branch has stopped answering are warnings above it. It is rendered rather
+	// than left to the logger's zero value, which happens to be info today.
 	logLevel = "info"
 )
 

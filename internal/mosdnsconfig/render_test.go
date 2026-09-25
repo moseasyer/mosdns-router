@@ -194,7 +194,7 @@ func TestRenderedRoutingNamesEachPluginExactlyOnceInLoadOrder(t *testing.T) {
 		}
 	}
 	if parsed.Log.Level == "" {
-		t.Error("the document sets no log level, and mosdns refuses to start without one")
+		t.Error("the document states no log level, so the level the router runs at is whatever the logger's zero value happens to be")
 	}
 }
 
