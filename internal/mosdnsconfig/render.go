@@ -496,14 +496,21 @@ func resolve(paths Paths) (resolvedPaths, error) {
 // outside the range of a port number is refused, because the plugin would be
 // handed a port it cannot dial and the domestic branch would be dead in a
 // document that looked configured.
+//
+// The refusal states what 0 means rather than only the accepted range. By the
+// time a reader has this message they are looking at a value that was refused, and
+// "must be between 1 and 65535" reads as though 0 were also outside the range --
+// which is false, because 0 is accepted and rendered as 53. A document that named
+// upstream_port: 0 and then a document that named upstream_port: 65536 would
+// otherwise produce refusals that differ only in the number.
 func checkDHCPUpstreamPort(value int) (int, error) {
 	if value == 0 {
 		return defaultDHCPUpstreamPort, nil
 	}
 	if value < 0 || value > maximumDHCPUpstreamPort {
 		return 0, fmt.Errorf(
-			"mosdnsconfig: the DHCP upstream port %d must be between 1 and %d, want a port a published address can be dialled on",
-			value, maximumDHCPUpstreamPort,
+			"mosdnsconfig: the DHCP upstream port %d is not a port a published address can be dialled on; 0 means the default %d, and any other value must be between 1 and %d",
+			value, defaultDHCPUpstreamPort, maximumDHCPUpstreamPort,
 		)
 	}
 	return value, nil

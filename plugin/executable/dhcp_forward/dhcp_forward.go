@@ -67,7 +67,9 @@ type Args struct {
 	CacheEntries int `yaml:"cache_entries"`
 	// UpstreamPort is the port a published address is dialled on. A published
 	// state carries bare addresses, so the port is a property of this
-	// configuration. Default 53, the port a DHCP DNS server answers on.
+	// configuration. Unset (0) means 53, the port a DHCP DNS server answers on.
+	// Anything outside 0 and 1..65535 is refused: 0 is the one value in the
+	// refusal's neighbourhood that is not a port of its own.
 	UpstreamPort int `yaml:"upstream_port"`
 	// FailurePolicy decides what a newer generation without a usable upstream
 	// means: "disable-current" adopts it and fails the branch closed, and
@@ -197,7 +199,13 @@ func (args Args) withDefaults() (Args, error) {
 		resolved.UpstreamPort = defaultUpstreamPort
 	}
 	if resolved.UpstreamPort > maximumUpstreamPort {
-		return resolved, fmt.Errorf("dhcp_forward: upstream_port must be between 1 and %d, got %d", maximumUpstreamPort, resolved.UpstreamPort)
+		// The message says what 0 means, because by the time this runs 0 has
+		// already become 53 and a reader comparing the value they wrote against
+		// the accepted range has no way to tell that from a value in range.
+		return resolved, fmt.Errorf(
+			"dhcp_forward: upstream_port %d is not a port; 0 means the default %d, and any other value must be between 1 and %d",
+			resolved.UpstreamPort, defaultUpstreamPort, maximumUpstreamPort,
+		)
 	}
 	if resolved.FailurePolicy == "" {
 		resolved.FailurePolicy = failurePolicyDisableCurrent

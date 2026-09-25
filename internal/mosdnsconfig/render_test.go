@@ -330,6 +330,37 @@ func TestRenderRefusesADialPortNothingCanDial(t *testing.T) {
 	}
 }
 
+// TestTheDialPortRefusalSaysWhatZeroMeans covers the message rather than the
+// range. 0 is accepted and rendered as 53, so a refusal that only says "must be
+// between 1 and 65535" describes a range 0 is not outside of, and a reader who
+// wrote upstream_port: 0 has no way to tell that from a value that was refused.
+// The document this renderer produces is read by whoever set that field, so the
+// two facts have to be in the message together.
+func TestTheDialPortRefusalSaysWhatZeroMeans(t *testing.T) {
+	_, err := Render(config.Defaults(), withDHCPUpstreamPort(ProductionPaths(), 65536))
+	if err == nil {
+		t.Fatal("Render accepted a port past 65535")
+	}
+	for name, want := range map[string]string{
+		"the port it refused":  "65536",
+		"that zero means 53":   "0 means the default 53",
+		"the range it accepts": "between 1 and 65535",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %s (%q):\n%v", name, want, err)
+		}
+	}
+	// And the value it accepts is still accepted: the message must not have
+	// changed what 0 means.
+	document, err := Render(config.Defaults(), withDHCPUpstreamPort(ProductionPaths(), 0))
+	if err != nil {
+		t.Fatalf("Render refused the port the message says means 53: %v", err)
+	}
+	if forwarder := argsOf[renderedDHCPForward](t, decodeRendered(t, document).entry(t, "dhcp_forward")); forwarder.UpstreamPort != 53 {
+		t.Errorf("upstream_port 0 rendered as %d, want the 53 the refusal names", forwarder.UpstreamPort)
+	}
+}
+
 // TestTheFailurePolicyTheOperatorChoseReachesThePlugin proves the rendered
 // argument is the policy's own value. A renderer that wrote its own default
 // would ignore an operator who chose the other behaviour, and the choice would
