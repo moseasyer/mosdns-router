@@ -848,7 +848,7 @@ func TestUnreadableStateIsRetriedUntilItIsUsable(t *testing.T) {
 func TestReadDHCPStateValidatesPublishedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dhcp-upstreams.json")
 
-	writeStateDocument(t, path, state.NewDHCPState(7, testInterface, "uuid", []string{"223.5.5.5"}, time.Unix(0, 0).UTC(), "dhcp4", true))
+	writeStateDocument(t, path, state.NewDHCPState(7, testInterface, "uuid", []string{"192.0.2.53"}, time.Unix(0, 0).UTC(), "dhcp4", true))
 	published, err := readDHCPState(path)
 	if err != nil {
 		t.Fatalf("read a valid published state: %v", err)
@@ -856,8 +856,8 @@ func TestReadDHCPStateValidatesPublishedState(t *testing.T) {
 	if published.Generation != 7 || published.Interface != testInterface {
 		t.Fatalf("read %+v, want generation 7 on %s", published, testInterface)
 	}
-	if len(published.Upstreams) != 1 || published.Upstreams[0] != "223.5.5.5" {
-		t.Fatalf("read upstreams %v, want [223.5.5.5]", published.Upstreams)
+	if len(published.Upstreams) != 1 || published.Upstreams[0] != "192.0.2.53" {
+		t.Fatalf("read upstreams %v, want [192.0.2.53]", published.Upstreams)
 	}
 
 	for name, upstreams := range map[string][]string{
@@ -867,7 +867,7 @@ func TestReadDHCPStateValidatesPublishedState(t *testing.T) {
 		"zoned IPv6":       {"fe80::1%" + testInterface},
 		"multicast":        {"224.0.0.1"},
 		"not an address":   {"resolver.example.com"},
-		"address and port": {"223.5.5.5:53"},
+		"address and port": {"192.0.2.53:53"},
 	} {
 		writeStateDocument(t, path, state.NewDHCPState(8, testInterface, "uuid", upstreams, time.Unix(0, 0).UTC(), "dhcp4", true))
 		if _, err := readDHCPState(path); err == nil {
@@ -924,7 +924,7 @@ func TestNewAppliesDocumentedDefaults(t *testing.T) {
 
 func TestPluginLoadsFromMosdnsConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dhcp-upstreams.json")
-	writeStateDocument(t, path, state.NewDHCPState(1, testInterface, "uuid", []string{"223.5.5.5"}, time.Unix(0, 0).UTC(), "dhcp4", true))
+	writeStateDocument(t, path, state.NewDHCPState(1, testInterface, "uuid", []string{"192.0.2.53"}, time.Unix(0, 0).UTC(), "dhcp4", true))
 
 	// The type and the argument names are spelled the way a mosdns configuration
 	// file spells them, not through the package's own constants.

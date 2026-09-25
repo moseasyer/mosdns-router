@@ -248,6 +248,17 @@ class PublicationTests(unittest.TestCase):
         )
         self.assertEqual(self.published()["observed_at"], "2026-09-25T00:30:00Z")
 
+    def test_rejects_an_observation_time_that_is_not_an_instant(self):
+        """A datetime without an offset has no instant to record.
+
+        The host's zone would supply one, and it is the operator's local time
+        rather than the moment the lease was observed, so the state would claim
+        an observation that never happened.
+        """
+        with self.assertRaises(ValueError):
+            self.publish(["192.168.1.1"], now=datetime.datetime(2026, 9, 25, 0, 0))
+        self.assertFalse(self.state_path.exists())
+
     def test_the_same_event_publishes_the_same_bytes_twice(self):
         first = self.directory / "first.json"
         second = self.directory / "second.json"
@@ -1580,7 +1591,13 @@ class DispatcherCommandLineTests(unittest.TestCase):
             ],
         )
 
-    def test_the_collector_reads_the_raw_lease_before_the_effective_dns(self):
+    def test_a_usable_effective_device_dns_beats_an_event_that_names_no_usable_resolver(self):
+        """The event named only the resolved stub, so the device's own DNS answers.
+
+        The raw lease fields are empty and the event's own variables hold nothing
+        a domestic query could be sent to, so the effective device DNS is the
+        first source that names a resolver at all.
+        """
         runner = RecordingRunner(
             {
                 ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE): "192.168.1.9",

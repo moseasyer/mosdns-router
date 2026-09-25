@@ -225,9 +225,17 @@ def _new_record(
 
 
 def _observed_at(now: datetime.datetime) -> str:
-    """Return ``now`` as the RFC 3339 UTC timestamp the state records."""
+    """Return ``now`` as the RFC 3339 UTC timestamp the state records.
+
+    A datetime without a UTC offset is refused rather than read in the host's
+    zone: the state records the instant the addresses were observed, and this
+    host's local time is not that instant, so publishing one would claim an
+    observation that never happened.
+    """
     if not isinstance(now, datetime.datetime):
         raise ValueError(f"now must be a datetime: {now!r}")
+    if now.utcoffset() is None:
+        raise ValueError(f"now must carry a utc offset, got the naive {now!r}")
     return now.astimezone(datetime.timezone.utc).strftime(OBSERVED_AT_FORMAT)
 
 

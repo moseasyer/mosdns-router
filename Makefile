@@ -1,5 +1,11 @@
 GO ?= go
 
+# The DHCP bridge is half of this project: the state document the Go plugin reads
+# is written by Python, and a change to one half that only the other half's tests
+# can see is a change nobody notices. Its suite therefore runs with the Go one.
+PYTHON ?= python3
+BRIDGE_TESTS := bridge/tests
+
 # Every entry point refuses to run on a different Go release: the module pins
 # go 1.25.0 and the reproducible build metadata assumes exactly that compiler.
 GO_REQUIRED_VERSION := 1.25.0
@@ -22,7 +28,7 @@ endif
 
 METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
 
-.PHONY: check-go test test-make-entrypoints build cross-build verify verify-build-info
+.PHONY: check-go test test-python test-make-entrypoints build cross-build verify verify-build-info
 
 # The guard is the only place that decides whether this host's Go is acceptable.
 check-go:
@@ -40,9 +46,15 @@ check-go:
 # implicit dependency updater: a stale go.mod or go.sum fails the command
 # instead of being silently rewritten. Run `go mod tidy` explicitly and review
 # its module-file changes as a separate step.
-test: check-go
+test: check-go test-python
 	@$(GO) test -mod=readonly ./...
 	@sh scripts/test-make-entrypoints.sh
+
+# A separate, non-recursive target, so the bridge suite can be run on its own
+# while it is being changed. `test` and therefore `verify` depend on it, because
+# the two halves of the bridge share one state schema and one committed fixture.
+test-python:
+	@$(PYTHON) -m unittest discover -s $(BRIDGE_TESTS)
 
 # This is a separate, non-recursive target: the regression harness inspects the
 # real Makefile with `make -n` and never invokes `make test` recursively.

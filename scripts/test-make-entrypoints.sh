@@ -1,11 +1,13 @@
 #!/bin/sh
-# Regression test for the Make entry points. It proves two things about the
+# Regression test for the Make entry points. It proves three things about the
 # real Makefile:
 #
 # 1. Every entry point runs through an exact go1.25.0 toolchain guard, so a
 #    different or missing Go release is refused before any command runs.
 # 2. Every Go invocation the entry points plan is readonly, so building,
 #    testing, and vetting can never rewrite go.mod or go.sum.
+# 3. The Python bridge suite is reachable from the test entry points, because
+#    the state document the Go plugin reads is written by Python.
 #
 # The entry points are exercised with stand-in toolchains and with `make -n`,
 # so the test never builds the project, never needs a second Go release, and
@@ -175,7 +177,24 @@ for override in "VERSION 1.2.3" "REVISION cafebabe" "BUILD_TIME 2026-09-25T00:00
 	fi
 done
 
-# 5. Nothing the test ran may change the module files.
+# 6. The Python bridge suite runs from the test entry points, because the state
+#    document the Go plugin reads is written by Python and a change to one half
+#    that only the other half's suite can see is a change nobody noticed.
+for target in test test-python verify; do
+	status=0
+	make --no-print-directory -n "$target" GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "dry run of $target exited $status"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+		continue
+	fi
+	if ! grep -q 'unittest discover -s bridge/tests' "$work/dryrun"; then
+		fail "$target does not run the python bridge suite"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+	fi
+done
+
+# 7. Nothing the test ran may change the module files.
 if ! cmp -s "$work/go.mod.before" go.mod; then
 	fail "go.mod was modified while checking the entry points"
 fi
