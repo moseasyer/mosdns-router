@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -147,7 +146,7 @@ func (r *runtime) exchange(ctx context.Context, query *dns.Msg) (*dns.Msg, error
 	}
 
 	key := newCacheKey(generation.generation, query)
-	if answer, ok := generation.cache.get(key, time.Now()); ok {
+	if answer, ok := generation.cache.get(key, query, time.Now()); ok {
 		return answer, nil
 	}
 
@@ -578,10 +577,16 @@ func statStateFile(path string) (fileSignature, error) {
 // --- the generation scoped cache ---
 
 // cacheKey identifies one cached answer. Two questions share a key only when the
-// upstream could not have answered them differently: the same name, type, and
-// class, the same DNSSEC and checking-disabled flags, and the same client subnet.
-// The generation is part of the key so an entry can never be attributed to
-// another set of upstreams.
+// upstream could not have answered them differently: the same name in the exact
+// case it arrived, the same type and class, the same DNSSEC, checking-disabled,
+// and authenticated-data flags, and the same client subnet. The generation is
+// part of the key so an entry can never be attributed to another set of
+// upstreams.
+//
+// The question name is the bytes that arrived rather than a lowercased form of
+// them: 0x20 is a request for randomised case, so one client's case can be
+// answered differently from another's, and the case a client sent is also the
+// case its own response has to echo.
 type cacheKey struct {
 	generation uint64
 	qname      string
@@ -589,6 +594,7 @@ type cacheKey struct {
 	qclass     uint16
 	do         bool
 	cd         bool
+	ad         bool
 	clientNet  string
 }
 
@@ -596,9 +602,10 @@ func newCacheKey(generation uint64, query *dns.Msg) cacheKey {
 	question := query.Question[0]
 	key := cacheKey{
 		generation: generation,
-		qname:      strings.ToLower(question.Name),
+		qname:      question.Name,
 		qtype:      question.Qtype,
 		qclass:     question.Qclass,
+		ad:         query.AuthenticatedData,
 		cd:         query.CheckingDisabled,
 	}
 	if opt := query.IsEdns0(); opt != nil {
@@ -638,9 +645,16 @@ func newResponseCache(maxEntries int) *responseCache {
 }
 
 // get returns a copy of the cached answer with the time it has been waiting
-// subtracted from its TTLs. An entry with no time left is a miss, not an answer
-// with a zero TTL.
-func (c *responseCache) get(key cacheKey, now time.Time) (*dns.Msg, bool) {
+// subtracted from its TTLs and with the fetching query's identity put on it. An
+// entry with no time left is a miss, not an answer with a zero TTL.
+//
+// The entry is a response to whichever query fetched it, so the transaction id
+// and the question section are the ones that went upstream now: an id from the
+// transaction that filled the cache is a response the client will discard, and a
+// question section in another client's case breaks 0x20 echoing. The question is
+// copied rather than shared, so a caller that edits its own query afterwards
+// cannot change an answer another query is holding.
+func (c *responseCache) get(key cacheKey, query *dns.Msg, now time.Time) (*dns.Msg, bool) {
 	entry, ok := c.entries.Get(key)
 	if !ok {
 		return nil, false
@@ -656,6 +670,9 @@ func (c *responseCache) get(key cacheKey, now time.Time) (*dns.Msg, bool) {
 	}
 	remaining := entry.ttl - elapsed
 	answer := entry.message.Copy()
+	answer.Id = query.Id
+	answer.Question = make([]dns.Question, len(query.Question))
+	copy(answer.Question, query.Question)
 	setTTL(answer, remaining)
 	return answer, true
 }
@@ -663,12 +680,18 @@ func (c *responseCache) get(key cacheKey, now time.Time) (*dns.Msg, bool) {
 // put stores an answer that can be reused: a response that answers the question
 // and carries a positive TTL. A SERVFAIL, a REFUSED, a bare NXDOMAIN without an
 // SOA, and a zero TTL are all left uncached.
+//
+// The stored copy carries a neutral id, because the entry is not a response to
+// any one transaction: get puts the fetching query's id on the answer it hands
+// out, so an id kept here could only ever leak into a different transaction.
 func (c *responseCache) put(key cacheKey, response *dns.Msg, now time.Time) {
 	ttl, ok := cacheableTTL(response)
 	if !ok {
 		return
 	}
-	c.entries.Add(key, cacheEntry{message: response.Copy(), storedAt: now, ttl: ttl})
+	stored := response.Copy()
+	stored.Id = 0
+	c.entries.Add(key, cacheEntry{message: stored, storedAt: now, ttl: ttl})
 }
 
 // cacheableTTL is the smallest TTL in the answer, which is how long every record

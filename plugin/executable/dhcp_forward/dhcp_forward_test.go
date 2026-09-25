@@ -187,6 +187,86 @@ func TestStateFileSignatureTracksFileIdentity(t *testing.T) {
 	}
 }
 
+// TestCacheHitCarriesTheCurrentQueryIdentity pins the transaction identity of a
+// cached answer. The entry is a response to whichever query fetched it, so the
+// second client for one name has to be answered with its own id and its own
+// question: a client that drops a response because the id is another
+// transaction's, or because the question inside it is a different one, treats a
+// correct answer as an error.
+func TestCacheHitCarriesTheCurrentQueryIdentity(t *testing.T) {
+	upstream := startServer(t, answerWith("192.0.2.71", 30))
+	forward, _ := newTestForwardForServer(t, Args{}, upstream)
+
+	first := exec(t, forward, "identity.example.com.", dns.TypeA, withID(0x1234))
+	second := exec(t, forward, "identity.example.com.", dns.TypeA, withID(0x5678))
+
+	if first.Id != 0x1234 {
+		t.Fatalf("first response id = %#x, want the query's %#x", first.Id, 0x1234)
+	}
+	if second.Id != 0x5678 {
+		t.Fatalf("cached response id = %#x, want the second query's %#x", second.Id, 0x5678)
+	}
+	if got := second.Question[0].Name; got != "identity.example.com." {
+		t.Fatalf("cached question = %q, want the current query's question", got)
+	}
+	if count := upstream.Count(testdns.ProtocolUDP, "identity.example.com."); count != 1 {
+		t.Fatalf("upstream received %d queries, want 1: the second must come from the cache", count)
+	}
+}
+
+// TestCacheSeparatesTheQuestionCase pins 0x20: the case a client sent is part of
+// the question, an upstream may answer the two cases differently, and the
+// response echoes the case the client used. A key that lowercased the name would
+// serve one client's case to the other.
+func TestCacheSeparatesTheQuestionCase(t *testing.T) {
+	upstream := startServer(t, answerWith("192.0.2.72", 30))
+	forward, _ := newTestForwardForServer(t, Args{}, upstream)
+
+	exec(t, forward, "Www.Example.com.", dns.TypeA, withID(0x0001))
+	exec(t, forward, "www.example.com.", dns.TypeA, withID(0x0002))
+	again := exec(t, forward, "Www.Example.com.", dns.TypeA, withID(0x0003))
+
+	if count := upstream.Count(testdns.ProtocolUDP, ""); count != 2 {
+		t.Fatalf("upstream received %d queries, want 2: the two cases are two questions", count)
+	}
+	if got := again.Question[0].Name; got != "Www.Example.com." {
+		t.Fatalf("cached question = %q, want the case this client asked in", got)
+	}
+	if again.Id != 0x0003 {
+		t.Fatalf("cached response id = %#x, want %#x", again.Id, 0x0003)
+	}
+}
+
+// TestCacheSeparatesTheAuthenticatedDataBit pins the AD bit in the key. The
+// upstream reports the identity of the request it answered, so an entry served to
+// a client that did not ask for validated data shows up in the answer itself and
+// not only in the query count.
+func TestCacheSeparatesTheAuthenticatedDataBit(t *testing.T) {
+	upstream := startServer(t, reportIdentity)
+	forward, _ := newTestForward(t, Args{}, []string{hostOf(t, upstream)}, portOf(t, upstream))
+
+	plain := exec(t, forward, "authenticated.example.com.", dns.TypeA)
+	checked := exec(t, forward, "authenticated.example.com.", dns.TypeA, withAD(true))
+	repeat := exec(t, forward, "authenticated.example.com.", dns.TypeA, withAD(true))
+
+	for _, check := range []struct {
+		what     string
+		response *dns.Msg
+		want     string
+	}{
+		{"plain", plain, "plain"},
+		{"authenticated data", checked, "plain+ad"},
+		{"repeated authenticated data", repeat, "plain+ad"},
+	} {
+		if got := reportedIdentities(t, check.response); len(got) != 1 || got[0] != check.want {
+			t.Fatalf("%s answer = %v, want [%s]", check.what, got, check.want)
+		}
+	}
+	if count := upstream.Count(testdns.ProtocolUDP, "authenticated.example.com."); count != 2 {
+		t.Fatalf("upstream received %d queries, want 2: the ad bit is part of the cache key", count)
+	}
+}
+
 func TestGenerationReplacedByRenameWithTheSameSizeAndTimeIsObserved(t *testing.T) {
 	replaced := startServer(t, answerWith("192.0.2.63", 300))
 	replacement := samePortServer(t, replaced, "127.0.0.2", answerWith("198.51.100.63", 300))
@@ -1248,6 +1328,19 @@ func newQueryContext(name string, qtype uint16, options ...func(*query_context.C
 
 // withDO sets the DNSSEC OK bit on the query that goes upstream, the way an
 // earlier plugin in the chain would.
+// withID sets the transaction id a client chose. A response has to carry the id
+// of the query it answers, and a cached answer is a response to whichever query
+// fetched it.
+func withID(id uint16) func(*query_context.Context) {
+	return func(qCtx *query_context.Context) { qCtx.Q().Id = id }
+}
+
+// withAD sets the header's authenticated-data bit, which asks the upstream for
+// answers it has validated itself.
+func withAD(ad bool) func(*query_context.Context) {
+	return func(qCtx *query_context.Context) { qCtx.Q().AuthenticatedData = ad }
+}
+
 func withDO(do bool) func(*query_context.Context) {
 	return func(qCtx *query_context.Context) {
 		opt := qCtx.Q().IsEdns0()
@@ -1288,6 +1381,9 @@ func withClass(class uint16) func(*query_context.Context) {
 // which identity its request carried.
 func identityOf(query *dns.Msg) string {
 	identity := "plain"
+	if query.AuthenticatedData {
+		identity += "+ad"
+	}
 	if opt := query.IsEdns0(); opt != nil {
 		if opt.Do() {
 			identity = "dnssec"
