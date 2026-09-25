@@ -482,7 +482,14 @@ timeline.
 3. Create a file in the same directory with mode `0640`.
 4. Encode one indented JSON document.
 5. Call `Sync`, `Close`, `Rename`, then sync the parent directory.
-6. Remove the temporary file on every error path.
+6. Remove the temporary file on every error path, and report a failed removal to
+   the caller instead of discarding it, because a surviving temporary file or
+   backup leaves a stale copy of runtime state in the state directory.
+
+The state package does not inspect the mode of a directory it did not create. A
+pre-existing runtime directory with the wrong mode, group, or setgid bit is
+reported by the packaging preflight, which knows the identities and groups that
+are allowed to share the directory.
 
 - [ ] **Step 5: Implement strict reads**
 
@@ -543,6 +550,16 @@ Expected: compile failure.
 - [ ] **Step 3: Implement the lock**
 
 Use `golang.org/x/sys/unix.Flock` with `LOCK_EX|LOCK_NB`, mode `0640`, sentinel `ErrLocked = errors.New("control lock is already held")`, and a `sync.Once`-guarded close. If the dependency is indirect, run `go mod tidy` rather than adding an unpinned version manually.
+
+Open the lock file with `os.O_CREATE|os.O_RDONLY`: creating it needs write
+permission on the directory, while the descriptor itself must stay incapable of
+modifying the state the lock protects. A same-package test reads the descriptor
+flags with `F_GETFL` and asserts `O_RDONLY`, because the kernel still takes the
+exclusive lock on a read-only descriptor. The shared ownership of the lock file
+between the router service, the DHCP bridge, and the optimizer is provisioned by
+the packaging plan with setgid directories, group ownership, and default ACLs;
+that plan also owns the real two-user systemd test, and the packaging preflight
+reports a pre-existing directory whose mode is wrong.
 
 - [ ] **Step 4: Run tests**
 
