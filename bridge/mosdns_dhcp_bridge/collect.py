@@ -14,7 +14,7 @@ import ipaddress
 import re
 from typing import Callable, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-__all__ = ["collect_dns"]
+__all__ = ["collect_dns", "is_interface_name", "normalize_upstreams", "usable_address"]
 
 # A command runner takes one argument array and returns its standard output.
 CommandRunner = Callable[[Sequence[str]], str]
@@ -24,10 +24,13 @@ Address = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 # The kernel caps a device name at IFNAMSIZ-1 characters, so nothing longer can
 # be a real interface. The accepted shape is deliberately narrow because the
 # name reaches the published state file, and ``\Z`` rather than ``$`` keeps a
-# trailing newline from ending the match.
+# trailing newline from ending the match. The character class is the same one
+# Linux ``dev_valid_name()`` and ``state.DHCPState.Validate`` accept, so an
+# interface this collector can name is an interface the state file can carry:
+# a colon is rejected by both, which is why this pattern has none.
 MAXIMUM_INTERFACE_NAME_LENGTH = 15
 _INTERFACE_NAME = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,%d}\Z" % (MAXIMUM_INTERFACE_NAME_LENGTH - 1)
+    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,%d}\Z" % (MAXIMUM_INTERFACE_NAME_LENGTH - 1)
 )
 
 # The dispatcher exports the DNS servers of the lease that just arrived, one
@@ -62,7 +65,7 @@ def collect_dns(env: Mapping[str, str], interface: str, run: CommandRunner) -> L
     answer: it means no usable address is configured for this interface right
     now, which is not the same as a collection failure.
     """
-    if not _is_interface_name(interface):
+    if not is_interface_name(interface):
         raise ValueError(
             "interface must be a network interface name of at most "
             f"{MAXIMUM_INTERFACE_NAME_LENGTH} characters, got {interface!r}"
@@ -111,26 +114,40 @@ def _normalized(outputs: Iterable[Optional[str]]) -> List[str]:
     at all, and a single unusable token must not discard the usable addresses
     reported next to it.
     """
-    addresses = set()
+    tokens = []
     for output in outputs:
         if not isinstance(output, str):
             continue
-        for token in SEPARATORS.split(output):
-            address = _address(token.strip(BRACKETS))
-            if address is not None:
-                addresses.add(address)
-    return [str(address) for address in sorted(addresses, key=_family_then_value)]
+        tokens.extend(token.strip(BRACKETS) for token in SEPARATORS.split(output))
+    return normalize_upstreams(tokens)
 
 
-def _address(token: str) -> Optional[Address]:
-    """Return the address ``token`` names, or None if a query cannot use it."""
-    if not token:
+def normalize_upstreams(values: Iterable[str]) -> List[str]:
+    """Return the usable addresses named by ``values``, deduplicated and ordered.
+
+    This is the one definition of what an upstream list looks like, and the
+    publisher reuses it so the two writers of an upstream set cannot disagree
+    about which addresses survive or in which order they are recorded.
+    """
+    addresses = {address for address in map(usable_address, values) if address is not None}
+    return sorted(addresses, key=_family_then_value)
+
+
+def usable_address(token: str) -> Optional[str]:
+    """Return the bare canonical address ``token`` names, or None if unusable.
+
+    An empty result is not an error: a source may report anything at all, and a
+    caller that needs a hard failure validates the returned value itself.
+    """
+    if not token or not isinstance(token, str):
         return None
     try:
         address = ipaddress.ip_address(token)
     except ValueError:
         return None
-    return address if _usable_upstream(address) else None
+    if not _usable_upstream(address):
+        return None
+    return str(address)
 
 
 def _usable_upstream(address: Address) -> bool:
@@ -153,13 +170,14 @@ def _usable_upstream(address: Address) -> bool:
     return True
 
 
-def _family_then_value(address: Address) -> Tuple[int, Address]:
+def _family_then_value(value: str) -> Tuple[int, Address]:
     """Order addresses IPv4 first, then numerically inside each family.
 
     The published state must not change just because a lease renewed its
     addresses in a different order, so the order is derived from the value
     itself and never from the order a source happened to report.
     """
+    address = ipaddress.ip_address(value)
     return (address.version, address)
 
 
@@ -180,12 +198,14 @@ def _read(run: CommandRunner, argv: Sequence[str]) -> Optional[str]:
     return output if isinstance(output, str) else None
 
 
-def _is_interface_name(interface: str) -> bool:
+def is_interface_name(interface: str) -> bool:
     """Report whether ``interface`` is a device name the kernel could own.
 
     The name is handed to fixed argument arrays, so no shell can reinterpret it;
     the narrow pattern is defense in depth that also keeps whitespace, a path
-    separator, and shell metacharacters out of the published state.
+    separator, and shell metacharacters out of the published state. The
+    publisher validates the same name before it is written, and a state file
+    whose interface this rejects is one the Go state validator rejects too.
     """
     if not isinstance(interface, str):
         return False

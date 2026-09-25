@@ -265,7 +265,6 @@ class InterfaceTests(unittest.TestCase):
             "vlan_2",
             "br-lan",
             "2eth0",
-            "enp3s0:1",
             "abcdefghijklmno",
         ]:
             with self.subTest(interface=interface):
@@ -274,6 +273,7 @@ class InterfaceTests(unittest.TestCase):
     def test_rejects_an_interface_name_that_could_carry_a_second_command(self):
         for interface in [
             "",
+            "enp3s0:1",
             "enp3s0 eth0",
             "enp3s0;id",
             "enp3s0|id",

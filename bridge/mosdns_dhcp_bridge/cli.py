@@ -1,0 +1,236 @@
+"""Turn one NetworkManager dispatcher event into a published DHCP DNS state.
+
+The dispatcher runs this program with the event's variables in the environment
+and reads nothing but the exit status, so the module is a thin, honest shell
+around two decisions:
+
+* **Which event is this, and which interface is it about?** The action comes from
+  ``NM_DISPATCHER_ACTION``; the interface comes from ``DEVICE_IP_IFACE``, then
+  ``INTERFACE``, then ``DEVICE`` -- the three variables NetworkManager defines
+  as an interface, in that order of specificity. ``NM_DISPLAY_NAME`` is a
+  connection profile's human-readable name, never a device name, so it is not
+  consulted. An action the bridge does not handle is not an error: NetworkManager
+  runs this program for events that have nothing to do with DNS, and the right
+  answer to those is to change nothing and succeed.
+* **Does this event change the published state?** The publisher answers that, and
+  only the actions that collect have their address list read first. A ``down``
+  event publishes no resolvers and never runs a command, because the lease those
+  resolvers came from is gone.
+
+The module also owns the exit status the dispatcher acts on. Nothing here calls
+``sys.exit``: ``main`` returns a code, and only the process entry point turns it
+into an exit status, so every path is testable.
+"""
+
+from __future__ import annotations
+
+import datetime
+import os
+import subprocess
+import sys
+from typing import Dict, List, Mapping, Sequence, Tuple
+
+from .collect import CommandRunner, collect_dns, is_interface_name
+from .publish import (
+    InvalidStateError,
+    LockUnavailable,
+    PublicationError,
+    publish_if_changed,
+)
+
+__all__ = ["main", "console_entry", "real_runner"]
+
+USAGE = "usage: mosdns-dhcp-bridge --state-file PATH --lock-file PATH"
+
+# The dispatcher names the event in this variable. An absent or empty one means
+# the program was not run by the dispatcher at all, which is a misconfiguration
+# worth reporting rather than ignoring.
+ACTION_VARIABLE = "NM_DISPATCHER_ACTION"
+
+# The variables NetworkManager defines as the interface, most specific first.
+# DEVICE_IP_IFACE is the interface the IP configuration is bound to, INTERFACE is
+# the dispatcher script's own interface, and DEVICE is the last resort.
+INTERFACE_VARIABLES = ("DEVICE_IP_IFACE", "INTERFACE", "DEVICE")
+
+CONNECTION_UUID_VARIABLE = "CONNECTION_UUID"
+
+# The source recorded for each action names where the addresses came from. The
+# two lease changes record the family whose lease delivered them, because that is
+# what a reader comparing two generations needs to know, and the two lifecycle
+# events record that no lease is in play right now.
+SOURCE_BY_ACTION = {
+    "up": "networkmanager",
+    "dhcp4-change": "dhcp4",
+    "dhcp6-change": "dhcp6",
+    "dns-change": "networkmanager",
+    "down": "down",
+}
+
+# A down event publishes an empty list instead of collecting: the addresses the
+# collector would find belong to a lease that no longer exists.
+DISABLING_ACTION = "down"
+
+OPTIONS = ("--state-file", "--lock-file")
+
+# A read-only nmcli or resolvectl query against NetworkManager's own state
+# answers in milliseconds. The bound only exists so a wedged D-Bus cannot hold a
+# dispatcher slot open; a command that reaches it is treated as an unavailable
+# source by the collector, not as a failure.
+COMMAND_TIMEOUT_SECONDS = 5.0
+
+EXIT_SUCCESS = 0
+EXIT_INVALID_INPUT = 2
+EXIT_LOCKED = 3
+EXIT_STATE = 4
+
+
+def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int:
+    """Publish the state for one dispatcher event and return its exit status.
+
+    ``argv`` is the command line without the program name, ``env`` the dispatcher's
+    environment, and ``run`` executes one read-only command. Returns 0 when the
+    state was published or was already current, 2 for a command line or
+    environment the bridge cannot act on, 3 while another bridge process holds
+    the publication lock, and 4 when the state could not be published.
+
+    Nothing raises out of this function. The dispatcher reads the exit status and
+    nothing else, so a raised error would replace a documented status with a
+    traceback and leave an operator guessing which stage failed.
+    """
+    try:
+        state_file, lock_file = _options(argv)
+    except ValueError as error:
+        return _fail(EXIT_INVALID_INPUT, str(error))
+
+    action = env.get(ACTION_VARIABLE, "")
+    if not isinstance(action, str) or not action:
+        return _fail(EXIT_INVALID_INPUT, f"{ACTION_VARIABLE} is not set")
+    if action not in SOURCE_BY_ACTION:
+        # An event this bridge does not act on: no command is run and no file is
+        # touched, so the state keeps describing the last real lease.
+        return EXIT_SUCCESS
+
+    try:
+        interface = _interface(env)
+    except ValueError as error:
+        return _fail(EXIT_INVALID_INPUT, str(error))
+
+    if action == DISABLING_ACTION:
+        upstreams: List[str] = []
+    else:
+        try:
+            upstreams = collect_dns(env, interface, run)
+        except ValueError as error:
+            return _fail(EXIT_INVALID_INPUT, str(error))
+
+    try:
+        publish_if_changed(
+            state_file,
+            interface=interface,
+            connection_uuid=env.get(CONNECTION_UUID_VARIABLE, ""),
+            upstreams=upstreams,
+            source=SOURCE_BY_ACTION[action],
+            now=_observed_now(),
+            lock_path=lock_file,
+        )
+    except LockUnavailable as error:
+        return _fail(EXIT_LOCKED, str(error))
+    except (InvalidStateError, PublicationError, OSError) as error:
+        return _fail(EXIT_STATE, str(error))
+    except ValueError as error:
+        return _fail(EXIT_INVALID_INPUT, str(error))
+    return EXIT_SUCCESS
+
+
+def _options(argv: Sequence[str]) -> Tuple[str, str]:
+    """Return the state file and lock file the command line names.
+
+    Both are required and neither may be repeated. A default would let a typo in
+    the dispatcher unit create a second, empty state file beside the real one
+    instead of failing.
+    """
+    values: Dict[str, str] = {}
+    index = 0
+    while index < len(argv):
+        option = argv[index]
+        if option not in OPTIONS:
+            raise ValueError(f"unknown argument {option!r}; {USAGE}")
+        if option in values:
+            raise ValueError(f"{option} is given more than once; {USAGE}")
+        if index + 1 >= len(argv):
+            raise ValueError(f"{option} needs a path; {USAGE}")
+        value = argv[index + 1]
+        if not value:
+            raise ValueError(f"{option} needs a non-empty path; {USAGE}")
+        values[option] = value
+        index += 2
+    missing = [option for option in OPTIONS if option not in values]
+    if missing:
+        raise ValueError(f"missing {', '.join(missing)}; {USAGE}")
+    return values["--state-file"], values["--lock-file"]
+
+
+def _interface(env: Mapping[str, str]) -> str:
+    """Return the interface this event is about.
+
+    The value is validated here rather than left to the collector, because the
+    down path never collects and would otherwise publish an interface name no
+    kernel device could own. An event with no interface at all is rejected: the
+    addresses it carries have no meaning without one.
+    """
+    for variable in INTERFACE_VARIABLES:
+        value = env.get(variable, "")
+        if value:
+            if is_interface_name(value):
+                return value
+            raise ValueError(
+                f"{variable} is not a network interface name: {value!r}"
+            )
+    raise ValueError(
+        f"no interface in {', '.join(INTERFACE_VARIABLES)}; "
+        "NM_DISPLAY_NAME is a connection name and is never used as an interface"
+    )
+
+
+def _observed_now() -> datetime.datetime:
+    """Return the time of this event, which is when the addresses are observed."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _fail(code: int, message: str) -> int:
+    """Report a failure on the dispatcher's own error stream and return ``code``.
+
+    The dispatcher collects the program's standard error into the NetworkManager
+    log, so a rejected event says why in one line instead of leaving an operator
+    with a silent exit status.
+    """
+    sys.stderr.write(f"mosdns-dhcp-bridge: {message}\n")
+    return code
+
+
+def real_runner(argv: Sequence[str]) -> str:
+    """Run one read-only command and return its standard output.
+
+    The command is an argument array and never a shell string, so an interface
+    name or an address that reaches this function cannot be reinterpreted. A
+    non-zero status, a missing binary, and a command that outruns the timeout all
+    raise, which the collector reads as "this source could not be read".
+    """
+    completed = subprocess.run(
+        list(argv),
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
+    return completed.stdout
+
+
+def console_entry() -> int:
+    """Run the bridge for the process the dispatcher started."""
+    return main(sys.argv[1:], os.environ, real_runner)
+
+
+if __name__ == "__main__":
+    sys.exit(console_entry())
