@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,17 @@ func main() {
 // It deliberately returns an exit code instead of terminating the process so
 // callers can exercise every CLI outcome in-process.
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWith(args, stdout, stderr, productionServices())
+}
+
+// runWith is run with an explicit services boundary, so a test can point the
+// update-lists command at a local origin while the lock, the publication and the
+// conversion stay the real ones.
+func runWith(args []string, stdout, stderr io.Writer, services listServices) int {
+	return runWithContext(context.Background(), args, stdout, stderr, services)
+}
+
+func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer, services listServices) int {
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -44,6 +56,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runValidate(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
+	case "update-lists":
+		return runUpdateLists(ctx, args[1:], stdout, stderr, services)
 	default:
 		writeCLIError(stderr, "unknown command %q", args[0])
 		return exitInvalidCLI
