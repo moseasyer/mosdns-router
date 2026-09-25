@@ -218,6 +218,55 @@ func TestPublishRestoresTheListWhenTheLockCannotBePublished(t *testing.T) {
 	}
 }
 
+func TestPublishKeepsTheOnlyCopyOfThePreviousListWhenTheRollbackItselfFails(t *testing.T) {
+	// Two failures in a row leave the backup as the only copy of the list the
+	// router was running. Cleaning it up would destroy the last thing that can
+	// put the gateway back on its previous rules, so it is named in the failure
+	// and left where the operator can find it.
+	pair := writePublishedPair(t)
+	calls := 0
+	ops := recordingOps(&[]string{})
+	rename := ops.rename
+	ops.rename = func(from, to string) error {
+		calls++
+		if calls >= 2 {
+			return errors.New("injected rename failure")
+		}
+		return rename(from, to)
+	}
+
+	err := publishWithOps(pair.lockPath, pair.listPath, newLock, []byte(newList), ops)
+	if err == nil {
+		t.Fatal("publish reported success although neither the lock nor the rollback worked")
+	}
+	if !strings.Contains(err.Error(), "the previous list is kept at") {
+		t.Fatalf("error = %v, want it to name the kept backup", err)
+	}
+	entries, readErr := os.ReadDir(pair.dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var backups []string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".bak") {
+			backups = append(backups, entry.Name())
+		}
+	}
+	if len(backups) != 1 {
+		t.Fatalf("directory holds %v, want exactly one kept backup", entryNames(entries))
+	}
+	kept, readErr := os.ReadFile(filepath.Join(pair.dir, backups[0]))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(kept) != oldList {
+		t.Fatalf("kept backup = %q, want the previous list %q", kept, oldList)
+	}
+	if !strings.Contains(err.Error(), backups[0]) {
+		t.Errorf("error = %v, want it to name the kept backup file %s", err, backups[0])
+	}
+}
+
 func TestPublishRemovesTheNewListWhenTheLockCannotBePublished(t *testing.T) {
 	// A first pin has no previous pair, so there is nothing to restore: the list
 	// the failed pin created has to go, or the router would read a list no lock

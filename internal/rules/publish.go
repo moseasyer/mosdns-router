@@ -189,10 +189,9 @@ func (s stagedFile) discard(err *error, ops fileOps) {
 // publication can put it back. A target that did not exist has nothing to copy,
 // and a rollback for it removes the file the failed publication created.
 type backupFile struct {
-	path     string
-	existed  bool
-	restored bool
-	keep     bool
+	path    string
+	existed bool
+	keep    bool
 }
 
 func takeBackup(target string, ops fileOps) (backupFile, error) {
@@ -236,8 +235,10 @@ func takeBackup(target string, ops fileOps) (backupFile, error) {
 
 // restore puts the previous contents of a target back after a failed
 // publication: by renaming the backup over a file that existed before, and by
-// removing a file the failed publication created when there was none.
-func (b backupFile) restore(target string, ops fileOps) error {
+// removing a file the failed publication created when there was none. The
+// receiver is a pointer because a rollback that succeeds has to be visible to the
+// deferred cleanup that runs after it.
+func (b *backupFile) restore(target string, ops fileOps) error {
 	if !b.existed {
 		if err := ops.remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -247,16 +248,15 @@ func (b backupFile) restore(target string, ops fileOps) error {
 	if err := ops.rename(b.path, target); err != nil {
 		return err
 	}
-	b.restored = true
 	return ops.syncDir(filepath.Dir(target))
 }
 
 // discard removes a backup that is no longer needed: either because the
-// publication succeeded, or because a rollback already renamed it back. A backup
-// that is still the only copy of the previous contents is kept and named in the
-// failure instead.
-func (b backupFile) discard(err *error, ops fileOps) {
-	if b.path == "" || b.restored || b.keep {
+// publication succeeded, or because a rollback already renamed it back, in which
+// case the path is simply gone. A backup that is still the only copy of the
+// previous contents is kept and named in the failure instead.
+func (b *backupFile) discard(err *error, ops fileOps) {
+	if b.path == "" || b.keep {
 		return
 	}
 	if removeErr := ops.remove(b.path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
