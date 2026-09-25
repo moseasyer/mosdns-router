@@ -610,6 +610,17 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0", count, foreignDomain)
 	}
 
+	// Asking again is answered by the foreign cache, and the resolver is not
+	// asked twice. The cache plugin always runs the rules after it, so this only
+	// holds because the branch ends on has_resp: without that check a cache hit
+	// would be forwarded as well and the cache would save nothing.
+	if got := addressesIn(t, ask(t, listenAddress, foreignDomain)); len(got) != 1 || got[0] != "203.0.113.10" {
+		t.Errorf("the repeated %s = %v, want the cached answer [203.0.113.10]", foreignDomain, got)
+	}
+	if count := foreign.Count("", foreignDomain); count != 1 {
+		t.Errorf("the foreign resolver received %d queries for %s in total, want 1: the second must come from the cache", count, foreignDomain)
+	}
+
 	instance.CloseWithErr(nil)
 	_ = instance.GetSafeClose().WaitClosed()
 }
