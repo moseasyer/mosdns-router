@@ -482,16 +482,42 @@ def _sync_directory(directory: str) -> None:
 def _ensure_directory(path: str) -> None:
     """Create the directory of ``path`` with the runtime mode when it is absent.
 
-    The mode is pinned on a directory this module creates, because the umask
+    The mode is pinned on a directory this module created, because the umask
     would otherwise leave the runtime state readable only by its owner. A
-    directory that already exists is left as it is: its ownership and its
-    default ACLs belong to the packaging, not to the bridge.
+    directory that is already there is left exactly as it is: its setgid bit and
+    its default ACLs belong to the packaging, and a second process that created
+    the same directory in the meantime has just proved that the provisioning is
+    in place.
     """
     directory = os.path.dirname(path) or "."
-    if os.path.isdir(directory):
-        return
-    os.makedirs(directory, mode=DIRECTORY_MODE, exist_ok=True)
-    os.chmod(directory, DIRECTORY_MODE)
+    for created in _missing_directories(directory):
+        try:
+            os.mkdir(created, DIRECTORY_MODE)
+        except FileExistsError:
+            # Another process created this one between the check above and now,
+            # so its mode is not this module's to pin.
+            continue
+        os.chmod(created, DIRECTORY_MODE)
+
+
+def _missing_directories(directory: str) -> List[str]:
+    """Return the directories ``directory`` needs, in the order to create them.
+
+    The walk stops at the first directory that exists, so only the levels that
+    are really absent are created and an existing parent is never touched. The
+    result runs from the outermost missing level to the directory itself, which
+    is the order they have to be created in.
+    """
+    missing: List[str] = []
+    current = directory
+    while not os.path.isdir(current):
+        missing.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    missing.reverse()
+    return missing
 
 
 def _is_source_token(source: Any) -> bool:

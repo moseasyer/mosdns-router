@@ -576,6 +576,75 @@ class ExistingStateTests(unittest.TestCase):
                 self.assertEqual(self.state_path.read_bytes(), payload)
 
 
+class RuntimeDirectoryTests(unittest.TestCase):
+    """The mode of the runtime directory, and whose it is to pin.
+
+    The bridge runs as root while the router runs as the service user, so the
+    packaging provisions ``/run/mosdns`` setgid with a default ACL and both
+    identities write into it. Stripping that after the fact would let one process
+    lock the other out of the state file.
+    """
+
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(self.workspace.cleanup)
+        self.directory = Path(self.workspace.name)
+        self.target = self.directory / "run" / "mosdns"
+
+    def publish(self, state_path):
+        return publish_if_changed(
+            str(state_path),
+            interface=INTERFACE,
+            connection_uuid=UUID,
+            upstreams=["192.168.1.1"],
+            source="nm-dhcp4",
+            now=NOW,
+        )
+
+    def provision(self, mode):
+        self.target.parent.mkdir()
+        self.target.mkdir()
+        os.chmod(self.target, mode)
+        return self.target / "dhcp-upstreams.json"
+
+    def test_a_directory_the_bridge_created_is_pinned_to_the_runtime_mode(self):
+        state = self.target / "dhcp-upstreams.json"
+        with _umask(0o077):
+            self.assertTrue(self.publish(state))
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o750)
+
+    def test_a_directory_that_already_existed_is_left_exactly_as_it_is(self):
+        state = self.provision(0o2750)
+        self.assertTrue(self.publish(state))
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o2750)
+
+    def test_a_directory_a_concurrent_creator_won_the_race_for_keeps_its_setgid_bit(self):
+        """The mode is pinned only for a directory this process created.
+
+        Two dispatcher events can reach the runtime directory at the same moment
+        on a machine where the bridge was installed while it was already running.
+        The check that found no directory and the creation that then found one
+        already there is that interleaving, and a chmod afterwards would take
+        the setgid bit and the default ACL away from the packaging.
+        """
+        state = self.provision(0o2750)
+        existing = os.path.isdir
+        raced = []
+
+        def checked(path):
+            if os.fspath(path) == str(self.target) and not raced:
+                raced.append(path)
+                return False
+            return existing(path)
+
+        with mock.patch("os.path.isdir", checked):
+            self.assertTrue(self.publish(state))
+
+        self.assertEqual(raced, [str(self.target)], "the test did not reproduce the create race")
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o2750)
+        self.assertTrue(state.is_file())
+
+
 class LockTests(unittest.TestCase):
     """One bridge process at a time, enforced by a real advisory lock."""
 
