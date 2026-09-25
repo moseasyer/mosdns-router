@@ -53,6 +53,7 @@ internal/filelock/lock.go
 internal/filelock/lock_test.go
 internal/status/render.go
 internal/status/render_test.go
+scripts/test-make-entrypoints.sh
 ```
 
 ### Shared interfaces produced by this plan
@@ -167,14 +168,16 @@ module mosdns-router
 
 go 1.25.0
 
-toolchain go1.25.0
-
 require (
     github.com/IrineSistiana/mosdns/v5 v5.3.4
     github.com/spf13/cobra v1.10.2
     gopkg.in/yaml.v3 v3.0.1
 )
 ```
+
+A `toolchain` directive is not added: `go 1.25.0` already pins the language
+version, `go mod tidy` strips a redundant `toolchain` line, and the Make entry
+points enforce the exact compiler instead.
 
 Create `internal/buildinfo/buildinfo_test.go`:
 
@@ -589,19 +592,29 @@ mosdns-cdnctl status --selector PATH --dhcp PATH --ech PATH
 
 ```make
 GO ?= go
-LDFLAGS = -s -w
-.PHONY: test build cross-build verify
-build:
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
-cross-build:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+GO_REQUIRED_VERSION := 1.25.0
+LDFLAGS ?= -s -w
+.PHONY: check-go test build cross-build verify
+check-go:
+	@# refuse any Go release other than $(GO_REQUIRED_VERSION)
 test:
-	$(GO) test ./...
+	@$(GO) test -mod=readonly ./...
+	@sh scripts/test-make-entrypoints.sh
+build:
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
+cross-build:
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
 verify: test
-	$(GO) vet ./...
+	@$(GO) vet -mod=readonly ./...
 ```
+
+Every entry point depends on `check-go`, and every Go command uses
+`-mod=readonly`, so no build target can act as an implicit dependency updater.
+`scripts/test-make-entrypoints.sh` proves the guard and the readonly flag on
+every entry point; a missing or missing-version `go.mod` fix therefore has to be
+applied by an explicit `go mod tidy` that a developer reviews.
 
 - [ ] **Step 6: Run complete local verification**
 
@@ -627,6 +640,9 @@ git commit -m "build: add reproducible project entry points"
 Run:
 
 ```bash
+go mod tidy -diff
+go test ./...
+go vet ./...
 make verify
 make cross-build
 git status --short
@@ -634,6 +650,8 @@ git status --short
 
 Expected:
 
+- `go mod tidy -diff` reports no difference and leaves `go.mod`/`go.sum` untouched;
+- plain `go test ./...` and `go vet ./...` work with no `GOFLAGS` and no `-mod=mod`;
 - all Go tests and vet pass;
 - amd64 and arm64 static binaries build;
 - no system networking or browser configuration changed;

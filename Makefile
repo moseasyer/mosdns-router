@@ -1,30 +1,47 @@
 GO ?= go
-LDFLAGS = -s -w
-MODULE_SAFE = sh scripts/go-module-safe.sh
 
-.PHONY: test test-go-module-wrapper build cross-build verify
+# Every entry point refuses to run on a different Go release: the module pins
+# go 1.25.0 and the reproducible build metadata assumes exactly that compiler.
+GO_REQUIRED_VERSION := 1.25.0
 
-# The wrapper snapshots and byte-restores go.mod and go.sum around every
-# module-mutating Go invocation, including failures and signals. Build targets
-# therefore cannot act as an implicit dependency updater; use an explicit tidy
-# workflow and review its module-file changes separately.
-test: test-go-module-wrapper
-	@$(MODULE_SAFE) $(GO) test -mod=mod ./...
+LDFLAGS ?= -s -w
 
-# This is a separate, non-recursive target: the regression harness exercises
-# the wrapper in an isolated fixture and never invokes `make test` recursively.
-test-go-module-wrapper:
-	@sh scripts/test-go-module-safe.sh
+.PHONY: check-go test test-make-entrypoints build cross-build verify
 
-build:
+# The guard is the only place that decides whether this host's Go is acceptable.
+check-go:
+	@if ! version=$$($(GO) version 2>&1); then \
+		echo "mosdns-router: '$(GO)' is not a usable Go toolchain: $$version" >&2; \
+		exit 1; \
+	fi; \
+	set -- $$version; \
+	if [ "$$3" != "go$(GO_REQUIRED_VERSION)" ]; then \
+		echo "mosdns-router: Go $(GO_REQUIRED_VERSION) is required, found $${3:-unknown}" >&2; \
+		exit 1; \
+	fi
+
+# -mod=readonly on every Go command makes the entry points unable to act as an
+# implicit dependency updater: a stale go.mod or go.sum fails the command
+# instead of being silently rewritten. Run `go mod tidy` explicitly and review
+# its module-file changes as a separate step.
+test: check-go
+	@$(GO) test -mod=readonly ./...
+	@sh scripts/test-make-entrypoints.sh
+
+# This is a separate, non-recursive target: the regression harness inspects the
+# real Makefile with `make -n` and never invokes `make test` recursively.
+test-make-entrypoints:
+	@sh scripts/test-make-entrypoints.sh
+
+build: check-go
 	@mkdir -p build
-	@$(MODULE_SAFE) $(GO) build -mod=mod -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
-	@$(MODULE_SAFE) $(GO) build -mod=mod -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-router ./cmd/mosdns-router
+	@$(GO) build -mod=readonly -trimpath -ldflags '$(LDFLAGS)' -o build/mosdns-cdnctl ./cmd/mosdns-cdnctl
 
-cross-build:
+cross-build: check-go
 	@mkdir -p build/linux-amd64 build/linux-arm64
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(MODULE_SAFE) $(GO) build -mod=mod -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
-	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(MODULE_SAFE) $(GO) build -mod=mod -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -mod=readonly -trimpath -o build/linux-amd64/mosdns-router ./cmd/mosdns-router
+	@CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -mod=readonly -trimpath -o build/linux-arm64/mosdns-router ./cmd/mosdns-router
 
 verify: test
-	@$(MODULE_SAFE) $(GO) vet -mod=mod ./...
+	@$(GO) vet -mod=readonly ./...
