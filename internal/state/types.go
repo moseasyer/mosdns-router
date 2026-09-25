@@ -269,11 +269,6 @@ func validateSchema(version int) error {
 	return nil
 }
 
-func validIPAddress(value string) bool {
-	_, err := netip.ParseAddr(value)
-	return err == nil
-}
-
 func validIPv4Address(value string) bool {
 	address, err := netip.ParseAddr(value)
 	return err == nil && !address.Is4In6() && address.Is4()
