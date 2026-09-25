@@ -6,7 +6,7 @@
 
 **Architecture:** A small Go module named `mosdns-router` wraps upstream MOSDNS v5.3.4 through its public plugin APIs rather than forking the repository. Shared policy and runtime-state contracts live under `internal/`; later plans implement the DHCP bridge, DNSCrypt integration, optimizer, and response plugins against those contracts.
 
-**Tech Stack:** Go 1.25, MOSDNS v5.3.4, `miekg/dns` v1.1.72 through MOSDNS, Cobra v1.10.2, YAML v3, standard-library tests, Make.
+**Tech Stack:** Go 1.25, MOSDNS v5.3.4, `miekg/dns` v1.1.70 through MOSDNS, Cobra v1.10.2, YAML v3, standard-library tests, Make.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`
 

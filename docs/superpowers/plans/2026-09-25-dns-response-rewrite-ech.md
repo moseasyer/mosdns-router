@@ -6,7 +6,7 @@
 
 **Architecture:** One recursive MOSDNS plugin wraps the foreign cache/forward path. It can short-circuit strict A/AAAA queries before any upstream/cache lookup, call the next sequence for normal queries, and then mutate only validated responses. ECHConfig bytes are fetched directly through the foreign DNSCrypt upstream, validated in memory, and never routed back through the rewrite plugin.
 
-**Tech Stack:** Go 1.25, MOSDNS v5.3.4 recursive plugin API, `miekg/dns` v1.1.72 SVCB/HTTPS support, RFC 9848/9849 binary parsing, atomic state, local DNS/TLS mocks.
+**Tech Stack:** Go 1.25, MOSDNS v5.3.4 recursive plugin API, `miekg/dns` v1.1.70 SVCB/HTTPS support, RFC 9848/9849 binary parsing, atomic state, local DNS/TLS mocks.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`
 
