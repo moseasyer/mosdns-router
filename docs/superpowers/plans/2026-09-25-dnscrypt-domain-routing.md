@@ -13,7 +13,8 @@
 ## Global Constraints
 
 - No generated domestic upstream may contain a Chinese public DNS address.
-- Foreign user queries must enter `127.0.0.1:15353` and must never fall back to the DHCP plugin.
+- Foreign user queries must enter `127.0.0.1:15353` over TCP and must never fall back to the DHCP plugin.
+- The local DNSCrypt listener must serve TCP as well as UDP, because the foreign forward uses TCP.
 - DNSCrypt configuration must use complete DNS stamps, not bare resolver IPs.
 - Default DNSCrypt endpoints are Quad9 Secure DNSCrypt v2, IPv4, no ECS, with authenticated provider certificates.
 - Plain bootstrap is used only for DNSCrypt provider-name resolution and must not receive ordinary user queries.
@@ -107,6 +108,7 @@ func TestDefaultsAreQuad9SecureV4WithoutECS(t *testing.T) {
 Decode the output with a TOML parser and assert:
 
 - `listen_addresses` contains only `127.0.0.1:15353`;
+- the listener serves TCP as well as UDP, which dnscrypt-proxy does for every listen address, so the configuration must not narrow it and the rendered `dnscrypt-proxy.toml` must carry no protocol restriction on that address;
 - `server_names` exactly matches the three static names;
 - `ignore_system_dns = true`;
 - `cache = false`;
@@ -262,7 +264,7 @@ udp_server
 tcp_server
 ```
 
-Assert both servers listen on `127.0.0.1:53`, foreign forward points only to `udp://127.0.0.1:15353`, and CN dispatch checks `qname $cn_domains` before default foreign dispatch.
+Assert both servers listen on `127.0.0.1:53`, foreign forward points only to `tcp://127.0.0.1:15353`, and CN dispatch checks `qname $cn_domains` before default foreign dispatch. The foreign upstream is TCP because MOSDNS v5.3.4's stock UDP transport was measured re-sending unanswered queries and dropping answers that arrived before its exchange waited for them -- the same behavior the domestic branch stopped accepting by owning its own one-write UDP exchange, and the foreign branch has no such client, so it is given the transport that does not lose a query.
 
 - [ ] **Step 2: Write failing safety tests**
 
@@ -306,7 +308,7 @@ Render `dhcp_forward` with `cache_entries: 4096`; its cache is generation-scoped
 127.0.0.1:15353
 ```
 
-No user-specific DHCP address appears in the file.
+The listener entry is the foreign upstream `tcp://127.0.0.1:15353`, never a `udp://` URL. No user-specific DHCP address appears in the file.
 
 - [ ] **Step 6: Run tests**
 
@@ -346,7 +348,7 @@ example.com A      -> foreign mock only
 
 - [ ] **Step 2: Add leak and truncation cases**
 
-Stop the foreign mock and assert `example.com` returns SERVFAIL while its query count at the domestic mock does not increase. Force a truncated foreign UDP answer and assert TCP succeeds. Query HTTPS type 65 and a >512-byte TXT response to exercise arbitrary type and TCP behavior.
+Stop the foreign mock and assert `example.com` returns SERVFAIL while its query count at the domestic mock does not increase. Assert the foreign query reached the mock over TCP, because a foreign forward left on `udp://` is the transport that drops and duplicates answers. Query HTTPS type 65 and a >512-byte TXT response to exercise arbitrary type and large-answer behavior over TCP.
 
 - [ ] **Step 3: Add a startup guard test**
 

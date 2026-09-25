@@ -446,7 +446,7 @@ Assert foreign path order:
 cdn_rewrite -> foreign_cache -> foreign_forward
 ```
 
-Assert `cdn_rewrite` is not in the domestic path and receives the policy file, selector, allowlist, ECH metadata, direct foreign upstream, and Cloudflare CIDR file. The plugin loads AAAA suppression, ECH failure policy, and stale grace through `config.Load` so one policy file is authoritative.
+Assert `cdn_rewrite` is not in the domestic path and receives the policy file, selector, allowlist, ECH metadata, direct foreign upstream, and Cloudflare CIDR file. That direct foreign upstream is `tcp://127.0.0.1:15353`, the same loopback TCP listener the foreign forward uses: ECHConfig bytes are fetched from the same resolver through the same transport, and MOSDNS's stock UDP transport is measured re-sending unanswered queries and dropping answers, so an ECH fetch must not be the one place that uses it. The plugin loads AAAA suppression, ECH failure policy, and stale grace through `config.Load` so one policy file is authoritative.
 
 - [ ] **Step 2: Run renderer tests and verify failure**
 

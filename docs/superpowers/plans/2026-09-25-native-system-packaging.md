@@ -80,6 +80,10 @@ Python interfaces:
 mosdns-dhcp-bridge --capture-current INTERFACE --state-file PATH --lock-file PATH
 ```
 
+The dispatcher script is installed as
+`/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge` with mode `0755`
+and invokes `python3 -m mosdns_dhcp_bridge.cli --state-file /run/mosdns/dhcp-upstreams.json --lock-file /run/mosdns/dhcp-bridge.lock INTERFACE ACTION`, or an installed wrapper that runs that exact module invocation. `no-wait.d` is the directory for a script that must not block the event, because the bridge only reads NetworkManager state and rewrites one runtime file; a blocking hook would hold a DHCP event open for the length of an `nmcli` call. Pinning the module invocation keeps the package's Python path explicit, and the dispatcher runs it as root with NetworkManager's own `script INTERFACE ACTION` arguments.
+
 ---
 
 ### Task 1: Add current-DHCP capture mode for first installation
@@ -94,7 +98,7 @@ mosdns-dhcp-bridge --capture-current INTERFACE --state-file PATH --lock-file PAT
 
 - [ ] **Step 1: Write failing capture-current tests**
 
-Use a fake runner and assert exact `nmcli` calls for raw DHCP4/DHCP6 fields, interface validation, unchanged-file behavior, and empty-DNS publication.
+Use a fake runner and assert exact `nmcli` calls for raw DHCP4/DHCP6 fields, interface validation, unchanged-file behavior, and empty-DNS publication. A capture must also record the source the collector reports, and an event whose resolvers were already published must not advance the generation.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -106,7 +110,11 @@ Expected: CLI rejects `--capture-current`.
 
 - [ ] **Step 3: Implement mutually exclusive modes**
 
-Support either dispatcher environment mode or `--capture-current INTERFACE`; reject both and neither. Capture-current uses source `installer-current` and must pass `internal/dhcpstate.VerifyFixture` in integration tests.
+Support either dispatcher environment mode or `--capture-current INTERFACE`; reject both and neither.
+
+Capture-current is the dispatcher's publication path with an explicit interface, not a second writer: it calls `collect_dns_with_source(env, interface, run)` and `publish_if_changed(...)` with the addresses and the source that answered, so an install that captures the current lease and the first `up` event that follows it record one state instead of two generations. It never invents a source of its own: `installer-current` is not a token any collector can produce, and a state naming it would be a document the router's source vocabulary does not cover.
+
+`CONNECTION_UUID` comes from the environment when the caller has it, and otherwise from `nmcli -g GENERAL.CONNECTION device show INTERFACE`, because a state with upstreams must record the connection the lease belongs to and an empty one would be refused as invalid. The result must pass `internal/dhcpstate.VerifyFixture` in integration tests.
 
 - [ ] **Step 4: Run tests**
 
@@ -370,6 +378,9 @@ reload systemd
 optionally purge state
 ```
 
+The installed hook is the `no-wait.d` dispatcher script this plan installs, and
+uninstall removes exactly that file.
+
 - [ ] **Step 4: Implement `emergency-rollback`**
 
 Restore only the last valid backup, verify the connection has a usable DNS path, and leave binaries/config installed for diagnosis. This command must work even if normal preflight fails.
@@ -412,7 +423,7 @@ git commit -m "feat: add safe uninstall and rollback"
 
 - [ ] **Step 1: Write package-content tests**
 
-Add a test that builds a staging root and asserts binaries, units, configs, installer, and dispatcher script are present with correct modes; `/var/lib/mosdns` is an empty state directory, not a shipped state file.
+Add a test that builds a staging root and asserts binaries, units, configs, installer, and dispatcher script are present with correct modes; `/var/lib/mosdns` is an empty state directory, not a shipped state file. The dispatcher script is the one named in this plan's interfaces -- `/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge`, mode `0755`, invoking `python3 -m mosdns_dhcp_bridge.cli` with the state and lock paths -- and the test reads its `Exec` line to prove the installed hook runs that invocation rather than a bare script name that depends on `$PATH` and on an interactive login shell's environment.
 
 - [ ] **Step 2: Add shipped configs**
 
