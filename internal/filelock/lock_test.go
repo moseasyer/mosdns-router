@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -127,13 +129,65 @@ func TestAcquireCreatesLockFileWithRequiredMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Close()
-	info, err := os.Stat(path)
+	assertFileMode(t, path, 0640)
+}
+
+// The mode must be exact rather than "whatever the caller's umask leaves
+// behind", so a restrictive umask cannot silently narrow the control lock file.
+func TestAcquireCreatesExactModeUnderRestrictiveUmask(t *testing.T) {
+	setUmask(t, 0o077)
+	path := filepath.Join(t.TempDir(), "control.lock")
+	lock, err := Acquire(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0640 {
-		t.Fatalf("lock file mode = %04o, want 0640", got)
+	defer lock.Close()
+	assertFileMode(t, path, 0640)
+}
+
+// A refused acquirer must still leave the lock file at the required mode. The
+// permissions of the file that guards runtime state must not depend on which
+// process won the lock race, so the mode is enforced before the lock is taken
+// rather than only on the success path.
+func TestRefusedAcquireStillRepairsMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.lock")
+	held, err := Acquire(path)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer held.Close()
+	// Simulate an operator or installer loosening the file while it is held.
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := Acquire(path)
+	if err == nil {
+		blocked.Close()
+		t.Fatal("expected ErrLocked while the lock is held")
+	}
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("error = %v, want ErrLocked", err)
+	}
+	assertFileMode(t, path, 0640)
+}
+
+// A lock file left behind by an earlier version, an installer, or an operator
+// must be repaired on acquire, because the lock guards runtime state that is
+// never meant to be world accessible.
+func TestAcquireRepairsPreExistingMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.lock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := Acquire(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	assertFileMode(t, path, 0640)
 }
 
 // Only a lock conflict means "another holder exists"; a failure to open the
@@ -188,6 +242,26 @@ func TestFilelockHelperProcess(t *testing.T) {
 	if err := lock.Close(); err != nil {
 		fmt.Fprintln(os.Stdout, helperFailed+": "+err.Error())
 	}
+}
+
+func assertFileMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("lock file mode = %04o, want %04o", got, want)
+	}
+}
+
+// setUmask changes the process-wide umask for one test and restores it during
+// cleanup. The umask is process-global state, so no test in this package uses
+// t.Parallel and the umask is always restored before the next test starts.
+func setUmask(t *testing.T, mask int) {
+	t.Helper()
+	previous := unix.Umask(mask)
+	t.Cleanup(func() { unix.Umask(previous) })
 }
 
 type helperProcess struct {

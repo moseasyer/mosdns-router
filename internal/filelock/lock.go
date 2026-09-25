@@ -19,7 +19,8 @@ import (
 // description, which for this package always means another holder exists.
 var ErrLocked = errors.New("control lock is already held")
 
-// lockFileMode matches the mode used for other runtime state files.
+// lockFileMode is the exact mode every control lock file must carry, whatever
+// the caller's umask or the file's previous mode.
 const lockFileMode = 0640
 
 // Lock holds an exclusive advisory lock on a control lock file. The lock is
@@ -31,11 +32,18 @@ type Lock struct {
 }
 
 // Acquire takes the control lock at path without blocking, creating the lock
-// file when it is absent. It returns ErrLocked when the lock is already held.
+// file when it is absent and enforcing mode 0640 on it. It returns ErrLocked
+// when the lock is already held.
 func Acquire(path string) (*Lock, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, lockFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("%s: open control lock: %w", path, err)
+	}
+	// OpenFile applies the mode only when it creates the file, and the umask
+	// can narrow what it creates, so pin the exact mode on every acquire.
+	if err := file.Chmod(lockFileMode); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("%s: set control lock mode: %w", path, err)
 	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		// EWOULDBLOCK is EAGAIN on every platform this package builds for, and
