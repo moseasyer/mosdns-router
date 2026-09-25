@@ -122,6 +122,28 @@ func TestRepeatedCloseReturnsNil(t *testing.T) {
 	}
 }
 
+// The control lock never writes anything: it is a mutual-exclusion device for
+// runtime state that other components own. A write-capable descriptor would let
+// any holder of the lock file corrupt or truncate the state it is supposed to
+// protect, so the descriptor must be opened read-only even though creating the
+// file needs write permission on the directory.
+func TestAcquireOpensTheLockFileReadOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.lock")
+	lock, err := Acquire(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+
+	status, err := unix.FcntlInt(lock.file.Fd(), unix.F_GETFL, 0)
+	if err != nil {
+		t.Fatalf("F_GETFL on the lock descriptor: %v", err)
+	}
+	if access := status & unix.O_ACCMODE; access != unix.O_RDONLY {
+		t.Fatalf("lock descriptor access mode = %d, want O_RDONLY (%d)", access, unix.O_RDONLY)
+	}
+}
+
 func TestAcquireCreatesLockFileWithRequiredMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "control.lock")
 	lock, err := Acquire(path)

@@ -219,6 +219,23 @@ Cover:
 - Firefox below 129: ECH disabled/reported, but basic routing preflight passes;
 - user-provided forced ECH domain on a system that cannot meet Firefox 129: reject only when ECH strict is enabled.
 
+Also cover the runtime directory prerequisites, because the control lock is
+acquired through a read-only descriptor and a state file is created at mode
+0640 by whichever of the two service identities wins the race:
+
+- `/var/lib/mosdns` and `/var/lib/mosdns/runtime` exist, are owned by
+  `root:mosdns`, are setgid directories (`2750`), and carry a default ACL
+  granting the service group `rwx` so a file created by one identity stays
+  group-owned and group-writable for the other;
+- `/run/mosdns` is provisioned the same way for the DHCP bridge and the service
+  group, and its group ownership survives a reboot;
+- a pre-existing directory that is world-readable, group-writable by an
+  unrelated group, or missing its setgid bit is a preflight failure reported
+  before any mutation, with the exact `stat` values in the message;
+- a pre-existing control lock file whose mode is not `0640`, or which is not
+  owned by `root:mosdns`, is reported rather than silently repaired by an
+  installer running as an unrelated user.
+
 - [ ] **Step 3: Run tests and verify failure**
 
 ```bash
@@ -414,6 +431,23 @@ After editing `policy.yaml`, run `sudo mosdns-cdnctl validate --policy /etc/mosd
 - [ ] **Step 3: Add Debian metadata**
 
 Package name `mosdns-router`, version `0.1.0`, architectures `amd64 arm64`, dependencies `python3 (>=3.10), systemd, network-manager, systemd-resolved, libc6`. Mark shipped configs as conffiles. `postinst` calls installer `install`; `prerm` calls `uninstall`; `postrm purge` calls `uninstall --purge` only when requested.
+
+`postinst` must provision the state directories before any unit starts, and the
+package-content test asserts the provisioned identity:
+
+```text
+/var/lib/mosdns              root:mosdns  2750  (setgid, default ACL rwx for mosdns)
+/var/lib/mosdns/runtime      root:mosdns  2750  (setgid, default ACL rwx for mosdns)
+/var/lib/mosdns/runtime/control.lock  created on first acquire at 0640
+/run/mosdns                  root:mosdns  2750  (setgid, default ACL rwx for mosdns)
+```
+
+The setgid bit and the group are what let the router service (user `mosdns`) and
+the DHCP bridge or optimizer (a second identity) share one control lock and one
+set of state files: whichever process creates a file does so at mode 0640 inside
+a group-writable setgid directory, so the other identity can read it, rename
+over it, and acquire the lock without any additional privilege. Do not grant
+world access and do not rely on a per-file `chown` from an unprivileged unit.
 
 - [ ] **Step 4: Build pinned dnscrypt-proxy**
 

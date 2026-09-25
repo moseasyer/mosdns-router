@@ -311,13 +311,14 @@ git commit -m "test: install package in Ubuntu matrix"
 **Files:**
 - Create: `tests/podman/mock-cdn/server.go`
 - Create: `tests/podman/scenarios/failure_test.py`
+- Create: `tests/podman/scenarios/two_user_lock_test.py`
 - Create: `tests/podman/scenarios/cdn_ech_test.py`
 - Create: `tests/podman/scenarios/upgrade_uninstall_test.py`
 - Modify: `tests/podman/run.py`
 
 **Interfaces:**
 - Consumes: running target, selector test fixtures, and mock CDN.
-- Produces: system-level failure and lifecycle evidence.
+- Produces: system-level failure, multi-user lock, and lifecycle evidence.
 
 - [ ] **Step 1: Implement the mock CDN server**
 
@@ -326,6 +327,30 @@ Serve certificate-authenticated `cloudflare.test` and `distribution.test` names,
 - [ ] **Step 2: Add deterministic failure injections**
 
 Cover DNSCrypt process stopped, DHCP DNS stopped, state corruption, ECH source timeout, bad selector, disk-full simulation, and simultaneous manual/automatic lock attempts. Assert fail-closed/no-leak behavior and last-known-good preservation.
+
+- [ ] **Step 3: Add the two-user control-lock and state test**
+
+This scenario runs the real units as two different unprivileged identities, because
+the control lock is acquired through a read-only descriptor and shared state
+files are created at mode 0640 inside setgid directories. Run
+`mosdns-router.service` as `mosdns` and `mosdns-cdn-optimizer.service` as a second
+`mosdns-optimizer` user in the same group, and assert:
+
+- while the optimizer holds `/var/lib/mosdns/runtime/control.lock`, a router-side
+  write is refused with the lock-held exit code and no partial state file
+  appears, and the reverse direction behaves the same way;
+- after the holder exits, the other identity acquires the lock, and the lock
+  file is still mode `0640` owned by the shared group;
+- a state file written by one identity is read, validated, and replaced by the
+  other identity without any additional privilege, and its mode stays `0640`;
+- neither identity can read `/etc/mosdns/`-owned secrets through the shared
+  runtime directory, and the shared directory is not world accessible;
+- a run that changes the runtime directory mode to `0755` or removes the setgid
+  bit makes the next systemd start fail closed with a preflight error naming the
+  directory, instead of silently creating a world-readable state file.
+
+Collect the evidence with `stat`, `systemctl show`, and the two units' journal
+entries, and record the resolved group of the created files.
 
 - [ ] **Step 3: Add CDN/ECH system assertions**
 
@@ -342,7 +367,7 @@ Change DNS to local, stop MOSDNS, run emergency rollback, and assert the origina
 - [ ] **Step 6: Run deterministic matrix**
 
 ```bash
-python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04 --scenario failure,cdn-ech,upgrade-uninstall
+python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04 --scenario failure,two-user-lock,cdn-ech,upgrade-uninstall
 ```
 
 Expected: PASS for each version.

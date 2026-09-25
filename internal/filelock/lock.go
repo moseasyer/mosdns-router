@@ -35,7 +35,11 @@ type Lock struct {
 // file when it is absent and enforcing mode 0640 on it. It returns ErrLocked
 // when the lock is already held.
 func Acquire(path string) (*Lock, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, lockFileMode)
+	// O_RDONLY with O_CREATE needs write permission on the directory, not on the
+	// file, so the lock file can be created while the descriptor stays
+	// incapable of modifying it. A holder of the control lock must never be
+	// able to truncate or rewrite the runtime state the lock protects.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, lockFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("%s: open control lock: %w", path, err)
 	}
