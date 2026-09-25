@@ -264,6 +264,72 @@ func TestDomesticBranchForwardsToTheDHCPPluginAndEnds(t *testing.T) {
 	}
 }
 
+// TestTheDialPortTheCallerChoseReachesThePlugin covers the one upstream address
+// the renderer does not get to choose. A published state document carries bare
+// addresses, so the port they are dialled on is a property of this document: a
+// caller that pointed the plugin at a resolver on another port has to have that
+// port rendered, or the plugin would dial 53 and the domestic branch would only
+// work by accident.
+func TestTheDialPortTheCallerChoseReachesThePlugin(t *testing.T) {
+	document, err := Render(config.Defaults(), withDHCPUpstreamPort(ProductionPaths(), 15354))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	forwarder := argsOf[renderedDHCPForward](t, decodeRendered(t, document).entry(t, "dhcp_forward"))
+	if forwarder.UpstreamPort != 15354 {
+		t.Errorf("dhcp_forward upstream_port = %d, want the caller's 15354", forwarder.UpstreamPort)
+	}
+}
+
+// TestAnUnsetDialPortRendersThePortADHCPResolverAnswersOn is the default. A
+// caller that says nothing about the port has to get 53 rendered rather than a
+// zero, because a zero is not a port: the plugin would refuse to dial it, and
+// the domestic branch would be dead in a document that looked configured.
+func TestAnUnsetDialPortRendersThePortADHCPResolverAnswersOn(t *testing.T) {
+	document, err := Render(config.Defaults(), withDHCPUpstreamPort(ProductionPaths(), 0))
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	forwarder := argsOf[renderedDHCPForward](t, decodeRendered(t, document).entry(t, "dhcp_forward"))
+	if forwarder.UpstreamPort != 53 {
+		t.Errorf("dhcp_forward upstream_port = %d, want 53: an unset dial port is the port a DHCP DNS server answers on", forwarder.UpstreamPort)
+	}
+}
+
+// TestRenderRefusesADialPortNothingCanDial is the safety table for the new
+// field. A port outside the range of a TCP or UDP port number is a document the
+// plugin would refuse at load, or one it would dial into nothing, and both are
+// worth a refusal here where the value can still be named. The control case is
+// the two ends of the range, which are diallable and must keep rendering.
+func TestRenderRefusesADialPortNothingCanDial(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		port         int
+		wantMention  string
+		wantAccepted bool
+	}{
+		"a negative port":   {port: -1, wantMention: "-1"},
+		"a port past 65535": {port: 65536, wantMention: "65536"},
+		"the lowest port":   {port: 1, wantAccepted: true},
+		"the highest port":  {port: 65535, wantAccepted: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			document, err := Render(config.Defaults(), withDHCPUpstreamPort(ProductionPaths(), testCase.port))
+			if testCase.wantAccepted {
+				if err != nil {
+					t.Fatalf("Render refused a diallable port %d: %v", testCase.port, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Render accepted upstream_port %d and wrote:\n%s", testCase.port, document)
+			}
+			if !strings.Contains(err.Error(), testCase.wantMention) {
+				t.Errorf("the refusal %q does not name the offending port %q", err, testCase.wantMention)
+			}
+		})
+	}
+}
+
 // TestTheFailurePolicyTheOperatorChoseReachesThePlugin proves the rendered
 // argument is the policy's own value. A renderer that wrote its own default
 // would ignore an operator who chose the other behaviour, and the choice would
@@ -962,6 +1028,11 @@ func withForeignListener(paths Paths, value string) Paths {
 
 func withListen(paths Paths, value string) Paths {
 	paths.Listen = value
+	return paths
+}
+
+func withDHCPUpstreamPort(paths Paths, value int) Paths {
+	paths.DHCPUpstreamPort = value
 	return paths
 }
 

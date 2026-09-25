@@ -61,11 +61,6 @@ const (
 	// set, and its size cannot be a stale-answer risk -- only a hit rate.
 	dhcpCacheEntries = 4096
 
-	// dhcpUpstreamPort is the port a published DHCP DNS address is dialled on. A
-	// published state carries bare addresses, so the port is a property of this
-	// configuration rather than of the state.
-	dhcpUpstreamPort = 53
-
 	// foreignCacheEntries bounds the foreign cache. The bound is the cache
 	// plugin's own documented default, stated here so the file does not follow a
 	// default that an upstream release can change; it is not a measurement, and
@@ -77,6 +72,14 @@ const (
 	// branch has stopped answering are warnings above it. It is rendered rather
 	// than left to the logger's zero value, which happens to be info today.
 	logLevel = "info"
+)
+
+// The bounds of the port a published DHCP DNS address is dialled on. A
+// published state carries bare addresses, so the port is a property of this
+// document; the default is the port a DHCP DNS server answers on.
+const (
+	defaultDHCPUpstreamPort = 53
+	maximumDHCPUpstreamPort = 65535
 )
 
 // foreignListenerScheme is the transport the foreign branch enters the DNSCrypt
@@ -135,6 +138,11 @@ type Paths struct {
 	// Listen is the address both servers bind, as host:port. The production value
 	// is the loopback the system's own stub resolver points at.
 	Listen string
+	// DHCPUpstreamPort is the port a published DHCP DNS address is dialled on.
+	// A published state carries bare addresses, so the port is a property of this
+	// configuration rather than of the state. Zero means the port a DHCP DNS
+	// server answers on, 53.
+	DHCPUpstreamPort int
 }
 
 // ProductionPaths returns the paths an installed router uses. They are the spec's
@@ -143,11 +151,12 @@ type Paths struct {
 // under /run.
 func ProductionPaths() Paths {
 	return Paths{
-		Policy:          "/etc/mosdns/policy.yaml",
-		CNDomains:       "/var/lib/mosdns/lists/cn-domains.txt",
-		DHCPState:       "/run/mosdns/dhcp-upstreams.json",
-		ForeignListener: "tcp://127.0.0.1:15353",
-		Listen:          "127.0.0.1:53",
+		Policy:           "/etc/mosdns/policy.yaml",
+		CNDomains:        "/var/lib/mosdns/lists/cn-domains.txt",
+		DHCPState:        "/run/mosdns/dhcp-upstreams.json",
+		ForeignListener:  "tcp://127.0.0.1:15353",
+		Listen:           "127.0.0.1:53",
+		DHCPUpstreamPort: 53,
 	}
 }
 
@@ -268,7 +277,7 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 				Args: dhcpForwardArgs{
 					StateFile:     paths.DHCPState,
 					CacheEntries:  dhcpCacheEntries,
-					UpstreamPort:  dhcpUpstreamPort,
+					UpstreamPort:  paths.DHCPUpstreamPort,
 					FailurePolicy: policy.DHCP.FailurePolicy,
 				},
 			},
@@ -383,11 +392,12 @@ func header(policyPath string) string {
 // resolvedPaths is a Paths that has passed every check. The document is built
 // from it and from nothing else, so no unchecked value can reach an argument.
 type resolvedPaths struct {
-	Policy          string
-	CNDomains       string
-	DHCPState       string
-	ForeignListener string
-	Listen          string
+	Policy           string
+	CNDomains        string
+	DHCPState        string
+	ForeignListener  string
+	Listen           string
+	DHCPUpstreamPort int
 }
 
 // resolve checks the paths and returns them in the form the document will carry.
@@ -472,7 +482,31 @@ func resolve(paths Paths) (resolvedPaths, error) {
 		)
 	}
 	resolved.ForeignListener = foreignURL(foreign)
+
+	port, err := checkDHCPUpstreamPort(paths.DHCPUpstreamPort)
+	if err != nil {
+		return resolvedPaths{}, err
+	}
+	resolved.DHCPUpstreamPort = port
 	return resolved, nil
+}
+
+// checkDHCPUpstreamPort resolves the port a published DHCP DNS address is dialled
+// on. An unset value is the port a DHCP DNS server answers on, 53; a value
+// outside the range of a port number is refused, because the plugin would be
+// handed a port it cannot dial and the domestic branch would be dead in a
+// document that looked configured.
+func checkDHCPUpstreamPort(value int) (int, error) {
+	if value == 0 {
+		return defaultDHCPUpstreamPort, nil
+	}
+	if value < 0 || value > maximumDHCPUpstreamPort {
+		return 0, fmt.Errorf(
+			"mosdnsconfig: the DHCP upstream port %d must be between 1 and %d, want a port a published address can be dialled on",
+			value, maximumDHCPUpstreamPort,
+		)
+	}
+	return value, nil
 }
 
 // cleanPath is filepath.Clean for a path that has already been checked for
