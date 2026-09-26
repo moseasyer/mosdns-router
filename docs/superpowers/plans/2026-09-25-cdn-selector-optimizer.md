@@ -28,6 +28,10 @@
 - A download that reaches 10 MiB in one second and one that takes three seconds must both count as consumed bytes.
 - The eleventh download must be rejected when 100 MiB are already consumed.
 - **Identity probes are deliberately outside the budget, so their body bytes are the one uncharged egress the report must account for: `prober.HTTPMetrics.BodyBytes` counts them per probe and a run sums them and shows the operator the uncharged identity total. The exposure is `prober.DefaultMaxIdentityBodyBytes` times the number of candidates proved.**
+- **`HTTPMetrics.BodyBytes` must be added in before the error is looked at.** `metrics, err := HTTPS(...); if err != nil { continue }` discards the only record of the bytes, and a refused probe is exactly the case where bytes were spent and nothing was published. A refused probe reports no other number, so `BodyBytes` is the whole accounting it has.
+- **A settle goes through `optimizer.Budget.Settle`, never `Consume`.** `Consume` cannot report a refusal, so a repeated settle, a settle of an amount this budget never reserved, and a failed persist are all silent, and each leaves the day over-charged. The runner keeps its own counters and reports them.
+- **One `*optimizer.Budget` lives for the whole life of every reservation it makes.** The outstanding-reservation set belongs to the value, not the document: a second `Budget` opened on the same document mid-run refuses every settle with `ErrNoReservation` and the day fills up with no transfer behind it. The document records no owner, because its schema is fixed and a crashed holder must not block the next run, so this is a requirement on the runner rather than something the budget can check.
+- **A `ByteBudget` that is not `*optimizer.Budget` re-opens the double-settle hole.** The settle-once rule lives in the concrete type, because the interface has no way to report a refusal. The prober's transfer call sites settle once by construction, so passing another implementation is safe there and unsafe anywhere else; the runner passes the concrete type.
 - A CloudFront winner validated for one hostname must never be copied to another hostname.
 - Corrupt selector state must not be overwritten by a failed test or pin operation.
 - A run that cannot refresh the official ranges must not silently measure nothing. **Decision (Task 1):** the
@@ -108,8 +112,11 @@ type CloudflareSource interface { Candidates(context.Context, int, time.Time) (C
 package prober
 
 type TCPMetrics struct { Samples int; P50MS float64; P95MS float64; JitterMS float64; Loss float64 }
-type HTTPMetrics struct { Status int; TLSMS float64; TTFBMS float64; TotalMS float64; Colocation string }
+type HTTPMetrics struct { Status int; TLSMS float64; TTFBMS float64; TotalMS float64; Colocation string; BodyBytes int64 }
 type DownloadMetrics struct { Bytes int64; Elapsed time.Duration; BytesPerSecond float64 }
+// The only implementation of ByteBudget is *optimizer.Budget. The settle-once rule
+// lives in that concrete type, because this interface cannot report a refusal, so
+// another implementation would have to reimplement it to be as safe.
 type ByteBudget interface {
     Reserve(int64) (int64, error)
     Consume(reserved, actual int64)
@@ -129,6 +136,15 @@ type Budget struct { Remaining int64 }
 func NewBudget(bytes int64) *Budget
 func NewPersistentBudget(path string, limit int64, location *time.Location, now time.Time) (*Budget, error)
 func (b *Budget) Reserve(requested int64) (int64, error)
+// Settle is the settle a caller must use. It closes exactly one outstanding
+// reservation and reports the three refusals — no such reservation (a repeated
+// settle, or a second Budget on the same document), a negative count, and a
+// persist that failed. Consume below is Settle with the error dropped, because
+// prober.ByteBudget has nowhere to put one; the one-shot guarantee is the same
+// either way, but a refusal is invisible through it.
+func (b *Budget) Settle(reserved, actual int64) error
+// Release hands back a whole reservation a caller will not use. Also one-shot.
+func (b *Budget) Release(reserved int64) error
 func (b *Budget) Consume(reserved, actual int64)
 func (b *Budget) Used() int64
 
@@ -402,7 +418,7 @@ Expected: compile failure.
 
 - [ ] **Step 5: Implement `Runner.Run`**
 
-Collect `Input` from the candidate sources, create the persistent daily budget under the control lock, execute probes with bounded concurrency, stop on context cancellation, and return a partial report plus error without applying. If the daily budget is exhausted, finish latency/health phases but skip further downloads and keep the current winner. A report is valid only if the policy and config SHA-256 match current configuration.
+Collect `Input` from the candidate sources, open the persistent daily budget once with `optimizer.NewPersistentBudget` and keep that one `*Budget` for the whole run, execute probes with bounded concurrency, stop on context cancellation, and return a partial report plus error without applying. The budget takes its own `bandwidth-budget.json.lock` around each persist and must never be opened under the control lock, which a multi-minute run would hold for the length of every download and which `apply`, `pin`, and `health-check` need. Settle each reservation with `Budget.Settle` and report a refusal; settle through `Consume` only where a caller cannot report one. Sum `HTTPMetrics.BodyBytes` across every identity probe, refused ones included, and report the uncharged identity total. If the daily budget is exhausted, finish latency/health phases but skip further downloads and keep the current winner. A report is valid only if the policy and config SHA-256 match current configuration.
 
 - [ ] **Step 6: Implement apply/pin/unpin**
 

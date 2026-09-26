@@ -104,9 +104,17 @@ type counter interface {
 //
 // Every reservation this budget hands out is remembered until it is settled or
 // released, and it is remembered once: a second settle of the same reservation is
-// refused rather than allowed to hand back the same bytes again. The remembered
-// set belongs to this value alone, so a run must spend through one Budget for a
-// document rather than opening a second one to settle the first one's work.
+// refused rather than allowed to hand back the same bytes again.
+//
+// The remembered set belongs to this value, not to the document, and that is a
+// requirement on the caller rather than an accident. One *Budget must live for the
+// whole life of every reservation it makes: a second Budget opened on the same
+// document mid-run has an empty remembered set, refuses every settle as
+// ErrNoReservation, and leaves the day charged for transfers that were handed
+// back. The symptom is a day that fills up with no transfer behind it, so a runner
+// keeps one Budget per document for its whole run and reuses it. The document
+// carries no owner, because its schema is fixed and a crashed holder must not
+// block the next run.
 type Budget struct {
 	mutex   sync.Mutex
 	counter counter

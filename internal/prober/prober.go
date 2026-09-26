@@ -22,9 +22,16 @@ import (
 // never finishes is already on the books; Consume settles it with what was
 // really transferred.
 //
-// The optimizer's persistent budget is the production implementation. The
-// interface is declared here, at the measurement boundary, because this is the
-// side that must not be able to read first and ask later.
+// The interface is declared here, at the measurement boundary, because this is the
+// side that must not be able to read first and ask later. It is deliberately
+// narrow, and the narrowness has a cost a caller must know about: the guarantee
+// that a reservation can be settled only once lives in the concrete budget, not
+// here, because this interface has no way to report a refusal and therefore no way
+// to know whether one happened. The only implementation of this contract is
+// *optimizer.Budget, and another implementation would have to reimplement the
+// one-shot rule to be as safe. Pass that type; if a caller finds itself writing
+// another one, the settle semantics are being re-decided away from the budget
+// that owns the day.
 type ByteBudget interface {
 	// Reserve charges up to requested bytes and returns the amount reserved, or
 	// an error when the day cannot cover it.
@@ -86,6 +93,11 @@ type HTTPMetrics struct {
 	// surprise in the operator's data allowance. It is reported even when the probe
 	// is refused, because bytes that crossed the network are spent whether or not
 	// the proof succeeded.
+	//
+	// So a caller must add it in before it looks at the error. The idiomatic
+	// "metrics, err := HTTPS(...); if err != nil { continue }" throws away the only
+	// accounting this field exists for, and a refused probe is the one case where
+	// the bytes were spent and nothing was published in exchange.
 	BodyBytes int64
 }
 
