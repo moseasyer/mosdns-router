@@ -28,10 +28,12 @@ const (
 	// strict arm: the client is given nothing rather than something that would
 	// connect in the clear.
 	FailClosed FailurePolicy = iota
-	// FallbackToOriginal hands the caller's own response back when there is no
-	// ECHConfig to install, and refuses everything else. It is the fallback arm:
-	// the upstream's HTTPS record is a working answer, and removing it would be a
-	// downgrade this router has no standing to impose.
+	// FallbackToOriginal hands the caller's own response back whenever this router
+	// cannot rewrite, and is the fallback arm: the upstream's HTTPS record is a
+	// working answer, and removing it would be a downgrade this router has no
+	// standing to impose. The refusal still comes back beside the message, so the
+	// caller can see that the ECH source, the selector or the answer's shape is what
+	// stopped the rewrite.
 	FallbackToOriginal
 )
 
@@ -88,11 +90,14 @@ type HTTPSInput struct {
 	// under a name the response does not answer is an answer to a question nobody
 	// asked.
 	QName string
-	// Selected is the address to hint, and it must be a routable public IPv4
-	// address on the same terms as the address rewrite. The hint is the only thing
-	// standing between a client and a network the selector has not proved, so an
-	// address that failed its health check reaches a client as a refusal rather
-	// than as a hint.
+	// Selected is the address to hint, and it must be a routable public IPv4 address
+	// on the same terms as the address rewrite. The hint is the only thing standing
+	// between a client and a network the selector has not proved, so an address that
+	// failed its health check must never become a hint. What happens then depends on
+	// the policy: a strict caller is refused, because a record with no hint sends the
+	// client to resolve the name and this router has emptied that resolution, while a
+	// fallback caller is handed the upstream's own record, which carries the
+	// upstream's own address and no key.
 	Selected netip.Addr
 	// ECH is the ECHConfigList the ECH source published: the SvcParamValue of an
 	// ech parameter including the outer uint16 list length, which is exactly what
@@ -136,10 +141,14 @@ type DroppedParameter struct {
 // HTTPS synthesizes the HTTPS record a client reads to decide how to reach a name,
 // or refuses to.
 //
-// It returns the caller's own message when the policy says to keep what the
-// upstream published, a copy carrying the synthesis when there is one to make, and
-// a nil message with an error when the call cannot be confirmed. An error is never
-// returned beside a message.
+// It returns a copy carrying the synthesis when there is one to make, and the
+// caller's own message with a refusal beside it when the policy says to keep what the
+// upstream published. A strict caller is refused with a nil message instead, so the
+// shape a caller has to handle is: a non-nil message may arrive with a non-nil error,
+// and forward the message while logging the error. What never arrives is an error
+// without a message on the fallback arm, or a message without a message-worthy cause:
+// there is no third shape, and a caller that checks the error before using the
+// message cannot get this wrong in the unsafe direction.
 //
 // The synthesized answer is always exactly one record: a ServiceMode for the name
 // the client asked about, carrying the ECHConfig as its ech parameter, the selected
