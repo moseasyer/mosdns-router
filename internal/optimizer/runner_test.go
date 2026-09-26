@@ -1394,6 +1394,52 @@ func TestRunnerReturnsAPartialReportWhenTheRunIsCancelled(t *testing.T) {
 	}
 }
 
+// A cancellation is not a reason to forget what the run already spent. The
+// identity phase's own bytes are the one egress the budget does not pay for, so
+// the report is the only accounting of them there is - and a run cut short
+// half way through the phase is exactly the case where an operator needs it,
+// because the day's report will not add up otherwise.
+//
+// One candidate against two profiles makes the order of the two facts certain: the
+// first proof runs to completion and reads its 2048 bytes, and the cancellation
+// arrives at the second. So the phase ends having spent exactly one probe's worth,
+// and the report has to say so rather than nothing.
+func TestACancelledIdentityPhaseStillReportsTheUnchargedBytesItSpent(t *testing.T) {
+	fixtures, candidates := threeGlobals()
+	fake := newFakeProber(fixtures)
+	ctx, cancel := context.WithCancel(t.Context())
+	proofs := 0
+	fake.before = func(kind, _ string) {
+		if kind != "https" {
+			return
+		}
+		proofs++
+		if proofs == 2 {
+			cancel()
+		}
+	}
+	profiles := []candidate.ProbeProfile{
+		testProfile("speed.example.test", 443),
+		testProfile("secure.example.test", 443),
+	}
+	report, err := newTestRunner(t, fake).Run(ctx, Input{
+		Cloudflare:         candidates[:1],
+		CloudflareProfiles: profiles,
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want an error that is context.Canceled", err)
+	}
+	if proofs < 2 {
+		t.Fatalf("the phase made %d identity proofs, want at least 2: the case needs one that completes and one that is cancelled", proofs)
+	}
+	// One probe of the record read 2048 bytes and one was cancelled before it read
+	// any, so the run's uncharged egress is exactly one probe's worth.
+	if report.IdentityBytes != runnerIdentityBytes {
+		t.Errorf("the partial report's identity total = %d, want %d: the proof that completed spent them, and the budget does not account for identity probes",
+			report.IdentityBytes, runnerIdentityBytes)
+	}
+}
+
 func TestRunnerMeasuresWhileAnotherProcessHoldsTheControlLock(t *testing.T) {
 	// The control lock is held for the read-validate-increment-write of the
 	// selector and for the final proof in front of it, and for nothing else. A

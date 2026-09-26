@@ -2201,19 +2201,26 @@ func (run *runState) proveIdentity(ctx context.Context) error {
 		found.proved = proved
 		return nil
 	})
-	if err == nil {
-		// The gate's output is counted here, while the phase that produced it is
-		// still the phase in progress, and so is the run's uncharged egress: every
-		// probe of the phase has been joined, so each candidate's own total is
-		// final and the run's is their sum.
-		for _, group := range run.groups {
-			group.proved = 0
-			for _, found := range group.measurements {
-				if found.proved {
-					group.proved++
-				}
-				run.report.IdentityBytes += found.identityBytes
+	// The gate's output is counted here, while the phase that produced it is
+	// still the phase in progress, and so is the run's uncharged egress: every
+	// probe of the phase has been joined, so each candidate's own total is final
+	// and the run's is their sum.
+	//
+	// Unconditionally, which is the whole of the fix. The sum was behind
+	// `err == nil`, and a cancelled phase is the case where the accounting is most
+	// needed: the probes that DID run spent their bytes, nothing on disk pays for
+	// an identity probe, and a partial report that dropped them would be the one
+	// document an operator reads to find out what a run cost. Nothing downstream
+	// reads these two numbers on this path - the run returns the error and no
+	// group is ever scored - so counting them changes no decision, only what the
+	// report is able to say.
+	for _, group := range run.groups {
+		group.proved = 0
+		for _, found := range group.measurements {
+			if found.proved {
+				group.proved++
 			}
+			run.report.IdentityBytes += found.identityBytes
 		}
 	}
 	run.report.Phases.Identity.EndedAt = run.stamp()
