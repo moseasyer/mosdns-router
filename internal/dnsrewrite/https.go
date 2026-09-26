@@ -35,34 +35,43 @@ const (
 	FallbackToOriginal
 )
 
-// The refusals a caller has to be able to tell apart, because the two policies
-// answer them differently and a caller that cannot tell which happened picks the
-// wrong one. The taxonomy is:
+// The refusals a caller has to be able to tell apart, because the two policies answer
+// them differently and a caller that cannot tell which happened picks the wrong one.
+// The taxonomy, in the order a caller has to test it:
 //
-//   - ErrNoECHConfig and ErrInvalidECHConfig: the ECH source has nothing to
-//     install, or has something this router will not forward. A fallback caller
-//     keeps the upstream record; a strict caller fails closed. They are separate
-//     because a missing config is worth a retry and a corrupt one is not, and
-//     because a caller that cannot tell them apart will keep a record when it
-//     should have blocked.
-//   - ErrNoSelectedAddress: there is no address to point the client at. It is
-//     every policy's problem, because a record with no hint, or a hint at an
-//     address that failed its health check, is the failure this project exists to
-//     prevent. A fallback caller gains nothing by keeping a record it would have
-//     to rewrite the moment the address is proved.
-//   - ErrNoCompatibleEndpoint: the name published a service binding and every one
-//     of them is unusable here. Nothing about the ECHConfig or the selected
-//     address is at fault, so a fallback caller has nothing better to hand back
-//     than the same unusable endpoints, and a strict caller must fail closed.
-//   - ErrNoOriginal: a fallback caller with no ECHConfig and no upstream record to
-//     keep. It is distinct from ErrNoECHConfig on purpose, and it carries that
-//     refusal inside it: the caller is being told there is nothing left to answer
-//     with, and the operator is being told why.
+//   - ErrNoECHConfig and ErrInvalidECHConfig: the ECH source has nothing to install,
+//     or has something this router will not forward. They are separate because a
+//     missing config is worth a retry and a corrupt one is not, and because a caller
+//     that cannot tell them apart will keep a record when it should have blocked.
+//   - ErrNoSelectedAddress: there is no address to point the client at -- none at all,
+//     none proved, or one that failed its health check.
+//   - ErrNoCompatibleEndpoint: the name published a service binding and every one of
+//     them is unusable here. Nothing about the ECHConfig or the selected address is at
+//     fault, so both policies fail: there is no better answer to hand back than the
+//     endpoints that are unusable.
+//   - ErrDelegatedName: the name belongs to somebody else. It is either a CNAME at
+//     that owner, or an RRset there that contains an alias. The upstream describes a
+//     service under another name, and a service mode synthesized here would contradict
+//     that description rather than answer it.
+//   - ErrUpstreamDenial: the upstream's answer is a statement about the name rather
+//     than an absence of one, so there is nothing here to rewrite and nothing to
+//     invent an answer from.
+//   - ErrNoOriginal: there is no upstream answer to hand back.
+//
+// The order matters for one reason, and a caller that gets it wrong forwards a nil
+// message. ErrNoOriginal wraps whichever refusal left nothing to forward, so
+// errors.Is(err, ErrNoECHConfig) is also true of an ErrNoOriginal, and a caller that
+// tests the inner cause first concludes there is an upstream record to keep and
+// forwards the nil one. Test ErrNoOriginal first; forward whatever message arrived
+// whatever the error; and fail closed when the message is nil, which is the shape a
+// FailClosed caller always gets on a refusal.
 var (
 	ErrNoECHConfig          = errors.New("dnsrewrite: there is no ECHConfig to install")
 	ErrInvalidECHConfig     = errors.New("dnsrewrite: the ECHConfig cannot be forwarded")
 	ErrNoSelectedAddress    = errors.New("dnsrewrite: there is no selected IPv4 address to point the client at")
 	ErrNoCompatibleEndpoint = errors.New("dnsrewrite: no upstream HTTPS endpoint can be used with the selected address")
+	ErrDelegatedName        = errors.New("dnsrewrite: the name is delegated to another name, so no service binding may be synthesized for it")
+	ErrUpstreamDenial       = errors.New("dnsrewrite: the upstream's answer is a statement about the name, not an absence of one")
 	ErrNoOriginal           = errors.New("dnsrewrite: there is no upstream HTTPS record to keep")
 )
 
@@ -165,10 +174,9 @@ type DroppedParameter struct {
 //     9460 Section 8 makes a record that names a key it does not carry, or names one
 //     twice, one a client must reject, and for a force-ECH name that rejection is a
 //     failed connection with nothing on the wire to explain it.
-//   - Nothing this router writes carries an IPv6 hint, and the address of the name
-//     the record now points at does not survive in the additional section, because
-//     RFC 9460 Section 7.3 has a client prefer an answer it already holds to the
-//     hint beside it.
+//   - Nothing this router writes carries an IPv6 hint, and no address of the name the
+//     record now points at survives in any section, because RFC 9460 Section 7.3 has
+//     a client prefer an answer it already holds to the hint beside it.
 func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	question, err := httpsQuestion(in)
 	if err != nil {
@@ -181,11 +189,14 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	// from the copy: nothing a client reads shares a buffer with the object the
 	// caller still holds.
 	clone := in.Response.Copy()
+	if err := delegated(clone, question.Name); err != nil {
+		return keepOrRefuse(in, question.Name, err)
+	}
 	published := recordsAt(clone, question.Name)
 
 	list, err := validatedECH(in.ECH)
 	if err != nil {
-		return keepOrRefuse(in, published, err)
+		return keepOrRefuse(in, question.Name, err)
 	}
 	if err := checkSelected(in.Selected); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrNoSelectedAddress, err)
@@ -195,16 +206,16 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 		return nil, err
 	}
 
+	// The record goes in where the records of this name were, whether there were
+	// any or not, and the addresses of this name go from wherever they were.
+	clone.Answer = replaceAt(clone.Answer, question.Name, record)
+	dropAddressesOf(clone, question.Name)
 	if len(published) == 0 {
-		// Nothing was published for this name, so there is no record to put a
-		// synthesis in place of and the whole answer is the record. emptyAnswer
-		// leaves the client's OPT and nothing else, which also disposes of any
-		// address for this name in the additional section.
-		emptyAnswer(clone)
-		clone.Answer = []dns.RR{record}
-	} else {
-		clone.Answer = replaceAt(clone.Answer, question.Name, record)
-		dropTargetAddresses(clone, question.Name)
+		// Nothing was published for this name, so the whole answer is the
+		// synthesized record and the sections that described the answer that is not
+		// being sent go with it. The address removal above has already run: it does
+		// not care which branch this is.
+		intoPositiveAnswer(clone)
 	}
 	// The record in the message is not the record that was signed, so the message
 	// says so: the signature over the HTTPS RRset this router replaced describes
@@ -217,21 +228,67 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	return clone, nil
 }
 
-// keepOrRefuse decides what a refusal about the ECHConfig means, which is the one
-// refusal the two policies answer differently. A strict caller fails closed. A
-// fallback caller hands the caller's own response back, because the upstream's
-// record is a working answer and removing it is a downgrade this router has no
-// standing to impose. Where there is no such record, the refusal names both facts,
-// so a caller that logs it sees that the ECH source failed and that there was
-// nothing to keep.
-func keepOrRefuse(in HTTPSInput, published []*dns.HTTPS, cause error) (*dns.Msg, error) {
+// keepOrRefuse turns a refusal into the answer the policy asks for. A strict caller
+// gets nothing and the refusal. A fallback caller gets its own response back where
+// there is something worth forwarding, and the refusal either way: the message is the
+// upstream's own answer, which is exactly what the fallback policy says to do when
+// this router cannot rewrite, and the error is why no key went into it. A caller that
+// discards the error is not unsafe -- the message is the one it would have sent
+// without this router in the path -- but it is blind, so the contract is to forward
+// the message and log the error.
+//
+// Where there is nothing to forward, the refusal says so, and ErrNoOriginal carries
+// the refusal that led to it, which is why a caller has to test that one first.
+func keepOrRefuse(in HTTPSInput, name string, cause error) (*dns.Msg, error) {
 	if in.Policy != FallbackToOriginal {
 		return nil, cause
 	}
-	if len(published) == 0 {
-		return nil, fmt.Errorf("%w, and there is no upstream HTTPS record to keep instead: %w", ErrNoOriginal, cause)
+	if !forwardable(in.Response, name) {
+		return nil, fmt.Errorf("%w, and there is no upstream answer to forward instead: %w", ErrNoOriginal, cause)
 	}
-	return in.Response, nil
+	return in.Response, cause
+}
+
+// forwardable reports whether the response is something a client can be handed as the
+// answer to this question. A record at the queried name is an answer. So is a denial of
+// existence: a NOERROR with no records and an SOA, or an NXDOMAIN, states a fact about
+// the name that a client caches and acts on, and forwarding it is exactly what the
+// client would have got without this router in the path. A failure that carries nothing
+// is not an answer, and neither is an empty response with no authority section: there is
+// nothing there to hand on, so the caller has to produce the failure itself.
+func forwardable(msg *dns.Msg, name string) bool {
+	for _, rr := range msg.Answer {
+		if sameName(rr.Header().Name, name) {
+			return true
+		}
+	}
+	for _, rr := range msg.Ns {
+		if rr.Header().Rrtype == dns.TypeSOA {
+			return true
+		}
+	}
+	return false
+}
+
+// delegated refuses a name the upstream has handed to somebody else, in the shape a CNAME
+// takes in an answer. The other shape, an RRset that contains an alias, is in classify,
+// because it is a property of the HTTPS records themselves rather than of the answer.
+//
+// The CNAME is checked before anything is synthesized because the two cannot share an
+// owner: RFC 1034 Section 3.6.2 forbids an answer carrying a CNAME and other data at
+// the same name, and a client is entitled to reject the whole thing. A caller that wants
+// the delegation followed is the caller that follows chains -- the address rewrite walks
+// to the terminal name and rewrites the address there -- and this function's whole
+// output is a service mode for the name it was asked about.
+func delegated(msg *dns.Msg, name string) error {
+	for _, rr := range msg.Answer {
+		record, ok := rr.(*dns.CNAME)
+		if !ok || !sameName(record.Hdr.Name, name) {
+			continue
+		}
+		return fmt.Errorf("%w: %q is a CNAME to %q, so the service the client would reach is the other name's", ErrDelegatedName, name, record.Target)
+	}
+	return nil
 }
 
 // httpsQuestion checks that the response is one this function can answer, and
@@ -635,20 +692,29 @@ func replaceAt(section []dns.RR, name string, record *dns.HTTPS) []dns.RR {
 	return out
 }
 
-// emptyAnswer turns a copy of a response that answered nothing into the shell a
-// positive answer is built in: the same id, the same question, the same recursion
-// and checking-disabled bits the client asked with, and a NOERROR rcode, because
-// the failure the upstream reported is not this router's answer to give. The
-// authority section goes because a synthesized positive answer claims no denial of
-// existence and no negative caching TTL. The additional section keeps only the
-// client's own OPT: every other record in it described an answer that is no longer
-// being sent, and an address the client would prefer to the hint is exactly what
-// dropTargetAddresses refuses to leave behind.
-func emptyAnswer(msg *dns.Msg) {
+// intoPositiveAnswer turns the copy of a response that published nothing for the name
+// into the shell the synthesized record is then the answer in: NOERROR, because the
+// upstream's failure is not this router's answer to give, the client's own recursion
+// and checking-disabled bits as the upstream echoed them, no authority section, and
+// the client's OPT as the only thing left in the additional section.
+//
+// The authority section goes because a synthesized positive answer claims no denial of
+// existence and no negative caching TTL, and an SOA saying "no records of this type
+// for this name" beside a record that this router just published is a statement the
+// message contradicts. The additional section keeps the client's OPT and nothing
+// else, because every other record in it described the answer being replaced.
+//
+// The AA bit is cleared with it, and deliberately: the synthesized record is not the
+// zone's data, it is this router's, so leaving the authoritative-answer bit set
+// would tell a client the answer came from the authoritative server. No client acts
+// on the bit -- RFC 1035 defines it for a resolver-to-resolver conversation and this
+// response is resolver-to-stub -- so clearing it is free, and the bits that are the
+// client's own, the recursion and checking-disabled bits, are left exactly as the
+// upstream echoed them.
+func intoPositiveAnswer(msg *dns.Msg) {
 	msg.Rcode = dns.RcodeSuccess
 	msg.Authoritative = false
 	msg.Truncated = false
-	msg.Answer = nil
 	msg.Ns = nil
 	kept := make([]dns.RR, 0, 1)
 	for _, rr := range msg.Extra {
@@ -659,19 +725,39 @@ func emptyAnswer(msg *dns.Msg) {
 	msg.Extra = kept
 }
 
-// dropTargetAddresses removes the addresses of the name the synthesized record now
-// points at. The record's effective TargetName is the name the client asked about,
-// and RFC 9460 Section 7.3 has a client ignore the hint when it already holds an A
-// or AAAA answer for that name, so an address in the additional section is an answer
-// that beats the selection and sends the browser to the anycast address the health
-// check never proved. Addresses for any other name belong to a different RRset and
-// are left alone, as is the client's OPT record, which is not an address at all. A
-// section with nothing to remove is the section it was handed, so an answer that
-// carried no address for this name is not given a new slice for having asked.
-func dropTargetAddresses(msg *dns.Msg, name string) {
-	kept := make([]dns.RR, 0, len(msg.Extra))
+// dropAddressesOf removes the addresses of the name the synthesized record now points
+// at, from every section that can carry one. That name is the record's effective
+// TargetName, and RFC 9460 Section 7.3 has a client ignore the hints when it already
+// holds an A or AAAA answer for it, so an address for it anywhere in the message is an
+// answer that beats the selected address and sends the browser to the anycast address
+// the health check never proved. The rule is about the name rather than about the
+// section: a client that finds the address in the answer section has found it as
+// surely as one that finds it beside the answer, and a resolver is free to put it in
+// either.
+//
+// This is why the plugin owns it rather than the caller. The address rewrite, Address,
+// owns the terminal A and AAAA records of a CDN name on an A or AAAA query, and it is
+// what installs the selected address there; it never sees an HTTPS answer, and it must
+// not, because installing an address into an HTTPS answer is a different claim from
+// replacing the addresses of a name. So the two functions cover disjoint messages, and
+// a caller answers an HTTPS question with this one and an A question with that one.
+//
+// Addresses of any other name belong to a different RRset and are left alone, as is
+// the client's OPT record, which is not an address at all. A section with nothing to
+// remove is the section it was handed, so a message that carried no address for this
+// name is not given new slices for having asked.
+func dropAddressesOf(msg *dns.Msg, name string) {
+	msg.Answer = withoutAddressesOf(msg.Answer, name)
+	msg.Extra = withoutAddressesOf(msg.Extra, name)
+}
+
+// withoutAddressesOf is one section of the rule above: the section it was handed when
+// there was nothing to remove, so an untouched message keeps the slices it arrived
+// with.
+func withoutAddressesOf(section []dns.RR, name string) []dns.RR {
+	kept := make([]dns.RR, 0, len(section))
 	removed := false
-	for _, rr := range msg.Extra {
+	for _, rr := range section {
 		switch record := rr.(type) {
 		case *dns.A:
 			if sameName(record.Hdr.Name, name) {
@@ -687,7 +773,7 @@ func dropTargetAddresses(msg *dns.Msg, name string) {
 		kept = append(kept, rr)
 	}
 	if !removed {
-		return
+		return section
 	}
-	msg.Extra = kept
+	return kept
 }
