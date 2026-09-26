@@ -2837,6 +2837,43 @@ func TestRunnerReportsEachGroupsOwnReasonWhenOneOfThemProducesNoWinner(t *testin
 	}
 }
 
+// The rule for which profiles a group is held to has exactly one implementation in
+// this project, `Profiles.ForSubject`, and it matches DNS names case
+// insensitively - as DNS names are matched everywhere else here. A CloudFront rule
+// and a candidate that spell the same hostname differently are the same group, and
+// the in-run gate has to reach the same verdict the final proof and the health
+// check do; a second copy of the rule that compares exactly is a group the run
+// refuses with "no identity profile" while the proof of the same address would
+// have found a profile.
+func TestRunnerHoldsAGroupToTheProfileThatNamesItsHostnameInAnyCase(t *testing.T) {
+	profile := testProfile("Assets.Example.test", 443)
+	rule := candidate.CloudFrontProfile{Profile: profile, Candidates: []netip.Addr{netip.MustParseAddr("205.251.192.1")}}
+	runner := newTestRunner(t, newFakeProber(map[string]*addressFixture{
+		"205.251.192.1": served(10, 1, 0, 5*mib),
+	}))
+
+	report, err := runner.Run(t.Context(), Input{
+		// The candidate spells the hostname the rule does not.
+		CloudFront:      []candidate.Candidate{cloudFrontCandidate("205.251.192.1", "assets.example.test")},
+		CloudFrontRules: []candidate.CloudFrontProfile{rule},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	group := groupNamed(t, report, "cloudfront/assets.example.test")
+	entry := candidateFor(t, group, "205.251.192.1")
+	if entry.Reason != "" {
+		t.Errorf("the candidate is refused with %q, want no refusal: the rule names %q and DNS names are case insensitive",
+			entry.Reason, profile.Hostname)
+	}
+	if !entry.Eligible {
+		t.Fatalf("the candidate is ineligible: %+v", entry)
+	}
+	if group.Winner == nil || group.Winner.IP != "205.251.192.1" {
+		t.Errorf("the group has no winner, want 205.251.192.1: the proof found the profile the exact match missed")
+	}
+}
+
 func TestRunnerRefusesAGroupWithNoIdentityProfile(t *testing.T) {
 	// A group nothing can be proved against cannot produce a winner, and the report
 	// has to say that rather than measuring candidates against nothing and calling

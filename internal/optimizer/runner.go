@@ -2093,9 +2093,12 @@ func (run *runState) collectGroups() ([]*measuredGroup, error) {
 	slices.SortFunc(keys, compareGroupKeys)
 
 	measured := make([]*measuredGroup, 0, len(keys))
+	// One Profiles value for the whole collection, so the in-run gate reads the
+	// same rule the final proof and the health check read.
+	held := Profiles{Global: global, ByHostname: byName}
 	for _, key := range keys {
 		group := groups[key]
-		run.identify(group, key, global, byName)
+		run.identify(group, key, held)
 		combined, err := combineForGroup(run.runner, group.order)
 		if err != nil {
 			return nil, err
@@ -2122,28 +2125,40 @@ func compareGroupKeys(first, second GroupKey) int {
 }
 
 // identify gives a group the profiles it is proved against, or the named reason
-// it cannot be measured. A global group is proved against every profile it was
-// given, because the design holds a manual Cloudflare address to the provider's
-// representative domain and every forced-ECH domain; a CloudFront group is proved
-// against its own hostname and no other, which is the anti-leak rule.
-func (run *runState) identify(group *measuredGroup, key GroupKey, global []candidate.ProbeProfile, byName map[string]candidate.ProbeProfile) {
-	if key.Hostname != "" {
-		profile, known := byName[key.Hostname]
-		if !known {
-			group.refusal = ReasonNoProfile
-			group.detail = fmt.Sprintf("no CloudFront profile names %q", key.Hostname)
-			return
-		}
-		group.profiles = []candidate.ProbeProfile{profile}
-		group.port = profile.Port
-		return
-	}
-	if len(global) == 0 {
+// it cannot be measured.
+//
+// Which profiles those are is Profiles.ForSubject's decision and not this
+// function's, and that is the whole point: it is the one implementation of "which
+// profiles is this group held to" that the final proof, a pin and the health check
+// all use, and a second copy here was a second rule that could drift from it - it
+// already had, matching hostnames exactly where ForSubject matches them as DNS
+// names are matched everywhere else. The subject is built from the group's key
+// because the key is what the group is; ForSubject reads the hostname and nothing
+// else, and the address is not known this early.
+//
+// What this function adds is everything the selection cannot: the named refusal
+// for a group no profile names at all, and the two rules about a global group's
+// profiles that have to be settled before a socket is opened - each one a usable
+// profile, and one port for the whole group.
+func (run *runState) identify(group *measuredGroup, key GroupKey, profiles Profiles) {
+	held := profiles.ForSubject(candidate.Candidate{Provider: key.Provider, Hostname: key.Hostname})
+	if len(held) == 0 {
 		group.refusal = ReasonNoProfile
-		group.detail = "the run was given no Cloudflare identity profile"
+		if key.Hostname != "" {
+			group.detail = fmt.Sprintf("no CloudFront profile names %q", key.Hostname)
+		} else {
+			group.detail = "the run was given no Cloudflare identity profile"
+		}
 		return
 	}
-	for index, profile := range global {
+	if key.Hostname != "" {
+		// A per-hostname group is held to exactly one profile, which ForSubject
+		// guarantees by returning at most one.
+		group.profiles = held
+		group.port = held[0].Port
+		return
+	}
+	for index, profile := range held {
 		if err := (candidate.CloudFrontProfile{Profile: profile}).Validate(); err != nil {
 			group.refusal = ReasonProfileInvalid
 			group.detail = err.Error()
@@ -2151,14 +2166,14 @@ func (run *runState) identify(group *measuredGroup, key GroupKey, global []candi
 		}
 		if index > 0 && profile.Port != group.port {
 			group.refusal = ReasonProfilePortsDiffer
-			group.detail = fmt.Sprintf("%s is served on port %d and %s on port %d", global[0].Hostname, group.port, profile.Hostname, profile.Port)
+			group.detail = fmt.Sprintf("%s is served on port %d and %s on port %d", held[0].Hostname, group.port, profile.Hostname, profile.Port)
 			return
 		}
 		if index == 0 {
 			group.port = profile.Port
 		}
 	}
-	group.profiles = global
+	group.profiles = held
 }
 
 // combineForGroup merges one group's channels: the official ones under the
@@ -2344,6 +2359,17 @@ func (run *runState) measureBandwidth(ctx context.Context) error {
 		// already full costs this run one refused reservation rather than one
 		// refusal per shortlist candidate. The run still says the day ran out.
 		if run.exhausted.Load() {
+			return nil
+		}
+		// The first profile is the one a transfer is measured through, and the
+		// invariant behind that index is that a group on the shortlist has at least
+		// one profile: a group identify refused has none, and identify's refusals
+		// leave it with no proved candidate, so the latency phase gives it an empty
+		// shortlist and it never reaches this loop. The check is here so that
+		// invariant is stated where it is relied on rather than only in a comment two
+		// hundred lines away, and the direction it fails in is the safe one: no
+		// transfer is made and no score is claimed.
+		if len(group.profiles) == 0 {
 			return nil
 		}
 		subject := group.order[index]
