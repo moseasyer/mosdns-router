@@ -229,15 +229,32 @@ func newECHProvider(o echProviderOptions) (*echProvider, error) {
 // re-reads the stored value and decides from that, and the sentinel surfaces only
 // when there is genuinely still nothing.
 //
-// The bound is two attempts, and each is a real fetch rather than a spin: a caller
-// that finds the other caller's fetch failed does its own, which is a second query
-// in a case that is already a failure. That is the price of never answering from a
-// snapshot taken before a wait, and it is paid only when the source is broken.
+// The bound is two attempts, and each is a real fetch rather than a spin -- but only
+// when the wait actually bought something. What it bought is a generation: only a
+// fetch that stored a key moves one, and a move is the only difference between the
+// snapshot a caller read before the wait and the one it would read after. When the
+// generation moved, the winner succeeded, the key this caller would re-read is not
+// the empty one it started with, and the retry is what saves a strict name from
+// answering SERVFAIL over a key that is sitting right there.
+//
+// When the generation did NOT move, the fetch this caller waited for stored nothing,
+// so re-reading finds the same value the caller already had and a second fetch buys
+// no information at all. It costs a whole exchange on the listener every foreign
+// query in this router depends on, paid by one caller at a time because the single
+// flight is still serialising them, and it reports a source fault to callers that
+// never read the source -- which is the shape a dead ECH source turns eight
+// concurrent force-ECH queries into. So that case falls through to the held-key
+// decision below: the last key in service if there is one and its grace has not
+// ended, ErrECHExpired if it has, and the failure itself if nothing was ever held.
 func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
 	var lastFailure error
 	for attempt := 0; attempt < 2; attempt++ {
 		e.mu.Lock()
 		held, have := e.current, e.have
+		// The generation is read here, before the wait, because after the wait it is
+		// the only thing that says whether the wait changed anything. Read it
+		// afterwards and it is always the winner's.
+		before := e.current.generation
 		status := ""
 		if have {
 			status = e.statusLocked()
@@ -257,10 +274,11 @@ func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
 			e.publish(echStatusFresh, fetched)
 			return fetched.raw, nil
 		}
-		if errors.Is(err, errECHNotRefetched) {
-			// Another caller did the fetch. This one re-reads the stored value at the
-			// top of the loop instead of deciding from anything it read before the
-			// wait, which is the only way a loser gets the key just published.
+		if errors.Is(err, errECHNotRefetched) && e.generationMoved(before) {
+			// Another caller fetched the key and it was stored, so this caller
+			// re-reads the stored value at the top of the loop instead of deciding
+			// from anything it read before the wait, which is the only way a loser
+			// gets the key just published.
 			continue
 		}
 		lastFailure = err
@@ -286,6 +304,16 @@ func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
 	}
 	e.logFetchFailure(lastFailure)
 	return nil, lastFailure
+}
+
+// generationMoved reports whether any key has been stored since the caller's reading
+// of the generation it was handed. It is the whole of what a wait can be worth: a
+// stored key and no stored key are the two outcomes, and only a stored key moves the
+// counter, so this is false exactly when the fetch this caller waited for failed.
+func (e *echProvider) generationMoved(before uint64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.current.generation != before
 }
 
 // logFetchFailure reports a refresh that did not happen. It is a separate function

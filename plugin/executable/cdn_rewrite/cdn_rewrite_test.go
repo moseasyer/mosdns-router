@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2712,6 +2713,122 @@ func TestTheFirstConcurrentCallersShareOneFetchAndAllGetTheKey(t *testing.T) {
 		if string(result.key) != string(echFixture(t)) {
 			t.Fatalf("caller %d got %d bytes, want the %d bytes the source published", index, len(result.key), len(echFixture(t)))
 		}
+	}
+}
+
+// The losing half of that race, on a source that never answers. The two tests above
+// share a fetch that SUCCEEDS, so the key is published and every caller that waited
+// finds it at the top of the loop: the second attempt is free and nothing is wrong.
+// On the failure path the same loop is a queue. The winner's fetch stores nothing,
+// so a waiter that re-reads finds exactly what it read before the wait, and starting
+// a fetch of its own is the only thing left for it to do -- one at a time, because
+// the single flight still holds the flag the winner is about to release. So eight
+// concurrent force-ECH HTTPS queries against an unreachable source cost a second
+// exchange on tcp://127.0.0.1:15353, the listener every foreign query in this router
+// depends on, and the callers that queue behind it are told a source fault they never
+// observed. At the production fetch timeout each of those exchanges is three seconds,
+// so the last client's context can expire while it waits for a key nobody is fetching.
+//
+// The assertions are exact, and none of them is a threshold on a clock. The origin is
+// held open on any exchange after the first -- a second exchange never returns until
+// this test releases it -- so "every caller is answered" and "a second exchange was
+// started" cannot both be true, and the race between the two is the whole property:
+// a caller answered while the origin is left alone was answered by the one exchange,
+// and a caller that had to wait for a second one is caught. The count then says how
+// many requests the source saw, and the split of errors says how many callers claimed
+// to have read it: one exchange, one reporter.
+func TestConcurrentCallersShareOneExchangeWithASourceThatKeepsFailing(t *testing.T) {
+	const callers = 8
+	// One exchange with a listener that has stopped answering: a cost the provider
+	// pays, not an error on the first byte. It only has to be long enough that the
+	// other seven callers are behind it rather than after it, because the assertion
+	// below does not depend on how long it is.
+	const exchange = 50 * time.Millisecond
+
+	var (
+		exchanges    atomic.Int64
+		announceLate sync.Once
+		late         = make(chan struct{})
+		release      = make(chan struct{})
+	)
+	sourceDown := errors.New("the ECH source is not answering")
+	h := newHarness(t)
+	h.upstream.setAnswer(func(dns.Question) (*dns.Msg, error) {
+		if exchanges.Add(1) == 1 {
+			time.Sleep(exchange)
+			return nil, sourceDown
+		}
+		// A second exchange is one nothing asked for, and this test will not let it
+		// finish: a caller that is waiting for it is the defect, and a caller waiting
+		// for the test is a test that hangs.
+		announceLate.Do(func() { close(late) })
+		<-release
+		return nil, sourceDown
+	})
+
+	results := make([]error, callers)
+	var group, ready sync.WaitGroup
+	group.Add(callers)
+	ready.Add(callers)
+	for index := range callers {
+		go func(index int) {
+			defer group.Done()
+			ready.Done()
+			_, results[index] = h.plugin.ech.Config(t.Context())
+		}(index)
+	}
+	ready.Wait()
+	// The first exchange is in flight by now and the others are behind it, which is
+	// the shape this test is about. Nothing below depends on the sleep: a caller that
+	// arrived after the first exchange is over would also find nothing stored, so one
+	// exchange is the only correct outcome either way.
+	time.Sleep(10 * time.Millisecond)
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+
+	lateStarted := false
+	select {
+	case <-done:
+	case <-late:
+		lateStarted = true
+		close(release)
+		<-done
+	case <-time.After(30 * time.Second):
+		close(release)
+		<-done
+		t.Fatal("the callers never finished: one of them is waiting for an exchange this test never released")
+	}
+	elapsed := time.Since(start)
+
+	if asked := h.upstream.asked(); len(asked) != 1 {
+		t.Fatalf("the source was asked %d times by %d concurrent callers against a source that fails, want 1: %+v", len(asked), callers, asked)
+	}
+	if lateStarted {
+		t.Fatalf("a caller started a second exchange after the first had already failed, and %d callers waited for it rather than being answered by the one exchange: %s", len(h.upstream.asked()), elapsed)
+	}
+	// Every caller fails closed rather than holding a key, and the seven that waited
+	// say so with the sentinel rather than with a fault of their own: logFetchFailure
+	// reads that sentinel as "you did not read the source, someone else did", and a
+	// caller reporting a source outage it never observed sends an operator after the
+	// wrong thing.
+	read, waited := 0, 0
+	for index, err := range results {
+		if err == nil {
+			t.Fatalf("caller %d got a key from a source that publishes none", index)
+		}
+		if errors.Is(err, errECHNotRefetched) {
+			waited++
+			continue
+		}
+		read++
+	}
+	if read != 1 || waited != callers-1 {
+		t.Fatalf("%d callers reported the source's own failure and %d reported waiting for another caller's fetch, want 1 and %d: one exchange has one reader", read, waited, callers-1)
 	}
 }
 
