@@ -19,6 +19,7 @@
 
 [Unit]
 Description=Two-minute CDN health check schedule
+Documentation=man:mosdns-cdnctl(1)
 
 [Timer]
 OnBootSec=2min

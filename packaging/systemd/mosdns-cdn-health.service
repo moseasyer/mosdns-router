@@ -15,8 +15,17 @@
 #
 # It is Type=oneshot, it is not enabled, and its timer starts it.
 
+# VERSION FLOOR: systemd 249, the oldest supported release (Ubuntu 22.04). The
+# newest directive in this file is ProtectProc= and ProcSubset=, both 247. A
+# directive newer than 249 must not be added here without checking the floor, and
+# `systemd-analyze verify` cannot check it for you: it runs against whatever
+# systemd the build host has (259 on the machine this was written on), so it
+# accepts a 255 directive that Ubuntu 22.04 would refuse at boot. Proving the
+# floor is a container run -- the spec's isolation testing, not this file.
+
 [Unit]
 Description=CDN health check: prove the address in service
+Documentation=man:mosdns-cdnctl(1)
 After=network.target
 
 [Service]
@@ -68,14 +77,19 @@ SystemCallArchitectures=native
 # which may be a UNIX socket. It enumerates no interface.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# The runtime directory is what this command writes in: the health document, the
+# Exactly the one directory this command writes in: the health document, the
 # selector it may transition, and the control lock.
 #
-# The lists directory is granted beside it although nothing in this command writes
-# there -- the prober it proves with offers no transfer and no cache. It is granted
-# because this unit and the optimizer's unit are one identity with one access set,
-# so a control operation cannot be refused by a mount that another control
-# operation needed. That is a deliberate over-grant and the test says so: if the
-# health check is ever confirmed to write nothing in the lists directory, this
-# entry is the first thing to go.
-ReadWritePaths=/var/lib/mosdns/runtime /var/lib/mosdns/lists
+# The lists directory is not here and does not need to be. This command builds its
+# checker from three paths, all of them in the runtime directory, and the prober it
+# proves addresses with offers no transfer and no cache -- so it writes nothing
+# anywhere else. The identity reads the published China list through its DAC
+# permissions (the state directories are root:mosdns 2750 with a default ACL for
+# the group this user has as its primary group), which is how it reads a document
+# the optimizer replaces, and a mount grant for a directory this command does not
+# write in would add no access the identity does not already have.
+#
+# installer/tests/test_units.py derives this row from the options runCDNHealthCheck
+# hands the checker, so a fourth path this command ever writes in fails the row
+# until the unit grants it.
+ReadWritePaths=/var/lib/mosdns/runtime

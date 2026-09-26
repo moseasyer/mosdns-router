@@ -16,8 +16,17 @@
 #
 # It is Type=oneshot, it is not enabled, and its timer starts it.
 
+# VERSION FLOOR: systemd 249, the oldest supported release (Ubuntu 22.04). The
+# newest directive in this file is ProtectProc= and ProcSubset=, both 247. A
+# directive newer than 249 must not be added here without checking the floor, and
+# `systemd-analyze verify` cannot check it for you: it runs against whatever
+# systemd the build host has (259 on the machine this was written on), so it
+# accepts a 255 directive that Ubuntu 22.04 would refuse at boot. Proving the
+# floor is a container run -- the spec's isolation testing, not this file.
+
 [Unit]
 Description=Daily check: has the pinned China domain list moved upstream?
+Documentation=man:mosdns-cdnctl(1)
 After=network.target
 
 [Service]

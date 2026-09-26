@@ -20,11 +20,12 @@ malformed calendar specification or an ExecStart that is not executable fails th
 build rather than the first boot.
 
 The tables are the contract. ``UNIT_DIRECTIVES`` is every directive of every
-shipped unit except ``Description=`` and ``Documentation=``, which are prose; the
-comments in the unit files are prose too, and neither is pinned, because pinning
-documentation makes a test fail over a rewording and trains everyone to rewrite
-the test instead of the thing it describes. Everything that is a decision is
-pinned, and a unit that grows a directive nobody decided on fails.
+shipped unit except ``Description=``, which is prose; the comments in the unit
+files are prose too, and neither is pinned, because pinning documentation makes a
+test fail over a rewording and trains everyone to rewrite the test instead of the
+thing it describes. Everything that is a decision is pinned -- ``Documentation=``
+included, because naming the manual page a unit is documented by is a decision --
+and a unit that grows a directive nobody decided on fails.
 """
 
 import ipaddress
@@ -124,22 +125,47 @@ SANDBOX = (
 # what lets either identity replace the other's files; per-service groups would
 # give the ACL to one identity and leave the other unable to write.
 #
-# The router writes the ECH state (cdn_rewrite) and the health file; the optimizer
-# and the health check write the selector, the bandwidth budget, the health
-# document and the published range cache; the bridge publishes the DHCP state. The
-# list check writes nothing at all -- `update-lists --check` is documented to take
-# no lock and write no file -- and dnscrypt-proxy's cache is off, so those two
-# units name no writable directory. The bridge has no unit: NetworkManager runs it
-# as root from a `no-wait.d` dispatcher script, so it is a row here and nowhere
-# else.
+# The rows are the code's write set, not a decision this module could make: each
+# one is derived from the writer that produces it and compared for equality, so a
+# unit that grants a directory the writer does not use and a writer that starts
+# using a directory the unit does not grant both fail here.
+#
+# The router writes the ECH state and nothing else -- cdn_rewrite publishes it and
+# dhcp_forward only reads the state the bridge publishes. It therefore does not
+# make /run/mosdns writable: the DHCP state arrives asynchronously from a
+# NetworkManager dispatcher, the plugin tolerates its absence, and an unprefixed
+# ReadWritePaths entry naming a directory that is not there fails the only
+# resolver on the host. The optimizer and the health check write the selector, the
+# budget, the health document and the control lock under the runtime directory,
+# and only the optimizer writes the published range cache under the lists
+# directory. The list check writes nothing at all -- `update-lists --check` is
+# documented to take no lock and write no file -- and dnscrypt-proxy's cache is
+# off, so those two units name no writable directory. The bridge has no unit:
+# NetworkManager runs it as root from a `no-wait.d` dispatcher script, so it is a
+# row below and nowhere else.
 WRITE_TABLE = {
-    ROUTER: (RUNTIME_DIR, RUN_DIR),
+    ROUTER: (RUNTIME_DIR,),
     OPTIMIZER: (RUNTIME_DIR, LISTS_DIR),
-    HEALTH: (RUNTIME_DIR, LISTS_DIR),
+    HEALTH: (RUNTIME_DIR,),
     LIST_CHECK: (),
     DNSCRYPT: (),
 }
+# The bridge's row: it has no unit, so it appears in no table above, and the only
+# thing a test can say about it is where it writes.
 BRIDGE_WRITES = (RUN_DIR,)
+
+# The directories this package provisions, and so the only ones a ReadWritePaths
+# entry may name without the `-` prefix. /var/lib/mosdns/runtime and
+# /var/lib/mosdns/lists are created by the package's postinst and survive a
+# reboot; /run/mosdns is on a tmpfs and is recreated by a tmpfiles.d entry, so
+# it is a volatile path like any other (see VOLATILE_PREFIXES).
+PROVISIONED = (RUNTIME_DIR, LISTS_DIR)
+
+# The directories that are gone after a reboot, so a ReadWritePaths entry naming
+# one fails the unit at start if the path is absent -- and the unprefixed form is
+# fatal. `-` is what makes a missing path tolerated. Nothing in this package
+# needs a volatile path: see the router's row above.
+VOLATILE_PREFIXES = ("/run/", "/var/run/", "/tmp/", "/dev/shm/")
 
 # The identity each unit runs as, and the group it runs under. Both mosdns service
 # users have `mosdns` as their primary group, which is the group the state
@@ -180,10 +206,14 @@ SCHEDULES = {
     LIST_CHECK_TIMER: (("OnCalendar", "*-*-* 03:30:00"), ("Persistent", "true")),
 }
 
-# Every directive of every shipped unit, except Description= and Documentation=.
+# Every directive of every shipped unit, except Description=.
 UNIT_DIRECTIVES = {
     ROUTER: {
         "Unit": (
+            # The manual page this router is documented by. The verify harness
+            # stubs man(1), so this directive is checked here whether or not the
+            # package has installed the page yet; Task 6 owns shipping the page.
+            ("Documentation", "man:mosdns-router(8)"),
             # Ordered after dnscrypt-proxy so the upstream exists when the router
             # takes its first foreign query, and pulled in with Wants rather than
             # Requires: a resolver that failed to start must not take the router
@@ -217,12 +247,15 @@ UNIT_DIRECTIVES = {
             # bounding set, the address-family list and ProtectSystem=strict carry
             # the confinement this package can actually stand behind.
             ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"),
-            ("ReadWritePaths", f"{RUNTIME_DIR} {RUN_DIR}"),
+            ("ReadWritePaths", f"{RUNTIME_DIR}"),
         ),
         "Install": (("WantedBy", "multi-user.target"),),
     },
     DNSCRYPT: {
-        "Unit": (("After", "network.target"),),
+        "Unit": (
+            ("Documentation", "man:dnscrypt-proxy(8)"),
+            ("After", "network.target"),
+        ),
         "Service": (
             ("Type", "simple"),
             ("User", "dnscrypt-proxy"),
@@ -249,7 +282,10 @@ UNIT_DIRECTIVES = {
         "Install": (("WantedBy", "multi-user.target"),),
     },
     OPTIMIZER: {
-        "Unit": (("After", "network.target"),),
+        "Unit": (
+            ("Documentation", "man:mosdns-cdnctl(1)"),
+            ("After", "network.target"),
+        ),
         "Service": (
             ("Type", "oneshot"),
             ("User", "mosdns-cdn"),
@@ -279,7 +315,10 @@ UNIT_DIRECTIVES = {
         ),
     },
     HEALTH: {
-        "Unit": (("After", "network.target"),),
+        "Unit": (
+            ("Documentation", "man:mosdns-cdnctl(1)"),
+            ("After", "network.target"),
+        ),
         "Service": (
             ("Type", "oneshot"),
             ("User", "mosdns-cdn"),
@@ -298,11 +337,16 @@ UNIT_DIRECTIVES = {
         + SANDBOX
         + (
             ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"),
-            ("ReadWritePaths", f"{RUNTIME_DIR} {LISTS_DIR}"),
+            # The runtime directory only: the health document, the selector this
+            # command may transition and the control lock are everything it writes.
+            ("ReadWritePaths", f"{RUNTIME_DIR}"),
         ),
     },
     LIST_CHECK: {
-        "Unit": (("After", "network.target"),),
+        "Unit": (
+            ("Documentation", "man:mosdns-cdnctl(1)"),
+            ("After", "network.target"),
+        ),
         "Service": (
             ("Type", "oneshot"),
             ("User", "mosdns-cdn"),
@@ -325,24 +369,29 @@ UNIT_DIRECTIVES = {
         ),
     },
     OPTIMIZER_TIMER: {
-        "Unit": (),
+        "Unit": (("Documentation", "man:mosdns-cdnctl(1)"),),
         "Timer": (("Unit", OPTIMIZER),) + SCHEDULES[OPTIMIZER_TIMER],
         "Install": (("WantedBy", "timers.target"),),
     },
     HEALTH_TIMER: {
-        "Unit": (),
+        "Unit": (("Documentation", "man:mosdns-cdnctl(1)"),),
         "Timer": (("Unit", HEALTH),) + SCHEDULES[HEALTH_TIMER],
         "Install": (("WantedBy", "timers.target"),),
     },
     LIST_CHECK_TIMER: {
-        "Unit": (),
+        "Unit": (("Documentation", "man:mosdns-cdnctl(1)"),),
         "Timer": (("Unit", LIST_CHECK),) + SCHEDULES[LIST_CHECK_TIMER],
         "Install": (("WantedBy", "timers.target"),),
     },
 }
 
 # Prose, and prose only. See the module docstring for why neither is pinned.
-PROSE_KEYS = frozenset({"Description", "Documentation"})
+# Documentation= is NOT in this set: a unit that documents itself points at a
+# manual page, and a package that has not installed its pages yet is a package
+# whose content test is missing -- not a reason for the unit to stop saying what it
+# documents. The verify harness stubs man(1) for that reason, so the directive is
+# checked here and the pages are Task 6's obligation.
+PROSE_KEYS = frozenset({"Description"})
 
 
 class UnitParseError(Exception):
@@ -595,7 +644,12 @@ class UnitTextTests(unittest.TestCase):
                 for section in sections:
                     self.assertIn(
                         section,
-                        ("Unit", "Service", "Timer", "Install", "Socket"),
+                        # Unit, Service, Timer and Install are the only sections a
+                        # service or a timer in this package has. A [Socket] here
+                        # would be socket activation, which is a different way for
+                        # the machine to reach a unit than "start it", and no
+                        # directive of one would be a decision anybody made.
+                        ("Unit", "Service", "Timer", "Install"),
                         f"{name} has a [{section}] section this package never writes",
                     )
                 self.assertTrue(
@@ -676,6 +730,44 @@ class UnitTextTests(unittest.TestCase):
             "every timer with a pinned schedule has a service, and every timer-driven service "
             "has exactly one timer",
         )
+
+    def test_a_writable_path_that_does_not_exist_is_tolerated_or_absent(self):
+        # The form of a ReadWritePaths entry is a start-time decision, not a
+        # convenience. Unprefixed, the path must exist or the unit fails its
+        # mount-namespace setup -- and systemd retries that failure on every
+        # RestartSec, so a path that is absent on a host is not a unit that starts
+        # late, it is a resolver that never comes up. The `-` prefix is what makes a
+        # missing path tolerated.
+        #
+        # A path under /run, /var/run, /tmp or /dev/shm is a volatile path: it is
+        # gone after a reboot whatever an installer did, and only a tmpfiles.d entry
+        # brings it back. So an entry naming one has to be `-`-prefixed whether or
+        # not this package installs that entry itself, and an unprefixed entry has to
+        # name a directory the package provisions.
+        for name in SERVICES:
+            values = directive_value(parsed(name), "Service", "ReadWritePaths")
+            entries = [part for value in values for part in value.split() if part]
+            for entry in entries:
+                tolerated = entry.startswith("-")
+                path = entry[1:] if tolerated else entry
+                with self.subTest(unit=name, path=path):
+                    if path.startswith(VOLATILE_PREFIXES):
+                        self.assertTrue(
+                            tolerated,
+                            f"{name} names {path} without the `-` prefix. It is a volatile "
+                            "path, so a host that has not created it yet fails this unit's "
+                            "mount-namespace setup, and the retry that follows is the only DNS "
+                            "path on the machine coming up and going down",
+                        )
+                        continue
+                    self.assertIn(
+                        path,
+                        PROVISIONED,
+                        f"{name} names {path} unprefixed, and {path} is not a directory this "
+                        f"package provisions ({list(PROVISIONED)}). An unprefixed entry has to "
+                        "name a path that exists when the unit starts, because nothing creates "
+                        "it at that moment",
+                    )
 
     def test_only_the_router_holds_a_capability(self):
         for name in SERVICES:
@@ -914,9 +1006,18 @@ class ShippedConfigListenerTests(unittest.TestCase):
                 f"{listening!r} is a LAN bind and the loopback check has to reject it",
             )
 
-    def test_the_units_and_the_configs_name_loopback_addresses_only(self):
-        for path in sorted(CONFIG_DIR.glob("mosdns.yaml")) + sorted(
-            CONFIG_DIR.glob("dnscrypt-proxy.toml")
+    def test_every_listener_the_configs_name_is_loopback(self):
+        # The scoped name is the honest one. This class checks BINDINGS and nothing
+        # else, because the broad reading -- every address either document names --
+        # is not a property this package can have: the resolver document has to name
+        # Quad9's own addresses to bootstrap provider names and to probe
+        # reachability, and those are destinations it dials, not interfaces it is
+        # reachable on. The units are held to the broad reading in
+        # test_no_unit_names_an_address_outside_loopback, where it is satisfiable,
+        # because a unit file is not supposed to name an address at all.
+        for path in (
+            sorted(CONFIG_DIR.glob("mosdns.yaml"))
+            + sorted(CONFIG_DIR.glob("dnscrypt-proxy.toml"))
         ):
             with self.subTest(config=path.name):
                 for value in yaml_listen_addresses(path.read_text(encoding="utf-8")) + (
@@ -965,6 +1066,52 @@ class ConfigPathTests(unittest.TestCase):
                     "own output is mosdns.yaml, and a unit loading a path that does not exist "
                     "is a service that cannot start",
                 )
+
+
+# What a diagnostic has to mention to be this package's business. The fake root
+# holds the host's own systemd units, and resolving a target's default
+# dependencies walks all of them: on a host that ships dracut, a unit in
+# /usr/lib/dracut is enabled by a symlink from /usr/lib/systemd/system that points
+# outside the copied tree, so it dangles in the fake root and systemd reports it.
+# Those are the host's diagnostics, about the host's packages, and they are the
+# same on every unit this package ships -- so the gate is not "stderr is empty" but
+# "nothing systemd said is about this package".
+OUR_SUBJECTS = tuple(SHIPPED_UNITS) + (
+    ROUTER_BINARY,
+    CDNCTL_BINARY,
+    DNSCRYPT_BINARY,
+    ROUTER_CONFIG,
+    DNSCRYPT_CONFIG,
+    POLICY,
+    RUNTIME_DIR,
+    LISTS_DIR,
+    RUN_DIR,
+)
+
+
+def our_diagnostics(name, completed):
+    """The lines of a verify run that are about this package rather than the host."""
+    lines = (completed.stdout + completed.stderr).splitlines()
+    return [
+        line
+        for line in lines
+        if line.strip() and any(subject in line for subject in OUR_SUBJECTS)
+    ]
+
+
+def host_wants_entries(root):
+    """The `*.wants/<unit>` entries under a systemd unit tree, as relative paths.
+
+    The `.wants` is a suffix of a path component rather than a component of its
+    own -- ``getty.target.wants/getty@tty1.service`` -- so the suffix is what is
+    matched.
+    """
+    return sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if any(part.endswith(".wants") for part in path.parts)
+        and not path.name.endswith(".wants")
+    )
 
 
 class SystemdAnalyzeTests(unittest.TestCase):
@@ -1017,11 +1164,20 @@ class SystemdAnalyzeTests(unittest.TestCase):
         # Symlinks are dereferenced: a symlinked /usr/lib/systemd/system would send
         # the relative links inside it back into the fake root, and verify would
         # report a loop for every alias instead of a unit property.
+        # Symlinks are PRESERVED, which is the whole reason this is a copy and not
+        # a selection. `symlinks=False` follows them, and following a relative link
+        # resolves it against the process's working directory rather than against
+        # the link's own directory -- so every one of the ~100 `*.wants` entries in
+        # a normal /usr/lib/systemd/system resolves to nothing, copytree is asked to
+        # ignore a dangling link, and the fake root ends up with no wants entries at
+        # all. That failure is silent, the closure is resolved without the target's
+        # real dependencies, and the result is a check that is clean because of what
+        # it dropped rather than because of what it verified. Preserved links
+        # resolve inside the copy, which is what they were pointing at.
         shutil.copytree(
             systemd_units,
             target / "systemd",
-            symlinks=False,
-            ignore_dangling_symlinks=True,
+            symlinks=True,
         )
         installed = directory / "etc" / "systemd" / "system"
         installed.mkdir(parents=True)
@@ -1044,12 +1200,26 @@ class SystemdAnalyzeTests(unittest.TestCase):
             stub.parent.mkdir(parents=True, exist_ok=True)
             stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             stub.chmod(0o755)
+        # `man` is stubbed so the harness's verdict does not depend on whether this
+        # package has installed its manual pages yet. `systemd-analyze verify`
+        # shells out to man(1) for every Documentation= entry and fails the unit
+        # with code 16 when the page is not there, and there is no --man=no to
+        # decline it -- so a package that has not shipped its man pages yet would
+        # otherwise be unable to state what it documents. Whether those pages exist
+        # is a package-content question for Task 6, recorded in the plan; it is not
+        # a unit-validity question and must not decide one.
+        man = directory / "stub-bin" / "man"
+        man.parent.mkdir(parents=True, exist_ok=True)
+        man.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        man.chmod(0o755)
         return directory
 
     def _verify(self, units):
         self._require_analyze()
         with tempfile.TemporaryDirectory() as raw:
             self._fake_root(Path(raw), units)
+            environment = dict(os.environ)
+            environment["PATH"] = str(Path(raw) / "stub-bin") + os.pathsep + environment["PATH"]
             results = {}
             for name in sorted(units):
                 completed = subprocess.run(
@@ -1057,6 +1227,7 @@ class SystemdAnalyzeTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=environment,
                 )
                 results[name] = completed
             return results
@@ -1071,11 +1242,122 @@ class SystemdAnalyzeTests(unittest.TestCase):
                     f"systemd-analyze verify rejected {name}:\n{completed.stdout}{completed.stderr}",
                 )
                 self.assertEqual(
-                    completed.stderr.strip(),
-                    "",
-                    f"systemd-analyze verify reported diagnostics for {name}, and a diagnostic "
-                    "is the whole reason this check exists",
+                    our_diagnostics(name, completed),
+                    [],
+                    f"systemd-analyze verify reported something about {name}, and a diagnostic "
+                    "about this package's own unit is the whole reason this check exists",
                 )
+
+    def test_the_fake_root_keeps_the_wants_entries_it_exists_to_resolve(self):
+        # A target's default dependencies are its .wants entries. A harness that
+        # drops them resolves the closure without them and reports the result as
+        # clean, so the copy is checked for having kept them -- as symlinks, since
+        # a dereferenced copy of a relative link is a file at a path nothing points
+        # at, which is the failure this test exists to make visible.
+        host = Path("/usr/lib/systemd")
+        self.assertTrue(
+            host.is_dir(),
+            "/usr/lib/systemd does not exist, so there is no unit tree to resolve default "
+            "dependencies against",
+        )
+        expected = host_wants_entries(host)
+        self.assertTrue(
+            expected,
+            "the host's systemd tree has no *.wants entries, so this check cannot tell a "
+            "preserved link from a dropped one and the harness is not being verified",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            self._fake_root(Path(raw), {name: unit_text(name) for name in SHIPPED_UNITS})
+            copied = Path(raw) / "usr" / "lib" / "systemd"
+            present = host_wants_entries(copied)
+            missing = sorted(set(expected) - set(present))
+            self.assertEqual(
+                missing,
+                [],
+                f"{len(missing)} of the host's {len(expected)} .wants entries are not in the "
+                f"fake root ({missing[:5]}), so the default dependencies this check resolves "
+                "are not the ones a real system has",
+            )
+            for relative in expected:
+                path = copied / relative
+                self.assertTrue(
+                    path.is_symlink(),
+                    f"{relative} exists in the fake root as "
+                    f"{'a regular file' if path.exists() else 'nothing'}, and a dereferenced "
+                    "wants entry is an enablement nothing follows",
+                )
+
+    def test_a_diagnostic_about_this_package_is_not_mistaken_for_the_hosts(self):
+        # The filter above is what replaces "stderr is empty", and a filter that
+        # matches nothing is as weak as an empty-stderr assertion that never fires.
+        # Both shapes are the real ones: systemd reports a broken property of our own
+        # unit by naming it, and it reports the host's dangling dracut link by
+        # naming that.
+        class Reported:
+            def __init__(self, text):
+                self.stdout = ""
+                self.stderr = text
+
+        self.assertEqual(
+            our_diagnostics(ROUTER, Reported(f"{ROUTER}:7: Unknown key 'Nope', ignoring.\n")),
+            [f"{ROUTER}:7: Unknown key 'Nope', ignoring."],
+            "a diagnostic naming one of this package's units is a failure, not noise",
+        )
+        self.assertEqual(
+            our_diagnostics(
+                ROUTER,
+                Reported("dracut-pre-udev.service: Failed to open /fake/usr/lib/dracut/x.service\n"),
+            ),
+            [],
+            "a diagnostic about the host's own unit tree is the host's problem, and failing on "
+            "it would make this gate depend on which packages the build host has",
+        )
+
+    def test_the_man_stub_is_what_keeps_documentation_from_deciding_the_verdict(self):
+        # `systemd-analyze verify` runs man(1) for every Documentation= entry and
+        # fails the unit with code 16 when the page is not installed, and there is no
+        # option to decline the check. Without the stub, a package that has not
+        # shipped its manual pages cannot state what its units document, and the
+        # only cure would be deleting the directive -- which is a package-completeness
+        # question deciding a unit-validity one. This is the proof that the stub is
+        # what changes the verdict, in both directions, on the same unit.
+        self._require_analyze()
+        documented = (
+            "[Unit]\nDescription=x\nDocumentation=man:mosdns-router(8)\n\n[Service]\n"
+            "Type=oneshot\nExecStart=/bin/true\n"
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self._fake_root(root, {"broken-man.service": documented}, ["/bin/true"])
+            stubbed = dict(os.environ)
+            stubbed["PATH"] = str(root / "stub-bin") + os.pathsep + stubbed["PATH"]
+            without = subprocess.run(
+                [self.analyze, "verify", "--root", str(root), "broken-man.service"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            with_man = subprocess.run(
+                [self.analyze, "verify", "--root", str(root), "broken-man.service"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=stubbed,
+            )
+        self.assertNotEqual(
+            without.returncode,
+            0,
+            "without the stub this unit fails on its missing man page, so the stub is not "
+            "what the shipped units are relying on and the claim in the harness docstring "
+            "is wrong",
+        )
+        self.assertIn("man mosdns-router(8)", without.stdout + without.stderr)
+        self.assertEqual(
+            with_man.returncode,
+            0,
+            "with the stub on PATH the same unit verifies, which is the point: "
+            f"{with_man.stdout}{with_man.stderr}",
+        )
 
     def test_the_verification_itself_rejects_a_broken_unit(self):
         # A gate that cannot fail is not a gate, so the same harness is run against
@@ -1112,6 +1394,10 @@ class SystemdAnalyzeTests(unittest.TestCase):
             # Nothing is stubbed here, so an ExecStart naming a missing binary is
             # missing in the root too -- which is the whole point of that case.
             self._fake_root(root, {name: text for name, (text, _, _) in broken.items()}, [])
+            environment = dict(os.environ)
+            environment["PATH"] = (
+                str(root / "stub-bin") + os.pathsep + environment["PATH"]
+            )
             for name, (_, refused, message) in broken.items():
                 with self.subTest(unit=name):
                     completed = subprocess.run(
@@ -1119,6 +1405,7 @@ class SystemdAnalyzeTests(unittest.TestCase):
                         capture_output=True,
                         text=True,
                         timeout=120,
+                        env=environment,
                     )
                     self.assertIn(
                         message,
@@ -1140,13 +1427,276 @@ class SystemdAnalyzeTests(unittest.TestCase):
                         )
 
 
+# The message every write-set failure ends with, so a person who has just added a
+# writer is told what the row now owes them.
+_HINT_NEW_WRITE = (
+    "A writer that has appeared or moved has to be resolved to the path it writes, and that "
+    "path's directory added to this unit's ReadWritePaths -- or the write has to be shown not to "
+    "be this identity's. A unit that does not grant a directory its own writer needs fails at "
+    "runtime with a mount-namespace error, which is not what an operator should be reading."
+)
+
+# Every way a Go program in this repository writes a file, so a new one cannot slip
+# past by not being the state package's helper. This is a guard, not an allowlist:
+# a call site that matches and cannot be resolved is a failure, not a pass.
+WRITE_CALL = re.compile(
+    r"(?P<call>\b(?:state\.\w*Write\w*|(?:os|ioutil)\.(?:WriteFile|Create|OpenFile|MkdirAll"
+    r"|Mkdir|Rename|Remove|RemoveAll|Truncate))\s*\()"
+)
+# The path a write call is given: the first argument, which is a field of some
+# receiver. A first argument that is a local variable cannot be followed from
+# here, and is reported as unresolved rather than guessed at.
+WRITE_TARGET = re.compile(r"^\s*(?:(?P<receiver>[A-Za-z_]\w*)\.)?(?P<field>\w+)\s*,")
+
+PLUGIN_DIRS = (
+    REPO / "plugin" / "executable" / "cdn_rewrite",
+    REPO / "plugin" / "executable" / "dhcp_forward",
+)
+
+
+def go_sources(directory):
+    """The non-test Go files of a directory, in a stable order."""
+    return [
+        (path.name, path.read_text(encoding="utf-8"))
+        for path in sorted(directory.glob("*.go"))
+        if not path.name.endswith("_test.go")
+    ]
+
+
+def go_text(directory):
+    return "".join(body for _name, body in go_sources(directory))
+
+
+def go_constant(name, directory):
+    """The right-hand side of a top-level constant, or ``None``."""
+    found = re.search(
+        rf"^\s*{re.escape(name)}\s*=\s*(?P<value>.+?)\s*$",
+        go_text(directory),
+        flags=re.MULTILINE,
+    )
+    return found.group("value") if found is not None else None
+
+
+def go_path_pieces(expression, directory, package_aliases, depth=0):
+    """The string pieces a Go constant expression is built from, in order.
+
+    A quoted literal is one piece. An identifier is another constant in the same
+    package, resolved in turn -- which is how a directory constant and a file-name
+    constant compose into one path. A qualified name is a constant in a package
+    this file imports, and the import block says which directory that is. Anything
+    else is refused, because a path this function cannot name is a path the table
+    cannot be derived from and the row has to be resolved by hand.
+    """
+    if depth > 3:
+        raise AssertionError(f"{expression!r} does not resolve within three hops")
+    qualified = re.fullmatch(r"(?P<pkg>\w+)\.(?P<name>\w+)", expression.strip())
+    if qualified is not None:
+        alias = qualified.group("pkg")
+        if alias not in package_aliases:
+            raise AssertionError(
+                f"{expression!r} names the package {alias!r}, which this derivation does not "
+                "know the import path of"
+            )
+        target = REPO / package_aliases[alias]
+        value = go_constant(qualified.group("name"), target)
+        if value is None:
+            raise AssertionError(
+                f"{expression!r} names a constant that is not in {target.relative_to(REPO)}"
+            )
+        return go_path_pieces(value, target, package_aliases, depth + 1)
+    pieces = []
+    for literal, name in re.findall(r'"([^"]*)"|(\b[A-Za-z_]\w*\b)', expression):
+        if literal:
+            pieces.append(literal)
+            continue
+        if not name:
+            continue
+        value = go_constant(name, directory)
+        if value is None:
+            raise AssertionError(
+                f"{name!r} in {expression!r} is not a top-level constant in "
+                f"{directory.relative_to(REPO)}, so the path cannot be named from here"
+            )
+        pieces.extend(go_path_pieces(value, directory, package_aliases, depth + 1))
+    return pieces
+
+
+def resolve_go_path(expression, directory, package_aliases):
+    """Resolve a Go constant expression to the absolute path it names."""
+    path = "".join(go_path_pieces(expression, directory, package_aliases))
+    if not path.startswith("/"):
+        raise AssertionError(
+            f"{expression!r} resolves to {path!r}, which is not an absolute path, so the "
+            "directory it names cannot be put in a table"
+        )
+    return path
+
+
+def router_write_calls():
+    """Every write call site in the two plugins the router loads, resolved to a key.
+
+    Each call is followed from the field it writes to the configuration key that
+    supplies it: ``state.WriteJSONAtomic(e.statePath, ...)`` -> ``statePath:
+    args.ECHStateFile`` -> ``ECHStateFile string `yaml:"ech_state_file"` ``. The
+    hops are read out of the source, and a call site that does not resolve comes
+    back with an empty key so the caller fails on it.
+    """
+    resolved = []
+    for directory in PLUGIN_DIRS:
+        sources = go_sources(directory)
+        everything = "".join(body for _name, body in sources)
+        for name, text in sources:
+            for match in WRITE_CALL.finditer(text):
+                line = text[match.start() : text.find("\n", match.start())]
+                target = WRITE_TARGET.match(line[match.end("call") - match.start() :])
+                key = ""
+                if target is not None:
+                    field = target.group("field")
+                    supplied = re.search(
+                        rf"^\s*{re.escape(field)}:\s*(?P<value>[^,\n]+),",
+                        everything,
+                        flags=re.MULTILINE,
+                    )
+                    if supplied is not None:
+                        named = re.search(
+                            r"args\.(?P<field>\w+)", supplied.group("value")
+                        )
+                        if named is not None:
+                            tag = re.search(
+                                rf"{named.group('field')}\s+string\s+`yaml:\"(?P<key>[^\"]+)\"`",
+                                everything,
+                            )
+                            key = tag.group("key") if tag is not None else ""
+                resolved.append((f"{directory.name}/{name}", match.group("call"), key))
+    return resolved
+
+
+def routing_document_value(key):
+    """The value a key has in the shipped routing document, or ``None``."""
+    if not key:
+        return None
+    found = re.search(
+        rf"^\s*{re.escape(key)}:\s*(?P<value>\S+)\s*$",
+        (CONFIG_DIR / "mosdns.yaml").read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    return found.group("value") if found is not None else None
+
+
+def router_write_directories():
+    """The directories the router's plugins write in, sorted."""
+    directories = set()
+    for _call_site, _call, key in router_write_calls():
+        path = routing_document_value(key)
+        if path is not None:
+            directories.add(os.path.dirname(path))
+    return tuple(sorted(directories))
+
+
+CDNCTL_DIR = REPO / "cmd" / "mosdns-cdnctl"
+
+
+def cdnctl_imports():
+    """The import aliases of the command, mapped to the directory they name.
+
+    Both spellings count: an import written with an explicit alias and one written
+    bare, where the alias is the last element of the path. Go's own compiler
+    decides the same thing, so a change to either form moves this map.
+    """
+    source = go_text(CDNCTL_DIR)
+    aliases = {}
+    for alias, path in re.findall(
+        r'^\s*(\w+)\s+"mosdns-router/internal/(\w+)"', source, flags=re.MULTILINE
+    ):
+        aliases[alias] = f"internal/{path}"
+    for path in re.findall(r'^\s*"mosdns-router/internal/(\w+)"', source, flags=re.MULTILINE):
+        aliases[path] = f"internal/{path}"
+    return aliases
+
+
+def command_write_directories(constant_suffix, fields):
+    """The directories a command's options hand it, resolved through its defaults.
+
+    ``fields`` are the struct fields the call sets. Each is an ``options.<field>``
+    on the parsed command line, each of those has a ``default...`` constant, and
+    each of those is either a literal path or a constant in a package this command
+    imports. Reading the four hops is what keeps the row equal to the code rather
+    than to a comment about the code.
+    """
+    source = go_text(CDNCTL_DIR)
+    aliases = cdnctl_imports()
+    directories = set()
+    for field in fields:
+        option = re.search(
+            rf"^\s*{re.escape(field)}:\s*options\.(?P<option>\w+),", source, flags=re.MULTILINE
+        )
+        if option is None:
+            raise AssertionError(
+                f"the {field} option is no longer set from the parsed command line, so this "
+                "derivation cannot say what path the command writes and the row has to be "
+                "resolved by hand"
+            )
+        named = option.group("option")
+        # The constants in this file whose name carries the option's own, matched
+        # on the declarations rather than on a naming convention: the option is
+        # `budget` and the constant is `defaultBandwidthBudgetPath`, and a
+        # convention that had to be guessed would break on the next flag.
+        candidates = [
+            name
+            for name in re.findall(r"^\s*(default\w+)\s*=", source, flags=re.MULTILINE)
+            if named.lower() in name.lower()
+        ]
+        if len(candidates) != 1:
+            raise AssertionError(
+                f"{len(candidates)} constants in cmd/mosdns-cdnctl carry the {named!r} option's "
+                f"name ({candidates!r}), so this derivation cannot say which default the "
+                f"{field} path comes from and the row has to be resolved by hand"
+            )
+        path = resolve_go_path(go_constant(candidates[0], CDNCTL_DIR), CDNCTL_DIR, aliases)
+        directories.add(os.path.dirname(path))
+    return tuple(sorted(directories))
+
+
+def health_check_write_directories():
+    """The directories `mosdns-cdnctl health-check` writes in, from its own options."""
+    return command_write_directories(
+        None, ("HealthPath", "SelectorPath", "ControlLockPath")
+    )
+
+
+def optimizer_write_directories():
+    """The directories `mosdns-cdnctl test --apply` writes in, from its own paths."""
+    runner = command_write_directories(
+        None, ("BudgetPath", "SelectorPath", "ControlLockPath")
+    )
+    # The candidate fetch caches the published range document at --ranges-cache,
+    # which the runner does not carry: it is a field of the source the run reads its
+    # candidates from, and the constant for it does not follow the default<Option>
+    # naming the other four do.
+    source = go_text(CDNCTL_DIR)
+    if "CachePath:" not in source:
+        raise AssertionError(
+            "the candidate fetch no longer names a ranges cache, so the optimizer's write set "
+            "has to be resolved by hand"
+        )
+    cache = go_constant("defaultCloudflareRangesCache", CDNCTL_DIR)
+    if cache is None:
+        raise AssertionError("defaultCloudflareRangesCache is gone")
+    return tuple(
+        sorted(set(runner) | {os.path.dirname(resolve_go_path(cache, CDNCTL_DIR, cdnctl_imports()))})
+    )
+
+
 class WriteSetEvidenceTests(unittest.TestCase):
     """The write table against the code that writes, so it cannot rot silently.
 
-    The table above is a decision; this is the check that the decision still
-    describes the code. A writer that starts writing a new directory has to be
-    added to both, because a unit that is not writable there fails at runtime with
-    a mount-namespace error rather than with anything an operator can read.
+    The table is not a decision this module could make and then check itself
+    against: every row is derived from the writer that produces it -- the plugins
+    the router loads, the options the two control commands are handed -- and
+    compared for equality. A unit that grants a directory its identity does not
+    write in fails, and a writer that starts using a directory its unit does not
+    grant fails the other way, which is the direction a table nobody checks
+    against the code fails in silently.
     """
 
     def _writable(self, name):
@@ -1288,67 +1838,67 @@ class WriteSetEvidenceTests(unittest.TestCase):
         )
         self.assertIn("os.replace", publisher, "the publisher replaces the state by rename")
 
-    def test_the_router_writes_only_the_ech_state(self):
-        # The router's whole write set is one document the cdn_rewrite plugin
-        # publishes; dhcp_forward only reads the state the bridge publishes. That is
-        # why the router's writable directory is the one holding it. /run/mosdns is
-        # granted beside it by the write table above, and it is where the DHCP state
-        # the router reads lives -- a grant nothing in this router writes today, and
-        # the one entry in the table this test cannot justify from the code.
-        writes = {
-            plugin.name: [
-                call
-                for path in sorted(plugin.glob("*.go"))
-                if not path.name.endswith("_test.go")
-                for call in re.findall(
-                    r"state\.Write\w*\(", path.read_text(encoding="utf-8")
-                )
-            ]
-            for plugin in (
-                REPO / "plugin" / "executable" / "cdn_rewrite",
-                REPO / "plugin" / "executable" / "dhcp_forward",
-            )
-        }
+    def test_the_router_writable_set_is_exactly_what_its_plugins_write(self):
+        # The router's write set is derived from the code that writes, not asserted
+        # as a fact about it. Every write call site in either plugin is resolved
+        # through to the configuration key it publishes, and the directories those
+        # keys are given in the shipped routing document are compared for EQUALITY
+        # with the table's row. So a unit that grants a directory the router does
+        # not write in fails, and -- the other direction -- a plugin that starts
+        # writing a document the unit does not grant also fails, with the message
+        # naming the call site that has to be accounted for.
         self.assertEqual(
-            writes,
-            {"cdn_rewrite": ["state.WriteJSONAtomic("], "dhcp_forward": []},
-            "a plugin that has started writing a second document has changed the router's write "
-            f"set, and the writable directory is {RUNTIME_DIR}",
+            tuple(sorted(self._writable(ROUTER))),
+            router_write_directories(),
+            "the router's writable set is what its two plugins write, and nothing else. "
+            + _HINT_NEW_WRITE,
         )
-        self.assertIn(
-            f"ech_state_file: {ECH_STATE}",
-            (CONFIG_DIR / "mosdns.yaml").read_text(encoding="utf-8"),
-            "the shipped routing document is what tells the router which document to publish",
+        self.assertEqual(
+            router_write_calls(),
+            [
+                (
+                    "cdn_rewrite/ech_provider.go",
+                    "state.WriteJSONAtomic(",
+                    "ech_state_file",
+                )
+            ],
+            "a write call site this derivation cannot resolve appeared in the router's plugins. "
+            + _HINT_NEW_WRITE,
         )
-        self.assertIn(
-            RUNTIME_DIR,
-            self._writable(ROUTER),
-            f"the router publishes {ECH_STATE}, so {RUNTIME_DIR} has to be writable in it",
+
+    def test_the_health_check_writable_set_is_exactly_where_its_checker_is_pointed(self):
+        # `health-check` builds its checker from three paths -- the health document,
+        # the selector and the control lock -- and every one of them is handed to it
+        # by name in runCDNHealthCheck. A fourth write would be a fourth option
+        # field, and the derivation reads those options, so the row cannot drift.
+        self.assertEqual(
+            tuple(sorted(self._writable(HEALTH))),
+            health_check_write_directories(),
+            "the health check's writable set is the set of paths its checker is handed, and the "
+            "DAC permissions of the shared group already grant it every one of them: a mount "
+            "grant for a directory this command does not write in is redundant. "
+            + _HINT_NEW_WRITE,
+        )
+
+    def test_the_optimizer_writable_set_is_exactly_what_its_paths_name(self):
+        self.assertEqual(
+            tuple(sorted(self._writable(OPTIMIZER))),
+            optimizer_write_directories(),
+            "the optimizer's writable set is the four paths its command is configured with: the "
+            "selector, the budget, the control lock and the published range cache. "
+            + _HINT_NEW_WRITE,
         )
 
     def test_the_optimizer_and_the_health_check_take_the_control_lock_under_a_writable_directory(self):
         for name in (OPTIMIZER, HEALTH):
             with self.subTest(unit=name):
-                writable = self._writable(name)
                 self.assertIn(
                     os.path.dirname(CONTROL_LOCK),
-                    writable,
+                    self._writable(name),
                     f"{name} acquires {CONTROL_LOCK} through a read-only descriptor, so the "
                     "directory holding it has to be writable or the command fails at its first "
                     "control operation",
                 )
-        for name, path in ((OPTIMIZER, SELECTOR), (HEALTH, HEALTH_STATE), (OPTIMIZER, BANDWIDTH_BUDGET)):
-            with self.subTest(unit=name, document=path):
-                self.assertIn(
-                    os.path.dirname(path),
-                    self._writable(name),
-                    f"{name} writes {path}",
-                )
-        self.assertIn(
-            LISTS_DIR,
-            self._writable(OPTIMIZER),
-            f"the optimizer caches the published range document at {RANGES_CACHE}",
-        )
 
     def test_every_writable_directory_is_named_by_something_that_writes_there(self):
         for name in SERVICES:

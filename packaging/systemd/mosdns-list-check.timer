@@ -17,6 +17,7 @@
 
 [Unit]
 Description=Daily China list drift check schedule
+Documentation=man:mosdns-cdnctl(1)
 
 [Timer]
 OnCalendar=*-*-* 03:30:00

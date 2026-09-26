@@ -24,9 +24,18 @@
 # directory that is absent fails this unit at start with a mount-namespace error,
 # which is the loud failure this unit would rather have than a router that
 # silently cannot write its ECH state.
+#
+# VERSION FLOOR: systemd 249, the oldest supported release (Ubuntu 22.04). The
+# newest directive in this file is ProtectProc= and ProcSubset=, both 247. A
+# directive newer than 249 must not be added here without checking the floor, and
+# note what the test cannot do for you: `systemd-analyze verify` runs against
+# whatever systemd the build host has (259 here), so it will happily accept a 255
+# directive that Ubuntu 22.04 would refuse at boot. The 249 check is a container
+# run, which is the spec's isolation testing and not this file.
 
 [Unit]
 Description=mosdns-router DNS router (loopback only)
+Documentation=man:mosdns-router(8)
 After=dnscrypt-proxy.service network.target
 Wants=dnscrypt-proxy.service
 
@@ -95,16 +104,21 @@ SystemCallArchitectures=native
 # particular either, and AF_UNIX costs nothing to keep.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# Per identity, and checked against the write table in
-# installer/tests/test_units.py: a directory nothing this unit writes is not
-# writable here. The ECH state the rewriter publishes is the router's only write,
-# and it lives in the runtime directory. /run is granted beside it although nothing
-# in the router writes there today -- the DHCP state the forwarder reads is
-# published by the bridge, which runs as root from a NetworkManager dispatcher --
-# because that is the directory the router's own state arrives in and a unit that
-# could not have written it could not report a state it had to change. The test
-# says so, and it is the first entry to go if that stops being true.
-ReadWritePaths=/var/lib/mosdns/runtime /run/mosdns
+# Per identity, and checked against the code that writes rather than against a
+# decision: the router's only write is the ECH state the response rewriter
+# publishes, and installer/tests/test_units.py derives that from the plugin's
+# write call sites and fails if the unit grants a directory it does not write in.
+#
+# /run/mosdns is deliberately NOT here. The DHCP state arrives asynchronously from
+# a NetworkManager dispatcher, dhcp_forward only reads it, and the plugin treats
+# its absence as "keep the current generation" -- so nothing in this router writes
+# there. A ReadWritePaths entry naming a directory that is not there fails the
+# unit's mount-namespace setup, and /run is a tmpfs, so on a host where the
+# dispatcher has not fired -- a static address, a link NetworkManager does not
+# manage, no dispatcher installed -- that failure is retried every RestartSec
+# forever and the machine has no DNS at all. An entry there would have to carry the
+# `-` prefix, and there is nothing to grant.
+ReadWritePaths=/var/lib/mosdns/runtime
 
 [Install]
 WantedBy=multi-user.target
