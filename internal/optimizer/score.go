@@ -452,8 +452,13 @@ func Select(group []CandidateResult, params Params) Selection {
 	// absence of good candidates. Validate is exported for a caller that wants to
 	// find this out before a run starts spending the user's bandwidth.
 	if err := params.Validate(); err != nil {
+		// The group is named on the refusal as well as on the answer, because the
+		// nested rankings are what a caller renders and the zero key renders as
+		// "(no group)" - a real group displayed as no group at all, beside an answer
+		// that names it. The counts are what is wrong here, not the group.
 		refusal := refuseAll(group, ReasonUnusableCounts)
-		return Selection{Group: groupKeyOf(group), Excluded: refusal.Excluded, Latency: refusal, Bandwidth: refusal}
+		refusal.Group = groupKeyOf(group)
+		return Selection{Group: refusal.Group, Excluded: refusal.Excluded, Latency: refusal, Bandwidth: refusal}
 	}
 	key := groupKeyOf(group)
 	eligible, refused := splitByLimits(group, params.Limits)

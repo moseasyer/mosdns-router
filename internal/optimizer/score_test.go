@@ -805,6 +805,15 @@ func TestScoreParamsRefuseCountsThatCannotSelectAnything(t *testing.T) {
 		if len(selection.Latency.Ranked) != 0 || len(selection.Bandwidth.Ranked) != 0 {
 			t.Errorf("%s: unusable counts produced a shortlist: %v", name, selection.Latency.Ranked)
 		}
+		// The refusal is about the counts, not about the group, so every part of the
+		// answer names the group the caller actually asked about. A nested ranking
+		// carrying the zero key renders as "(no group)" next to a Selection that
+		// names the real one, which reads as a second group nobody passed in.
+		want := GroupKey{Provider: candidate.ProviderCloudflare}
+		if selection.Group != want || selection.Latency.Group != want || selection.Bandwidth.Group != want {
+			t.Errorf("%s: the refusal names groups selection %v, latency %v, bandwidth %v, want %v on all three",
+				name, selection.Group, selection.Latency.Group, selection.Bandwidth.Group, want)
+		}
 	}
 	// The limits and the weights are not Validate's business: a zero Limits means
 	// no ceiling by definition, and an unnormalizable weighting already scores
