@@ -36,8 +36,9 @@ const (
 // The order of the three things that matter here is fixed and each is load
 // bearing. The reservation is persisted before a connection is opened, so a run
 // that dies mid-transfer is still charged and the day's cap still holds. The body
-// is read through a reader that cannot ask its source for a byte beyond the
-// reservation, so a server that offers more does not get it. And the transfer
+// is read through a reader that cannot ask its source for a byte beyond what the
+// reservation was granted, so a server that offers more does not get it and a
+// budget that granted less than was asked for is not read past. And the transfer
 // stops at whichever limit arrives first, so a slow candidate costs three seconds
 // rather than the whole reservation.
 //
@@ -94,7 +95,13 @@ func (p *NetworkProber) Download(ctx context.Context, subject candidate.Candidat
 		return DownloadMetrics{}, err
 	}
 
-	reader := newCountingReader(response.Body, maxBytes)
+	// Bounded by the reservation, not by the request. The two are the same number
+	// for the shipped budget, which grants exactly what it is asked for, but the
+	// interface does not promise that: a ByteBudget may hand back less than it was
+	// asked for, and a reader bounded by the request would then transfer more than
+	// the day paid for. The grant is what the budget will settle, so the grant is
+	// what may be read.
+	reader := newCountingReader(response.Body, reserved)
 	started := time.Now()
 	buffer := make([]byte, readBufferBytes)
 	var readErr error

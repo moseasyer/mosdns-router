@@ -1634,6 +1634,61 @@ func TestDownloadChargesWhatItReadBeforeTheConnectionFailed(t *testing.T) {
 	}
 }
 
+// cappingBudget grants less than it is asked for, which the interface allows and
+// the shipped budget never does. It exists because the reader's bound is the one
+// thing standing between a grant and a transfer: a reader bounded by the request
+// would take the 10 MiB it asked about from a budget that had promised 4 KiB, and
+// settle 10 MiB against a 4 KiB grant.
+type cappingBudget struct {
+	granted int64
+	// settled records what Consume was handed, which is what the day's charge
+	// would be.
+	settledActual int64
+	settles       int
+}
+
+var _ ByteBudget = (*cappingBudget)(nil)
+
+func (b *cappingBudget) Reserve(requested int64) (int64, error) {
+	if requested > b.granted {
+		return b.granted, nil
+	}
+	return requested, nil
+}
+
+func (b *cappingBudget) Consume(reserved, actual int64) {
+	b.settles++
+	b.settledActual = actual
+}
+
+// A budget that grants less than the transfer asked for bounds the transfer, and
+// the settlement is never larger than the grant. The body is a full 10 MiB, so a
+// reader bounded by the request would read all of it and settle all of it against
+// a 4 KiB promise.
+func TestDownloadIsBoundedByTheReservationAndNotTheRequest(t *testing.T) {
+	body := strings.Repeat("d", perCandidateBytes)
+	authority := newTestAuthority(t)
+	server, _ := mustIdentityServer(t, authority, profileHostname, payloadHandler(body))
+	measure, _ := mustProberFor(t, authority, server)
+	profile := downloadProfile(profileHostname)
+	const grant = 4096
+	budget := &cappingBudget{granted: grant}
+
+	metrics, err := measure.Download(t.Context(), identityCandidate(profileHostname), profile, perCandidateBytes, 10*time.Second, budget)
+	if err != nil {
+		t.Fatalf("measure a transfer against a budget that granted 4 KiB: %v", err)
+	}
+	if metrics.Bytes != grant {
+		t.Errorf("Bytes = %d, want the %d the budget granted: the transfer may not read past what it paid for", metrics.Bytes, grant)
+	}
+	if budget.settles != 1 {
+		t.Fatalf("the grant was settled %d times, want once", budget.settles)
+	}
+	if budget.settledActual != grant {
+		t.Errorf("the grant was settled with %d bytes, want %d: the day may not be charged for more than it granted", budget.settledActual, grant)
+	}
+}
+
 func TestDownloadRefusesATransferItCannotBound(t *testing.T) {
 	// A transfer with no byte limit, no time limit, or no budget is not a
 	// measurement: it is the unbounded thing this project exists to prevent, so it
