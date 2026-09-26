@@ -118,10 +118,17 @@ list, which is the first thing a later reader needs to know:
 ```go
 package echconfig
 
-type Config struct { Version uint16; ConfigID uint8; KEMID uint16; PublicName string; Raw []byte }
+type CipherSuite struct { KDFID uint16; AEADID uint16 }
+// Config carries the validated metadata, never the bytes: Raw below is the list the
+// parser was given, and every field here was read from a config's own declared
+// length. A config is in a List only if all of them passed.
+type Config struct { Version uint16; ConfigID uint8; KEMID uint16; PublicKey []byte; CipherSuites []CipherSuite; MaximumNameLength uint8; PublicName string }
 type List struct { Configs []Config; Raw []byte }
-func Parse(raw []byte) (List, error)
-func (l List) Validate() error
+// Parse returns a POINTER, and nil on every refusal, so a caller cannot read an
+// empty list as a list with nothing wrong in it. There is no Validate method: the
+// validation is the parse, and a caller that wanted to re-validate the bytes has
+// them in Raw and a parser that will refuse them again.
+func Parse(b []byte) (*List, error)
 
 package dnsclassify
 
@@ -149,6 +156,44 @@ type AddressInput struct { Response *dns.Msg; QType uint16; Provider candidate.P
 // they call Cloudflare-served.
 func Address(in AddressInput) (*dns.Msg, error)
 func StripModifiedDNSSEC(msg *dns.Msg)
+
+// The HTTPS surface, added by Task 3 and shipped in internal/dnsrewrite/https.go.
+// It is here rather than only in the Task 3 amendment below because a Task 5
+// implementer is most likely to miss an amendment 250 lines above their own
+// section, and a caller that compiles against this block needs all of it.
+func HTTPS(in HTTPSInput) (*dns.Msg, error)
+
+type FailurePolicy int
+
+const (
+    FailClosed        FailurePolicy = iota // strict
+    FallbackToOriginal                    // fallback
+)
+
+type HTTPSInput struct {
+    Response *dns.Msg      // never modified; every parameter is read from a clone
+    QName    string        // required, checked against the response's own question
+    Selected netip.Addr    // must be a routable public IPv4
+    ECH      []byte        // ECHConfigList bytes, validated here; nil means none
+    Policy   FailurePolicy
+    Report   func(Report)  // optional: what the synthesis left out, and why
+}
+
+type Report struct{ Dropped []DroppedParameter }
+type DroppedParameter struct {
+    Key    dns.SVCBKey
+    Reason string
+}
+
+var (
+    ErrNoECHConfig          // the ECH source published nothing
+    ErrInvalidECHConfig     // it published something this router will not forward
+    ErrNoSelectedAddress    // no address to hint: absent, unproved, or unhealthy
+    ErrNoCompatibleEndpoint // the name published service bindings, none usable here
+    ErrDelegatedName        // a CNAME at the owner, or an AliasMode record in its RRset
+    ErrUpstreamDenial       // the upstream's rcode is a statement, not an absence
+    ErrNoOriginal           // nothing to forward; wraps whichever refusal led there
+)
 
 package statewatch
 // Document is the union of the five state documents state.ReadJSON accepts as a
@@ -270,8 +315,27 @@ unsatisfiable: a function that neither returns a message nor mutates its argumen
 has nowhere to put a rewrite, so returning the message is the only shape that
 leaves the caller's object untouched. `AddressInput` carries the three fields that
 make the call checkable: `TerminalName`, `Hostname` and `Prefixes`. `Result`
-carries `Refusal`. Task 2 shipped all of these; the block above is the shipped
-shape, and it compiles verbatim against it.
+carries `Refusal`. Task 2 shipped all of these.
+
+**The canonical block above is the shipped shape, and it has been compiled against
+it.** A throwaway package declared the block verbatim — one file per package, the
+real imports — and a test in it compared every declaration with the package it
+names: every function and method signature, every struct's fields by name, type and
+tag, every constant's value, and each of the five state documents against the
+block's own `Document` constraint. It is deleted, and it is not part of `make
+verify`: a document that later plans are told to compile against needs checking
+once, by a person, rather than permanently.
+
+Two things that check cannot see, so a later editor must not treat a green run as
+permission to stop reading:
+
+- The seven sentinels are declared in the block by name and comment with no
+  `errors.New` call, because that is how a reader wants them; the throwaway
+  supplied throwaway values, so what was verified is the seven names, their
+  `error` type, and their being distinct from one another.
+- The `Document` constraint admits exactly those five documents only because
+  `internal/statewatch/watcher.go` says so. Go exposes no reflection over a type
+  set, so a sixth member in a copy of this block would satisfy the check.
 
 Three obligations no other section of this plan states, which the later tasks
 inherit:
@@ -303,8 +367,10 @@ Task 3 shipped and was reviewed. Five defects were Important and are fixed; the 
 now states the behaviour they changed, because two of them are decisions a package
 cannot make on its own and a third is a rule Task 5 inherits.
 
-**Interfaces (shipped).** `internal/dnsrewrite` now exports, and this is the shape Task
-5 compiles against:
+**Interfaces (shipped).** `internal/dnsrewrite` exports, and this is the shape Task
+5 compiles against. The block itself now lives in **Interfaces produced by this
+plan** above, with the rest of that package's surface, so there is one copy of it to
+be right; it is:
 
 ```go
 func HTTPS(in HTTPSInput) (*dns.Msg, error)
@@ -341,6 +407,14 @@ var (
     ErrNoOriginal           // nothing to forward; wraps whichever refusal led there
 )
 ```
+
+The canonical copy carries one correction to the text above it: `Response` is never
+modified, but the parameters a synthesis inherits **are** read from it, out of a
+`Copy()` of it. The line above said "never read for parameters", which is false and
+would have been read as "a caller may hand this a response with no records in it and
+still get a synthesis" — which is true, and for a different reason: what the
+response carried is an *absence or a statement* the synthesis answers over, never an
+authority for it.
 
 Four obligations, each one a change from what round 1 shipped:
 
