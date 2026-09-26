@@ -322,4 +322,3 @@ func TestParseCloudFrontProfilesKeepsThePortAProfileDeclaredOnBothSides(t *testi
 		t.Errorf("got port %d, want 8443", profiles[0].Profile.Port)
 	}
 }
-
