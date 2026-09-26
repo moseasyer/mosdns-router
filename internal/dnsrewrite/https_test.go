@@ -1017,60 +1017,107 @@ func TestHTTPSDropsNoDefaultAlpnWithNoAlpnToDefault(t *testing.T) {
 	selfConsistent(t, out)
 }
 
-// TestHTTPSUsesNothingFromAnAliasModeRecord states what an alias is. RFC 9460
-// Section 2.4.2 has recipients ignore every SvcParam on an alias, so a port or an
-// alpn read out of one describes a service this router cannot know anything about,
-// and copying it into a service mode would be inventing a binding. An alias also
-// carries no address, which is the same situation as no record at all: the key and
-// the selected address are enough to answer, and nothing is inherited.
-func TestHTTPSUsesNothingFromAnAliasModeRecord(t *testing.T) {
+// TestHTTPSRefusesAnRRsetThatContainsAnAlias is the delegation rule for the shape it
+// takes inside an HTTPS RRset. RFC 9460 Section 2.4.1 says a client that finds an
+// AliasMode record in an RRset must ignore the ServiceMode records in the same set,
+// because the alias is the whole instruction: the service lives at the TargetName and
+// this name has none of its own. Harvesting the service mode's parameters and writing
+// them under a TargetName of "." therefore does two wrong things at once. It claims a
+// service exists at this name when the upstream says it does not, and it reuses
+// parameters the upstream published for a binding a client is required to ignore --
+// the port and the protocol set of a host this router has never looked at.
+//
+// So an RRset at the queried name that contains an alias is not synthesized into. A
+// strict caller is refused, and a fallback caller is handed the upstream's own
+// message, which is a working answer: the client follows the alias to the name the
+// service really has, and connects to whatever that name resolves to. That is the
+// client's business and not this router's; what this router will not do is answer
+// under the delegated name with a service binding of its own invention.
+//
+// Both shapes are covered, because they fail differently if the rule is implemented
+// on the wrong record: an alias alone, where there is nothing to harvest and so
+// nothing to catch a mistake, and an alias beside a service mode, which is the case
+// with parameters to take.
+func TestHTTPSRefusesAnRRsetThatContainsAnAlias(t *testing.T) {
 	alias := httpsRecord("cdn.example.", 300, 0, "svc.example.net.",
 		&dns.SVCBAlpn{Alpn: []string{"h1"}},
 		&dns.SVCBPort{Port: 8443},
 	)
+	service := httpsRecord("cdn.example.", 300, 1, ".",
+		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+		&dns.SVCBPort{Port: 443},
+	)
 
-	t.Run("alone it yields the minimal record", func(t *testing.T) {
-		upstream := response("cdn.example.", dns.TypeHTTPS, alias)
-		got, err := HTTPS(httpsInput(t, upstream))
-		if err != nil {
-			t.Fatalf("HTTPS refused a name whose only record is an alias: %v", err)
-		}
-		out := onlyHTTPS(t, got)
-		if alpn := alpnOf(t, out); !reflect.DeepEqual(alpn, []string{"h2", "h3"}) {
-			t.Errorf("alpn = %v, want [h2 h3]: an alias's parameters are ignored, so none of them may be inherited", alpn)
-		}
-		if carries(out, dns.SVCB_PORT) {
-			t.Errorf("a port was read out of an alias: %s", carried(out))
-		}
-		if out.Hdr.Ttl != 0 {
-			t.Errorf("TTL = %d, want 0: an alias's lifetime is not the lifetime of a record this router synthesized", out.Hdr.Ttl)
-		}
-		if out.Priority != 1 || out.Target != "." {
-			t.Errorf("the record is priority %d target %q, want priority 1 target \".\"", out.Priority, out.Target)
-		}
-	})
+	for _, tt := range []struct {
+		name    string
+		records []dns.RR
+	}{
+		{name: "an alias on its own", records: []dns.RR{alias}},
+		{name: "an alias beside a service mode", records: []dns.RR{alias, service}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := response("cdn.example.", dns.TypeHTTPS, tt.records...)
+			before := packed(t, upstream)
 
-	t.Run("beside a service mode only the service mode is read", func(t *testing.T) {
-		upstream := response("cdn.example.", dns.TypeHTTPS, alias, httpsRecord("cdn.example.", 300, 1, ".",
-			&dns.SVCBAlpn{Alpn: []string{"h2"}},
-			&dns.SVCBPort{Port: 443},
-		))
-		got, err := HTTPS(httpsInput(t, upstream))
-		if err != nil {
-			t.Fatalf("HTTPS: %v", err)
-		}
-		out := onlyHTTPS(t, got)
-		if alpn := alpnOf(t, out); !reflect.DeepEqual(alpn, []string{"h2"}) {
-			t.Errorf("alpn = %v, want [h2] from the service mode record alone", alpn)
-		}
-		port, _ := param(t, out, dns.SVCB_PORT).(*dns.SVCBPort)
-		if port == nil || port.Port != 443 {
-			t.Errorf("port = %v, want 443 from the service mode record, not 8443 from the alias", port)
-		}
-		if out.Hdr.Ttl != 300 {
-			t.Errorf("TTL = %d, want the service mode record's 300", out.Hdr.Ttl)
-		}
-	})
+			t.Run("a strict caller is refused", func(t *testing.T) {
+				got, err := HTTPS(httpsInput(t, upstream))
+				if err == nil {
+					t.Fatalf("HTTPS synthesized into an RRset that delegates the name: %s", answered(got))
+				}
+				if got != nil {
+					t.Fatalf("HTTPS returned a message beside the error: %s", answered(got))
+				}
+				if !errors.Is(err, ErrDelegatedName) {
+					t.Fatalf("error = %v, want one a caller can recognise as %v", err, ErrDelegatedName)
+				}
+			})
+
+			t.Run("a fallback caller keeps the upstream's own RRset", func(t *testing.T) {
+				got, err := HTTPS(HTTPSInput{
+					Response: upstream,
+					QName:    "cdn.example.",
+					Selected: selected(),
+					ECH:      echFixture(t),
+					Policy:   FallbackToOriginal,
+				})
+				if !errors.Is(err, ErrDelegatedName) {
+					t.Errorf("error = %v, want %v beside the message", err, ErrDelegatedName)
+				}
+				if got != upstream {
+					t.Fatalf("HTTPS built a new message where the policy was to keep the upstream's own: %s", answered(got))
+				}
+				if after := packed(t, upstream); string(after) != string(before) {
+					t.Errorf("HTTPS changed the response it was given:\n before %s\n after  %s", before, after)
+				}
+				// Nothing of either record was inherited: the client receives the
+				// alias and the service mode exactly as published, so the alias's own
+				// target and the service mode's priority are both still there.
+				if got := answerTypes(got); len(got) != len(tt.records) {
+					t.Errorf("the answer holds %d record(s), want the %d the upstream published", len(got), len(tt.records))
+				}
+			})
+		})
+	}
+}
+
+// TestHTTPSStillRefusesAnEndpointUnderAnIPv6AddressWithoutTheAliasRule guards the
+// two rules against being confused for one another. An alias means the name is not
+// ours to describe; an endpoint under an IPv6 address means this release cannot
+// reach the one it describes. They are different faults with different sentinels, and
+// a caller that treated them as one would log a network reachability problem as a
+// delegation and the other way round.
+func TestHTTPSStillRefusesAnEndpointUnderAnIPv6AddressWithoutTheAliasRule(t *testing.T) {
+	upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, "2606:4700::1111.",
+		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+	))
+
+	_, err := HTTPS(httpsInput(t, upstream))
+	if !errors.Is(err, ErrNoCompatibleEndpoint) {
+		t.Fatalf("error = %v, want %v: an unreachable endpoint is not a delegation", err, ErrNoCompatibleEndpoint)
+	}
+	if errors.Is(err, ErrDelegatedName) {
+		t.Errorf("error = %v also matches %v, so a caller cannot tell an unreachable endpoint from a delegated name", err, ErrDelegatedName)
+	}
 }
 
 // TestHTTPSTakesTheShortestLifetimeOfTheEndpointsItInherits is the TTL rule at the

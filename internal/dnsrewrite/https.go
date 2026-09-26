@@ -161,6 +161,12 @@ type DroppedParameter struct {
 //     client can reach through anything this router publishes, so it contributes
 //     nothing; a name that published service bindings and has no usable one left is
 //     a refusal rather than a guess.
+//   - A name the upstream has delegated is not answered for at all. A CNAME at the
+//     queried owner, or an AliasMode record in the RRset there, means the service is
+//     described under another name, and a service mode synthesized here would claim a
+//     service that description denies. Both are refusals, and a fallback caller is
+//     handed the upstream's own answer, which sends the client to the name the service
+//     really has.
 //   - A parameter is inherited only when every usable endpoint carries it and every
 //     one of them carries the same value. A disagreement about a value is the
 //     obvious case; a disagreement about whether the key is there at all is the
@@ -199,12 +205,17 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 		return keepOrRefuse(in, question.Name, err)
 	}
 	if err := checkSelected(in.Selected); err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrNoSelectedAddress, err)
+		return keepOrRefuse(in, question.Name, fmt.Errorf("%w: %s", ErrNoSelectedAddress, err))
 	}
-	record, dropped, err := synthesized(question, published, list, in.Selected)
-	if err != nil {
-		return nil, err
+	found := classify(published)
+	if found.aliases > 0 {
+		return keepOrRefuse(in, question.Name, aliasRefusal(question.Name, found))
 	}
+	if found.bindings > 0 && len(found.usable) == 0 {
+		return keepOrRefuse(in, question.Name, fmt.Errorf("%w: %q published %d service mode record(s) and none of them is usable: %s",
+			ErrNoCompatibleEndpoint, question.Name, found.bindings, strings.Join(found.refusals, "; ")))
+	}
+	record, dropped := synthesized(question, found, list, in.Selected)
 
 	// The record goes in where the records of this name were, whether there were
 	// any or not, and the addresses of this name go from wherever they were.
@@ -270,9 +281,39 @@ func forwardable(msg *dns.Msg, name string) bool {
 	return false
 }
 
+// aliasRefusal is what an AliasMode record in the RRset at the queried name means for
+// this router. RFC 9460 Section 2.4.1 says a client that finds one must ignore the
+// ServiceMode records in the same set, because the alias is the whole instruction: the
+// service lives at the TargetName and this name has none of its own. Harvesting the
+// service mode's parameters and writing them under a TargetName of "." would claim a
+// service exists here that the upstream says does not, and would reuse a port and a
+// protocol set published for a binding a client is required to ignore.
+//
+// One clarification about the rule it implements, because the reasoning is easy to
+// overstate: the "ignore the service modes" clause is not on its own enough, because
+// this synthesis replaces the whole RRset and so leaves no alias behind for a client to
+// ignore. What makes it wrong is the first half of it -- the upstream describes a
+// service under another name, and a service mode for this name is a claim about a
+// service this router cannot see, made with parameters taken from a host it never
+// looked at. The delegation is the fault; the client's rule is the symptom. A fallback
+// caller is better served by the upstream's own RRset, which sends the client to the
+// name the service really has.
+func aliasRefusal(name string, found endpoints) error {
+	target := ""
+	for _, record := range found.published() {
+		if record.Priority == 0 {
+			target = record.Target
+			break
+		}
+	}
+	return fmt.Errorf("%w: the RRset at %q contains an AliasMode record to %q, so the service it describes is the other name's",
+		ErrDelegatedName, name, target)
+}
+
 // delegated refuses a name the upstream has handed to somebody else, in the shape a CNAME
-// takes in an answer. The other shape, an RRset that contains an alias, is in classify,
-// because it is a property of the HTTPS records themselves rather than of the answer.
+// takes in an answer. The other shape, an AliasMode record in the RRset there, is
+// refused above, because it is a property of the HTTPS records themselves rather than of
+// the answer.
 //
 // The CNAME is checked before anything is synthesized because the two cannot share an
 // owner: RFC 1034 Section 3.6.2 forbids an answer carrying a CNAME and other data at
@@ -365,18 +406,32 @@ type endpoints struct {
 	// refusals name each unusable service mode, so a refusal says which endpoints
 	// were considered and why none of them was offered.
 	refusals []string
+	// aliases counts the AliasMode records the name published. One is enough to stop
+	// the whole synthesis, so they are counted rather than merged: see aliasRefusal.
+	aliases int
+	// seen is every record the name published, in the order the answer carried them,
+	// so a refusal can name what it was looking at.
+	seen []*dns.HTTPS
+}
+
+// published returns every record the name published, aliases included.
+func (e endpoints) published() []*dns.HTTPS {
+	return e.seen
 }
 
 // classify applies the compatibility rule. A record with a SvcPriority of 0 is an
-// alias, and RFC 9460 Section 2.4.2 has recipients ignore every SvcParam on one, so
-// it is not a service binding and contributes nothing rather than being refused: an
-// alias carries no address either, which is the same situation as no record at all.
-// Everything else is a service mode, and a service mode is usable only when a
-// client can reach it through the one address this router installs.
+// alias: it is not a service binding, it is a statement that the service lives at its
+// TargetName, and RFC 9460 Section 2.4.1 has a recipient that finds one ignore every
+// ServiceMode record in the same RRset. So it is counted, not merged, and one of them
+// stops the whole synthesis -- see aliasRefusal. Everything else is a service mode,
+// and a service mode is usable only when a client can reach it through the one
+// address this router installs.
 func classify(published []*dns.HTTPS) endpoints {
 	var out endpoints
+	out.seen = published
 	for _, record := range published {
 		if record.Priority == 0 {
+			out.aliases++
 			continue
 		}
 		out.bindings++
@@ -455,15 +510,10 @@ func countHints(record *dns.HTTPS) (ipv4, ipv6 int) {
 	return ipv4, ipv6
 }
 
-// synthesized builds the one record the answer will carry, or refuses because the
-// name published a service binding and none of them can be used here.
-func synthesized(question dns.Question, published []*dns.HTTPS, list *echconfig.List, address netip.Addr) (*dns.HTTPS, []DroppedParameter, error) {
-	found := classify(published)
-	if found.bindings > 0 && len(found.usable) == 0 {
-		return nil, nil, fmt.Errorf("%w: %q published %d service mode record(s) and none of them is usable: %s",
-			ErrNoCompatibleEndpoint, question.Name, found.bindings, strings.Join(found.refusals, "; "))
-	}
-
+// synthesized builds the one record the answer will carry. Every refusal about what
+// the upstream published has already been made by the caller, so this function only
+// builds.
+func synthesized(question dns.Question, found endpoints, list *echconfig.List, address netip.Addr) (*dns.HTTPS, []DroppedParameter) {
 	record := &dns.HTTPS{SVCB: dns.SVCB{
 		Hdr: dns.RR_Header{
 			Name:   question.Name,
@@ -504,7 +554,7 @@ func synthesized(question dns.Question, published []*dns.HTTPS, list *echconfig.
 		&dns.SVCBIPv4Hint{Hint: []net.IP{net.IP(address.AsSlice())}},
 		&dns.SVCBMandatory{Code: mandatoryList(record.Value, found.usable)},
 	)
-	return record, dropped, nil
+	return record, dropped
 }
 
 // inheritedParameters collects what the usable endpoints describe, and reports what
