@@ -815,8 +815,16 @@ func TestCloudflareCacheKeepsTheValidatorAndTheBodyVerbatim(t *testing.T) {
 func TestCloudflareCacheIsWrittenOnlyUnderTheInjectedPath(t *testing.T) {
 	// The cache path is injected, so a test never writes the production path
 	// under /var/lib and a run never writes anywhere else.
+	//
+	// A run writes two files under the injected root rather than one: the cache
+	// envelope, and the plain prefix list the response rewriter reads, published
+	// beside it by the same fetch so the two cannot describe different documents.
+	// The property under test is therefore the one this test was written for --
+	// nothing outside the root -- plus the two names, because a third file here
+	// would be a leftover a reader has to recognise.
 	root := t.TempDir()
 	cachePath := filepath.Join(root, "lists", "cloudflare-ips.json")
+	prefixPath := filepath.Join(root, "lists", DefaultCloudflarePrefixFileName)
 	origin := newFakeOrigin(t, standardDocument(), fixtureETag)
 	cloudflareCandidates(t, newTestSource(t, origin, cachePath), 512, testDate(2026, time.September, 25))
 
@@ -832,8 +840,10 @@ func TestCloudflareCacheIsWrittenOnlyUnderTheInjectedPath(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("walk the injected cache root: %v", err)
 	}
-	if len(written) != 1 || written[0] != cachePath {
-		t.Errorf("the run wrote %v, want only %s", written, cachePath)
+	slices.Sort(written)
+	want := []string{cachePath, prefixPath}
+	if !slices.Equal(written, want) {
+		t.Errorf("the run wrote %v, want %v", written, want)
 	}
 }
 

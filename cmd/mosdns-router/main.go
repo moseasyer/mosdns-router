@@ -10,8 +10,10 @@ import (
 	"github.com/spf13/cobra"
 	"mosdns-router/internal/buildinfo"
 
-	// The router's own plugin: it forwards a query to the DNS servers the DHCP
-	// client is currently configured with, swapping them while mosdns runs.
+	// The router's own plugins: one forwards a query to the DNS servers the DHCP
+	// client is currently configured with, swapping them while mosdns runs, and one
+	// rewrites the addresses and the HTTPS records a response hands to a client.
+	_ "mosdns-router/plugin/executable/cdn_rewrite"
 	_ "mosdns-router/plugin/executable/dhcp_forward"
 )
 

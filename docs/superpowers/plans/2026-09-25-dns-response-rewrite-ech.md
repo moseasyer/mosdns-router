@@ -50,6 +50,8 @@ internal/dnsrewrite/https_test.go
 internal/statewatch/watcher.go
 internal/statewatch/text.go
 internal/statewatch/watcher_test.go
+internal/candidate/prefixes.go
+internal/candidate/prefixes_test.go
 plugin/executable/cdn_rewrite/cdn_rewrite.go
 plugin/executable/cdn_rewrite/ech_provider.go
 plugin/executable/cdn_rewrite/cdn_rewrite_test.go
@@ -59,6 +61,11 @@ cmd/mosdns-router/main.go
 tests/integration/rewrite_test.go
 Makefile
 ```
+
+The two `internal/candidate` files are Task 5's addition to the producer, added for
+the reason recorded in the amendments below: nothing produced a plain prefix list
+for the plugin's `cloudflare_cidr_file` to name, and the cached Cloudflare envelope
+is not one.
 
 ### Interfaces produced by this plan
 
@@ -349,6 +356,62 @@ Two rules that were already in the plan and are now stated in the code as well:
   REFUSED with an empty answer are absences; NXDOMAIN, FORMERR, NOTIMP, and any failure
   carrying records, are `ErrUpstreamDenial`. Task 5 forwards the upstream's own denial
   under the fallback policy and fails closed under strict.
+
+---
+
+### Amendments from Task 5
+
+Task 5 shipped the plugin. Three things the plan did not say are now recorded here,
+because each is a decision a later reader would otherwise have to rediscover, and
+two of them are places where the shipped behaviour is narrower or wider than the
+plan's own words.
+
+**The Cloudflare range list is produced by this plan, not by a later one.** The
+plan's ruling was that the same cached fetch that `update-lists` performs also
+publishes a parsed `cloudflare-prefixes.txt` beside the envelope, with no second
+network request. The shipped change is in `internal/candidate`, because that is
+where the cached fetch is: `HTTPCloudflareSource.Candidates` is the one function
+that reads the document, validates it, samples it and caches it, and the
+`update-lists` command is about the China domain list rather than about Cloudflare.
+So the list is published there, from the same document the run just accepted,
+beside the same cache path, as `cloudflare-prefixes.txt` — one prefix per line,
+masked, deduplicated, sorted, published through a temporary file and a rename with
+the cache's own 0644 mode discipline. A run now writes **two** files under its
+cache directory rather than one, which is why
+`TestCloudflareCacheIsWrittenOnlyUnderTheInjectedPath` was amended: its property
+(nothing outside the injected root) is unchanged and its expectation (one file) was
+not. Cost if wrong: one more artifact for packaging to provision, exactly as the
+ruling recorded.
+
+**The AAAA-suppression path is entered only for a name this router has classified.**
+The plan said Task 5 must reach `Address`'s AAAA arm only with a Cloudflare verdict
+it already holds, and an AAAA answer carries no address the published IPv4 ranges
+could be checked against — so the only evidence available is an A answer for that
+name which the classifier accepted. The plugin therefore keeps a bounded record of
+the terminal names it has classified as Cloudflare-served in the selector's current
+generation (`cdnNames`), and the AAAA path is entered only for a name that record
+holds, only under that generation, and only while the winner's proof window is open
+— the same two conditions under which the A answer was rewritten, so the two
+answers for one name always agree. A name that fell out of the bounded record, a
+name whose classification was refused, and every name under a new generation or a
+closed window keep every record they arrived with. This is state the plan did not
+describe, and it is the one addition in Task 5 that a reviewer should look at
+hardest: without it, either a CDN name's IPv6 answer keeps its addresses (a
+half-applied suppression) or every domain's does not (a suppression with no
+verdict behind it). Cost if wrong: a bounded amount of memory and one map lookup
+per AAAA query.
+
+**The ECH key is fetched independently of the address it is installed beside.** The
+plugin asks the ECH source for a key on every force-ECH HTTPS query, including the
+queries where the selector's proof window is closed and the address will be
+refused. The reason is a refusal that would otherwise name the wrong thing: with
+no key fetched, `dnsrewrite.HTTPS` refuses with `ErrNoECHConfig` before it reaches
+the address check, so an operator reading the log would be told the ECH source is
+broken when the selector is what failed. The cost is one query per source per key
+lifetime while no address is available — the same query a healthy deployment makes
+anyway — and the benefit is that the held key and `ech-state.json` stay current
+across a selector outage. Cost if wrong: none; the key is a public HPKE key and the
+query is on the listener the router already uses for every foreign query.
 
 ---
 

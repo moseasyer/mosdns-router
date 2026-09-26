@@ -134,6 +134,14 @@ func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localD
 	if err := storeDocument(s.cachePath, fetched); err != nil {
 		return CandidateSet{}, err
 	}
+	// The same accepted document is published as a plain prefix list beside the
+	// envelope, for the response rewriter that classifies answers against it. It
+	// is written from the document this run just validated rather than from the
+	// cache file, so the list and the envelope can never describe different
+	// documents, and it costs no second request: see publishPrefixList.
+	if err := publishPrefixList(s.cachePath, document); err != nil {
+		return CandidateSet{}, err
+	}
 	if len(blocks) == 0 {
 		return CandidateSet{}, fmt.Errorf("%s: the document covers no /24 block", s.baseURL)
 	}
