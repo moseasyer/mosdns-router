@@ -512,7 +512,9 @@ Assert one or two failures do not move state; the third consecutive failure does
 
 - [ ] **Step 2: Write failing persistence tests**
 
-Store only `healthy`, `consecutive_failures`, `last_success`, and `last_failure` in `/var/lib/mosdns/runtime/health.json`. A corrupt health file fails closed to three failures for a strict selector and is never treated as healthy.
+Store only `healthy`, `consecutive_failures`, `last_success`, and `last_failure` in `/var/lib/mosdns/runtime/health.json`. A corrupt health file fails closed to the policy's failure threshold for a strict selector and is never treated as healthy.
+
+**Correction (Task 5, fix round 1).** The preflight ruling that this file "is written through `state.WriteJSONAtomic`" cannot stand beside the corrupt-file rule above, and the two were written as if they could. `state.WriteJSONAtomic` refuses to replace a target it cannot read — the right answer for the selector, and the wrong one here: a corrupt health document is exactly the state this rule requires recovering from, so a writer that refuses to overwrite it would leave every future check failing closed to a history no real verdict could ever clear. The durable answer is the state package's, and the review ruled for it: `state.WriteReplacementJSONAtomic`, which is the same discipline — validate, same-directory temporary file, fsync, atomic rename at 0640, backup taken before the rename, rollback on a post-rename flush failure — plus a "may replace an unreadable target" policy that `state` honours for the health kind only. Every other kind, the selector above all, is still refused, and that asymmetry is a property of the document rather than a convention. `internal/health` keeps only what is the checker's: reading the previous document and composing the fail-closed sentence.
 
 - [ ] **Step 3: Run tests and verify failure**
 
@@ -525,6 +527,8 @@ Expected: compile failure.
 - [ ] **Step 4: Implement health checks**
 
 Use the same verified HTTPS identity path as final proof, HEAD when the profile supports it, GET with a zero-length/body limit otherwise, and no bandwidth-budget charge. Validate every CloudFront hostname separately.
+
+**Correction (Task 5, fix round 1).** "Every CloudFront hostname separately" and the same verified identity path are compatible, but a *serial* walk over the profile list is not, and the first implementation was serial. A health check's deadline covered the winner and every mapping, so a router with a long `--identity-domains` list on a slow edge expired mid-walk, read the cut-short walk as a failure, reached the threshold, and moved the resolver onto its fallback — including for a newly published winner, which failed for the same reason. The walk is now concurrent under `optimizer.ProofConcurrency`, the same documented limit the optimizer's final proof uses, and the pass deadline scales with the number of waves the pass needs (`Options.WaveTimeout × waves`, capped at `health.MaximumPassTimeout`, half the shipped 120-second interval). A transition's proof keeps one fixed deadline, because it runs under the control lock and a hold that grows with the list is a hold nobody can take; a list that overruns it is refused, which moves nothing and is retried two minutes later.
 
 - [ ] **Step 5: Add the CLI command**
 
@@ -571,3 +575,18 @@ Expected:
 - failed operations never overwrite selector state;
 - manual pin and health fallback work under concurrency;
 - no real external network dependency in default tests.
+
+## Outstanding for the final review
+
+- **A CloudFront mapping that has stopped serving is reported, not acted on.** Task 5
+  proves every published per-hostname mapping on every health check and gives each one
+  its own verdict, and the CLI prints it, but nothing moves it. `state.Selector` is
+  frozen: it carries one `winner_ip`, one `fallback_ip` and a per-hostname `cloudfront`
+  map with no fallback of its own, and `state.HealthState` carries four fields that can
+  describe one address. A failing mapping therefore stays published until the nightly
+  run replaces it — the identity phase of a run refuses an address that is not serving
+  its hostname, so the replacement is the next day's work — or an operator edits the
+  document. This is the right failure direction (nothing unproved is ever published) and
+  it is not this plan's to fix: **the response-rewrite plan owns the schema change** that
+  gives a per-hostname mapping a fallback, and until it does, this is the standing gap
+  between a health check's coverage and a health check's action.
