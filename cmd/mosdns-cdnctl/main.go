@@ -988,12 +988,3 @@ func writePartialReport(options cdnOptions, report optimizer.Report, stdout, std
 	}
 	_ = writeCDNReport(stdout, report, nil)
 }
-
-func slicesClone[T any](values []T) []T {
-	if values == nil {
-		return nil
-	}
-	cloned := make([]T, len(values))
-	copy(cloned, values)
-	return cloned
-}

@@ -1117,19 +1117,18 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	if err != nil {
 		return report, state.Selector{}, err
 	}
-	// Every group's own outcome is recorded before anything is written, so a
-	// refusal below still leaves a report that says which group was being published
-	// and which was keeping its mapping.
+	// Every group's own outcome is recorded in the report before anything is
+	// written, so a refusal below still leaves a document that says which group was
+	// being published and which was keeping its mapping. The report is the record;
+	// the decision's own copy of the group is not written to, so there is no second
+	// version of the outcome that could disagree with the first.
 	publishedAnywhere := false
 	for index := range decisions {
 		if decisions[index].published {
-			decisions[index].group.Outcome = OutcomePublished
 			report.Groups[index].Outcome = OutcomePublished
 			publishedAnywhere = true
 			continue
 		}
-		decisions[index].group.Outcome = OutcomeKept
-		decisions[index].group.OutcomeReason = decisions[index].reason
 		report.Groups[index].Outcome = OutcomeKept
 		report.Groups[index].OutcomeReason = decisions[index].reason
 	}
@@ -1247,8 +1246,9 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 
 // groupDecision is what one group decided, before any proof and before any write.
 type groupDecision struct {
-	// group is the group's own report entry, so the outcome is written back to the
-	// right one.
+	// group is the group's own report entry, held so the decision carries the
+	// hostname and provider it was made about. The outcome is written to the report
+	// and not to this copy, so the two cannot drift apart.
 	group GroupReport
 	// winner is the address to prove and publish, and it is the zero value for a
 	// group that keeps its mapping.
@@ -1763,9 +1763,11 @@ func (run *runState) finalize() {
 	run.report.BudgetExhausted = run.exhausted.Load()
 }
 
-// now is the runner's clock, read once per run so every timestamp in a report
-// comes from the same reading and the budget is charged to the same local date
-// the report is dated with.
+// now is the runner's clock. Every reading is taken where it is needed rather than
+// at the start of the run, so the boundaries a report carries are the instants the
+// phases happened - see runState.stamp - and the two readings a run does take once
+// up front are the ones that have to agree with each other: the report's
+// generated_at and the local date the budget is charged to.
 func (r *Runner) now() time.Time {
 	return r.options.Now().UTC()
 }
@@ -2520,7 +2522,7 @@ func (s *settlingBudget) Consume(reserved, actual int64) {
 func (s *settlingBudget) refused() []string {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	return slicesClone(s.refusals)
+	return slices.Clone(s.refusals)
 }
 
 // incumbentOf is the address a group had in service, which is the global winner
@@ -2568,15 +2570,6 @@ func sortedKeys(mapping map[string]string) []string {
 	}
 	slices.Sort(keys)
 	return keys
-}
-
-func slicesClone[T any](values []T) []T {
-	if values == nil {
-		return nil
-	}
-	cloned := make([]T, len(values))
-	copy(cloned, values)
-	return cloned
 }
 
 func isLowerHexDigest(value string) bool {

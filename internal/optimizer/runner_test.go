@@ -66,11 +66,6 @@ const (
 
 	// runnerTCPSamples is what each fixture reports for the connect measurement.
 	runnerTCPSamples = 10
-
-	// runnerPolicyBytes is the exact policy document the digest rule is about: the
-	// SHA-256 in the test below is the one this content produces, not a number read
-	// back out of the implementation.
-	runnerPolicyBytes = "schema_version: 1\nschedule: \"03:00\"\n"
 )
 
 // runnerPolicy is the shipped policy: cdn.latency_candidate_count 10, combined
@@ -96,9 +91,14 @@ func runnerPolicy() config.Policy {
 	}
 }
 
-// runnerSHA256 is the lowercase hex SHA-256 of the document the runner was
-// configured with, derived here from the literal bytes rather than read out of
-// any constant, so a change to the digest function is a failing test.
+// runnerSHA256 is the digest every fixture's runner is configured with, so the
+// reports they produce carry a value a test can state as a literal.
+//
+// It is computed here from the literal bytes rather than pasted, so it cannot
+// drift from them. It is not what pins the digest *function*: the document it
+// hashes is not one a test could state a published digest for, so a case that
+// wants the function itself checked uses a document every SHA-256 agrees on -
+// see TestPolicyDigestIsTheDigestOfTheDocumentBytes.
 var runnerSHA256 = func() string {
 	sum := sha256.Sum256([]byte("schema_version: 1\n"))
 	return hex.EncodeToString(sum[:])
