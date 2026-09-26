@@ -912,9 +912,15 @@ func writeReportFile(path string, report optimizer.Report) error {
 
 // writeCDNReport is what an operator reads. Every line is a fact with its number on
 // it, because the report's job is to be acted on and a run that found a winner it
-// could not publish has to say so here rather than only on stderr. A nil published
-// means nothing was written, which is the case for a report-only run and for one
-// whose apply was refused.
+// could not publish has to say so here rather than only on stderr.
+//
+// A nil published means nothing was written, and there are three ways to get here
+// with one: a report-only run that never applied anything, an apply in which every
+// group kept its mapping, and an apply that was refused at one of its gates. The
+// report's own outcome says which of the last two it was, and the two must never
+// be allowed to read alike - an outcome line claiming a publication beside an
+// "applied: nothing" line is the mislabel this function's callers are checked
+// against in their tests.
 func writeCDNReport(output io.Writer, report optimizer.Report, published *state.Selector) error {
 	if published != nil {
 		writeReportLine(output, "applied: %s\n", published.WinnerIP)
