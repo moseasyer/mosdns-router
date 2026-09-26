@@ -63,6 +63,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"mosdns-router/internal/candidate"
@@ -81,14 +82,29 @@ const (
 	// selector and the control lock the other control commands use.
 	DefaultHealthPath = "/var/lib/mosdns/runtime/" + DefaultHealthPathName
 
-	// DefaultProbeTimeout bounds the whole watch phase: every published address,
-	// every profile it is held to. It is one deadline for the whole pass and not one
-	// per address, so a router with a long forced-ECH list cannot turn a two-minute
-	// check into a two-minute check per domain. It carries the same value as the
-	// prober's own per-probe bound, so a host that is slow enough to exhaust one
-	// probe exhausts the pass with it and the rest of the walk is reported as cut
-	// short rather than as proved.
-	DefaultProbeTimeout = 10 * time.Second
+	// DefaultWaveTimeout bounds one wave of concurrent identity proofs: a single
+	// answer's time on a healthy host. It carries the same value as the prober's own
+	// per-probe bound, so a host slow enough to exhaust one probe exhausts its wave
+	// with it.
+	//
+	// It is a wave and not a pass because the pass is not one wave. A check that is
+	// held to a single fixed deadline has to choose between refusing a long profile
+	// list and leaving it unproved, and a health check makes that choice in the worst
+	// possible direction: a deadline that cuts a healthy address's walk short reports
+	// a failure, three of those report a rollback, and the router spends the rest of
+	// the day on its fallback for a list it would have answered. The pass deadline is
+	// therefore this bound times the number of waves the pass needs - see
+	// MaximumPassTimeout for the ceiling on that.
+	DefaultWaveTimeout = 10 * time.Second
+
+	// MaximumPassTimeout is the ceiling on a pass's deadline however many waves it
+	// needs, and it is half the shipped 120 second health interval on purpose: two
+	// passes may not overlap, and a pass that overran its interval would be
+	// measuring the state the previous pass had already changed. A list long enough
+	// to hit the ceiling is answered as far as it gets, and the rest of the walk is
+	// reported as cut short - a failure, because an address whose profile was never
+	// asked has not been proved.
+	MaximumPassTimeout = 60 * time.Second
 )
 
 // Prober is the only measurement a health check makes. It is the HTTPS identity
@@ -273,9 +289,17 @@ type Options struct {
 	// instant.
 	Now func() time.Time
 
-	// ProbeTimeout bounds the watch phase, before the control lock is taken. The
-	// zero value means DefaultProbeTimeout.
-	ProbeTimeout time.Duration
+	// WaveTimeout bounds one wave of concurrent proofs in the watch phase, before the
+	// control lock is taken. The zero value means DefaultWaveTimeout, and the pass's
+	// own deadline is this times the number of waves the pass needs, capped at
+	// MaximumPassTimeout.
+	WaveTimeout time.Duration
+
+	// ProofConcurrency is how many of a subject's profile proofs run at once. The zero
+	// value means optimizer.ProofConcurrency, which is the number an apply's final
+	// proof uses over the same profiles; a case sets it to one when it needs the order
+	// of the walk to be the order the profiles are configured in.
+	ProofConcurrency int
 
 	// ProofTimeout bounds the fallback's proof inside a transition, which is the
 	// one piece of network I/O this package does under the control lock. The zero
@@ -330,8 +354,11 @@ func NewChecker(prober Prober, options Options) (*Checker, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	if options.ProbeTimeout <= 0 {
-		options.ProbeTimeout = DefaultProbeTimeout
+	if options.WaveTimeout <= 0 {
+		options.WaveTimeout = DefaultWaveTimeout
+	}
+	if options.ProofConcurrency <= 0 {
+		options.ProofConcurrency = optimizer.ProofConcurrency
 	}
 	if options.ProofTimeout <= 0 {
 		options.ProofTimeout = optimizer.FinalProofTimeout
@@ -399,10 +426,15 @@ func (c *Checker) Check(ctx context.Context) (result Result, err error) {
 		}}, nil
 	}
 
-	// The watch phase, with no control lock held. The proofs are the reason: they
-	// take seconds, and a shared lock held for that is a lock every apply, pin and
-	// unpin waits behind.
-	watch, cancelWatch := context.WithTimeout(ctx, c.options.ProbeTimeout)
+	// The watch phase, with no control lock held. The proofs are the reason: they take
+	// seconds, and a shared lock held for that is a lock every apply, pin and unpin
+	// waits behind.
+	//
+	// The deadline is the pass's own rather than one wave's, because the pass is not
+	// one wave: the winner's profiles are answered at the documented limit and then
+	// each published mapping is answered, and a pass that gave both of those one wave
+	// would be reporting cut-short walks on any list longer than the limit.
+	watch, cancelWatch := context.WithTimeout(ctx, c.passTimeout(len(current.CloudFront)))
 	defer cancelWatch()
 	winner := c.proveSubject(watch, publishedAddress(current.WinnerIP, ""))
 	mappings := c.proveMappings(watch, current.CloudFront)
@@ -634,14 +666,17 @@ func (c *Checker) moveToFallback(ctx context.Context, current state.Selector, mo
 	return published, report.Bytes, nil
 }
 
-// proveMappings proves every published per-hostname mapping, one at a time and in
-// hostname order, so the verdicts a check reports are the same whatever order the
-// selector's map happened to iterate in.
+// proveMappings proves every published per-hostname mapping, in hostname order so the
+// verdicts a check reports are the same whatever order the selector's map happened to
+// iterate in, and at the same concurrency limit the winner's own profiles are proved
+// at. Each mapping is one address held to one profile, so this is the second fan-out
+// of the pass rather than part of the first.
 //
-// Every mapping gets a verdict, including the ones a deadline or a cancellation
-// kept the check from reaching: a hostname that was not checked is reported as not
-// checked, which is the unattempted-slot rule applied to the loop rather than to a
-// single address's profile list.
+// Every mapping gets a verdict, including the ones a deadline or a cancellation kept
+// the check from reaching: a hostname that was not checked is reported as not checked,
+// which is the unattempted-slot rule applied to the loop rather than to a single
+// address's profile list. Each report owns its own slot, so the two orderings - the
+// walk's and the document's - never have to agree.
 func (c *Checker) proveMappings(ctx context.Context, mappings map[string]string) []AddressReport {
 	if len(mappings) == 0 {
 		return nil
@@ -651,10 +686,11 @@ func (c *Checker) proveMappings(ctx context.Context, mappings map[string]string)
 		hostnames = append(hostnames, hostname)
 	}
 	slices.Sort(hostnames)
-	reports := make([]AddressReport, 0, len(hostnames))
-	for _, hostname := range hostnames {
-		reports = append(reports, c.proveSubject(ctx, publishedAddress(mappings[hostname], hostname)))
-	}
+	reports := make([]AddressReport, len(hostnames))
+	parallelFor(ctx, len(hostnames), c.options.ProofConcurrency, func(index int) {
+		hostname := hostnames[index]
+		reports[index] = c.proveSubject(ctx, publishedAddress(mappings[hostname], hostname))
+	})
 	return reports
 }
 
@@ -677,18 +713,22 @@ type proofAnswer struct {
 	// profile. It is the zero value of a slot nobody filled, which is the direction
 	// that fails.
 	dispatched bool
-	err        error
+	// bytes is what this one proof read, refusals included, carried in the slot
+	// because a concurrent walk cannot add to one counter without either a lock or a
+	// total that depends on which worker finished first.
+	bytes int64
+	err   error
 }
 
 // proveSubject proves one published address against the profiles its own group is
 // held to, and returns that address's own verdict.
 //
-// The walk is sequential and that is a decision rather than an omission. A health
-// check runs every two minutes, the whole pass has one deadline, and a serial walk
-// makes "which of the configured profiles was reached" an exact statement in the
-// detail a report carries - which is the statement an operator needs when a check
-// is refused. It is also the shape with the fewest ways to mistake a profile that
-// was never dispatched for one that was.
+// The walk is concurrent, at the same documented limit an apply's final proof uses and
+// for the same reason: the time a proof takes is one answer's time rather than the sum
+// of the list's, and a serial walk over a realistic forced-ECH list would spend the
+// pass deadline on a perfectly healthy address and report a cut-short walk as a
+// failure. The verdict is then read in profile order, so which profile refused is a
+// statement about the configuration rather than about which worker lost a race.
 //
 // Two refusals happen before a socket is opened. An address the selector names that
 // is not one a rewrite target may name is not dialled at all, because a candidate
@@ -710,24 +750,93 @@ func (c *Checker) proveSubject(ctx context.Context, subject candidate.Candidate)
 	}
 
 	answers := make([]proofAnswer, len(applicable))
-	for index, profile := range applicable {
-		// A context that is already done stops the walk rather than asking a
-		// question whose answer cannot arrive. The slots from here on stay
-		// undispatched, and the walk below treats them as the refusals they are.
-		if ctx.Err() != nil {
-			break
-		}
-		metrics, err := c.prober.HTTPS(ctx, subject, healthProfile(profile))
-		// The bytes are added in before the error is looked at, which is the whole
-		// reason HTTPMetrics carries the field: an identity proof is deliberately
-		// outside the daily budget, so the refused proof - the one that spent bytes
-		// and published nothing - is exactly the case whose cost would otherwise go
-		// unrecorded.
-		report.Bytes += metrics.BodyBytes
-		answers[index] = proofAnswer{dispatched: true, err: err}
+	parallelFor(ctx, len(applicable), c.options.ProofConcurrency, func(index int) {
+		metrics, err := c.prober.HTTPS(ctx, subject, healthProfile(applicable[index]))
+		// Each answer owns its own slot: no two workers write the same element, and
+		// the bytes are carried in the slot rather than added to a shared counter, so
+		// the total does not depend on which worker finished first.
+		//
+		// The bytes are carried rather than dropped because an identity proof is
+		// deliberately outside the daily budget: the refused proof - the one that spent
+		// bytes and published nothing - is exactly the case whose cost would otherwise
+		// go unrecorded, and the sum below adds them all before any error is looked at.
+		answers[index] = proofAnswer{dispatched: true, bytes: metrics.BodyBytes, err: err}
+	})
+	// Summed before the verdict, whatever the answers say.
+	for _, answer := range answers {
+		report.Bytes += answer.bytes
 	}
 	report.Verdict, report.Detail = decideVerdict(ctx, subject, answers)
 	return report
+}
+
+// passTimeout is the deadline for a watch phase with this many published mappings.
+// The winner's own group and the mappings are two separate fan-outs, so the pass
+// costs a wave for each wave either of them needs.
+func (c *Checker) passTimeout(mappings int) time.Duration {
+	limit := c.options.ProofConcurrency
+	waves := wavesFor(len(c.options.Profiles.Global), limit) + wavesFor(mappings, limit)
+	if waves < 1 {
+		waves = 1
+	}
+	scaled := time.Duration(waves) * c.options.WaveTimeout
+	if scaled > MaximumPassTimeout {
+		return MaximumPassTimeout
+	}
+	return scaled
+}
+
+// wavesFor is how many waves of limit-at-a-time a list of count items needs. An empty
+// list needs none, because there is nothing to wait for.
+func wavesFor(count, limit int) int {
+	if count <= 0 || limit < 1 {
+		return 0
+	}
+	return (count + limit - 1) / limit
+}
+
+// parallelFor runs body for every index below count, with at most limit calls in
+// flight, and stops handing out work the moment ctx is done. The indexes it never
+// reached are therefore left for the caller to notice: a slot no body filled is the
+// unattempted case, and the verdict walk treats it as the refusal it is.
+//
+// A trap for the next caller, recorded because it is a hang and not a failure: body
+// must not return an error and must not leave its worker. A worker that returns early
+// leaves a slot unfilled, the feeder blocks on an unbuffered channel with no reader
+// left to take the next index, and nothing closes that channel - so the pass hangs
+// rather than failing. Both bodies here record into their own slot and return.
+func parallelFor(ctx context.Context, count, limit int, body func(index int)) {
+	if count == 0 {
+		return
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	work := make(chan int)
+	var group sync.WaitGroup
+	for worker := 0; worker < limit && worker < count; worker++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for index := range work {
+				if ctx.Err() != nil {
+					return
+				}
+				body(index)
+			}
+		}()
+	}
+	for index := 0; index < count; index++ {
+		select {
+		case work <- index:
+		case <-ctx.Done():
+			close(work)
+			group.Wait()
+			return
+		}
+	}
+	close(work)
+	group.Wait()
 }
 
 // decideVerdict turns a walk's answers into one verdict, and the order of the

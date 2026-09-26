@@ -108,14 +108,19 @@ const (
 // nobody can take.
 const FinalProofTimeout = 15 * time.Second
 
-// proofConcurrency is how many of a subject's profile proofs run at once.
+// ProofConcurrency is how many of a subject's profile proofs run at once.
 //
 // It is high enough that a realistic profile list - the provider's representative
 // domain and a handful of forced-ECH domains - is a single wave, and low enough
 // that a long list is answered in bounded waves rather than all at once. The
 // deadline above is what bounds the hold either way; this bounds how much of the
 // host a single apply leans on.
-const proofConcurrency = 16
+//
+// It is exported because it is a decision a second caller of the same walk has to
+// share: the health check proves the addresses a selector has published over
+// exactly these profiles, and a limit of its own would be a second number with the
+// same meaning and no reason to be different.
+const ProofConcurrency = 16
 
 // The three refusals the runner adds, as named constants for the same reason the
 // scorer's are: a report has to say which rule refused a candidate, and a rule
@@ -1456,7 +1461,7 @@ func (p Profiles) all() []candidate.ProbeProfile {
 // own hostname's, so a proof never crosses the boundary between the global group
 // and a per-hostname one.
 //
-// The profiles of one address are proved concurrently, under proofConcurrency, so
+// The profiles of one address are proved concurrently, under ProofConcurrency, so
 // the time the whole proof takes is one probe's time rather than the sum of the
 // list's. The deadline is the caller's - Apply puts one over the entire final-proof
 // phase, which is what bounds the control lock's hold - and this function adds
@@ -1504,7 +1509,7 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 	// context's error, so it says whether the run was cut short and not which
 	// profiles were reached; the per-slot state is what says that, and it is the one
 	// guard here because it cannot be satisfied by a slot nobody filled.
-	_ = forEachIndex(ctx, len(applicable), proofConcurrency, func(ctx context.Context, index int) error {
+	_ = forEachIndex(ctx, len(applicable), ProofConcurrency, func(ctx context.Context, index int) error {
 		metrics, err := r.prober.HTTPS(ctx, subject, applicable[index])
 		answers[index] = proofAnswer{state: proofAnswered, metrics: metrics, err: err}
 		return nil

@@ -14,6 +14,7 @@ package health_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -49,6 +50,12 @@ const (
 	winnerIP   = "104.16.1.1"
 	fallbackIP = "104.16.0.1"
 )
+
+// deadlineWindow is the tolerance on a case that reads a context deadline. The
+// deadline is a wall-clock instant built from the moment the check asked for one, so
+// it lands within microseconds of that moment; a window this wide absorbs a loaded
+// host without being wide enough to confuse one wave's worth of time with two.
+const deadlineWindow = 30 * time.Millisecond
 
 // representativeDomain is the global identity profile every fixture is proved
 // against, and cloudFrontHostname is the per-hostname half of the anti-leak rule:
@@ -87,9 +94,19 @@ type fakeProber struct {
 	mutex  sync.Mutex
 	calls  []probeCall
 	answer func(probeCall) (measure.HTTPMetrics, error)
+	// delay is how long every proof takes, which is how a slow edge is expressed
+	// without a socket: the wall time a walk spends is the delay times the number of
+	// waves, and a case that cannot see a wave has no way to see the bug.
+	delay time.Duration
+	// deadlines records the deadline each proof was handed, so a case can read the
+	// pass's own budget rather than infer it from what happened.
+	deadlines []time.Time
+	// inFlight and peakInFlight are how many proofs were running at the same moment,
+	// and the most that ever were. A serial walk peaks at one.
+	inFlight, peakInFlight int
 }
 
-func (p *fakeProber) HTTPS(_ context.Context, subject candidate.Candidate, profile candidate.ProbeProfile) (measure.HTTPMetrics, error) {
+func (p *fakeProber) HTTPS(ctx context.Context, subject candidate.Candidate, profile candidate.ProbeProfile) (measure.HTTPMetrics, error) {
 	call := probeCall{
 		address:  subject.IP.String(),
 		hostname: profile.Hostname,
@@ -98,11 +115,54 @@ func (p *fakeProber) HTTPS(_ context.Context, subject candidate.Candidate, profi
 	}
 	p.mutex.Lock()
 	p.calls = append(p.calls, call)
+	if deadline, ok := ctx.Deadline(); ok {
+		p.deadlines = append(p.deadlines, deadline)
+	}
+	p.inFlight++
+	if p.inFlight > p.peakInFlight {
+		p.peakInFlight = p.inFlight
+	}
 	p.mutex.Unlock()
+
+	defer func() {
+		p.mutex.Lock()
+		p.inFlight--
+		p.mutex.Unlock()
+	}()
+	if p.delay > 0 {
+		select {
+		case <-time.After(p.delay):
+		case <-ctx.Done():
+			// The prober package's own rule: a request cut short by its context
+			// answers with the context's error and no measurements, because a number
+			// beside a timeout is a number a caller can mistake for one.
+			return measure.HTTPMetrics{}, ctx.Err()
+		}
+	}
 	if p.answer == nil {
 		return measure.HTTPMetrics{Status: http.StatusOK}, nil
 	}
 	return p.answer(call)
+}
+
+// peak records the most proofs that were ever in flight at once, which is what tells
+// a concurrent walk from a serial one.
+func (p *fakeProber) peak() int {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.peakInFlight
+}
+
+// deadline is the pass deadline the proofs were handed. Every proof of a pass shares
+// one context, so the first reading is the pass's budget.
+func (p *fakeProber) deadline(t *testing.T) time.Time {
+	t.Helper()
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if len(p.deadlines) == 0 {
+		t.Fatal("no proof recorded the deadline it was handed")
+	}
+	return p.deadlines[0]
 }
 
 // asked returns the recorded proofs as "address hostname method", sorted, so a
@@ -188,7 +248,7 @@ func newWorld(t *testing.T, selector state.Selector, profiles optimizer.Profiles
 		ControlLockPath:  w.lockPath,
 		FailureThreshold: threshold,
 		Now:              func() time.Time { return w.moment },
-		ProbeTimeout:     time.Second,
+		WaveTimeout:      time.Second,
 		ProofTimeout:     time.Second,
 	}
 	w.rebuild()
@@ -599,6 +659,11 @@ func TestAnExpiredDeadlineFailsTheCheckWithoutProbingAnything(t *testing.T) {
 // profiles after the one that was cut short were never asked, and "we do not
 // know" is the verdict. It is not a failure - a cancellation is not the host
 // refusing - and it is not a pass either.
+//
+// The walk is pinned to one proof at a time here, because the property under test is
+// the order of the walk and not its width: at the documented limit, whether the second
+// profile is dispatched before the first one's cancellation lands is a race, and a
+// case that depended on it would be testing the scheduler.
 func TestACancelledMidProofIsNeitherAFailureNorAPass(t *testing.T) {
 	w := newWorld(t, publishedSelector(), optimizer.Profiles{
 		Global: []candidate.ProbeProfile{
@@ -606,6 +671,8 @@ func TestACancelledMidProofIsNeitherAFailureNorAPass(t *testing.T) {
 			identityProfile("forced.example.test"),
 		},
 	}, 3)
+	w.options.ProofConcurrency = 1
+	w.rebuild()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w.prober.answer = func(probeCall) (measure.HTTPMetrics, error) {
@@ -1485,5 +1552,206 @@ func TestTheDefaultHealthPathIsTheRuntimeDirectory(t *testing.T) {
 	want := "/var/lib/mosdns/runtime/health.json"
 	if health.DefaultHealthPath != want {
 		t.Errorf("DefaultHealthPath = %q, want %q", health.DefaultHealthPath, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the walk's shape
+// ---------------------------------------------------------------------------
+
+// globalProfilesOf builds a global identity profile list of n hostnames, so a case can
+// ask what a walk over a long list costs. The names are numbered rather than invented
+// because a list's length is the point and its contents are not.
+func globalProfilesOf(n int) optimizer.Profiles {
+	profiles := make([]candidate.ProbeProfile, 0, n)
+	for index := 0; index < n; index++ {
+		profiles = append(profiles, identityProfile(fmt.Sprintf("domain%02d.example.test", index)))
+	}
+	return optimizer.Profiles{Global: profiles}
+}
+
+// A long profile list is answered in waves rather than one at a time, so the time a
+// check spends is the number of waves and not the length of the list. The number
+// itself is the documented one the optimizer's final proof uses; what is being pinned
+// here is that this walk uses it at all, because a serial walk over a realistic
+// forced-ECH list times the pass deadline out on a perfectly healthy address.
+func TestTheProfilesOfOneAddressAreProvedInWaves(t *testing.T) {
+	const proofs = 24
+	w := newWorld(t, publishedSelector(), globalProfilesOf(proofs), 3)
+	// Forty milliseconds a proof: a serial walk would spend 960 milliseconds here, and
+	// the pass deadline below is two waves of a second, so the deadline is not what
+	// the case is measuring.
+	w.prober.delay = 40 * time.Millisecond
+
+	began := time.Now()
+	result := w.check()
+	elapsed := time.Since(began)
+
+	if result.Winner.Verdict != health.VerdictHealthy {
+		t.Fatalf("the verdict = %v, want %v (detail: %s)", result.Winner.Verdict, health.VerdictHealthy, result.Winner.Detail)
+	}
+	if peak := w.prober.peak(); peak < 2 {
+		t.Errorf("the walk proved one profile at a time: peak in flight = %d over %d proofs", peak, proofs)
+	}
+	if peak := w.prober.peak(); peak > optimizer.ProofConcurrency {
+		t.Errorf("peak in flight = %d, above the documented limit %d", peak, optimizer.ProofConcurrency)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("the pass took %s for %d proofs, want about two waves of 40ms rather than %d of them", elapsed, proofs, proofs)
+	}
+}
+
+// The pass deadline is one wave's bound for every wave the pass needs, so a list
+// longer than the concurrency limit is given the time its extra waves cost instead of
+// being cut short. The numbers are the fixture's own: a wave is 100ms, the limit is
+// sixteen proofs at a time, and the cap is the documented maximum.
+func TestThePassDeadlineScalesWithTheNumberOfWaves(t *testing.T) {
+	cases := []struct {
+		name     string
+		profiles int
+		mappings int
+		want     time.Duration
+	}{
+		{name: "one profile", profiles: 1, want: 100 * time.Millisecond},
+		{name: "a full wave", profiles: optimizer.ProofConcurrency, want: 100 * time.Millisecond},
+		{name: "one profile over a wave", profiles: optimizer.ProofConcurrency + 1, want: 200 * time.Millisecond},
+		{name: "three waves", profiles: 2*optimizer.ProofConcurrency + 1, want: 300 * time.Millisecond},
+		// The mappings are the pass's second fan-out, so each wave of them is a wave
+		// the winner's own profiles do not get.
+		{name: "one mapping of its own", profiles: 1, mappings: 1, want: 200 * time.Millisecond},
+		{name: "mappings beyond a wave", profiles: 1, mappings: optimizer.ProofConcurrency + 1, want: 300 * time.Millisecond},
+	}
+	for _, testCase := range cases {
+		selector := publishedSelector()
+		selector.CloudFront = nil
+		for index := 0; index < testCase.mappings; index++ {
+			if selector.CloudFront == nil {
+				selector.CloudFront = map[string]string{}
+			}
+			selector.CloudFront[fmt.Sprintf("front%02d.example.test", index)] = fmt.Sprintf("104.16.3.%d", index+1)
+		}
+		profiles := globalProfilesOf(testCase.profiles)
+		for index := 0; index < testCase.mappings; index++ {
+			hostname := fmt.Sprintf("front%02d.example.test", index)
+			if profiles.ByHostname == nil {
+				profiles.ByHostname = map[string]candidate.ProbeProfile{}
+			}
+			profiles.ByHostname[hostname] = identityProfile(hostname)
+		}
+		w := newWorld(t, selector, profiles, 3)
+		w.options.WaveTimeout = 100 * time.Millisecond
+		w.rebuild()
+
+		began := time.Now()
+		w.check()
+		// The deadline is a wall-clock instant built from the moment the check asked
+		// for it, so it is compared with a small window around that moment rather than
+		// with the case's own injected clock, which the context builder does not read.
+		granted := w.prober.deadline(t).Sub(began)
+		if granted < testCase.want-deadlineWindow || granted > testCase.want+deadlineWindow {
+			t.Errorf("%s: the pass was given %s, want %s", testCase.name, granted, testCase.want)
+		}
+	}
+
+	// A list long enough to overrun the cap gets the cap and no more: a pass that ran
+	// for longer than the health interval would overlap the next one.
+	w := newWorld(t, publishedSelector(), globalProfilesOf(1000), 3)
+	w.options.WaveTimeout = 2 * time.Second
+	w.rebuild()
+	began := time.Now()
+	w.check()
+	if granted := w.prober.deadline(t).Sub(began); granted < health.MaximumPassTimeout-deadlineWindow || granted > health.MaximumPassTimeout+deadlineWindow {
+		t.Errorf("a list of 1000 profiles was given %s, want the cap %s", granted, health.MaximumPassTimeout)
+	}
+}
+
+// The hazard the scaling exists for: a long list on a slow edge is a healthy winner,
+// and a deadline that cannot cover its waves turns it into three failures and a
+// rollback onto the fallback. Three passes of the same list must leave the selector
+// exactly as it was.
+func TestALongListOnASlowEdgeDoesNotTripTheThreshold(t *testing.T) {
+	w := newWorld(t, publishedSelector(), globalProfilesOf(20), 3)
+	w.prober.delay = 30 * time.Millisecond
+	// Thirty milliseconds a proof, two waves, so a healthy pass needs 60ms of a
+	// 200ms budget. A serial walk would need 600ms of it and would be cut short.
+	w.options.WaveTimeout = 100 * time.Millisecond
+	w.rebuild()
+	before := w.readSelectorBytes()
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		w.moment = baseMoment.Add(time.Duration(attempt) * 2 * time.Minute)
+		result := w.check()
+		if result.Winner.Verdict != health.VerdictHealthy {
+			t.Fatalf("check %d = %v, want %v (detail: %s)", attempt, result.Winner.Verdict, health.VerdictHealthy, result.Winner.Detail)
+		}
+		if result.Health.ConsecutiveFailures != 0 {
+			t.Fatalf("check %d recorded %d failures", attempt, result.Health.ConsecutiveFailures)
+		}
+		if result.Transition != nil {
+			t.Fatalf("check %d published a transition: %+v", attempt, *result.Transition)
+		}
+	}
+	if after := w.readSelectorBytes(); after != before {
+		t.Errorf("three healthy passes changed the selector:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// One profile is one wave, and a single-profile check is exactly what it was: the
+// probe is handed the wave bound itself, with nothing added to it.
+func TestASingleProfileCheckIsUnchanged(t *testing.T) {
+	// No published mapping, so this is one address with one profile and one wave.
+	selector := publishedSelector()
+	selector.CloudFront = nil
+	w := newWorld(t, selector, profilesFor(), 3)
+	w.prober.answer = refusingWinner(12)
+
+	began := time.Now()
+	result := w.check()
+	if result.Winner.Verdict != health.VerdictFailed {
+		t.Fatalf("the verdict = %v, want %v", result.Winner.Verdict, health.VerdictFailed)
+	}
+	if granted := w.prober.deadline(t).Sub(began); granted < time.Second-deadlineWindow || granted > time.Second+deadlineWindow {
+		t.Errorf("a one-profile pass was given %s, want the wave bound 1s unscaled", granted)
+	}
+	if result.Health.ConsecutiveFailures != 1 {
+		t.Errorf("consecutive failures = %d, want 1", result.Health.ConsecutiveFailures)
+	}
+	if peak := w.prober.peak(); peak != 1 {
+		t.Errorf("peak in flight = %d for one profile, want 1", peak)
+	}
+}
+
+// The transition's proof is bounded by one deadline rather than by the list's waves,
+// and the reason is the lock it runs under: a hold that grows with the list is a hold
+// nobody can take, while a list that overruns the bound is refused - which moves
+// nothing, leaves the count at the threshold, and is tried again in two minutes. The
+// direction is the safe one, and this case is it.
+func TestTheTransitionIsRefusedWhenItsProofRunsOutOfTime(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.writeHealth(state.HealthState{
+		SchemaVersion:       state.SchemaVersion,
+		ConsecutiveFailures: 2,
+		LastFailure:         baseMoment.Add(-2 * time.Minute),
+	})
+	before := w.readSelectorBytes()
+	// The winner refuses immediately; the fallback is slower than the whole bound the
+	// transition gives its proof.
+	w.options.ProofTimeout = 20 * time.Millisecond
+	w.prober.answer = refusingWinner(12)
+	w.prober.delay = 60 * time.Millisecond
+	w.rebuild()
+
+	result, err := w.checker.Check(context.Background())
+	if !errors.Is(err, health.ErrFallbackRefused) {
+		t.Fatalf("the check's error = %v, want %v", err, health.ErrFallbackRefused)
+	}
+	if result.Transition != nil {
+		t.Errorf("an overrunning proof published a transition: %+v", *result.Transition)
+	}
+	if after := w.readSelectorBytes(); after != before {
+		t.Errorf("an overrunning proof changed the selector:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if result.Health.ConsecutiveFailures != 3 {
+		t.Errorf("consecutive failures = %d, want 3: the count has to survive for the next tick", result.Health.ConsecutiveFailures)
 	}
 }

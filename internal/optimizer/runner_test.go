@@ -3404,8 +3404,8 @@ func TestApplyNeverRunsMoreProfileProofsAtOnceThanTheLimit(t *testing.T) {
 	// The concurrency is bounded as well as parallel. A profile list long enough to
 	// overrun the limit is answered in waves, and the limit is what keeps the hold
 	// predictable rather than proportional to whatever the operator has listed.
-	profiles := make([]candidate.ProbeProfile, 0, proofConcurrency+4)
-	for index := 0; index < proofConcurrency+4; index++ {
+	profiles := make([]candidate.ProbeProfile, 0, ProofConcurrency+4)
+	for index := 0; index < ProofConcurrency+4; index++ {
 		profiles = append(profiles, testProfile(fmt.Sprintf("ech-%d.example.test", index), 443))
 	}
 	fixtures, candidates := threeGlobals()
@@ -3420,11 +3420,11 @@ func TestApplyNeverRunsMoreProfileProofsAtOnceThanTheLimit(t *testing.T) {
 	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(profiles...)); err != nil {
 		t.Fatalf("Apply with %d profiles: %v", len(profiles), err)
 	}
-	if got := fake.peakProofs(); got != proofConcurrency {
-		t.Errorf("the prober was answering %d proofs at once, want the limit of %d", got, proofConcurrency)
+	if got := fake.peakProofs(); got != ProofConcurrency {
+		t.Errorf("the prober was answering %d proofs at once, want the limit of %d", got, ProofConcurrency)
 	}
-	if got := len(fake.profiledCalls()); got != 3+proofConcurrency+4 {
-		t.Errorf("the prober was asked for %d identity proofs, want %d: every profile is still proved", got, 3+proofConcurrency+4)
+	if got := len(fake.profiledCalls()); got != 3+ProofConcurrency+4 {
+		t.Errorf("the prober was asked for %d identity proofs, want %d: every profile is still proved", got, 3+ProofConcurrency+4)
 	}
 }
 
@@ -3553,7 +3553,7 @@ func TestApplyRefusesWhenTheDeadlineFiresWhileTheProfilesAreStillBeingFed(t *tes
 	// The first wave answers in full even after the deadline, which is the shape
 	// that puts the un-fed tail in the walk: the sixteen that ran succeeded, so the
 	// walk reaches index sixteen, and index sixteen is the one that must refuse.
-	count := proofConcurrency + 4
+	count := ProofConcurrency + 4
 	profiles := echProfiles(count)
 	fixtures, candidates := threeGlobals()
 	// The winner answers every profile slowly and in full. It is the apply's proofs
@@ -3588,21 +3588,21 @@ func TestApplyRefusesWhenTheDeadlineFiresWhileTheProfilesAreStillBeingFed(t *tes
 	// compared as a set, because the wave's own order is the dispatcher's business
 	// and the gate's only claim is about which names it reached.
 	asked := fake.profiledCalls()
-	if len(asked) != 3+proofConcurrency {
-		t.Fatalf("the prober was asked for %d proofs, want %d: the run's three and one full wave of %d", len(asked), 3+proofConcurrency, proofConcurrency)
+	if len(asked) != 3+ProofConcurrency {
+		t.Fatalf("the prober was asked for %d proofs, want %d: the run's three and one full wave of %d", len(asked), 3+ProofConcurrency, ProofConcurrency)
 	}
 	names := make([]string, 0, len(asked)-3)
 	for _, call := range asked[3:] {
 		names = append(names, call.Hostname)
 	}
 	slices.Sort(names)
-	want := make([]string, 0, proofConcurrency)
-	for index := 0; index < proofConcurrency; index++ {
+	want := make([]string, 0, ProofConcurrency)
+	for index := 0; index < ProofConcurrency; index++ {
 		want = append(want, fmt.Sprintf("ech-%d.example.test", index))
 	}
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
-		t.Errorf("the one wave asked for was %v,\nwant %v: the wave must be the first %d profiles and no other", names, want, proofConcurrency)
+		t.Errorf("the one wave asked for was %v,\nwant %v: the wave must be the first %d profiles and no other", names, want, ProofConcurrency)
 	}
 	mustBeUnchanged(t, selectorPath, before)
 }
@@ -3637,7 +3637,7 @@ func TestApplyProvesEveryConfiguredProfileAndNamesTheOneThatRefused(t *testing.T
 	// All five were asked, and the refusing one is among them: the refusal is a
 	// verdict about the host, not an excuse to ask about fewer names. The proofs of
 	// one address run concurrently, so this compares the set of names rather than
-	// their order - the order is proofConcurrency's business, not this gate's.
+	// their order - the order is ProofConcurrency's business, not this gate's.
 	asked := fake.profiledCalls()[3:]
 	names := make([]string, 0, len(asked))
 	for _, call := range asked {
