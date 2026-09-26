@@ -193,6 +193,11 @@ type router struct {
 	output  *lockedBuffer
 	exited  chan struct{}
 	err     error
+	// expectsFailure marks a child this harness started knowing would not run. A
+	// case about a configuration the router refuses has to be able to hold the
+	// non-zero exit without the stop-time report turning it into a second failure
+	// of the same thing; the case still asserts on the exit itself.
+	expectsFailure bool
 }
 
 func startRouter(t *testing.T, configPath string) *router {
@@ -254,9 +259,10 @@ func (r *router) stop(t *testing.T) {
 
 func (r *router) reportExit(t *testing.T) {
 	t.Helper()
-	if r.err != nil {
-		t.Errorf("mosdns-router did not exit cleanly: %v\n%s", r.err, r.diagnostics())
+	if r.err == nil || r.expectsFailure {
+		return
 	}
+	t.Errorf("mosdns-router did not exit cleanly: %v\n%s", r.err, r.diagnostics())
 }
 
 // running reports whether the child is still alive, for a case that wants to say
@@ -453,6 +459,71 @@ func (h *harness) publishState(t *testing.T, generation uint64) {
 	}
 }
 
+// unstartableConfiguration is a configuration the pinned mosdns refuses to load.
+// It is what a case uses to make the child exit at startup: a plugin type that is
+// not registered is a load failure rather than a runtime one, so the process is
+// gone within milliseconds and the reason is in its output rather than in a
+// timeout.
+const unstartableConfiguration = `log:
+  level: info
+plugins:
+  - tag: broken
+    type: no_such_plugin_type
+    args: {}
+`
+
+// TestTheReadinessPollGivesUpOnAChildThatHasExited covers the cost of a
+// configuration mistake. The poll is a loop with a deadline, and a child that has
+// already exited will never answer it, so without a liveness check a case waits
+// out the whole readiness timeout for each transport before it says anything --
+// two full waits for a failure whose reason was in the child's output all along,
+// and a report that says "not answering" about a process that is not running. The
+// check must cost nothing when the child is alive, so the bound below is tight
+// against the timeout rather than against the poll interval.
+func TestTheReadinessPollGivesUpOnAChildThatHasExited(t *testing.T) {
+	address, _, reason := discoverUnicastAddress()
+	if !address.IsValid() {
+		// This case never publishes a state document, so it does not need the
+		// address the routing cases need; it only has to be asked of a host that
+		// can run it at all.
+		t.Skipf("this host cannot run the end-to-end cases (%s)", reason)
+	}
+
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "mosdns.yaml")
+	if err := os.WriteFile(configPath, []byte(unstartableConfiguration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listen := reserveLoopbackAddress(t)
+	child := startRouter(t, configPath)
+	child.expectsFailure = true
+
+	started := time.Now()
+	// The poll is given a harness that carries only what it reads -- the address
+	// it probes and the child it is waiting on -- so the case is about the poll and
+	// not about a router that never came up.
+	h := &harness{listen: listen, router: child}
+	verdict := h.pollUntilAnswering(testdns.ProtocolUDP)
+	waited := time.Since(started)
+
+	if verdict == nil {
+		t.Fatal("the poll reported a router that never started as answering")
+	}
+	// The verdict has to name the exit and carry the child's own reason, because
+	// that is what a person reads: "not answering" about a process that is not
+	// running is the report the check exists to replace.
+	if !strings.Contains(verdict.Error(), "no_such_plugin_type") {
+		t.Errorf("the poll's verdict does not carry the child's own reason:\n%v", verdict)
+	}
+	if !strings.Contains(verdict.Error(), "exited") {
+		t.Errorf("the poll's verdict does not say the child exited rather than that it was silent:\n%v", verdict)
+	}
+	if waited > readinessTimeout/2 {
+		t.Errorf("the poll spent %s reporting a child that had already exited, want well under the %s readiness timeout",
+			waited.Round(time.Millisecond), readinessTimeout)
+	}
+}
+
 // ask sends one query to the router and returns the answer. The transport is the
 // hop from this process to the router, which is a choice a case makes; the
 // router's own hop to the foreign resolver is always TCP.
@@ -508,14 +579,19 @@ func (c counts) since(earlier counts) counts {
 func (h *harness) waitUntilAnswering(t *testing.T) {
 	t.Helper()
 	for _, transport := range []string{testdns.ProtocolUDP, testdns.ProtocolTCP} {
-		h.pollUntilAnswering(t, transport)
+		if err := h.pollUntilAnswering(transport); err != nil {
+			t.Fatalf("%v", err)
+		}
 	}
 	t.Logf("the router answers on %s; it enters the foreign resolver at %s and reads its DHCP upstreams from %s",
 		h.listen, h.foreign.Address(), h.stateFile)
 }
 
-func (h *harness) pollUntilAnswering(t *testing.T, transport string) {
-	t.Helper()
+// pollUntilAnswering returns why the router is not answering on one transport, and
+// nil once it is. It is a value rather than a fatal call so a case can drive the
+// poll against a child that is never coming up and observe what it concluded --
+// which is the only way the liveness check below is testable.
+func (h *harness) pollUntilAnswering(transport string) error {
 	client := &dns.Client{Net: transport, Timeout: readinessDialWait}
 	query := new(dns.Msg)
 	query.SetQuestion(readinessName, dns.TypeA)
@@ -524,23 +600,31 @@ func (h *harness) pollUntilAnswering(t *testing.T, transport string) {
 	deadline := time.Now().Add(readinessTimeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		// A child that has already exited will never answer, so the deadline is
+		// the wrong thing to wait for: the whole readiness timeout would be spent
+		// polling a socket nobody holds, once per transport, and the reason the
+		// child is gone is in the output it wrote on its way out. The liveness
+		// check is the first thing the loop does, so a configuration mistake costs
+		// one poll interval rather than a timeout -- and it costs nothing at all
+		// while the child is alive, which is the case every other test is in.
+		if !h.router.running() {
+			return fmt.Errorf("mosdns-router exited (%v) before it answered a %s query on %s, so waiting cannot succeed:\n%s",
+				h.router.err, transport, h.listen, h.router.diagnostics())
+		}
 		response, _, err := client.Exchange(query, h.listen)
 		switch {
 		case err != nil:
 			lastErr = err
 		case response.Id != query.Id || len(response.Question) != 1 || response.Question[0].Name != readinessName:
-			t.Fatalf("the router answered the readiness query with a message for a different transaction or question: %v", response)
+			return fmt.Errorf("the router answered the readiness query with a message for a different transaction or question: %v", response)
 		default:
 			// Any rcode will do. What is proved here is that the listener answers,
 			// not which branch a probe name belongs to.
-			return
+			return nil
 		}
 		time.Sleep(readinessPollWait)
 	}
-	if h.router.running() {
-		lastErr = fmt.Errorf("the child process is running but not answering (%w)", lastErr)
-	}
-	t.Fatalf("the router answered no %s query on %s within %s: %v\n%s",
+	return fmt.Errorf("the router answered no %s query on %s within %s: the child process is running but not answering (%v)\n%s",
 		transport, h.listen, readinessTimeout, lastErr, h.router.diagnostics())
 }
 
