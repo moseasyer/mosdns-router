@@ -824,16 +824,15 @@ func (c *Checker) moveToFallback(ctx context.Context, current state.Selector, de
 	if err := state.WriteJSONAtomic(c.options.SelectorPath, published); err != nil {
 		return state.Selector{}, proved, err
 	}
-	proved.at = moment
 	return published, proved, nil
 }
 
-// transitionProof is what a transition's own proof cost and when it completed. The
-// instant is carried rather than read again so the health document that follows the
-// transition and the selector it published cannot disagree about it.
+// transitionProof is what a transition's own proof cost. It is what the check
+// reports on top of the transition, and it carries nothing about time: the health
+// document that follows a transition reads the instant out of the selector it just
+// published, and so does any reader, which is why the two cannot disagree.
 type transitionProof struct {
 	bytes int64
-	at    time.Time
 }
 
 // proveMappings proves every published per-hostname mapping, in hostname order so the
