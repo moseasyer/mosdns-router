@@ -1424,3 +1424,51 @@ func TestHTTPSAnswersTheNameTheClientAskedAbout(t *testing.T) {
 		t.Errorf("ipv4hint = %v, want exactly [%s]", hints, selectedIP)
 	}
 }
+
+// TestHTTPSSharesNoBufferWithTheResponseItWasGiven is the other half of the rule the
+// test above states as non-mutation, and the two fail independently. Not writing to
+// the caller's response is what a read-only synthesis looks like; sharing no buffer
+// with it is what a copy looks like, and a synthesis that reads a parameter and keeps
+// the pointer it read has done the first and not the second. The difference matters
+// because the caller is a plugin in front of a cache that owns the object: the next
+// reader of that cache may rewrite the very parameters this answer now refers to,
+// and a browser would be handed a parameter set that changed under it.
+//
+// So the caller's own parameters are corrupted after the call and the answer is
+// compared as wire bytes before and after. Comparing the bytes catches a change in a
+// header bit, in a length prefix, or in the order of anything; the value assertions
+// say which parameter it was.
+func TestHTTPSSharesNoBufferWithTheResponseItWasGiven(t *testing.T) {
+	local := &dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")}
+	alpn := &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}}
+	dohpath := &dns.SVCBDoHPath{Template: "/dns-query{?dns}"}
+	upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, ".", alpn, dohpath, local))
+
+	got, err := HTTPS(httpsInput(t, upstream))
+	if err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	wire := packed(t, got)
+
+	// The caller keeps using its own response: it is going into a cache, and
+	// something else is entitled to edit it. Three of its parameters are edited
+	// here, one buffer at a time. That this is visible in the caller's own object is
+	// the point -- the other test above holds that HTTPS itself never writes to it.
+	local.Data[0] = 'X'
+	alpn.Alpn[0] = "h9"
+	dohpath.Template = "/elsewhere"
+
+	if now := packed(t, got); string(now) != string(wire) {
+		t.Errorf("the answer changed when the caller's own parameters were edited:\n before %s\n after  %s", wire, now)
+	}
+	out := onlyHTTPS(t, got)
+	if kept := param(t, out, localKey).(*dns.SVCBLocal).Data; string(kept) != "probe" {
+		t.Errorf("key65400 = %q after the caller edited its own buffer, want %q: the answer refers to the caller's parameter", kept, "probe")
+	}
+	if kept := alpnOf(t, out); kept[0] != "h2" {
+		t.Errorf("alpn = %v after the caller edited its own parameter, want [h2 h3]: the answer refers to the caller's parameter", kept)
+	}
+	if kept := param(t, out, dns.SVCB_DOHPATH).(*dns.SVCBDoHPath).Template; kept != "/dns-query{?dns}" {
+		t.Errorf("dohpath = %q after the caller edited its own parameter, want the upstream's template: the answer refers to the caller's parameter", kept)
+	}
+}

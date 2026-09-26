@@ -141,7 +141,14 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	if err != nil {
 		return nil, err
 	}
-	published := recordsAt(in.Response, question.Name)
+	// Everything below reads the copy, not the caller's response. The parameters a
+	// synthesis inherits are pointers, and a pointer the answer keeps is a pointer
+	// the next reader of the caller's cache can rewrite under a browser that has
+	// already been handed this answer, so the records harvested below are harvested
+	// from the copy: nothing a client reads shares a buffer with the object the
+	// caller still holds.
+	clone := in.Response.Copy()
+	published := recordsAt(clone, question.Name)
 
 	list, err := validatedECH(in.ECH)
 	if err != nil {
@@ -155,7 +162,6 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 		return nil, err
 	}
 
-	clone := in.Response.Copy()
 	if len(published) == 0 {
 		// Nothing was published for this name, so there is no record to put a
 		// synthesis in place of and the whole answer is the record. emptyAnswer
