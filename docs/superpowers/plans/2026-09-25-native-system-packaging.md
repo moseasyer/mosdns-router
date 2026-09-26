@@ -449,9 +449,18 @@ package-content test asserts the provisioned identity:
 ```text
 /var/lib/mosdns              root:mosdns  2750  (setgid, default ACL rwx for mosdns)
 /var/lib/mosdns/runtime      root:mosdns  2750  (setgid, default ACL rwx for mosdns)
+/var/lib/mosdns/lists        root:mosdns  2750  (setgid, default ACL rwx for mosdns)
 /var/lib/mosdns/runtime/control.lock  created on first acquire at 0640
 /run/mosdns                  root:mosdns  2750  (setgid, default ACL rwx for mosdns)
 ```
+
+`/var/lib/mosdns/lists` is here because the CDN selector plan's range cache lives
+at `/var/lib/mosdns/lists/cloudflare-ips.json` and the China list at
+`/var/lib/mosdns/lists/cn-domains.txt`: both are read and renamed over by the same
+two service identities, and the range cache's own writer creates the directory only
+when it is absent. The cache *file* is deliberately not in the 0640 set — it is
+published reference data, written 0644 by `internal/candidate` — so the directory
+has to be the thing that lets both identities read and replace it.
 
 The setgid bit and the group are what let the router service (user `mosdns`) and
 the DHCP bridge or optimizer (a second identity) share one control lock and one

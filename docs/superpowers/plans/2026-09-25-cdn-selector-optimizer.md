@@ -43,7 +43,7 @@
   overwritten by it. With no cache at all, or a 304 that cannot be satisfied, the run fails rather
   than measuring an empty set. Serving stale is safe because every candidate in a stale set still has
   to pass the final identity proof before it can be published.
-- **The group barrier is enforced on every exported function that takes a group, not only on the three that take a slice.** `RankScore`, `CombinedScore` and `TenthPercentileSpeed` each take a group without going through `Select`, and a check on the *subject* is not a check on the *group*: a subject can be a good member of a slice that also holds another hostname's results, and the percentile arithmetic then compares the two. All five refuse a slice that is not one group. A review of this must check the entry points, not the call graph inside the package.
+- **The group barrier is enforced on every exported function that takes a group, not only on the three that take a slice.** `RankScore`, `CombinedScore` and `TenthPercentileSpeed` each take a group without going through `Select`, and a check on the *subject* is not a check on the *group*: a subject can be a good member of a slice that also holds another hostname's results, and the percentile arithmetic then compares the two. All six refuse a slice that is not one group. A review of this must check the entry points, not the call graph inside the package.
 - **The exclusion ceilings are `optimizer.DefaultLimits()` and Task 4 must pass them.** `config.Policy` has no loss or latency ceiling field and this plan may not add one, so the ceilings are a parameter with a documented default: `DefaultMaxLossFraction` 0.10 and `DefaultMaxP50MS` 150ms, both inclusive. `optimizer.Limits{}` still means "no ceiling" and a caller can still ask for it, but a caller that writes `Params{}` by accident must reach for `DefaultLimits()` rather than for the zero value, which measures and publishes a candidate that dropped 40% of its handshakes. A review of the runner must confirm the value it passes.
 - **`Params.Validate()` is a gate, not a convenience.** A non-positive `latency_candidate_count`, `latency_top` or `bandwidth_top` cannot select anything, and the three come from three separate policy fields. `Select` refuses every candidate with `ReasonUnusableCounts` rather than returning an empty union that reads as "nothing was good enough", and `Validate` lets the runner find it out before it spends the day's bandwidth.
 - **Two identity gates, and the scorer deliberately holds neither.** The phase order is `collect -> TCP -> HTTPS identity -> latency shortlist -> bandwidth -> score -> final proof`. A candidate reaches the scorer only if it already passed the identity probe for the hostname it is scored for, and the proof runs again on the winner before anything is published. `optimizer.CandidateResult.HTTP` is therefore carried and never read, and that is the design: a third gate over a fact two others hold would be the one a caller mistakes for the gate itself. A review of the runner must confirm both gates run, because a candidate with no proof will be scored, and scored well.
@@ -60,12 +60,17 @@
 ## File Map
 
 ```text
+cmd/mosdns-cdnctl/main.go
+cmd/mosdns-cdnctl/main_test.go
+cmd/mosdns-cdnctl/update_lists.go
 internal/candidate/types.go
-internal/candidate/cloudflare.go
+internal/candidate/types_test.go
 internal/candidate/user.go
-internal/candidate/cloudfront.go
-internal/candidate/cloudflare_test.go
 internal/candidate/user_test.go
+internal/candidate/cloudflare.go
+internal/candidate/cloudflare_test.go
+internal/candidate/fetch.go
+internal/candidate/cloudfront.go
 internal/candidate/cloudfront_test.go
 internal/prober/prober.go
 internal/prober/tcp.go
@@ -73,14 +78,20 @@ internal/prober/http.go
 internal/prober/download.go
 internal/prober/prober_test.go
 internal/optimizer/budget.go
+internal/optimizer/budget_test.go
 internal/optimizer/score.go
+internal/optimizer/score_test.go
 internal/optimizer/runner.go
 internal/optimizer/runner_test.go
+internal/measure/measure.go
 internal/health/checker.go
 internal/health/checker_test.go
-cmd/mosdns-cdnctl/main.go
-Makefile
+internal/health/verdict_test.go
+internal/state/atomic.go
+internal/state/atomic_test.go
 ```
+
+`internal/measure/measure.go` is here because `prober`'s in-package test uses `*optimizer.Budget` and Go forbids the cycle; `internal/state/atomic.go` because the health document is written by the state package's own writer rather than by the checker; and `internal/health/verdict_test.go` because the verdict's `String` is a reporting contract. The Makefile is **not** in this range: no build target, packaging rule or entry point changed, and this plan touched no file outside the four directories above plus `internal/measure` and `internal/state`.
 
 ### Interfaces produced by this plan
 
@@ -147,7 +158,11 @@ type Prober interface {
 ```go
 package optimizer
 
-type Budget struct { Remaining int64 }
+// Budget has no exported field: the day is a document and a day rule, not a
+// number a caller may read or write. Used, Standing, Reserve, Settle, Release and
+// Consume are the whole surface, and the one-shot settlement rule lives in this
+// concrete type because the prober's interface has nowhere to report a refusal.
+type Budget struct { /* private: mutex, counter, limit, location, moment, outstanding, lastKnown */ }
 func NewBudget(bytes int64) *Budget
 func NewPersistentBudget(path string, limit int64, location *time.Location, now time.Time) (*Budget, error)
 func (b *Budget) Reserve(requested int64) (int64, error)
@@ -162,6 +177,9 @@ func (b *Budget) Settle(reserved, actual int64) error
 func (b *Budget) Release(reserved int64) error
 func (b *Budget) Consume(reserved, actual int64)
 func (b *Budget) Used() int64
+// Standing is Used and the limit the day is held to, from one read, so a report
+// cannot show a total and a limit from two different moments.
+func (b *Budget) Standing() (used, limit int64)
 
 type CandidateResult struct {
     Candidate candidate.Candidate
@@ -178,6 +196,11 @@ type Input struct {
     CloudFront         []candidate.Candidate
     CloudFrontRules    []candidate.CloudFrontProfile
     LastGood           state.Selector
+    // Stale is candidate.CandidateSet.Stale: the official ranges could not be
+    // refreshed and the last document this build accepted stood in for them. It
+    // becomes Report.Stale, which is the only place a reader learns the addresses
+    // in a report are yesterday's.
+    Stale bool
 }
 type ScoreWeights struct { Latency float64; Bandwidth float64; Stability float64 }
 // The exclusion ceilings, as parameters with a documented default. config.Policy
@@ -204,15 +227,58 @@ func (p Params) Validate() error
 // GroupKey is the one set of candidates that may be compared. Every function
 // below that takes a group refuses a slice holding more than one, including
 // RankScore, CombinedScore and TenthPercentileSpeed, which take a group without
-// going through Select.
+// going through Select. Six entry points share that barrier: RankLatency,
+// RankBandwidth, Select, RankScore, CombinedScore and TenthPercentileSpeed.
 type GroupKey struct { Provider candidate.Provider; Hostname string }
 func GroupOf(candidate.Candidate) GroupKey
 func (k GroupKey) Same(other GroupKey) bool
 func TenthPercentileSpeed(group []CandidateResult) float64
-type Report struct { GeneratedAt time.Time; Candidates []CandidateResult; Winner candidate.Candidate; BudgetUsed int64 }
+// Report is per group, because the winner is per group and the anti-leak rule is
+// the whole reason: a CloudFront address is one hostname's answer, so a report
+// with a single winner would either drop the CloudFront groups or publish one of
+// them for everything. The brief's Candidates and Winner are Groups[].Candidates
+// and Groups[].Winner; GeneratedAt, IdentityBytes, BudgetUsed, BudgetLimit and
+// BudgetRemaining are the run's. Every field is JSON-tagged and read back by an
+// apply that refuses anything it does not recognize.
+type Report struct {
+    SchemaVersion   int           `json:"schema_version"`
+    GeneratedAt     time.Time     `json:"generated_at"`
+    PolicySHA256    string        `json:"policy_sha256"`
+    ConfigSHA256    string        `json:"config_sha256"`
+    Stale           bool          `json:"stale_candidates"`
+    Groups          []GroupReport `json:"groups"`
+    IdentityBytes   int64         `json:"identity_body_bytes"`
+    BudgetUsed      int64         `json:"budget_used_bytes"`
+    BudgetLimit     int64         `json:"budget_limit_bytes"`
+    BudgetRemaining int64         `json:"budget_remaining_bytes"`
+    BudgetExhausted bool          `json:"budget_exhausted"`
+    Phases          PhaseTimes    `json:"phases"`
+    FinalProofPassed  bool        `json:"final_proof_passed"`
+    FinalProofRefused string       `json:"final_proof_refused,omitempty"`
+    Outcome         Outcome       `json:"outcome,omitempty"`
+}
+type GroupReport struct {
+    Group             GroupKey          `json:"-"`
+    Provider          string            `json:"provider"`
+    Hostname          string            `json:"hostname,omitempty"`
+    Candidates        []ReportCandidate `json:"candidates"`
+    Winner            *ReportWinner     `json:"winner,omitempty"`
+    NoWinner          string            `json:"no_winner_reason,omitempty"`
+    P10BytesPerSecond float64           `json:"p10_bytes_per_second"`
+    Outcome           Outcome           `json:"outcome,omitempty"`
+    OutcomeReason     string            `json:"outcome_reason,omitempty"`
+}
 type Runner struct { /* private */ }
-func NewRunner(config.Policy, prober.Prober) *Runner
+// NewRunner takes the paths, the clock and the configuration digest as Options,
+// because a runner with no budget path, selector path, control lock or digest is a
+// runner that cannot be checked and cannot be used - and it returns an error
+// because the counts are validated here, before any measurement, rather than by a
+// run that has already spent the user's bandwidth.
+func NewRunner(policy config.Policy, prober Prober, options Options) (*Runner, error)
 func (r *Runner) Run(context.Context, Input) (Report, error)
+func (r *Runner) Apply(context.Context, Report, Profiles) (Report, state.Selector, error)
+func (r *Runner) Pin(context.Context, netip.Addr, Profiles) (PinResult, error)
+func (r *Runner) Unpin() (state.Selector, error)
 ```
 
 ---
@@ -233,6 +299,8 @@ func (r *Runner) Run(context.Context, Input) (Report, error)
 - [ ] **Step 1: Write failing user-list tests**
 
 Cover single IPv4, `/32`, CIDR, comments, duplicates, IPv6 rejection, malformed input, and deterministic ordering. A user candidate must retain `Source="user"` even if it also appears in an official range.
+
+**The group boundary a user list is subject to.** Every entry in the user's own list becomes a **global** candidate: it is a `ProviderCloudflare` candidate with an empty `Hostname`, whichever provider it was meant for, because the list has no per-hostname structure and the anti-leak rule needs one. A per-hostname address therefore comes from a CloudFront profile (`cloudfront-domains.yaml`), never from the user list — a user who wants an address published for one hostname must write that hostname into a profile. This does not violate the anti-leak rule, which is about copying a *winner* across hostnames rather than about where an address is measured: a user's global entry is only ever published in the global group, and never into a CloudFront mapping. The obligation is that the plan state it rather than leave the guarantee ambiguous.
 
 - [ ] **Step 2: Write failing Cloudflare API tests**
 
@@ -268,7 +336,7 @@ Cloudflare source URL:
 https://api.cloudflare.com/client/v4/ips
 ```
 
-Cache raw JSON plus ETag under `/var/lib/mosdns/lists/cloudflare-ips.json`. **This release does not fetch the AWS published ranges document at all** — it is not read, not cached, and not exposed. A per-hostname CloudFront address comes from a CloudFront profile, so the range list has no consumer: a CloudFront address means nothing behind a hostname no profile names, and the thousands of addresses AWS announces have no profile to be proved against. An earlier build of this task fetched the document, validated it and exposed it through `ReferencePrefixes`; nothing read it, so it was deleted rather than delivered as a component described as active reference data. `CloudFrontSource` is kept as the interface a CloudFront source would satisfy; the CLI reaches CloudFront through `ParseCloudFrontProfiles` on the operator's YAML.
+Cache raw JSON plus ETag under `/var/lib/mosdns/lists/cloudflare-ips.json`. **The cache's own file discipline is 0644 and the directory it creates is 0755**, because the cached document is published reference data rather than router state and the reader in the other half of this project runs unprivileged. `/var/lib/mosdns/lists` is a *packaging* obligation and the two plans have to agree about it: the packaging plan must provision it beside `/var/lib/mosdns` and `/var/lib/mosdns/runtime`, as `root:mosdns 2750` setgid with the same default ACL, because two service identities (the optimizer timer and the DHCP bridge) share it and a directory one of them cannot rename over is a cache that fails on the second run. The writer still creates the directory when it is absent — so a hand-built tree works — but the shipped tree is packaging's. **This release does not fetch the AWS published ranges document at all** — it is not read, not cached, and not exposed. A per-hostname CloudFront address comes from a CloudFront profile, so the range list has no consumer: a CloudFront address means nothing behind a hostname no profile names, and the thousands of addresses AWS announces have no profile to be proved against. An earlier build of this task fetched the document, validated it and exposed it through `ReferencePrefixes`; nothing read it, so it was deleted rather than delivered as a component described as active reference data. `CloudFrontSource` is kept as the interface a CloudFront source would satisfy; the CLI reaches CloudFront through `ParseCloudFrontProfiles` on the operator's YAML.
 
 - [ ] **Step 7: Run tests**
 
@@ -336,7 +404,7 @@ Expected: compile failure.
 
 - [ ] **Step 6: Implement budget reservation**
 
-Reserve the requested maximum before I/O, persist the reservation in `/var/lib/mosdns/runtime/bandwidth-budget.json` with `state.WriteJSONAtomic` under the control lock, wrap the body in a counting limited reader, stop on timer, consume actual bytes, and return unused reservation. A process crash conservatively leaves the reservation charged until the local date changes. Reset `used_bytes` only when the recorded local date differs. Use `sync.Mutex`; never infer budget from file size or cache headers.
+Reserve the requested maximum before I/O, persist the reservation in `/var/lib/mosdns/runtime/bandwidth-budget.json`, wrap the body in a counting limited reader, stop on timer, consume actual bytes, and return unused reservation. **The persist takes the budget's own `bandwidth-budget.json.lock` and is never made under the control lock** — a multi-minute run would hold the control lock for the length of every download, and `apply`, `pin` and `health-check` need it; the preflight ruling that superseded the Foundation's shared-control-lock ruling for this document is the one that stands. A process crash conservatively leaves the reservation charged until the local date changes. Reset `used_bytes` only when the recorded local date differs. Use `sync.Mutex`; never infer budget from file size or cache headers.
 
 - [ ] **Step 7: Implement probes**
 
@@ -451,7 +519,7 @@ Start with selector generation 4. A successful apply writes generation 5 and mov
 
 - [ ] **Step 3: Write failing pin/unpin tests**
 
-`Pin` validates the address against every `Input.CloudflareProfiles` entry and every CloudFront profile, stores mode `manual`, increments generation once, and never changes the file on failure. `Unpin` stores mode `auto`, keeps current winner as fallback, and increments generation.
+`Pin` proves the address against the profiles of the group it would be published for — **every global profile for an address with no hostname of its own, and only its own hostname's profile for one that has** (the AMENDED rule in Review Focus; the withdrawn wording was "every `Input.CloudflareProfiles` entry and every CloudFront profile", which refuses every pin and `test --apply` on a router that has a CloudFront domain list) — then stores mode `manual`, increments generation once, and never changes the file on failure. `Unpin` stores mode `auto`, keeps current winner as fallback, and increments generation. Both refuse a `disabled` selector with `ErrModeDisabled` before either opens a socket, and `Pin`'s result carries the uncharged identity bytes its proofs read (`optimizer.PinResult`).
 
 - [ ] **Step 4: Run tests and verify failure**
 
@@ -518,7 +586,7 @@ Assert one or two failures do not move state; the third consecutive failure does
 
 - [ ] **Step 2: Write failing persistence tests**
 
-Store only `healthy`, `consecutive_failures`, `last_success`, and `last_failure` in `/var/lib/mosdns/runtime/health.json`. A corrupt health file fails closed to the policy's failure threshold for a strict selector and is never treated as healthy.
+Store only `healthy`, `consecutive_failures`, `last_success`, and `last_failure` in `/var/lib/mosdns/runtime/health.json`. A corrupt health file **fails closed to the policy's failure threshold**: the document this build cannot read is not a history that vouches for an address, so the count starts at the threshold and this check's own verdict is added to it. It is the *document* that is never treated as healthy — the check that then succeeds replaces it with a real one, because a successful pass is a proof and the next check is the thing that decides; a corrupt file that no check could ever replace would leave the router failing closed forever.
 
 **Correction (Task 5, fix round 1).** The preflight ruling that this file "is written through `state.WriteJSONAtomic`" cannot stand beside the corrupt-file rule above, and the two were written as if they could. `state.WriteJSONAtomic` refuses to replace a target it cannot read — the right answer for the selector, and the wrong one here: a corrupt health document is exactly the state this rule requires recovering from, so a writer that refuses to overwrite it would leave every future check failing closed to a history no real verdict could ever clear. The durable answer is the state package's, and the review ruled for it: `state.WriteReplacementJSONAtomic`, which is the same discipline — validate, same-directory temporary file, fsync, atomic rename at 0640, backup taken before the rename, rollback on a post-rename flush failure — plus a "may replace an unreadable target" policy that `state` honours for the health kind only. Every other kind, the selector above all, is still refused, and that asymmetry is a property of the document rather than a convention. `internal/health` keeps only what is the checker's: reading the previous document and composing the fail-closed sentence.
 
@@ -596,3 +664,55 @@ Expected:
   it is not this plan's to fix: **the response-rewrite plan owns the schema change** that
   gives a per-hostname mapping a fallback, and until it does, this is the standing gap
   between a health check's coverage and a health check's action.
+
+## Recorded: accepted findings this release does not change
+
+These were raised in review, accepted, and are recorded here so they are not
+rediscovered as open questions. Each is either a deliberate decision with its reason
+or a bound in the safe direction.
+
+- **The daily sample rotates only the host octet, and that is the specification's own
+  requirement.** The design samples one address per `/24` and rotates *the sampled
+  address* by a daily seed; `dailySeed.addressIn` hashes the block's own address with
+  the local date and moves only `raw[3]`, so the block set is identical every day. A
+  persistently bad *block* is therefore never rotated out, which is the cost of the
+  specified rule and not a defect in this implementation. (Previously filed as an open
+  question; it conforms.)
+- **`prober.HTTPMetrics.BodyBytes` is a floor, not an exact wire charge**, because the
+  transport may have buffered one read before the probe stopped. And with the shipped
+  CLI it is **always 0**: the global identity profile is a `GET /` expecting 200 with
+  no body digest, and no CloudFront profile the CLI builds names one either, so no
+  identity probe this project's own configuration performs has a body to count. The
+  figure is still reported because it is the only account of an uncharged egress a
+  caller that *does* name a digest can have.
+- **Only body bytes are charged** to the daily budget: headers, request bytes and
+  handshake buffering are not, and neither is the 3xx body of a followed same-host
+  redirect — `net/http` drains a bounded amount of it while following the hop, outside
+  the counting reader. Every one of these is bounded and in the under-counting
+  direction, so none of them can break the cap.
+- **The redirect host comparison ignores the port.** Its impact is nil rather than
+  merely bounded: the transfer's dialer ignores the URL's port and always dials the
+  profile's port, so a same-host redirect naming a different port reaches the same
+  address, and every hop still completes its own certificate check for the same name.
+- **The global identity profile is `GET /`, 200, no body digest** — the provider's
+  representative domain and the forced-ECH domains. That is a real gap in *content*
+  verification: it proves routing and identity, not that the document behind the
+  hostname is the one expected. The plan names it rather than weakening the check,
+  because a domain that answers something else is a domain to take out of the list.
+- **`candidate.Combine` caps the official channel by input order** rather than the
+  package sort order. It is deterministic and coherent with the report's collection
+  order, which is the order the report lists candidates in.
+- **A user `/24`-or-narrower prefix expansion includes `.0` and `.255`.** A deliberate
+  enumeration, pinned as intended.
+- **`health.Options.ProofConcurrency` exists for one order-sensitive case**; the
+  production value is `optimizer.ProofConcurrency`, the number an apply's final proof
+  uses over the same profiles.
+- **The one-`*Budget`-per-document rule is a convention, not an invariant.** The
+  document records no owner because its schema is fixed and a crashed holder must not
+  block the next run, so the requirement is on the runner — see `Budget`'s own doc.
+- **A post-rename directory-sync failure inside `state.WriteJSONAtomic` can return an
+  error with the new selector live**, so the report under-claims rather than
+  over-claims. The safe direction.
+- **`Apply`'s zero `Selector` return means both "published nothing" and "refused"**,
+  distinguished by the error and by the report's `Outcome`. Safe because the zero value
+  is refused by `state.Selector.Validate` and no shipped caller discards the error.

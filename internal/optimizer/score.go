@@ -53,7 +53,7 @@ import (
 	"mosdns-router/internal/measure"
 )
 
-// The five reasons a candidate is not scored. They are named constants and
+// The eight reasons a candidate is not scored. They are named constants and
 // not formatted strings because a report has to say which rule refused a
 // candidate, and a rule that can only be recognised by its wording is a rule
 // nobody can match on.

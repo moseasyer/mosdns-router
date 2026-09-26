@@ -1171,11 +1171,11 @@ func PolicyDigest(document []byte) string {
 //  2. the configuration digest, which has to be the one this router is running;
 //  3. the report's age, against MaxReportAge;
 //  4. the control lock, taken before anything is read or written;
-//  5. the current selector, read under the lock, with a manual pin refusing the
-//     apply outright;
+//  5. the current selector, read under the lock, with a manual pin or a disabled
+//     selector refusing the apply outright;
 //  6. the final identity proof for every winner, under the lock, immediately
-//     before the write, against the profiles this configuration names rather than
-//     any the report carries.
+//     before the write, against the profiles of the winner's own group - the ones
+//     this configuration has for it - and never any the report carries.
 //
 // Only then is a temporary file written, and it is written by
 // state.WriteJSONAtomic under the lock that is still held. Every refusal returns
