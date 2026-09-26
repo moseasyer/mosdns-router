@@ -551,7 +551,15 @@ func rewriteResponse(t *testing.T, request *dns.Msg, fixture rewriteFixture) *dn
 			if fixture.publishECHKey {
 				raw, err := base64.StdEncoding.DecodeString(echFixtureBase64)
 				if err != nil {
-					t.Fatalf("decode the ECH fixture: %v", err)
+					// This runs on the resolver's handler goroutine, so a Fatalf here
+					// runs runtime.Goexit on the wrong goroutine: no reply is ever
+					// written, the client waits out its own timeout, and the case
+					// fails as a timeout that says nothing about the ECH path or
+					// about the fixture that caused it. Report and answer SERVFAIL,
+					// which is what a handler returning nil does, so the case fails
+					// where the fixture is wrong.
+					t.Errorf("decode the ECH fixture: %v", err)
+					return nil
 				}
 				source.Value = append(source.Value, &dns.SVCBECHConfig{ECH: raw})
 			}
