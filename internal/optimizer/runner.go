@@ -202,13 +202,12 @@ var (
 	// future, which cannot be a record of anything that has happened.
 	ErrReportTooOld = errors.New("the report is outside the age an apply accepts")
 
-	// ErrNoWinner reports a report that measured nothing publishable: no group
-	// named a winner, or every winner was refused before scoring.
-	ErrNoWinner = errors.New("the report names no winner")
-
 	// ErrSwitchNotAllowed reports a report whose winner is not the required
 	// improvement over the address already in service, or whose recorded decision
-	// disagrees with the one this configuration reaches from the same numbers.
+	// disagrees with the one this configuration reaches from the same numbers. It is
+	// a refusal of the whole apply, because it is a statement about the document
+	// rather than about one group's address: a group whose own switch the gate
+	// refuses keeps its mapping and is reported as kept, not refused.
 	ErrSwitchNotAllowed = errors.New("the winner is not enough of an improvement over the incumbent")
 
 	// ErrModeManual reports an automatic apply against a selector an operator has
@@ -455,6 +454,27 @@ type Input struct {
 	Stale bool
 }
 
+// Outcome is what an apply did with one group, or with a whole report.
+//
+// It is per group because the decision is: a group that found an address clearing
+// the switch gate is published, and a group that did not keeps the mapping it had.
+// One verdict for the whole report would let a single group's ordinary "not better
+// tonight" stop every other group from improving, for as long as the conditions
+// lasted.
+type Outcome string
+
+const (
+	// OutcomePublished means this group's winner was proved again and written into
+	// the selector.
+	OutcomePublished Outcome = "published"
+
+	// OutcomeKept means nothing was written for this group and its current mapping
+	// stands. The group's OutcomeReason says which of the reasons it was: the run
+	// measured nothing publishable, or the winner was not enough of an improvement
+	// over the address already in service.
+	OutcomeKept Outcome = "kept"
+)
+
 // Report is what a run produces: the measurement, the decision, and the two
 // digests that let an apply check both. It is a document, so every field is
 // JSON-tagged and every field is read back by an apply that refuses anything it
@@ -519,6 +539,11 @@ type Report struct {
 	FinalProofPassed bool `json:"final_proof_passed"`
 	// ProofedAt is when that second proof completed.
 	ProofedAt time.Time `json:"proofed_at,omitzero"`
+	// Outcome is what the apply did with the report as a whole: published if any
+	// group was, kept if every group kept its mapping. It is empty in a report that
+	// has not been applied, and it is the answer to "did this run change anything"
+	// without reading every group.
+	Outcome Outcome `json:"outcome,omitempty"`
 }
 
 // GroupReport is one group's whole measurement and decision. A run may hold more
@@ -548,6 +573,14 @@ type GroupReport struct {
 	// rank is taken over, not the whole group: a shortlist candidate that never
 	// entered the comparison has no say in the floor of the set that did.
 	P10BytesPerSecond float64 `json:"p10_bytes_per_second"`
+	// Outcome is what an apply did with this group, and OutcomeReason why. Both are
+	// empty in a report that has not been applied.
+	Outcome Outcome `json:"outcome,omitempty"`
+	// OutcomeReason is the named reason a group was kept rather than published:
+	// which group measured nothing publishable, or which winner was not enough of
+	// an improvement. A published group leaves it empty, because the switch
+	// decision's own reason already covers the one case that has one.
+	OutcomeReason string `json:"outcome_reason,omitempty"`
 }
 
 // ReportCandidate is one candidate as a report states it. Every measurement is
@@ -683,6 +716,9 @@ func (r Report) Validate() error {
 	if err := validatePhases(r.Phases); err != nil {
 		return err
 	}
+	if err := r.validateOutcomes(); err != nil {
+		return err
+	}
 	if len(r.Groups) == 0 {
 		return errors.New("the report holds no group, so it measured nothing")
 	}
@@ -690,6 +726,57 @@ func (r Report) Validate() error {
 		if err := r.Groups[index].validate(); err != nil {
 			return fmt.Errorf("groups[%d]: %w", index, err)
 		}
+	}
+	return nil
+}
+
+// validateOutcomes is the coherence of an applied report's decisions, checked
+// where it is read rather than trusted.
+//
+// A report straight from a run carries no outcomes at all, and that is the common
+// case: the apply is what fills them in. A report that does carry them was applied
+// once, and re-applying it means these fields have to describe the same document -
+// so a kept group has to say why, and the overall outcome has to be the aggregate
+// of the groups' rather than a second opinion about them.
+func (r Report) validateOutcomes() error {
+	published := 0
+	recorded := false
+	for index := range r.Groups {
+		switch r.Groups[index].Outcome {
+		case "":
+			if r.Groups[index].OutcomeReason != "" {
+				return fmt.Errorf("groups[%d]: a group with no outcome carries an outcome reason %q", index, r.Groups[index].OutcomeReason)
+			}
+			continue
+		case OutcomePublished:
+			published++
+		case OutcomeKept:
+			if r.Groups[index].OutcomeReason == "" {
+				return fmt.Errorf("groups[%d]: a kept group must say why it kept its mapping", index)
+			}
+		default:
+			return fmt.Errorf("groups[%d]: outcome must be %q or %q, got %q", index, OutcomePublished, OutcomeKept, r.Groups[index].Outcome)
+		}
+		recorded = true
+	}
+	switch r.Outcome {
+	case "":
+		if recorded {
+			return errors.New("the report records a decision for a group and no outcome for the report")
+		}
+	case OutcomePublished:
+		if !recorded {
+			return errors.New("the report claims it published and records no group's decision")
+		}
+		if published == 0 {
+			return errors.New("the report claims it published and every group kept its mapping")
+		}
+	case OutcomeKept:
+		if published != 0 {
+			return errors.New("the report claims it kept everything while a group was published")
+		}
+	default:
+		return fmt.Errorf("outcome must be %q or %q, got %q", OutcomePublished, OutcomeKept, r.Outcome)
 	}
 	return nil
 }
@@ -969,9 +1056,30 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	if age := r.now().Sub(report.GeneratedAt); age > MaxReportAge || age < 0 {
 		return report, state.Selector{}, fmt.Errorf("%w: the report is dated %s, which is %s from now, and the limit is %s", ErrReportTooOld, report.GeneratedAt.Format(time.RFC3339), age, MaxReportAge)
 	}
-	publishable, err := report.publishableWinners(r.policy.CDN.SwitchImprovementPercent)
+	decisions, err := report.decisions(r.policy.CDN.SwitchImprovementPercent)
 	if err != nil {
 		return report, state.Selector{}, err
+	}
+	// Every group's own outcome is recorded before anything is written, so a
+	// refusal below still leaves a report that says which group was being published
+	// and which was keeping its mapping.
+	publishedAnywhere := false
+	for index := range decisions {
+		if decisions[index].published {
+			decisions[index].group.Outcome = OutcomePublished
+			report.Groups[index].Outcome = OutcomePublished
+			publishedAnywhere = true
+			continue
+		}
+		decisions[index].group.Outcome = OutcomeKept
+		decisions[index].group.OutcomeReason = decisions[index].reason
+		report.Groups[index].Outcome = OutcomeKept
+		report.Groups[index].OutcomeReason = decisions[index].reason
+	}
+	if publishedAnywhere {
+		report.Outcome = OutcomePublished
+	} else {
+		report.Outcome = OutcomeKept
 	}
 
 	lock, err := filelock.Acquire(r.options.ControlLockPath)
@@ -993,12 +1101,23 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	if current.Mode == "manual" {
 		return report, state.Selector{}, fmt.Errorf("%w: %s is pinned to %s", ErrModeManual, r.options.SelectorPath, current.WinnerIP)
 	}
+	if !publishedAnywhere {
+		// Every group kept its mapping, so there is nothing to write: no generation
+		// move for a run that changed nothing, and no refreshed proof for a winner
+		// this apply did not touch.
+		return report, current, nil
+	}
 
-	// The final proof, for every winner, under the lock, before the write.
+	// The final proof, for every published group, under the lock, before the write.
+	// A group that keeps its mapping is not proved, because nothing of it is being
+	// published and a proof is the cost of a publish.
 	report.Phases.FinalProof.StartedAt = r.now()
-	proved := make([]winnerPublication, 0, len(publishable))
-	for _, group := range publishable {
-		metrics, err := r.proveAddress(ctx, group.winner, profiles)
+	proved := make([]groupDecision, 0, len(decisions))
+	for _, decision := range decisions {
+		if !decision.published {
+			continue
+		}
+		metrics, err := r.proveAddress(ctx, decision.winner, profiles)
 		if err != nil {
 			report.Phases.FinalProof.EndedAt = r.now()
 			return report, state.Selector{}, err
@@ -1007,7 +1126,7 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 		// report can account for it: a report written before an apply says nothing
 		// about the bytes that apply spent.
 		report.IdentityBytes += metrics.BodyBytes
-		proved = append(proved, group)
+		proved = append(proved, decision)
 	}
 	report.Phases.FinalProof.EndedAt = r.now()
 	report.FinalProofPassed = true
@@ -1017,14 +1136,28 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	published.SchemaVersion = state.SchemaVersion
 	published.Generation = current.Generation + 1
 	published.ConfigSHA256 = r.options.ConfigSHA256
-	published.LastSuccess = r.now()
-	published.WinnerProofUntil = r.now().Add(WinnerProofTTL)
 	published.LastFailure = ""
-	for _, group := range proved {
-		switch group.group.Hostname {
+	// The last success and the proof expiry describe the *global* winner's proof, so
+	// they move only when the global group was proved in this apply. A CloudFront
+	// mapping changing says nothing about whether the global address is still
+	// serving, and the state package refuses a proof that does not follow its last
+	// success - so refreshing one without the other would produce a document no
+	// writer of this project can produce.
+	globalProved := false
+	for _, decision := range proved {
+		if decision.group.Hostname == "" {
+			globalProved = true
+		}
+	}
+	if globalProved {
+		published.LastSuccess = r.now()
+		published.WinnerProofUntil = r.now().Add(WinnerProofTTL)
+	}
+	for _, decision := range proved {
+		switch decision.group.Hostname {
 		case "":
-			published.WinnerIP = group.winner.IP.String()
-			published.FallbackIP = fallbackAfter(group.winner.IP.String(), current)
+			published.WinnerIP = decision.winner.IP.String()
+			published.FallbackIP = fallbackAfter(decision.winner.IP.String(), current)
 			published.Provider = string(candidate.ProviderCloudflare)
 		default:
 			if published.CloudFront == nil {
@@ -1032,14 +1165,14 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 			} else {
 				published.CloudFront = maps.Clone(current.CloudFront)
 			}
-			published.CloudFront[group.group.Hostname] = group.winner.IP.String()
+			published.CloudFront[decision.group.Hostname] = decision.winner.IP.String()
 		}
 	}
 	// A selector that has never run has no provider, and the state package refuses
-	// one without. A CloudFront-only first apply takes the provider of the winner
-	// it did publish, which names the CDN the mappings belong to.
+	// one without. A CloudFront-only first apply takes the provider of the group it
+	// did publish, which names the CDN the mappings belong to.
 	if published.Provider == "" && len(proved) > 0 {
-		published.Provider = proved[0].group.Provider
+		published.Provider = string(proved[0].group.Provider)
 	}
 	if err := state.WriteJSONAtomic(r.options.SelectorPath, published); err != nil {
 		return report, state.Selector{}, err
@@ -1047,53 +1180,66 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	return report, published, nil
 }
 
-// winnerPublication is one group that is going to be published, with the address
-// as a candidate value, because the final proof needs a hostname and an address
-// rather than two strings.
-type winnerPublication struct {
-	group  GroupReport
+// groupDecision is what one group decided, before any proof and before any write.
+type groupDecision struct {
+	// group is the group's own report entry, so the outcome is written back to the
+	// right one.
+	group GroupReport
+	// winner is the address to prove and publish, and it is the zero value for a
+	// group that keeps its mapping.
 	winner candidate.Candidate
+	// published is this group's decision on its own account, with no reference to
+	// any other group.
+	published bool
+	// reason is why a group keeps its mapping, and is empty for a published one.
+	reason string
 }
 
-// publishableWinners is the report's groups that may be written, and the refusal
-// when none of them may.
+// decisions is every group's own decision, in report order.
 //
-// A group whose recorded switch decision disagrees with the one this
-// configuration reaches from the same numbers is refused rather than published:
-// the recorded decision is an integrity claim about the report, and a report whose
-// two halves disagree was not written by the run that measured it. The decision
-// is recomputed rather than read, so a report cannot carry a switch this router's
-// policy would not allow.
-func (r Report) publishableWinners(threshold float64) ([]winnerPublication, error) {
-	publishable := make([]winnerPublication, 0, len(r.Groups))
-	named := 0
+// The three outcomes are per group and not one verdict for the report:
+//
+//   - a group whose winner clears the switch gate publishes;
+//   - a group whose winner is refused keeps the mapping it has, because "not an
+//     improvement tonight" is an ordinary outcome and not a failure;
+//   - a group that measured nothing publishable keeps its mapping for the same
+//     reason, and the report says which of the two it was.
+//
+// The one refusal that is still the whole apply's is a group whose *recorded*
+// decision disagrees with the one this configuration reaches from the same
+// numbers. That is an integrity failure about the document rather than a routing
+// decision about an address, and it is reported before any group is acted on.
+func (r Report) decisions(threshold float64) ([]groupDecision, error) {
+	decided := make([]groupDecision, 0, len(r.Groups))
 	for _, group := range r.Groups {
-		if group.Winner == nil {
-			continue
+		decision := groupDecision{group: group}
+		switch {
+		case group.Winner == nil:
+			decision.reason = group.NoWinner
+			if decision.reason == "" {
+				decision.reason = "the group measured nothing publishable"
+			}
+		default:
+			allowed, refusal := switchDecision(*group.Winner, threshold, r.BudgetExhausted)
+			if group.Winner.SwitchAllowed != allowed || group.Winner.SwitchRefusal != refusal {
+				return nil, fmt.Errorf("%w: the report records %q for %s, and this configuration reaches %q from the same numbers",
+					ErrSwitchNotAllowed, group.Winner.SwitchRefusal, group.Winner.IP, refusal)
+			}
+			if !allowed {
+				decision.reason = refusal
+				break
+			}
+			decision.published = true
+			decision.winner = candidate.Candidate{
+				Provider: candidate.Provider(group.Provider),
+				IP:       parseRetained(group.Winner.IP),
+				Source:   group.Winner.Source,
+				Hostname: group.Hostname,
+			}
 		}
-		named++
-		allowed, refusal := switchDecision(*group.Winner, threshold, r.BudgetExhausted)
-		if !allowed {
-			return nil, fmt.Errorf("%w: %s: %s", ErrSwitchNotAllowed, group.Group, refusal)
-		}
-		if group.Winner.SwitchAllowed != allowed || group.Winner.SwitchRefusal != refusal {
-			return nil, fmt.Errorf("%w: the report records %q for %s, and this configuration reaches %q from the same numbers",
-				ErrSwitchNotAllowed, group.Winner.SwitchRefusal, group.Winner.IP, refusal)
-		}
-		publishable = append(publishable, winnerPublication{group: group, winner: candidate.Candidate{
-			Provider: candidate.Provider(group.Provider),
-			IP:       parseRetained(group.Winner.IP),
-			Source:   group.Winner.Source,
-			Hostname: group.Hostname,
-		}})
+		decided = append(decided, decision)
 	}
-	if len(publishable) == 0 {
-		if named == 0 {
-			return nil, fmt.Errorf("%w: every group reports why it produced none", ErrNoWinner)
-		}
-		return nil, fmt.Errorf("%w: no group named a winner that may be published", ErrNoWinner)
-	}
-	return publishable, nil
+	return decided, nil
 }
 
 // switchDecision is the switch gate as the whole system applies it, in one place

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1083,12 +1084,13 @@ func TestRunnerReportsARefusedSwitchWhenTheWinnerIsNotAnImprovement(t *testing.T
 	// has to say so, because "the run succeeded" is otherwise the whole of what an
 	// operator hears.
 	//
-	// The threshold is 100 percent, which the policy allows and which a group of
-	// three can fail: the scores are 3.0, 2.0 and 1.0, the incumbent is the middle
-	// one, and 3.0 is not twice 2.0. The shipped ten percent cannot fail here -
-	// the union of the best three on each half spreads its scores by at least a
-	// sixth, which is more than a tenth - so a case that exercises the refusal needs
-	// a threshold a three-candidate group can miss.
+	// The threshold is 100 percent here for clarity about the arithmetic rather than
+	// for reachability: the scores are 3.0, 2.0 and 1.0, the incumbent is the middle
+	// one, and 3.0 is not twice 2.0. The shipped ten percent refuses switches too -
+	// closeCallCloudFront below is a group where the winner's 2.45 is 4.3 percent
+	// above the runner-up's 2.35 and the gate says no - but that takes a group whose
+	// three rank orders disagree, and this case is about the run recording a
+	// refusal at all.
 	fixtures, candidates := threeGlobals()
 	report, err := newTestRunner(t, newFakeProber(fixtures), func(tuning *runnerTuning) {
 		tuning.policy.CDN.SwitchImprovementPercent = 100
@@ -1672,32 +1674,6 @@ func TestApplyRefusesWhileTheSelectorIsPinnedByHand(t *testing.T) {
 	mustBeUnchanged(t, selectorPath, before)
 }
 
-func TestApplyRefusesAReportWhoseWinnerIsNotAnImprovement(t *testing.T) {
-	// A report that decided not to switch is not applied. The gate has already run,
-	// the run has already said no, and an apply that published anyway would be a
-	// second implementation of the same decision with a different answer.
-	fixtures, candidates := threeGlobals()
-	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(fixtures), func(tuning *runnerTuning) {
-		tuning.policy.CDN.SwitchImprovementPercent = 100
-	})
-	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
-	report, err := runner.Run(t.Context(), Input{
-		Cloudflare:         candidates,
-		CloudflareProfiles: []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
-		LastGood:           readSelector(t, selectorPath),
-	})
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if mustWinner(t, mustGroup(t, report, "cloudflare/")).SwitchAllowed {
-		t.Fatal("the run allowed a switch it should have refused, so this case proves nothing")
-	}
-	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrSwitchNotAllowed) {
-		t.Fatalf("Apply of a report that refused its own switch returned %v, want %v", err, ErrSwitchNotAllowed)
-	}
-	mustBeUnchanged(t, selectorPath, before)
-}
-
 func TestApplyRefusesAReportWhoseRecordedSwitchTheConfigurationDoesNotAgreeWith(t *testing.T) {
 	// The recorded decision is an integrity claim, not an input. An apply
 	// recomputes it from the report's own numbers and the threshold in force, and a
@@ -2017,12 +1993,14 @@ func TestApplyStillRefusesAGlobalWinnerOneGlobalProfileWillNotVouchFor(t *testin
 	mustBeUnchanged(t, selectorPath, before)
 }
 
-func TestApplyRefusesAReportWithNoWinner(t *testing.T) {
-	// A report that found nothing has no address to publish, and the refusal says
-	// which of the two reasons applied rather than failing later on an empty field.
+func TestApplyKeepsTheSelectorWhenTheReportHasNoWinnerAtAll(t *testing.T) {
+	// A report that found nothing publishable in any group keeps everything, and says
+	// which group produced nothing and why. There is no address to publish, so there
+	// is no proof to run and no write to make: the operator's address stays in
+	// service and the report carries the reason.
 	fixtures, candidates := threeGlobals()
 	for _, fixture := range fixtures {
-		fixture.identityErr = errors.New("the response is a 521")
+		fixture.identityErr = errors.New("the response is a 521, which the profile does not expect")
 	}
 	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(fixtures))
 	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
@@ -2033,8 +2011,21 @@ func TestApplyRefusesAReportWithNoWinner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrNoWinner) {
-		t.Fatalf("Apply of a report with no winner returned %v, want %v", err, ErrNoWinner)
+	applied, published, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	if err != nil {
+		t.Fatalf("Apply of a report with no winner anywhere: %v", err)
+	}
+	if published.WinnerIP != "104.16.1.1" {
+		t.Errorf("the published winner is %q, want the 104.16.1.1 that was in service", published.WinnerIP)
+	}
+	if applied.Outcome != OutcomeKept {
+		t.Errorf("the apply's outcome is %q, want %q", applied.Outcome, OutcomeKept)
+	}
+	if groupOutcome(t, applied, "cloudflare/") != OutcomeKept {
+		t.Errorf("the group's outcome is %q, want %q", groupOutcome(t, applied, "cloudflare/"), OutcomeKept)
+	}
+	if reason := groupOutcomeReason(t, applied, "cloudflare/"); reason != ReasonNoProvedCandidate {
+		t.Errorf("the group's reason is %q, want %q", reason, ReasonNoProvedCandidate)
 	}
 	mustBeUnchanged(t, selectorPath, before)
 }
@@ -2924,4 +2915,350 @@ func TestApplyStampsTheFinalProofFromTheClockAtTheMoment(t *testing.T) {
 		t.Errorf("the published selector records success at %s, which is not after the proof ended at %s",
 			published.LastSuccess, proof.EndedAt)
 	}
+}
+
+// A three-candidate group whose three rank orders disagree, so the winner's score
+// is only about four percent above the runner-up's and the ten percent gate can
+// refuse a same-run switch. This is the shape the shipped shortlists really
+// produce, and it is why a per-group switch decision is reachable at all:
+//
+//	address        p50   jitter   speed          ranks (lat, bw, stab)   score
+//	205.251.192.1  10ms  30ms     3 MiB/s        1, 2, 3                 2.35
+//	205.251.192.2  20ms  20ms     5 MiB/s        2, 1, 2                 2.45
+//	205.251.192.3  30ms  10ms     1 MiB/s        3, 3, 1                 1.20
+//
+// 2.45 is not ten percent better than 2.35, so a winner of .2 over an incumbent
+// of .1 is refused. Each figure is 4500*rank-share + 1000*rank-share over the
+// three ranks 3, 2 and 1.
+func closeCallCloudFront(t *testing.T) (map[string]*addressFixture, []candidate.Candidate, candidate.CloudFrontProfile) {
+	t.Helper()
+	fixtures := map[string]*addressFixture{
+		"205.251.192.1": served(10, 30, 0, 3*float64(mib)),
+		"205.251.192.2": served(20, 20, 0, 5*float64(mib)),
+		"205.251.192.3": served(30, 10, 0, 1*float64(mib)),
+	}
+	listed := []candidate.Candidate{
+		cloudFrontCandidate("205.251.192.1", "assets.example.test"),
+		cloudFrontCandidate("205.251.192.3", "assets.example.test"),
+	}
+	rule := candidate.CloudFrontProfile{
+		Profile:    testProfile("assets.example.test", 443),
+		Candidates: []netip.Addr{netip.MustParseAddr("205.251.192.2")},
+	}
+	return fixtures, listed, rule
+}
+
+// twoGroups is one run over the global group and one CloudFront group, against a
+// selector holding an address in service for each: the global group's runner-up, and
+// the CloudFront group's runner-up, whose score is within four percent of that
+// group's winner. So the global group clears the ten percent gate and switches, and
+// the CloudFront group does not - which is the ordinary night this ruling is about.
+//
+// It returns the runner, the report and the profile set, and each case applies it
+// and looks at one thing.
+func twoGroups(t *testing.T, frontFixtures map[string]*addressFixture) (*testRunner, Report, Profiles) {
+	t.Helper()
+	fixtures, globals := threeGlobals()
+	_, listed, rule := closeCallCloudFront(t)
+	for address, fixture := range frontFixtures {
+		fixtures[address] = fixture
+	}
+	runner := newTestRunner(t, newFakeProber(fixtures))
+	current := mustSelector(t, 4, "104.16.1.1", "")
+	current.CloudFront = map[string]string{"assets.example.test": "205.251.192.1"}
+	writeSelector(t, runner.selectorPath, current)
+	report, err := runner.Run(t.Context(), Input{
+		Cloudflare:         globals,
+		CloudflareProfiles: []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+		CloudFront:         listed,
+		CloudFrontRules:    []candidate.CloudFrontProfile{rule},
+		LastGood:           readSelector(t, runner.selectorPath),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return runner, report, Profiles{
+		Global:     []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+		ByHostname: map[string]candidate.ProbeProfile{"assets.example.test": rule.Profile},
+	}
+}
+
+//
+
+func TestApplySwitchesTheGroupsThatImprovedAndKeepsTheOnesThatDidNot(t *testing.T) {
+	// Each group's decision is its own. The global group found an address that
+	// clears the improvement gate and the CloudFront group found one that does not,
+	// and the first is published while the second keeps the mapping it had - because
+	// an all-or-nothing apply would let one group's ordinary "not better tonight"
+	// stop the other group from improving, every night, for as long as it lasted.
+	clean, _, _ := closeCallCloudFront(t)
+	runner, report, profiles := twoGroups(t, clean)
+	selectorPath := runner.selectorPath
+	before := mustReadSelectorBytes(t, selectorPath)
+
+	if winner := mustWinner(t, groupNamed(t, report, "cloudflare/")); !winner.SwitchAllowed {
+		t.Errorf("the global winner %s is refused its switch, want it allowed: 3.0 is more than ten percent better than 2.0", winner.IP)
+	}
+	frontWinner := mustWinner(t, groupNamed(t, report, "cloudfront/assets.example.test"))
+	if frontWinner.IP != "205.251.192.2" {
+		t.Fatalf("the CloudFront winner is %s at %g, want 205.251.192.2 at 2.45", frontWinner.IP, frontWinner.Score)
+	}
+	if frontWinner.SwitchAllowed {
+		t.Error("the CloudFront winner was allowed to switch, want it refused: 2.45 is not ten percent better than 2.35")
+	}
+
+	applied, published, err := runner.Apply(t.Context(), report, profiles)
+	if err != nil {
+		t.Fatalf("Apply with one group refusing its switch: %v", err)
+	}
+	// The global group switched.
+	if published.WinnerIP != "104.16.0.1" {
+		t.Errorf("the published global winner is %q, want 104.16.0.1", published.WinnerIP)
+	}
+	// The CloudFront group kept the address it had, and did not fall back to
+	// clearing the mapping either: a refusal is not a withdrawal.
+	if published.CloudFront["assets.example.test"] != "205.251.192.1" {
+		t.Errorf("the published CloudFront mapping is %q, want the 205.251.192.1 it already had",
+			published.CloudFront["assets.example.test"])
+	}
+	// The document did change - the global winner moved - so the generation moved
+	// and the file is not what it was.
+	if published.Generation != 5 {
+		t.Errorf("the published selector is generation %d, want 5", published.Generation)
+	}
+	if string(before) == string(mustReadSelectorBytes(t, selectorPath)) {
+		t.Error("the apply changed nothing, but the global winner should have moved")
+	}
+	// The report says which group did what.
+	if applied.Outcome != OutcomePublished {
+		t.Errorf("the apply's overall outcome is %q, want %q: one group published", applied.Outcome, OutcomePublished)
+	}
+	if got := groupOutcome(t, applied, "cloudfront/assets.example.test"); got != OutcomeKept {
+		t.Errorf("the CloudFront group's outcome is %q, want %q", got, OutcomeKept)
+	}
+	if reason := groupOutcomeReason(t, applied, "cloudfront/assets.example.test"); !strings.Contains(reason, "2.45") {
+		t.Errorf("the CloudFront group's reason is %q, want the refusal that names the two scores", reason)
+	}
+	// Only the published group was proved again. The run proved all six candidates -
+	// three global against the global profile, three per-hostname against their own -
+	// and the apply proved the one winner it was about to write. The kept group is
+	// not proved, because a proof is the cost of a publish and nothing of it is being
+	// published.
+	proofs := runner.prober.(*fakeProber).profiledCalls()
+	if len(proofs) != 7 {
+		t.Errorf("the prober was asked for %d identity proofs, want 7: six candidates in the run and the published winner", len(proofs))
+	} else if last := proofs[len(proofs)-1]; last.Address != "104.16.0.1" || last.Hostname != "speed.example.test" {
+		t.Errorf("the last proof was %s against %q, want the published global winner against the global profile", last.Address, last.Hostname)
+	}
+}
+
+func TestApplyKeepsAGroupsMappingWhenThatGroupProducedNoWinner(t *testing.T) {
+	// A group that measured nothing publishable keeps its mapping, and does not stop
+	// the groups that did. The CloudFront addresses here cannot be proved, so that
+	// group has no winner at all - which is a different fact from a refused switch and
+	// is reported as one.
+	frontFixtures, _, _ := closeCallCloudFront(t)
+	for _, fixture := range frontFixtures {
+		fixture.identityErr = errors.New("the certificate presented is for other.example.test, not assets.example.test")
+	}
+	runner, report, profiles := twoGroups(t, frontFixtures)
+	selectorPath := runner.selectorPath
+
+	if groupNamed(t, report, "cloudfront/assets.example.test").Winner != nil {
+		t.Fatal("the CloudFront group named a winner although none of its addresses could be proved")
+	}
+	applied, published, err := runner.Apply(t.Context(), report, profiles)
+	if err != nil {
+		t.Fatalf("Apply with one group measuring nothing: %v", err)
+	}
+	if published.WinnerIP != "104.16.0.1" {
+		t.Errorf("the published global winner is %q, want 104.16.0.1: one group failing is not a failed apply", published.WinnerIP)
+	}
+	if published.CloudFront["assets.example.test"] != "205.251.192.1" {
+		t.Errorf("the published CloudFront mapping is %q, want the 205.251.192.1 it already had",
+			published.CloudFront["assets.example.test"])
+	}
+	// The report says which group did what, and why the other one did nothing.
+	if got := groupOutcome(t, applied, "cloudfront/assets.example.test"); got != OutcomeKept {
+		t.Errorf("the CloudFront group's outcome is %q, want %q", got, OutcomeKept)
+	}
+	if reason := groupOutcomeReason(t, applied, "cloudfront/assets.example.test"); reason != ReasonNoProvedCandidate {
+		t.Errorf("the CloudFront group's reason is %q, want the no-winner reason the run reported", reason)
+	}
+	if got := groupOutcome(t, applied, "cloudflare/"); got != OutcomePublished {
+		t.Errorf("the global group's outcome is %q, want %q", got, OutcomePublished)
+	}
+	if applied.Outcome != OutcomePublished {
+		t.Errorf("the apply's overall outcome is %q, want %q: one group published", applied.Outcome, OutcomePublished)
+	}
+	_ = selectorPath
+}
+
+func TestApplyWritesNothingWhenEveryGroupIsKept(t *testing.T) {
+	// Nothing was published, so there is nothing to write: no generation move, no
+	// refreshed proof, and a file an operator can see is byte-for-byte what it was.
+	// A generation that moved for a run that changed nothing would tell the
+	// rewriter that something happened when nothing did.
+	fixtures, globals := threeGlobals()
+	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(fixtures))
+	// The incumbent is the winner of its own run, and a winner that is the address
+	// already in service is published - so make it a group where the winner is
+	// barely better instead: the two candidates of a three-candidate group with the
+	// close call.
+	closeFixtures, listed, rule := closeCallCloudFront(t)
+	frontRunner, frontPath := newTestRunnerWithSelector(t, newFakeProber(closeFixtures))
+	current := mustSelector(t, 4, "205.251.192.1", "")
+	current.CloudFront = map[string]string{"assets.example.test": "205.251.192.1"}
+	current.WinnerIP = ""
+	before := writeSelector(t, frontPath, current)
+	report, err := frontRunner.Run(t.Context(), Input{
+		CloudFront:      listed,
+		CloudFrontRules: []candidate.CloudFrontProfile{rule},
+		LastGood:        readSelector(t, frontPath),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	_ = runner
+	_ = selectorPath
+	_ = globals
+	applied, published, err := frontRunner.Apply(t.Context(), report, Profiles{
+		ByHostname: map[string]candidate.ProbeProfile{"assets.example.test": rule.Profile},
+	})
+	if err != nil {
+		t.Fatalf("Apply with every group kept: %v", err)
+	}
+	if applied.Outcome != OutcomeKept {
+		t.Errorf("the apply's overall outcome is %q, want %q", applied.Outcome, OutcomeKept)
+	}
+	if published.Generation != 4 {
+		t.Errorf("the published selector is generation %d, want the 4 it already had", published.Generation)
+	}
+	mustBeUnchanged(t, frontPath, before)
+}
+
+// groupOutcome and groupOutcomeReason read one group's decision out of an applied
+// report, which is where an operator looks for it.
+func groupOutcome(t *testing.T, report Report, group string) Outcome {
+	t.Helper()
+	return groupNamed(t, report, group).Outcome
+}
+
+func groupOutcomeReason(t *testing.T, report Report, group string) string {
+	t.Helper()
+	return groupNamed(t, report, group).OutcomeReason
+}
+
+func mustReadSelectorBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
+}
+
+func TestAnAppliedReportIsWrittenBackAndReadBackWithItsOutcomes(t *testing.T) {
+	// The outcomes an apply fills in are part of the document, so they survive a
+	// round trip through the file and Validate still accepts the result. A report
+	// that only validated in memory would be a document an operator could read and
+	// an apply could not.
+	clean, _, _ := closeCallCloudFront(t)
+	applied := mustRunAndApplyTwoGroups(t, clean)
+	path := filepath.Join(t.TempDir(), "applied.json")
+	if err := WriteReport(path, applied); err != nil {
+		t.Fatalf("WriteReport of an applied report: %v", err)
+	}
+	read, err := ReadReport(path)
+	if err != nil {
+		t.Fatalf("ReadReport of an applied report: %v", err)
+	}
+	if read.Outcome != OutcomePublished {
+		t.Errorf("the report read back says the outcome is %q, want %q", read.Outcome, OutcomePublished)
+	}
+	if got := groupOutcome(t, read, "cloudfront/assets.example.test"); got != OutcomeKept {
+		t.Errorf("the CloudFront group's outcome read back is %q, want %q", got, OutcomeKept)
+	}
+	if reason := groupOutcomeReason(t, read, "cloudfront/assets.example.test"); !strings.Contains(reason, "2.45") {
+		t.Errorf("the CloudFront group's reason read back is %q, want the refusal that names the two scores", reason)
+	}
+	// The document's raw text carries the fields, so an operator reading the file
+	// sees the decisions rather than having to infer them.
+	document, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"outcome": "published"`, `"outcome": "kept"`, `"outcome_reason"`} {
+		if !strings.Contains(string(document), field) {
+			t.Errorf("the written report has no %s:\n%s", field, document)
+		}
+	}
+}
+
+func TestReadReportRefusesAnOutcomeThatDoesNotMatchItsGroups(t *testing.T) {
+	// The recorded decisions are an integrity claim about the document, so the
+	// incoherent ones are refused rather than interpreted: a kept group that does not
+	// say why, an outcome nothing recognises, and an overall outcome that contradicts
+	// its own groups.
+	//
+	// The edits are made to the decoded value and the document re-encoded, because
+	// that is what a hand-edited or machine-edited report is, and because rewriting
+	// the text of a real document here would pin the JSON's indentation as well as
+	// its meaning.
+	clean, _, _ := closeCallCloudFront(t)
+	applied := mustAppliedTwoGroupReport(t, clean)
+	cases := map[string]func(*Report){
+		"a kept group with no reason": func(report *Report) {
+			report.Groups[1].OutcomeReason = ""
+		},
+		"an outcome nothing recognises": func(report *Report) {
+			report.Groups[0].Outcome = "published-mostly"
+		},
+		"an overall outcome its groups contradict": func(report *Report) {
+			report.Outcome = OutcomeKept
+		},
+		"a report that published with every group kept": func(report *Report) {
+			report.Groups[0].Outcome = OutcomeKept
+			report.Groups[0].OutcomeReason = "the winner is the address already in service"
+		},
+	}
+	for name, edit := range cases {
+		t.Run(name, func(t *testing.T) {
+			edited := applied
+			edited.Groups = slices.Clone(applied.Groups)
+			edit(&edited)
+			document, err := json.MarshalIndent(edited, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "report.json")
+			if err := os.WriteFile(path, document, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadReport(path); !errors.Is(err, ErrInvalidReport) {
+				t.Fatalf("ReadReport of a report with %s returned %v, want %v", name, err, ErrInvalidReport)
+			}
+		})
+	}
+}
+
+// mustAppliedTwoGroupReport is a run and an apply over two groups, one of which
+// keeps its mapping, which is the shape the outcome cases need.
+func mustAppliedTwoGroupReport(t *testing.T, frontFixtures map[string]*addressFixture) Report {
+	t.Helper()
+	applied := mustRunAndApplyTwoGroups(t, frontFixtures)
+	if applied.Outcome != OutcomePublished {
+		t.Fatalf("the fixture's overall outcome is %q, want %q", applied.Outcome, OutcomePublished)
+	}
+	return applied
+}
+
+func mustRunAndApplyTwoGroups(t *testing.T, frontFixtures map[string]*addressFixture) Report {
+	t.Helper()
+	runner, report, profiles := twoGroups(t, frontFixtures)
+	applied, _, err := runner.Apply(t.Context(), report, profiles)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	return applied
 }

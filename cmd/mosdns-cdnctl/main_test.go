@@ -321,8 +321,12 @@ type stubProber struct {
 	// proof of every candidate from the second proof an apply runs on the winner.
 	httpsCalls int
 	// identityErr refuses every identity proof, as an address that is not serving
-	// the hostname does.
+	// any of the hostnames does.
 	identityErr error
+	// identityRefusedFor refuses the identity proof for named hostnames and answers
+	// the rest, which is the shape a real refusal has: a Cloudflare anycast address
+	// serves the provider's domains and cannot present a chain for a CloudFront one.
+	identityRefusedFor map[string]error
 	// transferred is what each transfer delivers.
 	transferred int64
 }
@@ -331,10 +335,13 @@ func (p *stubProber) TCP(context.Context, netip.Addr, uint16, int) (prober.TCPMe
 	return prober.TCPMetrics{Samples: 10, P50MS: 10, P95MS: 20, JitterMS: 1, Loss: 0}, nil
 }
 
-func (p *stubProber) HTTPS(_ context.Context, _ candidate.Candidate, _ candidate.ProbeProfile) (prober.HTTPMetrics, error) {
+func (p *stubProber) HTTPS(_ context.Context, _ candidate.Candidate, profile candidate.ProbeProfile) (prober.HTTPMetrics, error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	p.httpsCalls++
+	if refused, is := p.identityRefusedFor[profile.Hostname]; is {
+		return prober.HTTPMetrics{BodyBytes: 512}, refused
+	}
 	if p.identityErr != nil {
 		return prober.HTTPMetrics{BodyBytes: 512}, p.identityErr
 	}
@@ -1056,5 +1063,62 @@ func TestCommandsRefuseAnEmptyRequiredFlag(t *testing.T) {
 				t.Errorf("the refusal does not name the empty flag: %s", stderr.String())
 			}
 		})
+	}
+}
+
+// TestTestCommandSaysWhichGroupKeptItsMapping covers the one night shape that is
+// ordinary rather than exceptional: one group found an address that clears the
+// switch gate and another did not. The overall outcome is "published" and the
+// second group's own outcome is "kept", and the output has to say both - an
+// overall answer alone hides whichever group did nothing.
+func TestTestCommandSaysWhichGroupKeptItsMapping(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	// The operator's CloudFront rule names an address of its own, so the run measures
+	// a second group.
+	if err := os.WriteFile(fixture.profilesPath, []byte(`schema_version: 1
+profiles:
+  - hostname: assets.example.test
+    url: https://assets.example.test/
+    method: GET
+    port: 443
+    expected_status:
+      - 200
+    ip: 205.251.192.1
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stub := newStubProber()
+	// The address cannot serve the hostname it is named for, so that group measures
+	// nothing publishable while the global group measures cleanly.
+	stub.identityRefusedFor = map[string]error{
+		"assets.example.test": errors.New("the certificate presented is for speed.example.test, not assets.example.test"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"test", "--apply"}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("test --apply exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "outcome: published") {
+		t.Errorf("the output does not say the apply published something:\n%s", output)
+	}
+	if !strings.Contains(output, "group: cloudfront/assets.example.test") {
+		t.Errorf("the output does not mention the CloudFront group:\n%s", output)
+	}
+	if !strings.Contains(output, "outcome: kept") {
+		t.Errorf("the output does not say the CloudFront group kept its mapping:\n%s", output)
+	}
+	if !strings.Contains(output, "outcome-reason: "+optimizer.ReasonNoProvedCandidate) {
+		t.Errorf("the output does not say why the CloudFront group was kept:\n%s", output)
+	}
+	// The global winner moved and the per-hostname mapping did not.
+	selector := state.Selector{}
+	if err := state.ReadJSON(fixture.selectorPath, &selector); err != nil {
+		t.Fatal(err)
+	}
+	if selector.WinnerIP != "104.16.0.1" {
+		t.Errorf("the published global winner is %q, want 104.16.0.1", selector.WinnerIP)
 	}
 }

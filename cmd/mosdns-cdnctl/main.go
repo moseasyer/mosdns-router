@@ -849,6 +849,12 @@ func writeCDNReport(output io.Writer, report optimizer.Report, published *state.
 	} else {
 		writeReportLine(output, "applied: nothing\n")
 	}
+	if report.Outcome != "" {
+		// The overall outcome, and then each group's own, because the two are not the
+		// same answer: one group publishing while another keeps its mapping is
+		// "published" overall and "kept" for the group that did not.
+		writeReportLine(output, "outcome: %s\n", report.Outcome)
+	}
 	writeReportLine(output, "generated-at: %s\n", report.GeneratedAt.Format(time.RFC3339))
 	writeReportLine(output, "config-sha256: %s\n", report.ConfigSHA256)
 	writeReportLine(output, "stale-candidates: %t\n", report.Stale)
@@ -887,6 +893,12 @@ func writeCDNReport(output io.Writer, report optimizer.Report, published *state.
 			writeReportLine(output, "  winner: %s score %g %s\n", group.Winner.IP, group.Winner.Score, verdict)
 		case group.NoWinner != "":
 			writeReportLine(output, "  no-winner: %s\n", group.NoWinner)
+		}
+		if group.Outcome != "" {
+			writeReportLine(output, "  outcome: %s\n", group.Outcome)
+			if group.OutcomeReason != "" {
+				writeReportLine(output, "    outcome-reason: %s\n", group.OutcomeReason)
+			}
 		}
 	}
 	if report.FinalProofPassed {
