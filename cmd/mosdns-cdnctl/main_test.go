@@ -1122,3 +1122,79 @@ profiles:
 		t.Errorf("the published global winner is %q, want 104.16.0.1", selector.WinnerIP)
 	}
 }
+
+func TestCommandsRefuseAReportPathThatIsSomethingTheRunAlsoUses(t *testing.T) {
+	// `--report PATH` is a path a command writes, and every other path a command
+	// names is a file it reads or a state file it publishes. Naming the same file
+	// twice means a run overwrites the policy it just read, the selector it is about
+	// to publish into, or the budget document it is charging, with a report document
+	// - so the collision is refused where the other flags are parsed, before any
+	// network I/O and before the control lock is taken.
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	collisions := map[string]string{
+		"the selector":         fixture.selectorPath,
+		"the policy":           fixture.policyPath,
+		"the budget":           fixture.budgetPath,
+		"the control lock":     fixture.lockPath,
+		"the profile document": fixture.profilesPath,
+		"the identity domains": fixture.identities,
+		"the candidate list":   fixture.candidatesPath(),
+	}
+	for name, path := range collisions {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"test", "--report", path}, fixture.flags()...)
+			if code := runWithContext(t.Context(), args, &stdout, &stderr,
+				servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitInvalidCLI {
+				t.Fatalf("test --report %s exit = %d, want %d (stderr: %s)", name, code, exitInvalidCLI, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), path) {
+				t.Errorf("the refusal does not name the colliding path: %s", stderr.String())
+			}
+		})
+	}
+	// A path that resolves to the same file by another spelling is the same
+	// collision: a report written to "<dir>/./cdn-selector.json" overwrites the
+	// selector beside it.
+	t.Run("another spelling of the same path", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		spelling := filepath.Join(fixture.directory, ".", filepath.Base(fixture.selectorPath))
+		args := append([]string{"test", "--report", spelling}, fixture.flags()...)
+		if code := runWithContext(t.Context(), args, &stdout, &stderr,
+			servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitInvalidCLI {
+			t.Fatalf("test --report %s exit = %d, want %d (stderr: %s)", spelling, code, exitInvalidCLI, stderr.String())
+		}
+	})
+	// A report beside the selector is fine, which is what the other cases have to be
+	// measured against.
+	t.Run("a report of its own", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := append([]string{"test", "--report", fixture.reportPath}, fixture.flags()...)
+		if code := runWithContext(t.Context(), args, &stdout, &stderr,
+			servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+			t.Fatalf("test --report of its own exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+		}
+	})
+}
+
+func TestTestCommandProvesAGlobalAddressOnceWhenTheIdentityListNamesTheRepresentativeDomain(t *testing.T) {
+	// The representative domain leads the global profile set and the forced-ECH list
+	// follows it, so an operator who lists the same name in both gets one profile.
+	// Two would be the same proof run twice, and the final gate runs under the
+	// control lock.
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	if err := os.WriteFile(fixture.identities, []byte(defaultRepresentativeDomain+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stub := newStubProber()
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"test"}, fixture.flags()...), &stdout, &stderr,
+		servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("test exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	// Three candidates against one profile: the name appears once, so it is proved
+	// once.
+	if got := stub.proofs(); got != 3 {
+		t.Errorf("the prober was asked for %d identity proofs, want 3: the representative domain listed twice is one profile", got)
+	}
+}

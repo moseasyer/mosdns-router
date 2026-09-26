@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -358,7 +359,54 @@ func parseCDNOptions(name string, args []string, positional int) (cdnOptions, er
 			return cdnOptions{}, fmt.Errorf("%s must not be empty", required.name)
 		}
 	}
+	if err := refuseReportCollision(name, &options); err != nil {
+		return cdnOptions{}, err
+	}
 	return options, nil
+}
+
+// refuseReportCollision refuses a --report that names a file the same invocation
+// also uses.
+//
+// A report is written by the command, and every other path it names is either read
+// or published: the policy the run is measured under, the selector it publishes
+// into, the budget document it charges, the control lock it takes, the profile and
+// candidate documents it reads, and the cache it keeps the published ranges in.
+// Naming one of those as the report means a run overwrites the very document it
+// just used, and the damage is silent - the next run reads a report where it
+// expects a policy and says so much later.
+//
+// The paths are compared absolute, so a report written to "./cdn-selector.json" is
+// recognised as the selector at its installed path rather than as a new file
+// beside it.
+func refuseReportCollision(name string, options *cdnOptions) error {
+	if options.report == "" {
+		return nil
+	}
+	report, err := filepath.Abs(options.report)
+	if err != nil {
+		return fmt.Errorf("--report %s: %w", options.report, err)
+	}
+	for _, other := range []struct{ flag, path string }{
+		{"policy", options.policy},
+		{"selector", options.selector},
+		{"budget", options.budget},
+		{"control-lock", options.controlLock},
+		{"profiles", options.profiles},
+		{"identity-domains", options.identities},
+		{"candidates", options.candidates},
+		{"ranges-cache", options.rangesCache},
+	} {
+		absolute, err := filepath.Abs(other.path)
+		if err != nil {
+			continue
+		}
+		if absolute == report {
+			return fmt.Errorf("%s: --report %s is the same file as --%s (%s), which this run reads or writes",
+				name, options.report, other.flag, other.path)
+		}
+	}
+	return nil
 }
 
 // candidateSource is where a run's candidates come from. It is a value rather than

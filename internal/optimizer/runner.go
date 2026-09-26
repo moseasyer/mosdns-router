@@ -855,6 +855,13 @@ func (g *GroupReport) validate() error {
 	if len(g.Candidates) == 0 {
 		return errors.New("the group holds no candidate, so nothing was measured for it")
 	}
+	// Note on a gap that is not exploitable: a candidate entry carries its own
+	// hostname and this validation holds each entry to the rules for the provider
+	// and hostname *it* names, without comparing that hostname to the one the group
+	// it is listed under. It costs nothing, because neither the published key nor
+	// the final proof reads the entry's hostname - the group's is what is written and
+	// what is proved - so a hand-edited entry with a foreign hostname changes no
+	// decision. It is named here rather than left for a reader to wonder.
 	for index, entry := range g.Candidates {
 		subject := candidate.Candidate{
 			Provider: candidate.Provider(entry.Provider),
@@ -1624,7 +1631,10 @@ func (r *Runner) holdControlLock() (*filelock.Lock, state.Selector, error) {
 // after the winner has been proved again. A run that could not finish returns
 // the part of the report it did produce together with the error, so an operator
 // can see how far it got.
-func (r *Runner) Run(ctx context.Context, input Input) (Report, error) {
+// The report is a named return so the deferred finalisation below is what the
+// caller receives: `return run.report, nil` copies the report as it stood before
+// the defer ran, which is the copy that had the zero totals.
+func (r *Runner) Run(ctx context.Context, input Input) (report Report, err error) {
 	run := &runState{runner: r, input: input, startedAt: r.now()}
 	run.report = Report{
 		SchemaVersion: ReportSchemaVersion,
@@ -1633,6 +1643,18 @@ func (r *Runner) Run(ctx context.Context, input Input) (Report, error) {
 		ConfigSHA256:  r.options.ConfigSHA256,
 		Stale:         input.Stale,
 	}
+	// The day's total and the refused settlements are read on the way out however the
+	// run ended, not on the way in when it succeeded. A cancelled run's report is the
+	// only record of what it cost, and a report that printed zero bytes spent because
+	// the run did not finish would be the one document an operator reads to find out
+	// what a run cost.
+	//
+	// The defer is what makes that true for every early return below, including the
+	// ones added later.
+	defer func() {
+		run.finalize()
+		report = run.report
+	}()
 
 	// One budget for the whole run, opened once. The outstanding-reservation set
 	// lives in this value rather than in the document, so a second Budget over
@@ -1661,10 +1683,22 @@ func (r *Runner) Run(ctx context.Context, input Input) (Report, error) {
 		return run.report, err
 	}
 	run.score()
-	run.report.SettleRefusals = run.spend.refused()
-	run.report.BudgetUsed = budget.Used()
-	run.report.BudgetExhausted = run.exhausted.Load()
 	return run.report, nil
+}
+
+// finalize reads the day's total and the refused settlements into the report.
+//
+// It is a separate step and not the tail of the scoring phase because a run that
+// stopped early has still spent bytes, and the run's own counters are only complete
+// once every probe it started has been joined - which the phase boundaries are.
+func (run *runState) finalize() {
+	if run.spend != nil {
+		run.report.SettleRefusals = run.spend.refused()
+	}
+	if run.budget != nil {
+		run.report.BudgetUsed = run.budget.Used()
+	}
+	run.report.BudgetExhausted = run.exhausted.Load()
 }
 
 // now is the runner's clock, read once per run so every timestamp in a report
@@ -2348,6 +2382,15 @@ func (run *runState) forEachGroupCandidate(ctx context.Context, limit int, short
 // flight, and returns the context's error if the run was cancelled part way
 // through. The remaining indexes are left unrun rather than started, so a
 // cancelled run does not open sockets it is going to abandon.
+//
+// A trap for the next caller, recorded here because it is a deadlock and not a
+// failure: body must not return a non-nil error. A worker that returns one leaves
+// its slot unfilled, the feeder blocks on an unbuffered channel with no reader left
+// to take the next index, and nothing closes that channel - the run hangs rather
+// than failing. Every body in this file returns nil and records a probe's refusal
+// in the report instead, which is the shape that keeps the workers fed. If a future
+// body needs to fail, it has to cancel the context or collect its own errors
+// outside this loop.
 func forEachIndex(ctx context.Context, count, limit int, body func(context.Context, int) error) error {
 	if count == 0 {
 		return ctx.Err()

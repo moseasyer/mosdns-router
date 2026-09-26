@@ -3400,3 +3400,73 @@ func TestApplyNeverRunsMoreProfileProofsAtOnceThanTheLimit(t *testing.T) {
 		t.Errorf("the prober was asked for %d identity proofs, want %d: every profile is still proved", got, 3+proofConcurrency+4)
 	}
 }
+
+func TestApplyAccountsForTheIdentityBytesOfARefusedFinalProof(t *testing.T) {
+	// A refused proof still read the body it took to reach its verdict, and those
+	// bytes are the operator's data allowance whether or not anything was published.
+	// The report an apply hands back on a refusal is the only place that can say so,
+	// because the report on disk predates the proof entirely.
+	fixtures, candidates := threeGlobals()
+	// The winner answers the run's proof and is refused by the apply's, having read
+	// a body to reach the verdict.
+	refused := served(10, 1, 0, 5*mib)
+	refused.identityCallsBeforeFailure = 1
+	refused.identityBodyBytes = 4096
+	fixtures["104.16.0.1"] = refused
+	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(fixtures))
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+	runBytes := report.IdentityBytes
+
+	applied, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Fatalf("Apply whose final proof was refused returned %v, want %v", err, ErrIdentityRefused)
+	}
+	// The run's three candidates read 1024 each, and the refused proof read 4096 more.
+	if want := runBytes + 4096; applied.IdentityBytes != want {
+		t.Errorf("the refused apply's report accounts for %d identity bytes, want %d: the refused proof's 4096 are uncharged and unaccounted", applied.IdentityBytes, want)
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestRunnerFinalisesAPartialReportSoItsAccountOfTheDayIsTrue(t *testing.T) {
+	// A cancelled run returns the part of the report it did produce, and that part
+	// has to be true: the day stands where the transfers left it and the settlements
+	// the budget refused are named. A partial report that printed zero bytes spent
+	// would be the one document an operator reads to find out what a run cost.
+	//
+	// One candidate, so the bandwidth phase has one task and the cancellation cannot
+	// race the dispatch of another. The fake's transfer does not consult the context,
+	// so the reservation is made and settled - twice, and the second settle is refused
+	// - and the phase discovers the cancellation only as it finishes.
+	fixtures := map[string]*addressFixture{"104.16.0.1": served(10, 1, 0, 5*mib)}
+	fixtures["104.16.0.1"].settleTwice = true
+	fake := newFakeProber(fixtures)
+	ctx, cancel := context.WithCancel(t.Context())
+	fake.before = func(kind, _ string) {
+		if kind == "download" {
+			cancel()
+		}
+	}
+
+	report, err := newTestRunner(t, fake).Run(ctx, Input{
+		Cloudflare:         []candidate.Candidate{globalCandidate("104.16.0.1")},
+		CloudflareProfiles: []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want the context's error", err)
+	}
+	if report.BudgetUsed != runnerDownloadBytes {
+		t.Errorf("the partial report says the day stands at %d bytes, want the %d the transfer left it at",
+			report.BudgetUsed, runnerDownloadBytes)
+	}
+	if len(report.SettleRefusals) != 1 {
+		t.Errorf("the partial report carries %d settlement refusals, want the 1 the double settle produced: %v",
+			len(report.SettleRefusals), report.SettleRefusals)
+	}
+	// The phases the run finished still say so, which is what makes this a partial
+	// report rather than an empty one.
+	if report.Phases.Identity.EndedAt.IsZero() {
+		t.Error("the partial report is missing the identity phase's end, so the run got no further than the fixtures claim")
+	}
+}
