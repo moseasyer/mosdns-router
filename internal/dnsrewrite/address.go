@@ -84,10 +84,14 @@ type AddressInput struct {
 	// well as trusting the caller's verdict: one foreign address, an empty prefix
 	// set, a chain that will not follow and a response with no address are all
 	// refusals here too, so a wiring mistake that names the Cloudflare group for a
-	// response that is not one stops at this door. A CloudFront rewrite has no
-	// such list -- no published set of CloudFront ranges exists, and a
+	// response that is not one stops at this door. The same ranges keep a
+	// CloudFront mapping off a response that is Cloudflare-served, because the two
+	// paths claim disjoint sets of responses and a label that crosses between them
+	// is a mistake worth refusing rather than serving. A CloudFront rewrite has no
+	// range list of its own -- no published set of CloudFront ranges exists, and a
 	// distribution is proved for one hostname by a probe rather than by a range --
-	// so the exact hostname is that path's whole gate.
+	// so on that path the exact hostname is the authorisation and these ranges are
+	// only the thing that says the answer is somebody else's.
 	Prefixes []netip.Prefix
 	// SuppressAAAA removes the AAAA records of the question name and of every
 	// name on its CNAME chain, and nothing else. A record belonging to a name
@@ -160,6 +164,17 @@ func authorize(in AddressInput) ([]string, string, error) {
 		if !sameName(in.Hostname, question.Name) {
 			return nil, "", fmt.Errorf("dnsrewrite: the CloudFront mapping for %q does not cover the queried name %q",
 				in.Hostname, question.Name)
+		}
+		// The cross-check that the exact hostname cannot provide. A mapping is
+		// authorised by a hostname and nothing else, because no published range
+		// list says which networks serve a distribution, so without this a
+		// response that is Cloudflare-served by the caller's own ranges could be
+		// rewritten into a CloudFront address by a caller that mislabelled it --
+		// the wrong CDN for the name, from a name the mapping genuinely covers.
+		// A distribution answer is in no published range, so this does not fire on
+		// the path it is meant to allow.
+		if verdict := dnsclassify.Cloudflare(in.Response, in.Prefixes); verdict.AllMatch {
+			return nil, "", errors.New("dnsrewrite: the response is served by Cloudflare according to the caller's own published ranges, so no per-hostname CloudFront mapping may claim it")
 		}
 	}
 	// The published ranges gate the one path that installs an address, and they
@@ -285,13 +300,26 @@ func chainOwners(owners []string) map[string]bool {
 // checkSelected refuses an address that must never become a client's answer. The
 // selection is read from a file on disk, and a file can hold anything an operator
 // or a broken writer put in it, so the value is checked here as well as where it
-// was written: a loopback or private address installed as a CDN answer points a
-// browser at this router or at a network it cannot reach.
+// was published: a loopback, LAN, shared-space or IPv6 address installed as a CDN
+// answer points a browser at this router or at a network it cannot reach.
 //
-// The full list of reserved ranges is the state package's, and it is applied
-// where the value is published. What is left here is what netip can decide on its
-// own plus the shared address space of RFC 6598, which netip does not classify as
-// private and which is not a place a CDN answer may point.
+// This check is a cheap second opinion, not the authority. state is: every value
+// that reaches this function was published as a public IPv4 address by
+// state.validPublicIPv4Address, which holds the full 14-range list and refuses
+// all of them. This one is deliberately narrower, and a narrower allow list is a
+// weaker check, so what it adds is a cheap second opinion on the mistakes an
+// operator actually makes by hand -- a loopback address, a LAN address, a
+// carrier-grade NAT address, an IPv6 address, an address that is not an address
+// at all.
+//
+// The known narrowing: it does not cover 0.0.0.0/8 beyond 0.0.0.0 itself,
+// 192.0.0.0/24, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24
+// and 240.0.0.0/4, so an address in one of those would be installed if it ever
+// reached here. It cannot, because state refuses to publish it, and the gap is
+// recorded rather than closed here so that one list owns the rule. The
+// documentation ranges being in the gap is also why the tests in this package
+// select 203.0.113.9: a fixture address that no test can reach, and one this
+// check accepts on purpose.
 func checkSelected(address netip.Addr) error {
 	switch {
 	case !address.IsValid():

@@ -305,7 +305,7 @@ func TestAResponseThePluginDidNotModifyKeepsItsDNSSECRecords(t *testing.T) {
 		Selected:     netip.MustParseAddr("203.0.113.9"),
 	})
 	if err == nil {
-		t.Fatalf("Address rewrote a response the classification refused: %v", got.Answer)
+		t.Fatalf("Address rewrote a response the classification refused: %s", answered(got))
 	}
 	assertUnmodified(t, msg, before)
 
