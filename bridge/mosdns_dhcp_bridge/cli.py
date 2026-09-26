@@ -25,6 +25,19 @@ around two decisions:
   the event is reported and nothing is published, so a wedged D-Bus leaves the
   last good generation in place.
 
+The program is run two ways, and the command line says which, rather than the
+program guessing. NetworkManager runs it as a dispatcher event, with the event's
+variables in the environment. An installation runs it with
+``--capture-current INTERFACE`` before any event exists, because it has to know
+which resolvers are in use before it rewrites NetworkManager. The two are
+mutually exclusive and one of them is required: a command line carrying both, or
+neither, is a command line this program reports rather than a machine it cannot
+act on. A capture is that same publication path with an interface the caller
+names -- the same collector, the same publisher, the same recorded source, and
+the same refusal ladder -- so a capture and the first event after it are one
+state rather than two generations, and a capture cannot record a document an
+event would have refused.
+
 The module also owns the exit status the dispatcher acts on. Nothing here calls
 ``sys.exit``: ``main`` returns a code, and only the process entry point turns it
 into an exit status, so every path is testable.
@@ -36,7 +49,7 @@ import datetime
 import os
 import subprocess
 import sys
-from typing import Dict, List, Mapping, Sequence, Tuple
+from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence
 
 from .collect import (
     CommandRunner,
@@ -54,7 +67,8 @@ from .publish import (
 __all__ = ["main", "console_entry", "real_runner"]
 
 USAGE = (
-    "usage: mosdns-dhcp-bridge --state-file PATH --lock-file PATH [INTERFACE [ACTION]]"
+    "usage: mosdns-dhcp-bridge --state-file PATH --lock-file PATH "
+    "[--capture-current INTERFACE | INTERFACE [ACTION]]"
 )
 
 # The dispatcher names the event in this variable. An absent or empty one means
@@ -71,6 +85,18 @@ INTERFACE_VARIABLES = ("DEVICE_IP_IFACE", "INTERFACE", "DEVICE")
 
 CONNECTION_UUID_VARIABLE = "CONNECTION_UUID"
 
+# The mode an installation runs this program in: no dispatcher event exists yet,
+# so the caller names the interface itself. It is mutually exclusive with the
+# dispatcher's environment, and each of the two on its own is a complete mode.
+CAPTURE_OPTION = "--capture-current"
+
+# The field that carries the UUID of the connection a device is using. Its
+# sibling GENERAL.CONNECTION holds the connection's *name* -- the string a
+# profile is called, which is not what the state records -- so this is the field a
+# capture has to ask for, and a value that is not a UUID is refused by the
+# publisher rather than written.
+CONNECTION_FIELD = "GENERAL.CON-UUID"
+
 # The events whose DNS the bridge collects. Every one of them records the source
 # that answered, never the event itself: the same lease read through the same
 # source by an interface coming up, a lease renewal, and a DNS change is one
@@ -84,7 +110,15 @@ COLLECTING_ACTIONS = ("up", "dhcp4-change", "dhcp6-change", "dns-change")
 DISABLING_ACTION = "down"
 DISABLING_SOURCE = "down"
 
-OPTIONS = ("--state-file", "--lock-file")
+# Each option with the kind of value it takes, so a refusal names what is missing
+# rather than calling a missing interface a missing path.
+OPTIONS = {
+    "--state-file": "path",
+    "--lock-file": "path",
+    CAPTURE_OPTION: "interface name",
+}
+# The two paths are required in both modes; the capture option is the mode.
+REQUIRED_OPTIONS = ("--state-file", "--lock-file")
 
 # NetworkManager runs a dispatcher script as `script INTERFACE ACTION`, so two
 # positional arguments may follow the options: the interface the event is about
@@ -108,35 +142,83 @@ EXIT_LOCKED = 3
 EXIT_STATE = 4
 
 
+class _Request(NamedTuple):
+    """The command line as one mode: a capture interface, or a dispatcher's arguments.
+
+    ``capture`` is the interface an installation named and is None when the
+    dispatcher runs the program. That is the whole of the mode, and it is decided
+    here, before any command runs, because the two invocations read different
+    things and neither may act as the other.
+    """
+
+    state_file: str
+    lock_file: str
+    capture: Optional[str]
+    positionals: List[str]
+
+
 def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int:
-    """Publish the state for one dispatcher event and return its exit status.
+    """Publish the state for one event, or for a capture, and return its exit status.
 
     ``argv`` is the command line without the program name, ``env`` the dispatcher's
     environment, and ``run`` executes one read-only command. Returns 0 when the
     state was published or was already current, 2 for a command line or
-    environment the bridge cannot act on, 3 while another bridge process holds
-    the publication lock, and 4 when the state could not be published or no
-    source that reports the lease could be read.
+    environment the bridge cannot act on -- including one that names neither mode
+    or both of them -- 3 while another bridge process holds the publication lock,
+    and 4 when the state could not be published or no source that reports the
+    lease could be read.
 
     Nothing raises out of this function. The dispatcher reads the exit status and
     nothing else, so a raised error would replace a documented status with a
     traceback and leave an operator guessing which stage failed.
     """
     try:
-        state_file, lock_file, positionals = _options(argv)
+        request = _options(argv)
     except ValueError as error:
         return _fail(EXIT_INVALID_INPUT, str(error))
 
     action = env.get(ACTION_VARIABLE, "")
-    if not isinstance(action, str) or not action:
-        return _fail(EXIT_INVALID_INPUT, f"{ACTION_VARIABLE} is not set")
+    # An exported but empty action names no event, and neither does one that is not
+    # text: both are the same as an absent one, so a capture may be run from an
+    # environment that happens to hold the variable, and a dispatcher run may not
+    # claim to be a capture.
+    event = action if isinstance(action, str) and action else ""
+
+    if request.capture is not None:
+        if event:
+            return _fail(
+                EXIT_INVALID_INPUT,
+                f"{CAPTURE_OPTION} and {ACTION_VARIABLE} are two ways to run this "
+                f"program and cannot both be given: a capture has no dispatcher "
+                f"event, and an event is told its interface by NetworkManager",
+            )
+        return _capture(request.capture, request, env, run)
+    if not event:
+        return _fail(
+            EXIT_INVALID_INPUT,
+            f"{ACTION_VARIABLE} is not set, so this is neither a dispatcher event "
+            f"nor a capture; an installation with no event names the interface "
+            f"with {CAPTURE_OPTION}",
+        )
+    return _dispatcher(request, env, event, run)
+
+
+def _dispatcher(
+    request: _Request, env: Mapping[str, str], action: str, run: CommandRunner
+) -> int:
+    """Publish the state one NetworkManager event is about, and return its exit status.
+
+    ``action`` is the event's own action, already read from the environment, and
+    the decision this makes is the one the module docstring describes: which event
+    this is, and which interface it is about.
+    """
     if action != DISABLING_ACTION and action not in COLLECTING_ACTIONS:
         # An event this bridge does not act on: no command is run and no file is
         # touched, so the state keeps describing the last real lease.
         return EXIT_SUCCESS
 
     try:
-        interface = _interface(env, positionals)
+        interface = _interface(env, request.positionals)
     except ValueError as error:
         return _fail(EXIT_INVALID_INPUT, str(error))
 
@@ -156,15 +238,125 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
             return _fail(EXIT_INVALID_INPUT, str(error))
         upstreams, source = collected.addresses, collected.source
 
+    return _publish(
+        request,
+        interface,
+        upstreams,
+        source,
+        env.get(CONNECTION_UUID_VARIABLE, ""),
+    )
+
+
+def _capture(
+    interface: str, request: _Request, env: Mapping[str, str], run: CommandRunner
+) -> int:
+    """Publish the lease in use right now on an interface an installation named.
+
+    This is the dispatcher's publication path with an explicit interface, not a
+    second writer of the state. The addresses come from the same collector, the
+    recorded source is the one that answered rather than the fact that a capture
+    happened, and the same publisher decides whether anything changed. A capture
+    and the first event after it therefore record one state rather than two
+    generations for a lease that never moved, and a source token of the capture's
+    own would make every later event a new generation for resolvers that did not
+    change.
+    """
+    # The name is checked here rather than left to the collector, for the same
+    # reason the event's own interface is: it reaches fixed argument arrays and the
+    # published document, and refusing it is still free because nothing has run.
+    if not is_interface_name(interface):
+        return _fail(
+            EXIT_INVALID_INPUT,
+            f"{CAPTURE_OPTION} is not a network interface name: {interface!r}",
+        )
+
+    try:
+        collected = collect_dns_with_source(env, interface, run)
+    except SourcesUnavailable as error:
+        return _fail(EXIT_STATE, str(error))
+    except ValueError as error:
+        return _fail(EXIT_INVALID_INPUT, str(error))
+
+    try:
+        connection_uuid = _connection_uuid(env, interface, run)
+    except SourcesUnavailable as error:
+        # After the collection and before the lock, for the same reason: a
+        # connection that could not be read says nothing about the lease, and a
+        # state without the connection its resolvers came from is one the
+        # publisher refuses, so the last good generation stands.
+        return _fail(EXIT_STATE, str(error))
+
+    return _publish(
+        request,
+        interface,
+        collected.addresses,
+        collected.source,
+        connection_uuid,
+    )
+
+
+def _connection_uuid(
+    env: Mapping[str, str], interface: str, run: CommandRunner
+) -> str:
+    """Return the connection the lease on ``interface`` belongs to.
+
+    NetworkManager exports ``CONNECTION_UUID`` to every dispatcher event it runs,
+    so an event never has to ask. An installation runs before any event exists and
+    has no such variable, and asks NetworkManager once instead. The lookup is
+    mandatory rather than a convenience: a state that names resolvers has to name
+    the connection they belong to, and the publisher refuses one whose connection
+    is empty, so a capture that cannot name the connection publishes nothing at
+    all rather than a document the router would not read.
+
+    A command that could not be read raises the collector's own failure, for the
+    same reason the collector raises it: a NetworkManager that cannot be queried
+    is not evidence that the lease lost its resolvers. The message names no
+    address, no UUID, and no interface, because it is written to a log.
+    """
+    exported = env.get(CONNECTION_UUID_VARIABLE, "")
+    if exported:
+        return exported
+    answer: Optional[str] = None
+    try:
+        output = run(["nmcli", "-g", CONNECTION_FIELD, "device", "show", interface])
+        answer = output if isinstance(output, str) else None
+    except Exception:
+        # Deliberately broad, and confined to the injected call: the runner owns
+        # process handling, so a missing binary, a non-zero status, and a timeout
+        # all arrive here, and all mean the same thing -- no answer.
+        answer = None
+    if answer is None:
+        raise SourcesUnavailable(
+            "the connection of the captured interface could not be read: nmcli -g "
+            f"{CONNECTION_FIELD} device show failed"
+        )
+    return answer.strip()
+
+
+def _publish(
+    request: _Request,
+    interface: str,
+    upstreams: Sequence[str],
+    source: str,
+    connection_uuid: str,
+) -> int:
+    """Publish one observation's facts and return the exit status for it.
+
+    Both modes publish through here, which is what makes a capture and a
+    dispatcher event the same writer rather than two: the lock, the validation,
+    the decision about whether the state changed, and the meaning of every exit
+    status are decided once, so a capture cannot record a document an event would
+    have refused, nor refuse one an event would have published.
+    """
     try:
         publish_if_changed(
-            state_file,
+            request.state_file,
             interface=interface,
-            connection_uuid=env.get(CONNECTION_UUID_VARIABLE, ""),
+            connection_uuid=connection_uuid,
             upstreams=upstreams,
             source=source,
             now=_observed_now(),
-            lock_path=lock_file,
+            lock_path=request.lock_file,
         )
     except LockUnavailable as error:
         return _fail(EXIT_LOCKED, str(error))
@@ -175,14 +367,16 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     return EXIT_SUCCESS
 
 
-def _options(argv: Sequence[str]) -> Tuple[str, str, List[str]]:
-    """Return the state file, the lock file, and the dispatcher's arguments.
+def _options(argv: Sequence[str]) -> _Request:
+    """Return the paths, the capture interface, and the dispatcher's arguments.
 
-    Both options are required and neither may be repeated. A default would let a
+    Every option is required and none may be repeated. A default would let a
     typo in the dispatcher unit create a second, empty state file beside the real
-    one instead of failing. Anything that is not an option is the dispatcher's
-    own interface and action arguments, and more of them than the dispatcher
-    passes is a command line this program does not understand.
+    one instead of failing. Anything that is not an option is the dispatcher's own
+    interface and action arguments, and more of them than the dispatcher passes is
+    a command line this program does not understand; beside a capture they are
+    refused outright, because the capture has already named the interface and a
+    reader of the command line could not tell which of the two was used.
     """
     values: Dict[str, str] = {}
     positionals: List[str] = []
@@ -197,21 +391,32 @@ def _options(argv: Sequence[str]) -> Tuple[str, str, List[str]]:
             raise ValueError(f"unknown argument {option!r}; {USAGE}")
         if option in values:
             raise ValueError(f"{option} is given more than once; {USAGE}")
+        kind = OPTIONS[option]
         if index + 1 >= len(argv):
-            raise ValueError(f"{option} needs a path; {USAGE}")
-        value = argv[index + 1]
-        if not value:
-            raise ValueError(f"{option} needs a non-empty path; {USAGE}")
-        values[option] = value
+            raise ValueError(f"{option} needs a {kind}; {USAGE}")
+        argument = argv[index + 1]
+        if not argument:
+            raise ValueError(f"{option} needs a non-empty {kind}; {USAGE}")
+        values[option] = argument
         index += 2
-    missing = [option for option in OPTIONS if option not in values]
+    missing = [option for option in REQUIRED_OPTIONS if option not in values]
     if missing:
         raise ValueError(f"missing {', '.join(missing)}; {USAGE}")
     if len(positionals) > MAXIMUM_POSITIONAL_ARGUMENTS:
         raise ValueError(
             f"the dispatcher passes an interface and an action, got {' '.join(positionals)}"
         )
-    return values["--state-file"], values["--lock-file"], positionals
+    if positionals and CAPTURE_OPTION in values:
+        raise ValueError(
+            f"{CAPTURE_OPTION} already names the interface, so the dispatcher's own "
+            f"arguments do not belong on the same command line: {' '.join(positionals)}"
+        )
+    return _Request(
+        state_file=values["--state-file"],
+        lock_file=values["--lock-file"],
+        capture=values.get(CAPTURE_OPTION),
+        positionals=positionals,
+    )
 
 
 def _interface(env: Mapping[str, str], positionals: Sequence[str]) -> str:
