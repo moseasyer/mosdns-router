@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -988,33 +989,55 @@ func TestHTTPSReportsTheUnchargedBytesItRefusedToKeepReading(t *testing.T) {
 }
 
 func TestHTTPSNeverReadsMoreThanTheIdentityCapAllows(t *testing.T) {
-	// The cap is the whole bound, and it is the default that a production prober
-	// gets. A body one byte under it is read whole and reported exactly; a body one
-	// byte over it is refused, and the refusal costs one byte more than the cap and
-	// never the whole body.
+	// The cap is the whole bound, and it is the default a production prober gets.
+	// The body here is four times the cap, so a reader that ignored the cap would
+	// report four times as many bytes as the one that honours it: the fixture is
+	// deliberately much larger than the cap rather than one byte over it, because a
+	// body one byte over proves nothing about where the reader stops.
 	authority := newTestAuthority(t)
-	atCap := strings.Repeat("d", DefaultMaxIdentityBodyBytes)
-	server, _ := mustIdentityServer(t, authority, profileHostname, payloadHandler(atCap))
+	server, _ := mustIdentityServer(t, authority, profileHostname, payloadHandler(strings.Repeat("d", 4*DefaultMaxIdentityBodyBytes)))
 	measure, _ := mustProberFor(t, authority, server)
 	profile := identityProfile(t, server, profileHostname, []int{http.StatusOK})
-	// The digest does not match on purpose: the point of this case is how much was
-	// read, not whether it matched.
-	profile.BodySHA256 = strings.Repeat("a", 64)
+	// The digest does not match on purpose: the point of the refused cases is how
+	// much was read, not whether it matched.
+	mismatch := strings.Repeat("a", 64)
 
+	profile.BodySHA256 = mismatch
 	metrics, err := measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
 	if err == nil {
-		t.Fatalf("a body of %d bytes was accepted under a digest it does not match: %+v", len(atCap), metrics)
+		t.Fatalf("a body of %d bytes was accepted under a digest it does not match: %+v", 4*DefaultMaxIdentityBodyBytes, metrics)
 	}
-	if metrics.BodyBytes != DefaultMaxIdentityBodyBytes {
-		t.Errorf("BodyBytes = %d for a body of exactly the cap, want the whole %d read", metrics.BodyBytes, DefaultMaxIdentityBodyBytes)
+	// One byte past the cap is where the reader stops, and one byte past the cap is
+	// all it reports: a reader that ignored the cap would have reported four times
+	// this, which is the whole difference this bound makes to the exposure.
+	if metrics.BodyBytes != DefaultMaxIdentityBodyBytes+1 {
+		t.Errorf("BodyBytes = %d for a body of four times the cap, want the cap and the one byte that proves it: %d", metrics.BodyBytes, DefaultMaxIdentityBodyBytes+1)
 	}
 
-	overCap := atCap + "d"
+	// A body that fits is read whole and reported exactly, because a probe that
+	// reported the cap for every body would be no use as an accounting figure.
+	fits := strings.Repeat("d", 1024)
+	server, _ = mustIdentityServer(t, authority, profileHostname, payloadHandler(fits))
+	measure, _ = mustProberFor(t, authority, server)
+	profile.BodySHA256 = digestOf(fits)
+	metrics, err = measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
+	if err != nil {
+		t.Fatalf("prove a profile whose body fits under the cap: %v", err)
+	}
+	if metrics.BodyBytes != int64(len(fits)) {
+		t.Errorf("BodyBytes = %d for a %d byte body under the cap, want every byte of it", metrics.BodyBytes, len(fits))
+	}
+
+	// And the cap is a refusal in its own right, not only a way of noticing a
+	// digest mismatch: a profile that names a document larger than the cap can
+	// never be proved, and says so rather than reading the whole thing.
+	overCap := strings.Repeat("d", DefaultMaxIdentityBodyBytes+1)
 	server, _ = mustIdentityServer(t, authority, profileHostname, payloadHandler(overCap))
 	measure, _ = mustProberFor(t, authority, server)
+	profile.BodySHA256 = digestOf(overCap)
 	metrics, err = measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
 	if err == nil {
-		t.Fatalf("a body one byte over the cap was accepted: %+v", metrics)
+		t.Fatalf("a profile naming a body over the cap was accepted: %+v", metrics)
 	}
 	if metrics.BodyBytes != DefaultMaxIdentityBodyBytes+1 {
 		t.Errorf("BodyBytes = %d for a body one byte over the cap, want %d", metrics.BodyBytes, DefaultMaxIdentityBodyBytes+1)
@@ -1029,6 +1052,24 @@ func TestHTTPSNeverReadsMoreThanTheIdentityCapAllows(t *testing.T) {
 //
 // The two forbidden names are built from halves so that this test file is not
 // itself a match for either of them.
+// TestTheExportedOptionsCannotCarryTrustAnchors closes the gap the source scan
+// cannot. The scan lets exactly one file name the trust anchors, and that file is
+// where an exported override would be the natural place to put one back, so the
+// scan would not see it. This test is the rule the scan cannot express: the only
+// thing a production caller can hand a prober is Options, and Options carries no
+// pool of trust anchors. A prober is therefore verified against the host's own
+// roots, always, and no policy document, profile, or line of Go in another
+// package can change that.
+func TestTheExportedOptionsCannotCarryTrustAnchors(t *testing.T) {
+	anchors := reflect.TypeOf((*x509.CertPool)(nil))
+	options := reflect.TypeOf(Options{})
+	for field := 0; field < options.NumField(); field++ {
+		if options.Field(field).Type == anchors {
+			t.Errorf("Options.%s carries a trust anchor pool, so a production caller could have every identity proof verified against roots the router does not trust", options.Field(field).Name)
+		}
+	}
+}
+
 func TestTheSourceScanFailsOnForbiddenCode(t *testing.T) {
 	forbiddenVerification := "InsecureSkip" + "Verify"
 	forbiddenAnchors := "Root" + "CAs"
@@ -1765,6 +1806,13 @@ func statusHandler(status int) http.HandlerFunc {
 func writeIdentityBody(writer http.ResponseWriter) {
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write([]byte(identityBody))
+}
+
+// digestOf is the SHA-256 a profile would name for a body, written out here so a
+// test that serves a body of its own can state the digest that body has.
+func digestOf(body string) string {
+	digest := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(digest[:])
 }
 
 // identityProfile is the profile a verified host answers: its own name, its own
