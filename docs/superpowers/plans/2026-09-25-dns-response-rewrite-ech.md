@@ -160,6 +160,112 @@ inherit:
   state the ruling exists to prevent. The function is exported and takes the
   message in place, so call it on the copy the plugin already made.
 
+### Amendments from the Task 3 review (fix round 1)
+
+Task 3 shipped and was reviewed. Five defects were Important and are fixed; the plan
+now states the behaviour they changed, because two of them are decisions a package
+cannot make on its own and a third is a rule Task 5 inherits.
+
+**Interfaces (shipped).** `internal/dnsrewrite` now exports, and this is the shape Task
+5 compiles against:
+
+```go
+func HTTPS(in HTTPSInput) (*dns.Msg, error)
+
+type FailurePolicy int
+
+const (
+    FailClosed        FailurePolicy = iota // strict
+    FallbackToOriginal                    // fallback
+)
+
+type HTTPSInput struct {
+    Response *dns.Msg      // never modified, and never read for parameters
+    QName    string        // required, checked against the response's own question
+    Selected netip.Addr    // must be a routable public IPv4
+    ECH      []byte        // ECHConfigList bytes, validated here; nil means none
+    Policy   FailurePolicy
+    Report   func(Report)  // optional: what the synthesis left out, and why
+}
+
+type Report struct{ Dropped []DroppedParameter }
+type DroppedParameter struct {
+    Key    dns.SVCBKey
+    Reason string
+}
+
+var (
+    ErrNoECHConfig          // the ECH source published nothing
+    ErrInvalidECHConfig     // it published something this router will not forward
+    ErrNoSelectedAddress    // no address to hint: absent, unproved, or unhealthy
+    ErrNoCompatibleEndpoint // the name published service bindings, none usable here
+    ErrDelegatedName        // a CNAME at the owner, or an AliasMode record in its RRset
+    ErrUpstreamDenial       // the upstream's rcode is a statement, not an absence
+    ErrNoOriginal           // nothing to forward; wraps whichever refusal led there
+)
+```
+
+Four obligations, each one a change from what round 1 shipped:
+
+- **`HTTPS` returns the message and the refusal together under the fallback policy.**
+  A `FallbackToOriginal` caller gets `(in.Response, err)` for every refusal, and
+  `(clone, nil)` for a synthesis. A `FailClosed` caller gets `(nil, err)` for every
+  refusal. There is no third shape. **Task 5 must forward whatever message arrived and
+  log the error, and must fail closed when the message is nil.** A caller that returns
+  as soon as it sees an error throws away the upstream's own answer and turns a working
+  fallback domain into a SERVFAIL; a caller that ignores the error is safe but blind to
+  a broken ECH source, a dead selector, or a name the upstream delegated. Note the
+  ordering requirement, which is the shape of the last sentinel: `ErrNoOriginal` wraps
+  the refusal that left nothing to forward, so `errors.Is(err, ErrNoECHConfig)` is also
+  true of it. Test `ErrNoOriginal` first; forward the message either way; fail closed
+  when it is nil. This amends the Task 2 obligation above for `HTTPS` only: `Address`
+  still returns a message only with a nil error.
+- **A missing or unhealthy selected address is fatal under strict only.** Under
+  `FailClosed` an address that is absent, unproved or failed its health check is
+  `ErrNoSelectedAddress`, because a record with no hint sends the client to resolve the
+  name and a force-ECH domain has that resolution emptied. Under
+  `FallbackToOriginal` the same input yields `(in.Response, ErrNoSelectedAddress)`: the
+  upstream's record still describes the service, its own hint is still the upstream's to
+  vouch for, and no `ipv4hint` and no `ech` are written, because there is no address to
+  point at. Falling back to SERVFAIL there would take a fallback domain offline through
+  the project's own health gate, which is the opposite of what the policy is for. The
+  cost is recorded rather than hidden: a fallback domain whose selector is down serves
+  an answer whose ClientHello this router could not encrypt, and the error is the only
+  thing that says so.
+- **A name the upstream delegated is never synthesized into.** Two shapes: a CNAME at
+  the owner, and an RRset at the owner containing an AliasMode record (RFC 9460
+  Section 2.4.1). Both are `ErrDelegatedName`, both are refusals under strict, and both
+  hand the upstream's own answer back under fallback. **Task 5 must not attempt to
+  rewrite a name this package refused as delegated, and must not treat the refusal as an
+  ECH-source failure** -- the two sentinels are separate on purpose. Note the cost,
+  which is real: a force-ECH domain that is a CNAME is unreachable over HTTPS in strict
+  mode, because the service is described under the other name. The alternative, which
+  round 1 did, is to drop the chain and synthesize a service mode for the queried name,
+  which covers more domains and relies on a certificate this router cannot check.
+- **The addresses of the queried name are removed from every section, by this package.**
+  RFC 9460 Section 7.3 has a client ignore the hints when it already holds an A or AAAA
+  answer for the record's effective TargetName, which is the name the client asked
+  about, so an address for that name in either the answer or the additional section is
+  an answer that beats the selected address. **Task 5 must not add an address for the
+  queried name to an HTTPS answer after calling `HTTPS`**, and must not rely on this
+  package for an A or AAAA query: `Address` owns the terminal A and AAAA records of a
+  CDN name on an A or AAAA answer, this owns the addresses of the queried name inside an
+  HTTPS answer, and the two cover disjoint messages. A caller that answered an HTTPS
+  query and then rewrote its addresses would be answering a question the client did not
+  ask.
+
+Two rules that were already in the plan and are now stated in the code as well:
+
+- **A parameter is inherited only when every retained endpoint carries it with the same
+  value.** RFC 9460 Section 7.2 makes an absent key an instruction to use the default,
+  so an endpoint that omits a parameter has claimed the default and one endpoint's value
+  is not the service's value. A dropped parameter leaves a usable record, and every drop
+  is reported through `Report` so Task 5 can log and count the degraded answers.
+- **An upstream answer this router may not turn positive.** A NODATA, a SERVFAIL and a
+  REFUSED with an empty answer are absences; NXDOMAIN, FORMERR, NOTIMP, and any failure
+  carrying records, are `ErrUpstreamDenial`. Task 5 forwards the upstream's own denial
+  under the fallback policy and fails closed under strict.
+
 ---
 
 ### Task 1: Parse and validate ECHConfigList bytes
