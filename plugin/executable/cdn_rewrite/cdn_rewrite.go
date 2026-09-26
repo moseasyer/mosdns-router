@@ -41,7 +41,6 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -355,7 +354,15 @@ func disabledSelector() state.Selector {
 // without this the router would keep serving yesterday's force-ECH list with
 // nothing anywhere saying the file is broken -- and losing strict ECH is the one
 // failure here that is invisible to the client it protects.
+//
+// A nil is dropped rather than logged, and that is a guard rather than a
+// convention: the handler is shared by the two statewatch watchers and the range
+// list's own poll, and a nil arriving here would produce a line claiming a
+// document was kept when nothing was refused.
 func (p *Plugin) logReloadRefusal(err error) {
+	if err == nil {
+		return
+	}
 	p.logger.Warn("cdn_rewrite: keeping the last valid document", zap.Error(err))
 }
 
@@ -452,18 +459,34 @@ func (p *Plugin) rewriteAddress(qCtx *query_context.Context, response *dns.Msg, 
 	// for one distribution says nothing about any other name, and no published
 	// range list can say otherwise, so the exact name is the whole of the check.
 	//
-	// The winner's proof window does not gate this arm, and the asymmetry is
-	// forced rather than chosen. The window describes the GLOBAL winner: the
-	// optimizer and the health check stamp it when they prove that one address,
-	// and a CloudFront-only installation publishes no global winner at all, so it
-	// has no window and a gate on it would switch the whole feature off there. A
-	// per-hostname mapping carries its own authorisation -- the exact name it was
-	// proved for -- and the health check proves every mapping on the same two-minute
-	// interval, reporting a failing one; what it does not do is remove it, which
-	// this plan already records as a named limitation rather than inheriting it
-	// silently.
+	// The authorisation is the QUERIED name and the addresses replaced are the ones
+	// at the END of the chain, and that is deliberate rather than an oversight. A
+	// distribution reached through a CNAME is the ordinary shape of a per-hostname
+	// mapping: the queried name is the name the operator configured and the name the
+	// health check proved the mapping against, while the addresses a client would
+	// connect to are the terminal ones. Requiring the terminal to BE the queried
+	// name would refuse every such setup, which is the whole point of a mapping.
+	// The guard that keeps this honest is the one below: the caller's own published
+	// ranges must NOT say the response is Cloudflare-served, because a mapping is a
+	// distribution's address and a Cloudflare address is not a distribution's.
+	//
+	// The winner's proof window does not gate this arm, and the asymmetry is forced
+	// rather than chosen. The window describes the GLOBAL winner: the optimizer and
+	// the health check stamp it when they prove that one address, and a
+	// CloudFront-only installation publishes no global winner at all, so it has no
+	// window and a gate on it would switch the whole feature off there. A
+	// per-hostname mapping carries its own authorisation, and the health check
+	// proves every mapping on the same two-minute interval, reporting a failing one;
+	// what it does not do is remove it, which this plan already records as a named
+	// limitation rather than inheriting it silently.
 	if mapped, ok := mappedAddress(published, name); ok {
-		return p.installAddress(qCtx, response, dnsrewrite.AddressInput{
+		// The arm returns either way, whether the rewrite happened or was refused.
+		// Falling through would consult the global Cloudflare classification of the
+		// same response, which is the one thing a per-hostname mapping exists to
+		// keep separate: a response this arm refused as Cloudflare-served would
+		// otherwise be rewritten with the global winner a moment later, and a
+		// response this arm rewrote would be rewritten a second time.
+		p.installAddress(qCtx, response, dnsrewrite.AddressInput{
 			Response:     response,
 			QType:        dns.TypeA,
 			Provider:     candidate.ProviderCloudFront,
@@ -473,6 +496,7 @@ func (p *Plugin) rewriteAddress(qCtx *query_context.Context, response *dns.Msg, 
 			Prefixes:     p.prefixes.Prefixes(),
 			SuppressAAAA: p.suppressAAAA,
 		}, name, "the CloudFront mapping for "+name)
+		return nil
 	}
 
 	if published.Provider != string(candidate.ProviderCloudflare) {
@@ -489,7 +513,7 @@ func (p *Plugin) rewriteAddress(qCtx *query_context.Context, response *dns.Msg, 
 		// designed to make inexpressible: both are empty here.
 		return nil
 	}
-	if err := p.installAddress(qCtx, response, dnsrewrite.AddressInput{
+	rewritten := p.installAddress(qCtx, response, dnsrewrite.AddressInput{
 		Response:     response,
 		QType:        dns.TypeA,
 		Provider:     verdict.Provider,
@@ -497,25 +521,30 @@ func (p *Plugin) rewriteAddress(qCtx *query_context.Context, response *dns.Msg, 
 		Selected:     winner,
 		Prefixes:     p.prefixes.Prefixes(),
 		SuppressAAAA: p.suppressAAAA,
-	}, name, "the Cloudflare classification of "+name); err != nil {
-		return err
+	}, name, "the Cloudflare classification of "+name)
+	// The name is remembered only when the A answer it belongs to was actually
+	// rewritten. The record is what lets an AAAA query for the same name be
+	// answered, and the plan's constraint is "when A is rewritten, suppress AAAA
+	// for the same CDN name": a name whose A answer this router refused and left as
+	// the upstream published has not been rewritten, and emptying its IPv6 answer
+	// would be suppressing it on the strength of a rewrite that did not happen.
+	if rewritten {
+		p.cdn.record(published.Generation, verdict.TerminalName)
 	}
-	// The name is remembered so that an AAAA query for it can be answered, which
-	// is the only way an IPv6 answer can be known to belong to a CDN name: the
-	// published ranges are IPv4 and an AAAA answer carries no address to check.
-	p.cdn.record(published.Generation, verdict.TerminalName)
 	return nil
 }
 
-// installAddress applies one authorized address rewrite and sets the result.
+// installAddress applies one authorized address rewrite and sets the result, and
+// reports whether the message the client will get is a rewritten one.
 //
 // The response the sequence produced is handed to the rewrite package as it is,
 // and that package never modifies it: a rewrite lands on a copy, and the fallback
 // arm of the HTTPS path hands the original back so its bytes are provably the ones
-// the cache still holds. The message that comes back is therefore either a new
-// object carrying the rewrite or the caller's own, and setting it back is what
-// makes the change visible to the client.
-func (p *Plugin) installAddress(qCtx *query_context.Context, response *dns.Msg, in dnsrewrite.AddressInput, name, why string) error {
+// the cache still holds. What comes back is therefore either a new object carrying
+// the rewrite or the caller's own, and whether it is a different object is how a
+// rewrite is told from a no-op -- which is the only question the caller has, and
+// the one its record of the name depends on.
+func (p *Plugin) installAddress(qCtx *query_context.Context, response *dns.Msg, in dnsrewrite.AddressInput, name, why string) bool {
 	rewritten, err := dnsrewrite.Address(in)
 	if rewritten != nil {
 		qCtx.SetResponse(rewritten)
@@ -528,8 +557,9 @@ func (p *Plugin) installAddress(qCtx *query_context.Context, response *dns.Msg, 
 			zap.String("name", name),
 			zap.String("authorised_by", why),
 			zap.Error(err))
+		return false
 	}
-	return nil
+	return rewritten != response
 }
 
 // suppressIPv6 is the AAAA path, and it is the one path with no classification of
@@ -563,7 +593,7 @@ func (p *Plugin) suppressIPv6(qCtx *query_context.Context, response *dns.Msg, na
 	if !p.cdn.holds(published.Generation, terminal) {
 		return nil
 	}
-	return p.installAddress(qCtx, response, dnsrewrite.AddressInput{
+	p.installAddress(qCtx, response, dnsrewrite.AddressInput{
 		Response:     response,
 		QType:        dns.TypeAAAA,
 		Provider:     candidate.ProviderCloudflare,
@@ -572,6 +602,7 @@ func (p *Plugin) suppressIPv6(qCtx *query_context.Context, response *dns.Msg, na
 		Prefixes:     p.prefixes.Prefixes(),
 		SuppressAAAA: true,
 	}, name, "the Cloudflare classification of "+terminal)
+	return nil
 }
 
 // rewriteHTTPS is the HTTPS path, and it runs for a name the operator asked to
@@ -819,9 +850,14 @@ func (p *Plugin) Close() error {
 type prefixList struct {
 	path     string
 	interval time.Duration
-	logger   *zap.Logger
 	report   func(error)
 	current  atomic.Pointer[[]netip.Prefix]
+
+	// reporting guards reported, which the poll goroutine writes. It is held only
+	// to decide whether to report, never while the handler runs, so a handler that
+	// called back into the list could not deadlock on it.
+	reporting sync.Mutex
+	reported  error
 
 	stop chan struct{}
 	done chan struct{}
@@ -832,6 +868,20 @@ type prefixList struct {
 // The first read is synchronous for the reason it is in the watchers: a router
 // that boots after the daily list updater has published its ranges serves them
 // from its first query.
+//
+// A list this build cannot use is refused HERE rather than tolerated, and the
+// contrast with the force-ECH allowlist is deliberate and worth stating. A missing
+// or unreadable allowlist leaves the plugin serving with nothing forced, which is
+// inert but not wrong: no domain is claimed that the operator did not list, so the
+// failure is a missing safety setting rather than a wrong answer, and refusing to
+// start over it would take a resolver offline for a file the operator may not have
+// created yet. A missing or unreadable RANGE list is the other shape: it classifies
+// every response as somebody else's, so every rewrite in the router silently stops
+// while the router looks healthy, and a router whose whole selection feature is off
+// is not serving. That is why the range list refuses at construction and the
+// allowlist does not, and why the allowlist's absence is reported once rather than
+// silently: an operator who believes they are forcing ECH for a domain is told the
+// list is not there.
 func newPrefixList(path string, interval time.Duration, report func(error)) (*prefixList, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("the Cloudflare range list path must not be empty")
@@ -842,7 +892,6 @@ func newPrefixList(path string, interval time.Duration, report func(error)) (*pr
 	list := &prefixList{
 		path:     path,
 		interval: interval,
-		logger:   zap.NewNop(),
 		report:   report,
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -889,8 +938,42 @@ func (l *prefixList) run() {
 		case <-l.stop:
 			return
 		case <-ticker.C:
-			l.report(l.ReloadNow())
+			l.reportRefusal(l.ReloadNow())
 		}
+	}
+}
+
+// reportRefusal is the reporting rule, and it is the same rule the statewatch
+// watchers apply for the same reason.
+//
+// A successful reload is not reported at all. The poll runs twice a second for the
+// life of the router, so a handler called on every tick writes a line every tick --
+// at the production default, about 173,000 lines a day -- and the line the plugin's
+// handler logs says the last valid document was KEPT, which on a successful reload
+// is a lie. A log an operator cannot act on is worse than no log, because the one
+// time the same line is true is the time they have to notice it.
+//
+// A continuing refusal is reported once. One broken file is one problem, not two
+// hundred a second, and a repair ends the episode so that a file which breaks again
+// after being fixed is reported as the new problem it is. An episode is identified
+// by the refusal's own text, which is what names the file and the line: a different
+// message is a different problem even if the file is the same one.
+func (l *prefixList) reportRefusal(err error) {
+	l.reporting.Lock()
+	if err == nil {
+		l.reported = nil
+		l.reporting.Unlock()
+		return
+	}
+	if l.reported != nil && l.reported.Error() == err.Error() {
+		l.reporting.Unlock()
+		return
+	}
+	l.reported = err
+	report := l.report
+	l.reporting.Unlock()
+	if report != nil {
+		report(err)
 	}
 }
 
@@ -949,17 +1032,35 @@ func readPrefixList(path string) ([]netip.Prefix, error) {
 // It exists for one question the classifier cannot answer twice. An AAAA answer
 // carries no A record, so the published IPv4 ranges have nothing to check it
 // against and a classification of it would be a guess; the only evidence that a
-// name is Cloudflare-served is an A answer for it that said so. So the A path
-// records the name it proved, and the AAAA path is entered only for a name this
-// set already holds -- which is what keeps a plain domain's IPv6 answer intact.
+// name is Cloudflare-served is an A answer for it that the classifier accepted and
+// that this router actually rewrote. So the A path records the names it proved, and
+// the AAAA path is entered only for a name this set already holds -- which is what
+// keeps a plain domain's IPv6 answer intact.
 //
-// Three properties make the record safe rather than a second cache to reason
-// about. It is scoped to one generation, so a new selection empties it and no
-// answer is suppressed on the strength of a classification the current selector
-// never made. It is read only while the winner's proof window is open, so an A
-// answer and an AAAA answer for one name agree about whether the router is
-// rewriting it. And it is bounded, with the oldest name dropped when it is full,
-// so a flood of one-off names cannot make the router's memory grow with them.
+// THE ORDER OF THE TWO QUERIES IS PART OF THE CONTRACT, and a reader deciding
+// whether this is a bug needs to know it before they find it in a log. Suppressing
+// an IPv6 answer requires the A answer for the same name to have been rewritten
+// FIRST. A browser asking for A and AAAA at the same time -- the ordinary case, the
+// one Happy Eyeballs exists for -- routinely has the IPv6 one processed first, and
+// then only the A half of the pair is applied: the client is sent to the selected
+// IPv4 and keeps the upstream's real IPv6 addresses beside it. The direction of that
+// miss is "no suppression", so the client is left with exactly the IPv6 answer it
+// would have had without this router, which is the safe side of the line; the
+// opposite miss, an IPv6 answer emptied because some earlier A query happened to
+// touch the name, is what the generation and the window checks below rule out. The
+// mechanism is forced rather than chosen: an IPv6 answer carries no address for the
+// published ranges to classify, so there is nothing this router could look at
+// instead of the A answer it is waiting for.
+//
+// Four properties make the record safe rather than a second cache to reason about.
+// It is entered only when the A answer was really rewritten, so a refusal does not
+// earn a name its IPv6 answer then loses. It is scoped to one generation, so a new
+// selection empties it and no answer is suppressed on the strength of a
+// classification the current selector never made. It is read only while the winner's
+// proof window is open, so an A answer and an IPv6 answer for one name agree about
+// whether this router is rewriting it. And it is bounded, with the oldest name
+// dropped when it is full, so a flood of one-off names cannot make the router's
+// memory grow with them.
 type cdnNames struct {
 	mu         sync.Mutex
 	generation uint64
@@ -1010,13 +1111,3 @@ func (c *cdnNames) holds(generation uint64, terminal string) bool {
 	_, known := c.names[terminal]
 	return known
 }
-
-// prefixPathFor is where the parsed range list lives beside the document it was
-// parsed from, and it is what the plugin's cloudflare_cidr_file names.
-func prefixPathFor(cachePath string) string {
-	return filepath.Join(filepath.Dir(cachePath), defaultPrefixFileName)
-}
-
-// defaultPrefixFileName is the name of the parsed range list the cached document's
-// own fetch publishes beside its envelope.
-const defaultPrefixFileName = "cloudflare-prefixes.txt"

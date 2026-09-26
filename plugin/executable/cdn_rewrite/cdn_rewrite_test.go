@@ -197,6 +197,14 @@ func (f *fakeECHUpstream) failWith(err error) {
 	f.answer = func(dns.Question) (*dns.Msg, error) { return nil, err }
 }
 
+// setAnswer replaces what the client answers with, for a test whose source
+// changes its mind part way through.
+func (f *fakeECHUpstream) setAnswer(answer func(dns.Question) (*dns.Msg, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.answer = answer
+}
+
 func (f *fakeECHUpstream) asked() []echQuery {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -214,8 +222,11 @@ type harness struct {
 	upstream     *fakeECHUpstream
 	next         *fakeNext
 	now          time.Time
-	logs         *observer.ObservedLogs
-	plugin       *Plugin
+	// started is when the harness was built, so a test can wait for a number of
+	// poll intervals rather than for a wall-clock time it chose itself.
+	started time.Time
+	logs    *observer.ObservedLogs
+	plugin  *Plugin
 }
 
 // harnessConfig is what a test changes about a harness. Every field has a value
@@ -236,6 +247,9 @@ type harnessConfig struct {
 	// refusals are presented: every one of the six paths is required, and the test
 	// says which one it took away.
 	blankArg string
+	// noForceFile leaves the allowlist unwritten, which is the state a router whose
+	// operator has not created it yet is in.
+	noForceFile bool
 	// ownPolicy replaces the policy document the harness writes, for the one case
 	// where the document is meant to be something the config package refuses.
 	ownPolicy func(t *testing.T) []byte
@@ -296,6 +310,7 @@ func buildHarness(t *testing.T, configure ...func(*harnessConfig)) (*harness, er
 		forcePath:    filepath.Join(t.TempDir(), "force-ech-domains.txt"),
 		echStatePath: filepath.Join(t.TempDir(), "ech-state.json"),
 		prefixPath:   filepath.Join(t.TempDir(), "cloudflare-prefixes.txt"),
+		started:      time.Now(),
 	}
 	policyContents := policyDocument(t, settings.mutatePolicy)
 	if settings.ownPolicy != nil {
@@ -303,7 +318,9 @@ func buildHarness(t *testing.T, configure ...func(*harnessConfig)) (*harness, er
 	}
 	writeFile(t, h.policyPath, policyContents)
 	writeFile(t, h.selectorPath, selectorDocument(t, settings.selector))
-	writeFile(t, h.forcePath, []byte(settings.forceList))
+	if !settings.noForceFile {
+		writeFile(t, h.forcePath, []byte(settings.forceList))
+	}
 	writeFile(t, h.prefixPath, []byte(settings.prefixes))
 
 	args := Args{
@@ -681,6 +698,17 @@ func selectorWithMapping(hostname, address string) *state.Selector {
 func (h *harness) awaitSelector(t *testing.T, what string, accepted func(state.Selector) bool) {
 	t.Helper()
 	h.waitFor(t, what, func() bool { return accepted(h.plugin.selector.Snapshot()) })
+}
+
+// waitPolls waits for n poll intervals to pass, and fails the test if they do not
+// inside the deadline. It is how a test that asserts a poller did NOT do something
+// reaches a state where it would have: the number of polls is the evidence, and
+// the only way to get it is to let them happen.
+func (h *harness) waitPolls(t *testing.T, n int) {
+	t.Helper()
+	h.waitFor(t, itoa(n)+" poll intervals to pass", func() bool {
+		return time.Since(h.started) >= time.Duration(n)*testPollInterval
+	})
 }
 
 // waitFor polls a condition until it holds, and fails the test when it does not
@@ -1937,6 +1965,44 @@ func (h *harness) loggedRefusal() bool {
 	return h.loggedText("keeping the last valid document")
 }
 
+// countLogged counts the logged entries that name this text, in the message or in
+// any of its rendered fields. A refusal arrives as the error field of a warning, so
+// the message alone would not find it.
+func (h *harness) countLogged(text string) int {
+	count := 0
+	for _, entry := range h.logs.All() {
+		if strings.Contains(entry.Message, text) {
+			count++
+			continue
+		}
+		for _, field := range entry.ContextMap() {
+			if strings.Contains(fmt.Sprint(field), text) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+// loggedPath reports whether a refused reload named this file, which is how a test
+// says WHICH document was refused. A test that only counted log lines would be
+// satisfied by a different watcher's healthy poll, so every refusal assertion in
+// this file names the path the refusal is about.
+func (h *harness) loggedPath(path string) bool {
+	for _, entry := range h.logs.All() {
+		if strings.Contains(entry.Message, path) {
+			return true
+		}
+		for _, field := range entry.ContextMap() {
+			if strings.Contains(fmt.Sprint(field), path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // loggedText reports whether a refused reload named this text, which is how a
 // test checks that the operator is told which line stopped the list. The fields
 // are rendered rather than inspected, because a refusal arrives as the error field
@@ -2268,4 +2334,565 @@ func TestAQueryWithNoSingleQuestionIsRefused(t *testing.T) {
 	if h.next.calls != 0 {
 		t.Fatalf("the downstream sequence ran %d times for a query with two questions, want 0", h.next.calls)
 	}
+}
+
+// --- Fix round 1: the prefix poller, the record, and the CloudFront arm ---
+
+// A poll that succeeds is not an event. The poller runs twice a second for the
+// life of the router, so a handler called on every successful tick writes a line
+// every time, and a line that says "keeping the last valid document" when nothing
+// was refused is not a warning an operator can act on -- it is noise that hides the
+// one time it matters.
+func TestThePrefixPollerLogsNothingWhileItsFileIsReadable(t *testing.T) {
+	h := newHarness(t)
+
+	// Two hundred polls at the test poll interval: at the production default of half
+	// a second that is the same number of seconds this test spends one.
+	h.waitPolls(t, 200)
+
+	if entries := h.logs.All(); len(entries) != 0 {
+		for _, entry := range entries {
+			t.Errorf("a successful poll logged %q", entry.Message)
+		}
+	}
+}
+
+// A poll that succeeds reports nothing, and a refusal that keeps happening is
+// reported once until something changes. Both are decisions the poller makes, so
+// both are decided here where nothing else can be mistaken for them: the
+// integration test above proves the plugin's log is quiet, and this one proves why.
+func TestThePrefixPollerReportsOncePerEpisodeAndNotAtAllOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cloudflare-prefixes.txt")
+	writeFile(t, path, []byte(publishedPrefixes))
+
+	// The handler runs on the poll goroutine, so what it records is read through a
+	// lock: a test that asserted a count of refusals is asserting about two
+	// goroutines, and the race detector is part of this file's gate.
+	var recorded refusalRecorder
+	list, err := newPrefixList(path, time.Millisecond, recorded.record)
+	if err != nil {
+		t.Fatalf("newPrefixList: %v", err)
+	}
+	t.Cleanup(func() { _ = list.Close() })
+
+	h := &harness{started: time.Now()}
+	h.waitPolls(t, 50)
+	if got := recorded.all(); len(got) != 0 {
+		t.Fatalf("fifty successful polls reported %d times, want nothing: %v", len(got), got)
+	}
+
+	// Now break it, and leave it broken.
+	writeFile(t, path, []byte("not-a-prefix\n"))
+	h.waitFor(t, "the first refusal", func() bool { return len(recorded.all()) > 0 })
+	h.waitPolls(t, 50)
+	if got := recorded.all(); len(got) != 1 {
+		t.Fatalf("one continuing episode reported %d times, want 1: %v", len(got), got)
+	}
+
+	// Repair it, which ends the episode, and break it again.
+	writeFile(t, path, []byte(publishedPrefixes))
+	h.waitFor(t, "the repaired list to be served", func() bool { return len(list.Prefixes()) == 2 })
+	writeFile(t, path, []byte("still-not-a-prefix\n"))
+	h.waitFor(t, "the second episode to be reported", func() bool { return len(recorded.all()) > 1 })
+	if got := recorded.all(); len(got) != 2 {
+		t.Fatalf("the second episode reported %d times in total, want 2: %v", len(got), got)
+	}
+}
+
+// refusalRecorder is what a poll's report handler writes into. A nil is recorded
+// rather than dereferenced, so a poller that reports its successes fails a test
+// with a message instead of taking the process down -- which is what a handler
+// assuming it was never handed one would do in production.
+type refusalRecorder struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (r *refusalRecorder) record(failure error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if failure == nil {
+		r.entries = append(r.entries, "<a reload that succeeded>")
+		return
+	}
+	r.entries = append(r.entries, failure.Error())
+}
+
+func (r *refusalRecorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.entries...)
+}
+
+// A refusal that keeps happening is one problem, not two hundred a second, so it
+// is reported once until something changes.
+func TestAContinuingRefusalOfTheRangeListIsReportedOnce(t *testing.T) {
+	h := newHarness(t)
+	writeFile(t, h.prefixPath, []byte("not-a-prefix\n"))
+	h.waitFor(t, "the refusal to be reported", func() bool { return h.loggedText("not-a-prefix") })
+
+	h.waitPolls(t, 100)
+	if got := h.countLogged("not-a-prefix"); got != 1 {
+		t.Fatalf("the same refusal was reported %d times across a hundred polls, want 1", got)
+	}
+}
+
+// A repair ends the episode: a file that breaks again after it was fixed is a new
+// problem and has to be reported again, or an operator who repaired it and then
+// broke it again gets silence.
+func TestARepairedRangeListReportsItsNextRefusalAgain(t *testing.T) {
+	h := newHarness(t)
+	writeFile(t, h.prefixPath, []byte("not-a-prefix\n"))
+	h.waitFor(t, "the first refusal to be reported", func() bool { return h.loggedText("not-a-prefix") })
+
+	writeFile(t, h.prefixPath, []byte(publishedPrefixes))
+	h.waitFor(t, "the list to be served again", func() bool {
+		return len(h.plugin.prefixes.Prefixes()) == 2
+	})
+	writeFile(t, h.prefixPath, []byte("still-not-a-prefix\n"))
+	h.waitFor(t, "the second refusal to be reported", func() bool {
+		return h.loggedText("still-not-a-prefix")
+	})
+}
+
+// The two refusals below are about the selector and the allowlist, so what they
+// assert is that the refusal names THOSE files. A test that only counted log lines
+// would be satisfied by the range list's own healthy poll, which is the trap this
+// pair of assertions exists to close.
+func TestTheSelectorRefusalNamesTheSelectorFile(t *testing.T) {
+	h := newHarness(t)
+	writeFile(t, h.selectorPath, []byte("{ this is not a selector"))
+
+	h.waitFor(t, "the selector refusal", func() bool { return h.loggedPath(h.selectorPath) })
+}
+
+func TestAZeroByteForceECHListNamesTheAllowlistFile(t *testing.T) {
+	h := newHarness(t)
+	writeFile(t, h.forcePath, nil)
+
+	h.waitFor(t, "the allowlist refusal", func() bool { return h.loggedPath(h.forcePath) })
+}
+
+// A rewrite this router refused leaves the name out of the record, so a following
+// IPv6 answer is not suppressed on the strength of a rewrite that never happened.
+// The plan's constraint is "when A is rewritten, suppress AAAA for the same CDN
+// name", and a name whose A answer was left alone has not been rewritten.
+func TestARefusedAddressRewriteDoesNotEarnItsNameAnIPv6Suppression(t *testing.T) {
+	h := newHarness(t)
+	// A Cloudflare answer whose records carry no TTL, which the rewrite refuses:
+	// there is no lifetime to give a replacement.
+	h.next.response = answerWith(cloudflareName, dns.TypeA, aRecord(cloudflareName, cloudflareAddress, 0))
+	h.mustExec(t, cloudflareName, dns.TypeA)
+
+	original := answerWith(cloudflareName, dns.TypeAAAA, aaaaRecord(cloudflareName, "2606:4700::1111", 300))
+	before := mustPack(t, original)
+	h.next.response = original
+
+	response := h.mustExec(t, cloudflareName, dns.TypeAAAA)
+
+	if got := mustPack(t, response); string(got) != string(before) {
+		t.Fatalf("an IPv6 answer was suppressed for a name whose A answer was never rewritten:\n before %s\n after  %s", before, got)
+	}
+}
+
+// --- the CloudFront arm, for a name answered through a CNAME ---
+
+// A per-hostname mapping authorises the QUERY, and a CNAME's terminal addresses
+// are that query's answer. The health check proves the mapping against the queried
+// name's own profile, so the proof and the authorisation are about the same name,
+// and a distribution reached through an alias is exactly what a per-hostname
+// mapping exists for.
+func TestACloudFrontMappingRewritesTheTerminalNameOfAnAliasedAnswer(t *testing.T) {
+	h := newHarness(t)
+	mapped := selectorWithMapping(cloudFrontEntry, cloudFrontWinnerAddress)
+	h.writeSelector(t, mapped)
+	h.awaitSelector(t, "the CloudFront mapping to be published", func(s state.Selector) bool {
+		return s.CloudFront[cloudFrontEntry] == cloudFrontWinnerAddress
+	})
+	upstream := answerWith(cloudFrontName, dns.TypeA,
+		cnameRecord(cloudFrontName, "origin.cdn-vendor.example.", 300),
+		aRecord("origin.cdn-vendor.example.", cloudFrontAddress, 300),
+	)
+	h.next.response = upstream
+
+	response := h.mustExec(t, cloudFrontName, dns.TypeA)
+
+	if got := aAddresses(t, response.Answer); len(got) != 1 || got[0] != cloudFrontWinnerAddress {
+		t.Fatalf("addresses = %v, want the mapping's own address [%s] at the end of the chain", got, cloudFrontWinnerAddress)
+	}
+	if _, ok := response.Answer[0].(*dns.CNAME); !ok {
+		t.Fatalf("the answer's first record is %T, want the CNAME the upstream published: a rewrite replaces addresses, never the chain", response.Answer[0])
+	}
+	// The cached object is untouched, chain included: the plugin replaces
+	// addresses and never a delegation.
+	cached := upstream.Answer[0].(*dns.CNAME)
+	if cached.Target != "origin.cdn-vendor.example." {
+		t.Fatalf("the cached object's CNAME now points at %q", cached.Target)
+	}
+}
+
+// The adjacent hazard, and it is the reason the mapping arm passes the ranges at
+// all: a response the caller's OWN published ranges call Cloudflare-served is not a
+// distribution's, so no per-hostname mapping may claim it. The aliased shape is
+// the one that matters, because the Cloudflare addresses are at the far end of a
+// chain whose first name is the mapped one.
+func TestACloudFrontMappingIsRefusedAChainThatEndsInCloudflareSpace(t *testing.T) {
+	h := newHarness(t)
+	mapped := selectorWithMapping(cloudFrontEntry, cloudFrontWinnerAddress)
+	h.writeSelector(t, mapped)
+	h.awaitSelector(t, "the CloudFront mapping to be published", func(s state.Selector) bool {
+		return s.CloudFront[cloudFrontEntry] == cloudFrontWinnerAddress
+	})
+	original := answerWith(cloudFrontName, dns.TypeA,
+		cnameRecord(cloudFrontName, "origin.cdn-vendor.example.", 300),
+		aRecord("origin.cdn-vendor.example.", cloudflareAddress, 300),
+	)
+	before := mustPack(t, original)
+	h.next.response = original
+
+	response := h.mustExec(t, cloudFrontName, dns.TypeA)
+
+	if got := mustPack(t, response); string(got) != string(before) {
+		t.Fatalf("a Cloudflare-served answer was rewritten through a CloudFront mapping:\n before %s\n after  %s", before, got)
+	}
+}
+
+// The same guard without a chain in front of it: the mapped name is answered
+// directly with addresses the published ranges call Cloudflare's, which is the
+// shape a proxied name has, and no mapping may claim it either.
+func TestACloudFrontMappingIsRefusedADirectCloudflareAnswer(t *testing.T) {
+	h := newHarness(t)
+	mapped := selectorWithMapping(cloudFrontEntry, cloudFrontWinnerAddress)
+	h.writeSelector(t, mapped)
+	h.awaitSelector(t, "the CloudFront mapping to be published", func(s state.Selector) bool {
+		return s.CloudFront[cloudFrontEntry] == cloudFrontWinnerAddress
+	})
+	original := answerWith(cloudFrontName, dns.TypeA, aRecord(cloudFrontName, cloudflareAddress, 300))
+	before := mustPack(t, original)
+	h.next.response = original
+
+	response := h.mustExec(t, cloudFrontName, dns.TypeA)
+
+	if got := mustPack(t, response); string(got) != string(before) {
+		t.Fatalf("a Cloudflare-served answer was rewritten through a CloudFront mapping:\n before %s\n after  %s", before, got)
+	}
+}
+
+// --- the order of an A answer and an IPv6 answer for one name ---
+
+// Suppression of an IPv6 answer depends on the A answer for the same name having
+// been rewritten FIRST, and a browser asking for both at once is the ordinary case
+// rather than the corner one. Whichever the router happens to process first
+// decides, and the half that has no verdict to work from keeps the upstream's own
+// records. This test pins both halves of that property, in the order a client
+// produces them, so the outcome users see is the one the documentation describes.
+func TestAnIPv6AnswerProcessedBeforeItsAAnswerIsNotSuppressed(t *testing.T) {
+	h := newHarness(t)
+
+	// The IPv6 answer first, with no A answer behind it.
+	original := answerWith(cloudflareName, dns.TypeAAAA, aaaaRecord(cloudflareName, "2606:4700::1111", 300))
+	before := mustPack(t, original)
+	h.next.response = original
+	if got := mustPack(t, h.mustExec(t, cloudflareName, dns.TypeAAAA)); string(got) != string(before) {
+		t.Fatalf("an IPv6 answer arrived with no A answer behind it and was suppressed anyway:\n before %s\n after  %s", before, got)
+	}
+
+	// Then the A answer, which is rewritten and earns the suppression.
+	h.next.response = answerWith(cloudflareName, dns.TypeA, aRecord(cloudflareName, cloudflareAddress, 300))
+	if got := aAddresses(t, h.mustExec(t, cloudflareName, dns.TypeA).Answer); len(got) != 1 || got[0] != winnerAddress {
+		t.Fatalf("addresses = %v, want [%s]", got, winnerAddress)
+	}
+
+	// And the next IPv6 answer for the same name is emptied.
+	h.next.response = answerWith(cloudflareName, dns.TypeAAAA, aaaaRecord(cloudflareName, "2606:4700::1111", 300))
+	if got := len(h.mustExec(t, cloudflareName, dns.TypeAAAA).Answer); got != 0 {
+		t.Fatalf("the IPv6 answer carries %d records after its A answer was rewritten, want 0", got)
+	}
+}
+
+// A missing allowlist is an inert router, not a broken one -- and it is said out
+// loud, because an operator who believes they are forcing ECH for a domain is
+// otherwise getting nothing and no reason. This is the documented contrast with the
+// range list, which refuses to start instead: a missing allowlist claims no domain
+// the operator did not list, while a missing range list stops every rewrite in the
+// router without saying so.
+func TestAMissingForceECHListStartsThePluginAndSaysTheListIsNotThere(t *testing.T) {
+	h, err := buildHarness(t, func(c *harnessConfig) { c.noForceFile = true })
+	if err != nil {
+		t.Fatalf("a plugin whose allowlist is absent refused to start, want it to start with an empty list: %v", err)
+	}
+	if !h.loggedPath(h.forcePath) {
+		t.Fatal("the absent allowlist was not reported, so an operator forcing ECH for a domain has no reason to think the list is missing")
+	}
+	// And the router serves: a name nobody listed is answered by the ordinary path.
+	h.next.response = answerWith(cloudflareName, dns.TypeA, aRecord(cloudflareName, cloudflareAddress, 300))
+	if got := aAddresses(t, h.mustExec(t, cloudflareName, dns.TypeA).Answer); len(got) != 1 || got[0] != winnerAddress {
+		t.Fatalf("addresses = %v, want the ordinary path to keep serving [%s]", got, winnerAddress)
+	}
+}
+
+// A live selector that publishes no winner is a state the optimizer really does
+// produce -- a CloudFront-only first apply leaves the global group with nothing in
+// it -- so the plugin must not read an empty winner as an address to install.
+func TestALiveSelectorWithNoWinnerIPInstallsNothing(t *testing.T) {
+	h := newHarness(t)
+	h.plugin.selector = fixedSelector{state.Selector{
+		SchemaVersion: state.SchemaVersion,
+		Generation:    11,
+		Mode:          "auto",
+		Provider:      string(candidate.ProviderCloudflare),
+		LastSuccess:   h.now,
+	}}
+	original := answerWith(cloudflareName, dns.TypeA, aRecord(cloudflareName, cloudflareAddress, 300))
+	before := mustPack(t, original)
+	h.next.response = original
+
+	response := h.mustExec(t, cloudflareName, dns.TypeA)
+
+	if got := mustPack(t, response); string(got) != string(before) {
+		t.Fatalf("a selector with no winner installed an address:\n before %s\n after  %s", before, got)
+	}
+}
+
+// --- Fix round 1: the cold race, and the document that froze ---
+
+// The first pair of force-ECH HTTPS queries after a boot is the case the
+// single-flight exists for, and it is a pair: a browser's tab asks for several
+// names at once, and each of them needs the key. One of them fetches; the others
+// wait. What they must all get is the key that was fetched -- a caller that lost
+// the race and returned its own error would SERVFAIL a strict name for no reason at
+// all, on the first page load after a restart, intermittently.
+//
+// The origin's request count is the assertion that matters, because "nobody
+// errored" alone would also be true of an implementation that let every caller
+// fetch.
+func TestTheFirstConcurrentCallersShareOneFetchAndAllGetTheKey(t *testing.T) {
+	const callers = 8
+	h := newHarness(t)
+	// The answer blocks until the test releases it, so the fetch is still running
+	// while the other callers arrive and queue behind it. The assertion does not
+	// depend on that: a caller arriving after the fetch finds a fresh key at the
+	// top and fetches nothing either, so exactly one request is the only possible
+	// outcome and the count is what proves it. The block is here to make the
+	// interesting interleaving the likely one.
+	release := make(chan struct{})
+	h.upstream.setAnswer(func(question dns.Question) (*dns.Msg, error) {
+		<-release
+		return answerWithECH(echFixture(t), 300)(question)
+	})
+
+	type outcome struct {
+		key []byte
+		err error
+	}
+	results := make([]outcome, callers)
+	var group, ready sync.WaitGroup
+	group.Add(callers)
+	ready.Add(callers)
+	for index := range callers {
+		go func(index int) {
+			defer group.Done()
+			ready.Done()
+			results[index].key, results[index].err = h.plugin.ech.Config(t.Context())
+		}(index)
+	}
+	ready.Wait()
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	group.Wait()
+
+	if asked := h.upstream.asked(); len(asked) != 1 {
+		t.Fatalf("the source was asked %d times by %d concurrent callers, want 1: %+v", len(asked), callers, asked)
+	}
+	for index, result := range results {
+		if result.err != nil {
+			t.Fatalf("caller %d got the error %v, want the key the shared fetch published", index, result.err)
+		}
+		if string(result.key) != string(echFixture(t)) {
+			t.Fatalf("caller %d got %d bytes, want the %d bytes the source published", index, len(result.key), len(echFixture(t)))
+		}
+	}
+}
+
+// The same race one lifetime later, which is the quieter half of the same defect:
+// a caller whose key is past its grace gets ErrECHExpired if another caller's
+// refresh has already stored a new one, and a strict name then fails closed over a
+// key that is sitting right there.
+func TestACallerPastTheGraceIsServedByAConcurrentRefresh(t *testing.T) {
+	const callers = 4
+	h := newHarness(t, func(c *harnessConfig) {
+		c.echAnswer = answerWithECH(echFixture(t), 300)
+		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
+	})
+	// One key, fetched, and then a clock past its grace: the next caller has to
+	// fetch, and the one after it has to wait.
+	h.next.response = theHTTPSIn(t, forceECHName)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+	h.now = h.now.Add(300*time.Second + 901*time.Second)
+
+	release := make(chan struct{})
+	h.upstream.setAnswer(func(question dns.Question) (*dns.Msg, error) {
+		<-release
+		return answerWithECH(echFixture(t), 300)(question)
+	})
+
+	type outcome struct {
+		key []byte
+		err error
+	}
+	results := make([]outcome, callers)
+	var group sync.WaitGroup
+	group.Add(callers)
+	for index := range callers {
+		go func(index int) {
+			defer group.Done()
+			results[index].key, results[index].err = h.plugin.ech.Config(t.Context())
+		}(index)
+	}
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	group.Wait()
+
+	if asked := h.upstream.asked(); len(asked) != 2 {
+		t.Fatalf("the source was asked %d times, want 2: one for the key already fetched and one for the refresh", len(asked))
+	}
+	for index, result := range results {
+		if result.err != nil {
+			t.Fatalf("caller %d got the error %v, want the key a concurrent refresh published", index, result.err)
+		}
+		if string(result.key) != string(echFixture(t)) {
+			t.Fatalf("caller %d got %d bytes, want a usable key", index, len(result.key))
+		}
+	}
+}
+
+// The metadata document is what an operator and `mosdns-cdnctl status` read, so it
+// has to describe the key in service. A refresh that moved the times has to write
+// them: a file whose expiry is in the past while the router is serving a newer key
+// tells the reader the opposite of the truth, and the digest in it names a key that
+// is not the one being installed.
+func TestARefreshThatMovedTheTimesIsPublished(t *testing.T) {
+	h := newHarness(t, func(c *harnessConfig) {
+		c.echAnswer = answerWithECH(echFixture(t), 300)
+		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
+	})
+	h.next.response = theHTTPSIn(t, forceECHName)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+
+	first := readECHState(t, h.echStatePath)
+	if first.Generation != 1 {
+		t.Fatalf("the first document carries generation %d, want 1", first.Generation)
+	}
+
+	// Past the published lifetime, so the next query refreshes.
+	h.now = h.now.Add(301 * time.Second)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+
+	second := readECHState(t, h.echStatePath)
+	if want := time.Date(2026, 9, 25, 12, 5, 1, 0, time.UTC); !second.FetchedAt.Equal(want) {
+		t.Fatalf("fetched_at = %s, want the second fetch's own clock reading %s", second.FetchedAt, want)
+	}
+	if want := time.Date(2026, 9, 25, 12, 10, 1, 0, time.UTC); !second.ExpiresAt.Equal(want) {
+		t.Fatalf("expires_at = %s, want the second fetch plus its 300 second lifetime, %s", second.ExpiresAt, want)
+	}
+	if second.Generation != 2 {
+		t.Fatalf("generation = %d, want 2: the document on disk has to be the second fetch's", second.Generation)
+	}
+	if second.Status != "fresh" {
+		t.Fatalf("status = %q, want fresh", second.Status)
+	}
+}
+
+// The other half of what has to be published: a refresh that changed the KEY, not
+// only the clock. An operator comparing two digests is how they tell a rotated key
+// from a re-fetch of the same one, and a document that keeps the first digest after
+// a rotation says the key has not changed when it has.
+func TestARefreshThatChangedTheKeyIsPublished(t *testing.T) {
+	h := newHarness(t, func(c *harnessConfig) {
+		c.echAnswer = answerWithECH(echFixture(t), 300)
+		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
+	})
+	h.next.response = theHTTPSIn(t, forceECHName)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+	first := readECHState(t, h.echStatePath)
+
+	// The source rotates its key. The public name moves with it, because a client
+	// authenticates the name inside the config.
+	rotated := echFixtureFor(t, "rotated-ech.example.com")
+	h.upstream.setAnswer(answerWithECH(rotated, 300))
+	h.now = h.now.Add(301 * time.Second)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+
+	second := readECHState(t, h.echStatePath)
+	digest := sha256.Sum256(rotated)
+	if second.ConfigSHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("config_sha256 = %q, want the digest of the rotated key %q", second.ConfigSHA256, hex.EncodeToString(digest[:]))
+	}
+	if second.ConfigSHA256 == first.ConfigSHA256 {
+		t.Fatal("the document still carries the first key's digest after the source rotated it")
+	}
+	if second.PublicName != "rotated-ech.example.com" {
+		t.Fatalf("public_name = %q, want the rotated key's own public name", second.PublicName)
+	}
+}
+
+// Two callers can be inside the write with different snapshots, and only the newer
+// one may be what is on disk. The race itself is not reproducible on demand, so
+// this pins the rule rather than the interleaving: publish an older snapshot over a
+// newer one and assert the document still describes the key in service. It is a
+// white-box test for that reason, and it is worth one: without the rule the loser is
+// saved only by the state writer refusing a rollback, which logs a warning rather
+// than deciding anything.
+func TestAnOlderSnapshotIsNotPublishedOverANewerOne(t *testing.T) {
+	h := newHarness(t)
+	newer := echConfig{
+		raw:        echFixture(t),
+		source:     "cloudflare-ech.com",
+		publicName: "cloudflare-ech.com",
+		digest:     digestOf(echFixture(t)),
+		fetchedAt:  h.now,
+		expiresAt:  h.now.Add(300 * time.Second),
+		staleUntil: h.now.Add(300*time.Second + 900*time.Second),
+		generation: 2,
+	}
+	older := newer
+	older.generation = 1
+	older.digest = digestOf(echFixtureFor(t, "an-older-key.example.com"))
+
+	h.plugin.ech.publish(echStatusFresh, newer)
+	h.plugin.ech.publish(echStatusFresh, older)
+
+	document := readECHState(t, h.echStatePath)
+	if document.Generation != 2 {
+		t.Fatalf("generation on disk = %d, want 2: an older snapshot replaced the key in service", document.Generation)
+	}
+	if document.ConfigSHA256 != newer.digest {
+		t.Fatalf("config_sha256 on disk = %q, want the newer key's digest %q", document.ConfigSHA256, newer.digest)
+	}
+	// And the decision was MADE here rather than left to the state writer, which
+	// refuses a generation rollback and would leave the right bytes on disk while
+	// logging a warning about a write that should never have been attempted. The
+	// document being right is not enough to tell the two apart; the silence is.
+	if got := h.countLogged("could not be written"); got != 0 {
+		t.Fatalf("the older snapshot was attempted and refused %d times, want the rule to have dropped it before the write", got)
+	}
+}
+
+// digestOf is the digest of a list as the provider records it, so the fixtures
+// above and the provider agree without either of them re-deriving the other's rule.
+func digestOf(raw []byte) string {
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}
+
+// readECHState reads the document this plugin publishes, through the same reader
+// the rest of the project uses.
+func readECHState(t *testing.T, path string) state.ECHState {
+	t.Helper()
+	var document state.ECHState
+	if err := state.ReadJSON(path, &document); err != nil {
+		t.Fatalf("read the ECH state document: %v", err)
+	}
+	return document
 }
