@@ -477,6 +477,23 @@ type testRunner struct {
 	lockPath     string
 }
 
+// tickingClock is a clock that advances a millisecond every reading, which is what
+// makes a phase boundary assertion mean something: under a frozen clock every
+// stamp is the same instant and an ordering assertion over them is vacuous.
+type tickingClock struct {
+	mutex  sync.Mutex
+	origin time.Time
+	reads  int
+}
+
+func (c *tickingClock) now() time.Time {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	moment := c.origin.Add(time.Duration(c.reads) * time.Millisecond)
+	c.reads++
+	return moment
+}
+
 // newTestRunner builds a runner over a temporary directory, so nothing here can
 // reach /var/lib, and fails the test if it cannot be built.
 func newTestRunner(t *testing.T, prober Prober, tune ...func(*runnerTuning)) *testRunner {
@@ -565,6 +582,13 @@ func assertPhasesInOrder(t *testing.T, kinds []string) {
 // assertPhaseStamps fails the test when a phase boundary is missing or out of
 // order. The labels are the report's own field names, so a failure says which
 // boundary is wrong rather than that "a timestamp" is wrong.
+//
+// It is corroboration and not the proof of the phase order: under the frozen clock
+// the other cases use, every boundary is the same instant, so what this checks here
+// is that the fields are present and not out of order.
+// TestRunnerStampsEachPhaseBoundaryFromTheClockAtTheMoment is the case that gives
+// the check something to chew on, and assertPhasesInOrder - the prober's own call
+// log - is what actually proves the order.
 func assertPhaseStamps(t *testing.T, phases PhaseTimes) {
 	t.Helper()
 	for _, bound := range labelledPhases(phases)[:12] {
@@ -2788,5 +2812,116 @@ func TestReadReportRefusesTheDocumentsItCannotApply(t *testing.T) {
 				t.Fatalf("ReadReport of a report with %s returned %v, want %v", name, err, ErrInvalidReport)
 			}
 		})
+	}
+}
+
+func TestRunnerStampsEachPhaseBoundaryFromTheClockAtTheMoment(t *testing.T) {
+	// The report's phase boundaries are only worth carrying if each one is a reading
+	// taken when the phase happened. A run that stamped all of them with one reading
+	// would produce a document whose fourteen boundaries are the same instant, and an
+	// ordering check over them would be checking nothing.
+	//
+	// The clock here advances a millisecond per reading, so every boundary is a
+	// distinct literal. Under the frozen clock the other cases use, all of them are
+	// equal and this assertion would be vacuous - which is exactly why this case
+	// exists.
+	clock := &tickingClock{origin: runnerNow}
+	fixtures, candidates := threeGlobals()
+	report, err := newTestRunner(t, newFakeProber(fixtures), func(tuning *runnerTuning) {
+		tuning.options.Now = clock.now
+	}).Run(t.Context(), Input{
+		Cloudflare:         candidates,
+		CloudflareProfiles: []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// One reading dates the run, and then one per boundary: collect, TCP, identity,
+	// latency, bandwidth and score, two each, in that order.
+	want := []struct {
+		name  string
+		value time.Time
+	}{
+		{"generated_at", runnerNow},
+		{"collect.started_at", runnerNow.Add(1 * time.Millisecond)},
+		{"collect.ended_at", runnerNow.Add(2 * time.Millisecond)},
+		{"tcp.started_at", runnerNow.Add(3 * time.Millisecond)},
+		{"tcp.ended_at", runnerNow.Add(4 * time.Millisecond)},
+		{"identity.started_at", runnerNow.Add(5 * time.Millisecond)},
+		{"identity.ended_at", runnerNow.Add(6 * time.Millisecond)},
+		{"latency.started_at", runnerNow.Add(7 * time.Millisecond)},
+		{"latency.ended_at", runnerNow.Add(8 * time.Millisecond)},
+		{"bandwidth.started_at", runnerNow.Add(9 * time.Millisecond)},
+		{"bandwidth.ended_at", runnerNow.Add(10 * time.Millisecond)},
+		{"score.started_at", runnerNow.Add(11 * time.Millisecond)},
+		{"score.ended_at", runnerNow.Add(12 * time.Millisecond)},
+	}
+	if !report.GeneratedAt.Equal(want[0].value) {
+		t.Errorf("generated_at is %s, want %s: one reading dates the run", report.GeneratedAt, want[0].value)
+	}
+	got := labelledPhases(report.Phases)
+	for index, bound := range want[1:] {
+		if got[index].value.IsZero() {
+			t.Fatalf("the report has no %s", bound.name)
+		}
+		if !got[index].value.Equal(bound.value) {
+			t.Errorf("%s is %s, want %s: every boundary is its own reading of the clock",
+				bound.name, got[index].value.Format(time.RFC3339Nano), bound.value.Format(time.RFC3339Nano))
+		}
+	}
+}
+
+func TestApplyStampsTheFinalProofFromTheClockAtTheMoment(t *testing.T) {
+	// The seventh phase is the apply's, and its boundaries are read the same way. A
+	// proof that started at one instant and ended at another is what says the lock
+	// was held for a while, which is the number an operator needs when a health
+	// check times out behind an apply - and a pair of equal stamps would say the
+	// hold was instantaneous whatever it was.
+	//
+	// The exact offsets are not asserted here: how many times an apply reads the
+	// clock before the proof is its own business, and a test that pinned it would
+	// break for a change that improved nothing. What is asserted is the ordering the
+	// report exists to carry.
+	clock := &tickingClock{origin: runnerNow}
+	fixtures, candidates := threeGlobals()
+	runner := newTestRunner(t, newFakeProber(fixtures), func(tuning *runnerTuning) {
+		tuning.options.Now = clock.now
+	})
+	report, err := runner.Run(t.Context(), Input{
+		Cloudflare:         candidates,
+		CloudflareProfiles: []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	applied, published, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	proof := applied.Phases.FinalProof
+	if proof.StartedAt.IsZero() || proof.EndedAt.IsZero() {
+		t.Fatalf("the applied report has no final proof boundaries: %+v", proof)
+	}
+	if !proof.StartedAt.After(report.Phases.Score.EndedAt) {
+		t.Errorf("the final proof starts at %s, which is not after the score phase ended at %s: the seventh phase is the last one",
+			proof.StartedAt, report.Phases.Score.EndedAt)
+	}
+	if !proof.EndedAt.After(proof.StartedAt) {
+		t.Errorf("the final proof ends at %s and starts at %s, so its two boundaries are one reading of the clock",
+			proof.EndedAt, proof.StartedAt)
+	}
+	// The whole stamped sequence, the run's six phases and then the apply's, is
+	// strictly increasing: that is the property a reader takes from the document.
+	ordered := append(labelledPhases(report.Phases)[:12], labelledPhases(applied.Phases)[12:]...)
+	for index := 1; index < len(ordered); index++ {
+		if !ordered[index].value.After(ordered[index-1].value) {
+			t.Fatalf("%s (%s) is not after %s (%s): the stamped sequence is not increasing",
+				ordered[index].name, ordered[index].value.Format(time.RFC3339Nano),
+				ordered[index-1].name, ordered[index-1].value.Format(time.RFC3339Nano))
+		}
+	}
+	if !published.LastSuccess.After(proof.EndedAt) {
+		t.Errorf("the published selector records success at %s, which is not after the proof ended at %s",
+			published.LastSuccess, proof.EndedAt)
 	}
 }

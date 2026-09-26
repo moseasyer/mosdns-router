@@ -165,6 +165,11 @@ const ReportSchemaVersion = 1
 // is refused rather than published. The refusal is not a dead end: `test --apply`
 // re-runs the whole measurement in one invocation, so an operator who wants a
 // fresh report is never stuck with yesterday's.
+//
+// The age is measured from generated_at, which is when the run *started*, so a
+// report's own measurement time counts against it: a run that took an hour is
+// applied with an hour and one minute less than the two it had left. That is the
+// stricter direction, so it stands.
 const MaxReportAge = 2 * time.Hour
 
 // WinnerProofTTL is how long a published winner's proof is good for.
@@ -501,9 +506,12 @@ type Report struct {
 	// measure, and why. A winner this build cannot even take a candidate for is
 	// a winner the operator has to know about.
 	SkippedRetained []string `json:"skipped_retained,omitempty"`
-	// Phases is when each phase of the run started and ended. It is the run's own
-	// account of the order it ran in, and an apply reads it as part of validating
-	// the document.
+	// Phases is when each phase of the run started and ended, each boundary read
+	// from the clock where the phase happened, so the document is an account of how
+	// long each phase took as well as of the order they ran in. It is corroboration
+	// and not the proof of the order: the proof is the order the runner called the
+	// prober in, which a clock cannot show. An apply reads the boundaries as part of
+	// validating the document.
 	Phases PhaseTimes `json:"phases"`
 	// FinalProofPassed is true once the winner has been proved again under the
 	// control lock. A report read back from disk never has it, which is exactly
@@ -610,9 +618,14 @@ type PhaseBound struct {
 }
 
 // PhaseTimes is the run's own account of its order, one entry per documented
-// phase. The seven phases run in the order the fields are declared, and a report
-// whose stamps are not in that order is refused: a run that claims to have
-// measured speed before it proved identity is describing something it did not do.
+// phase, each boundary a reading of the clock taken where the phase happened. The
+// seven phases run in the order the fields are declared, and a report whose stamps
+// are not in that order is refused: a run that claims to have measured speed before
+// it proved identity is describing something it did not do.
+//
+// A phase that never ran carries two zero times, which is how a partial report says
+// where it stopped. The stamps order the phases that were recorded; they cannot
+// show that a phase happened, which is what the runner's own call order is for.
 type PhaseTimes struct {
 	Collect    PhaseBound `json:"collect"`
 	TCP        PhaseBound `json:"tcp"`
@@ -1372,10 +1385,10 @@ func (r *Runner) holdControlLock() (*filelock.Lock, state.Selector, error) {
 // the part of the report it did produce together with the error, so an operator
 // can see how far it got.
 func (r *Runner) Run(ctx context.Context, input Input) (Report, error) {
-	run := &runState{runner: r, input: input, now: r.now()}
+	run := &runState{runner: r, input: input, startedAt: r.now()}
 	run.report = Report{
 		SchemaVersion: ReportSchemaVersion,
-		GeneratedAt:   run.now.UTC(),
+		GeneratedAt:   run.startedAt.UTC(),
 		PolicySHA256:  r.options.ConfigSHA256,
 		ConfigSHA256:  r.options.ConfigSHA256,
 		Stale:         input.Stale,
@@ -1385,7 +1398,7 @@ func (r *Runner) Run(ctx context.Context, input Input) (Report, error) {
 	// lives in this value rather than in the document, so a second Budget over
 	// the same document mid-run would refuse every settle and leave the day
 	// charged for transfers that were handed back.
-	budget, err := NewPersistentBudget(r.options.BudgetPath, r.policy.CDN.Bandwidth.DailyBytes, r.options.Location, run.now)
+	budget, err := NewPersistentBudget(r.options.BudgetPath, r.policy.CDN.Bandwidth.DailyBytes, r.options.Location, run.startedAt)
 	if err != nil {
 		return run.report, err
 	}
@@ -1427,8 +1440,12 @@ func (r *Runner) now() time.Time {
 type runState struct {
 	runner *Runner
 	input  Input
-	now    time.Time
-	report Report
+	// startedAt is the one reading that dates the run: the report's generated_at and
+	// the local date the budget is charged to both come from it, so a run cannot
+	// straddle two days and split its spending between them. Every phase boundary is
+	// a separate reading - see stamp.
+	startedAt time.Time
+	report    Report
 
 	// groups is every group this run measures, in the order the report lists
 	// them, and current is the group a phase is working on.
@@ -1444,6 +1461,22 @@ type runState struct {
 	// bandwidth phase sets it from whichever probe hit the cap first and reads it
 	// from the ones still waiting to start.
 	exhausted atomic.Bool
+}
+
+// stamp is one reading of the clock, taken where a phase boundary happens.
+//
+// It is a call and not a field for the reason the report carries the boundaries at
+// all: a run that stamped all twelve of them with the reading it already had would
+// produce a document whose boundaries are one instant, and both a reader and
+// validatePhases would have nothing to order. Read at the moment, the fourteen
+// stamps are an actual account of how long each phase took and in what order they
+// happened.
+//
+// It is corroboration, not the proof of the phase order. The proof is the order
+// the runner calls the prober in, which the prober itself sees; a clock cannot show
+// that a phase did not happen, only that the ones that were stamped are in order.
+func (run *runState) stamp() time.Time {
+	return run.runner.now()
 }
 
 // measuredGroup is one group's candidates, its identity profile, and what has
@@ -1499,10 +1532,10 @@ type measurement struct {
 // a run that collects a mixed group has already made the mistake the scorer
 // refuses to fix afterwards.
 func (run *runState) collect() error {
-	run.report.Phases.Collect.StartedAt = run.now
+	run.report.Phases.Collect.StartedAt = run.stamp()
 	groups, err := run.collectGroups()
 	run.groups = groups
-	run.report.Phases.Collect.EndedAt = run.now
+	run.report.Phases.Collect.EndedAt = run.stamp()
 	return err
 }
 
@@ -1696,7 +1729,7 @@ func combineForGroup(runner *Runner, subjects []candidate.Candidate) ([]candidat
 // sample, and the scorer refuses it for that on its own: a p50 of zero would
 // otherwise make an address nothing answered the fastest in the group.
 func (run *runState) measureConnect(ctx context.Context) error {
-	run.report.Phases.TCP.StartedAt = run.now
+	run.report.Phases.TCP.StartedAt = run.stamp()
 	err := run.forEachCandidate(ctx, connectConcurrency, func(ctx context.Context, group *measuredGroup, index int) error {
 		// A group that cannot be identified has no port to aim at, and dialling
 		// port zero would measure nothing for a candidate the identity gate is
@@ -1714,7 +1747,7 @@ func (run *runState) measureConnect(ctx context.Context) error {
 		group.measurements[index].tcpErr = err
 		return nil
 	})
-	run.report.Phases.TCP.EndedAt = run.now
+	run.report.Phases.TCP.EndedAt = run.stamp()
 	return err
 }
 
@@ -1729,7 +1762,7 @@ func (run *runState) measureConnect(ctx context.Context) error {
 // idiomatic "metrics, err := HTTPS(...); if err != nil { continue }" throws that
 // record away.
 func (run *runState) proveIdentity(ctx context.Context) error {
-	run.report.Phases.Identity.StartedAt = run.now
+	run.report.Phases.Identity.StartedAt = run.stamp()
 	err := run.forEachCandidate(ctx, identityConcurrency, func(ctx context.Context, group *measuredGroup, index int) error {
 		subject := group.order[index]
 		found := group.measurements[index]
@@ -1771,7 +1804,7 @@ func (run *runState) proveIdentity(ctx context.Context) error {
 			}
 		}
 	}
-	run.report.Phases.Identity.EndedAt = run.now
+	run.report.Phases.Identity.EndedAt = run.stamp()
 	return err
 }
 
@@ -1779,14 +1812,14 @@ func (run *runState) proveIdentity(ctx context.Context) error {
 // the group, by the scorer's own ranking and under the same ceilings. It opens no
 // socket, and it is where the run decides which candidates are worth a transfer.
 func (run *runState) shortlistByLatency() error {
-	run.report.Phases.Latency.StartedAt = run.now
+	run.report.Phases.Latency.StartedAt = run.stamp()
 	for _, group := range run.groups {
 		// The ranking reads the connect measurement only, which is all this phase
 		// has: a transfer is exactly what the shortlist decides whether to spend.
 		ranking := RankLatency(group.provedResults(false), run.runner.params.LatencyCandidates, run.runner.params.Limits)
 		group.shortlist = group.shortlistFrom(ranking.Ranked)
 	}
-	run.report.Phases.Latency.EndedAt = run.now
+	run.report.Phases.Latency.EndedAt = run.stamp()
 	return nil
 }
 
@@ -1835,7 +1868,7 @@ func (g *measuredGroup) shortlistFrom(ranked []CandidateResult) []int {
 // winner is allowed to switch: a run that could not afford to measure does not
 // get to change the address in service.
 func (run *runState) measureBandwidth(ctx context.Context) error {
-	run.report.Phases.Bandwidth.StartedAt = run.now
+	run.report.Phases.Bandwidth.StartedAt = run.stamp()
 	err := run.forEachShortlisted(ctx, downloadConcurrency, func(ctx context.Context, group *measuredGroup, index int) error {
 		// A transfer that has not started has not spent anything, so a day that is
 		// already full costs this run one refused reservation rather than one
@@ -1859,18 +1892,18 @@ func (run *runState) measureBandwidth(ctx context.Context) error {
 		}
 		return nil
 	})
-	run.report.Phases.Bandwidth.EndedAt = run.now
+	run.report.Phases.Bandwidth.EndedAt = run.stamp()
 	return err
 }
 
 // score is the scoring phase: the scorer's whole per-group decision, once per
 // group, over the candidates that passed the identity gate and nothing else.
 func (run *runState) score() {
-	run.report.Phases.Score.StartedAt = run.now
+	run.report.Phases.Score.StartedAt = run.stamp()
 	for _, group := range run.groups {
 		run.scoreGroup(group)
 	}
-	run.report.Phases.Score.EndedAt = run.now
+	run.report.Phases.Score.EndedAt = run.stamp()
 }
 
 // scoreGroup runs one group's selection and records it, including the winner and
