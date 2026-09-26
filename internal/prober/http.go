@@ -52,13 +52,17 @@ const (
 	// a run that cannot prove its candidates should still be able to measure the
 	// ten it proved. The cost of that decision is that identity bytes are bytes
 	// the budget does not know about, and the size of that exposure is this
-	// constant times the number of candidates probed. Sixty-four kilobytes is
-	// chosen because it is two orders of magnitude above any error page, redirect
-	// body, or small object a profile would name as its identity, and because at
-	// 512 candidates it puts the worst case at 32 MiB against a 100 MiB daily
-	// budget rather than the 512 MiB a megabyte cap allowed. Raising it is a
-	// deliberate act: the exposure grows with it, and HTTPMetrics.BodyBytes is how
-	// a run accounts for what it actually spent.
+	// constant times the number of candidates probed.
+	//
+	// Sixty-four kilobytes is chosen against the two things it has to clear: a
+	// profile's identity document, which is a small object and comfortably under
+	// it, and a hostile one, which is stopped at the cap whatever it is. Measured
+	// against the largest error page a CDN serves in practice, a few kilobytes, it
+	// is an order of magnitude of headroom rather than two, which is the margin it
+	// actually has. At 512 candidates that puts the worst case at 32 MiB against a
+	// 100 MiB daily budget, rather than the 512 MiB a megabyte cap allowed.
+	// Raising it is a deliberate act: the exposure grows with it, and
+	// HTTPMetrics.BodyBytes is how a run accounts for what it actually spent.
 	DefaultMaxIdentityBodyBytes = 64 << 10
 )
 

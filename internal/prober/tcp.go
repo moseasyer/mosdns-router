@@ -78,18 +78,13 @@ func (o Options) withDefaults() Options {
 // and the only way to set it is newProber, which is not exported, so a production
 // caller cannot reach it at all: production identity proofs are verified against
 // the host's own roots, and a test in this package can prove the difference
-// between a chain those roots carry and one they do not. anchors() is the single
-// place the value leaves this struct, so the whole of the trust decision is one
-// reviewed file and one method.
+// between a chain those roots carry and one they do not. clientConfig below is the
+// only reader of the value and the only place the trust decision is expressed, so
+// the whole of it is one reviewed file and one method.
 type probeOptions struct {
 	// RootCAs overrides the trust anchors, for a test that must verify a chain
 	// the host's roots cannot know about. A nil value means the system roots.
 	RootCAs *x509.CertPool
-}
-
-// anchors are the trust roots an identity proof is verified against.
-func (o probeOptions) anchors() *x509.CertPool {
-	return o.RootCAs
 }
 
 // clientConfig is the TLS configuration every identity proof is verified with.
