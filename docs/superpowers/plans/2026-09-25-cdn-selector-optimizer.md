@@ -27,6 +27,7 @@
 - A fast TCP handshake must not make an IP eligible without Host/SNI/certificate validation.
 - A download that reaches 10 MiB in one second and one that takes three seconds must both count as consumed bytes.
 - The eleventh download must be rejected when 100 MiB are already consumed.
+- **Identity probes are deliberately outside the budget, so their body bytes are the one uncharged egress the report must account for: `prober.HTTPMetrics.BodyBytes` counts them per probe and a run sums them and shows the operator the uncharged identity total. The exposure is `prober.DefaultMaxIdentityBodyBytes` times the number of candidates proved.**
 - A CloudFront winner validated for one hostname must never be copied to another hostname.
 - Corrupt selector state must not be overwritten by a failed test or pin operation.
 - A run that cannot refresh the official ranges must not silently measure nothing. **Decision (Task 1):** the

@@ -76,6 +76,17 @@ type HTTPMetrics struct {
 	// x-amz-cf-pop and cf-ray the response carried. It is a label for the report
 	// and is never an input to eligibility, because the host under test writes it.
 	Colocation string
+	// BodyBytes is how many body bytes this probe read, and it is the one number
+	// here that is not a measurement of the candidate.
+	//
+	// An identity probe is deliberately not charged to the daily budget, so
+	// nothing on disk records the body bytes a run spent proving identity. This
+	// field is that record: a caller sums it across the run's probes and shows the
+	// operator what the uncharged identity traffic was, instead of leaving it as a
+	// surprise in the operator's data allowance. It is reported even when the probe
+	// is refused, because bytes that crossed the network are spent whether or not
+	// the proof succeeded.
+	BodyBytes int64
 }
 
 // DownloadMetrics is what one address actually delivered, and what it cost.

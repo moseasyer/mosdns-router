@@ -923,6 +923,103 @@ func TestAProberWithNoOptionsStillBoundsItsMeasurements(t *testing.T) {
 	})
 }
 
+// TestHTTPSReportsTheIdentityBytesItRead is about the exposure the review found
+// unmeasured. An identity probe is deliberately not charged to the daily budget,
+// so the bytes it reads are bytes the budget does not know about. That is a
+// deliberate trade (see DefaultMaxIdentityBodyBytes), not an oversight, and a
+// trade nobody counts is a surprise waiting for the next run. Every body byte the
+// probe reads is reported, so a run can add the probes up and show the operator
+// what the identity checks cost.
+func TestHTTPSReportsTheIdentityBytesItRead(t *testing.T) {
+	authority := newTestAuthority(t)
+	server, _ := mustIdentityServer(t, authority, profileHostname, identityHandler)
+	measure, _ := mustProberFor(t, authority, server)
+	profile := identityProfile(t, server, profileHostname, []int{http.StatusOK})
+
+	metrics, err := measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
+	if err != nil {
+		t.Fatalf("prove a profile: %v", err)
+	}
+	if metrics.BodyBytes != int64(len(identityBody)) {
+		t.Errorf("BodyBytes = %d, want the %d the body carried", metrics.BodyBytes, len(identityBody))
+	}
+}
+
+func TestHTTPSReadsNoBodyForAProfileThatClaimsNothing(t *testing.T) {
+	// A profile with no digest makes no claim about the body, so the probe reads
+	// no body at all. This is the mitigation that makes the exposure small: most
+	// profiles need no digest, and the ones that do name a small document.
+	authority := newTestAuthority(t)
+	server, _ := mustIdentityServer(t, authority, profileHostname, payloadHandler(strings.Repeat("d", 4096)))
+	measure, _ := mustProberFor(t, authority, server)
+	profile := identityProfile(t, server, profileHostname, []int{http.StatusOK})
+	profile.BodySHA256 = ""
+
+	metrics, err := measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
+	if err != nil {
+		t.Fatalf("prove a profile with no body claim: %v", err)
+	}
+	if metrics.BodyBytes != 0 {
+		t.Errorf("BodyBytes = %d for a profile that claims nothing about the body, want 0", metrics.BodyBytes)
+	}
+}
+
+func TestHTTPSReportsTheUnchargedBytesItRefusedToKeepReading(t *testing.T) {
+	// A body past the cap is refused, and the refusal still has to say how much was
+	// read: those bytes crossed the network, they are not on the budget, and
+	// leaving them uncounted is the exact silence this metric exists to remove.
+	authority := newTestAuthority(t)
+	server, _ := mustIdentityServer(t, authority, profileHostname, payloadHandler(strings.Repeat("d", 8192)))
+	measure, _ := mustProberFor(t, authority, server)
+	profile := identityProfile(t, server, profileHostname, []int{http.StatusOK})
+	const cap = 4096
+	measure.options.MaxIdentityBodyBytes = cap
+
+	metrics, err := measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
+	if err == nil {
+		t.Fatalf("a body past the identity cap was accepted: %+v", metrics)
+	}
+	// The reader takes the cap and one more byte: one byte past the cap is how it
+	// knows the body is too long to be the document the profile named.
+	if metrics.BodyBytes != cap+1 {
+		t.Errorf("BodyBytes = %d after refusing an 8192 byte body under a %d byte cap, want %d", metrics.BodyBytes, cap, cap+1)
+	}
+}
+
+func TestHTTPSNeverReadsMoreThanTheIdentityCapAllows(t *testing.T) {
+	// The cap is the whole bound, and it is the default that a production prober
+	// gets. A body one byte under it is read whole and reported exactly; a body one
+	// byte over it is refused, and the refusal costs one byte more than the cap and
+	// never the whole body.
+	authority := newTestAuthority(t)
+	atCap := strings.Repeat("d", DefaultMaxIdentityBodyBytes)
+	server, _ := mustIdentityServer(t, authority, profileHostname, payloadHandler(atCap))
+	measure, _ := mustProberFor(t, authority, server)
+	profile := identityProfile(t, server, profileHostname, []int{http.StatusOK})
+	// The digest does not match on purpose: the point of this case is how much was
+	// read, not whether it matched.
+	profile.BodySHA256 = strings.Repeat("a", 64)
+
+	metrics, err := measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
+	if err == nil {
+		t.Fatalf("a body of %d bytes was accepted under a digest it does not match: %+v", len(atCap), metrics)
+	}
+	if metrics.BodyBytes != DefaultMaxIdentityBodyBytes {
+		t.Errorf("BodyBytes = %d for a body of exactly the cap, want the whole %d read", metrics.BodyBytes, DefaultMaxIdentityBodyBytes)
+	}
+
+	overCap := atCap + "d"
+	server, _ = mustIdentityServer(t, authority, profileHostname, payloadHandler(overCap))
+	measure, _ = mustProberFor(t, authority, server)
+	metrics, err = measure.HTTPS(t.Context(), identityCandidate(profileHostname), profile)
+	if err == nil {
+		t.Fatalf("a body one byte over the cap was accepted: %+v", metrics)
+	}
+	if metrics.BodyBytes != DefaultMaxIdentityBodyBytes+1 {
+		t.Errorf("BodyBytes = %d for a body one byte over the cap, want %d", metrics.BodyBytes, DefaultMaxIdentityBodyBytes+1)
+	}
+}
+
 func TestPackageSourceNeverSkipsCertificateVerification(t *testing.T) {
 	forbidden := "InsecureSkip" + "Verify"
 	root, err := filepath.Abs(filepath.Join("..", ".."))

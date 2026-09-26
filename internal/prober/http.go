@@ -45,10 +45,21 @@ const (
 	DefaultProbeTimeout = 10 * time.Second
 
 	// DefaultMaxIdentityBodyBytes bounds the body the identity probe reads for
-	// its digest. An identity response is a small document; a body past this is
-	// a host that is not answering the question, and reading further would be an
-	// unbounded transfer on a path that charged the day's budget for nothing.
-	DefaultMaxIdentityBodyBytes = 1 << 20
+	// its digest, and it is the bound on this package's one uncharged egress.
+	//
+	// Identity probing is deliberately outside the daily budget, so that the
+	// budget cannot be spent on the very checks that decide what may be measured:
+	// a run that cannot prove its candidates should still be able to measure the
+	// ten it proved. The cost of that decision is that identity bytes are bytes
+	// the budget does not know about, and the size of that exposure is this
+	// constant times the number of candidates probed. Sixty-four kilobytes is
+	// chosen because it is two orders of magnitude above any error page, redirect
+	// body, or small object a profile would name as its identity, and because at
+	// 512 candidates it puts the worst case at 32 MiB against a 100 MiB daily
+	// budget rather than the 512 MiB a megabyte cap allowed. Raising it is a
+	// deliberate act: the exposure grows with it, and HTTPMetrics.BodyBytes is how
+	// a run accounts for what it actually spent.
+	DefaultMaxIdentityBodyBytes = 64 << 10
 )
 
 // The edge a response says it was served from. CloudFront names its location in
@@ -89,13 +100,18 @@ func (p *NetworkProber) HTTPS(ctx context.Context, subject candidate.Candidate, 
 	defer func() { _ = response.Body.Close() }()
 
 	// The metrics are only built once every check has passed. A refused probe
-	// reports no numbers at all, because a number beside a refusal is a number a
-	// caller can mistake for a measurement.
+	// reports no numbers about the candidate at all, because a number beside a
+	// refusal is a number a caller can mistake for a measurement.
 	if err := checkProfileResponse(profile, response); err != nil {
 		return HTTPMetrics{}, err
 	}
-	if err := checkProfileBody(profile, response, p.options.MaxIdentityBodyBytes); err != nil {
-		return HTTPMetrics{}, err
+	// The one number a refused probe does report is how many uncharged bytes it
+	// read to reach its verdict. Those bytes are gone from the user's data
+	// allowance whether or not the proof worked, and an accounting figure is not a
+	// measurement of the candidate.
+	bodyBytes, err := checkProfileBody(profile, response, p.options.MaxIdentityBodyBytes)
+	if err != nil {
+		return HTTPMetrics{BodyBytes: bodyBytes}, err
 	}
 	return HTTPMetrics{
 		Status:     response.StatusCode,
@@ -103,6 +119,7 @@ func (p *NetworkProber) HTTPS(ctx context.Context, subject candidate.Candidate, 
 		TTFBMS:     milliseconds(timings.firstByte.Sub(timings.written)),
 		TotalMS:    milliseconds(time.Since(timings.started)),
 		Colocation: colocation(response.Header),
+		BodyBytes:  bodyBytes,
 	}, nil
 }
 
@@ -146,25 +163,32 @@ func checkProfileResponse(profile candidate.ProbeProfile, response *http.Respons
 }
 
 // checkProfileBody holds the body to the profile's digest, and bounds how much of
-// it is read to do so. A profile with no digest is making no claim about the body,
-// and it is read no further than its headers: reading what this probe has no claim
-// about would be a transfer it cannot account for.
-func checkProfileBody(profile candidate.ProbeProfile, response *http.Response, maximum int64) error {
+// it is read to do so. It returns how many bytes it read on every path, including
+// the refusing ones, because those bytes are the caller's uncharged egress and
+// the caller is the only thing that can account for them.
+//
+// A profile with no digest is making no claim about the body, and it is read no
+// further than its headers: reading what this probe has no claim about would be a
+// transfer it cannot account for and does not need to make.
+func checkProfileBody(profile candidate.ProbeProfile, response *http.Response, maximum int64) (int64, error) {
 	if profile.BodySHA256 == "" {
-		return nil
+		return 0, nil
 	}
+	// One byte past the cap is how the probe learns that a body is too long to be
+	// the document the profile named, so that byte is the cost of finding out and
+	// is reported as read.
 	body, err := io.ReadAll(io.LimitReader(response.Body, maximum+1))
 	if err != nil {
-		return fmt.Errorf("read the body of the response for %s: %w", profile.Hostname, err)
+		return int64(len(body)), fmt.Errorf("read the body of the response for %s: %w", profile.Hostname, err)
 	}
 	if int64(len(body)) > maximum {
-		return fmt.Errorf("the response for %s is larger than the %d bytes an identity probe reads", profile.Hostname, maximum)
+		return int64(len(body)), fmt.Errorf("the response for %s is larger than the %d bytes an identity probe reads", profile.Hostname, maximum)
 	}
 	digest := sha256.Sum256(body)
 	if got := hex.EncodeToString(digest[:]); got != profile.BodySHA256 {
-		return fmt.Errorf("the body of the response for %s hashes to %s, want the %s the profile names", profile.Hostname, got, profile.BodySHA256)
+		return int64(len(body)), fmt.Errorf("the body of the response for %s hashes to %s, want the %s the profile names", profile.Hostname, got, profile.BodySHA256)
 	}
-	return nil
+	return int64(len(body)), nil
 }
 
 // roundTrip performs the one request of a probe and reports when each part of it
