@@ -1,0 +1,29 @@
+# The health-check cadence: every two minutes, which is policy.yaml's
+# cdn.health.interval of 120 seconds.
+#
+# Deliberately NOT Persistent, and that is the one difference between this timer
+# and the other two. A calendar timer with Persistent=true replays every elapse the
+# machine missed; at a two-minute cadence a laptop that was closed for a day comes
+# back and runs 720 health checks in a row, each of which opens sockets to prove
+# an address, and the first thing it does is hold the control lock the optimizer
+# needs. A check that is two minutes late is still a check. This one is caught up
+# by the next elapse instead, which is 120 seconds away.
+#
+# The first run is two minutes after boot rather than immediately: at boot the
+# router is still coming up and the selector the check reads may not exist yet, and
+# the check's answer to a selector that names no winner is already a successful
+# run that says so.
+#
+# To move the cadence, drop in over this timer and reload it -- the commands are
+# the ones in mosdns-cdn-optimizer.timer, with this timer's name.
+
+[Unit]
+Description=Two-minute CDN health check schedule
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=mosdns-cdn-health.service
+
+[Install]
+WantedBy=timers.target

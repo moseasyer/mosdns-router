@@ -1,0 +1,110 @@
+# The DNS router: the machine's resolver, on loopback only.
+#
+# It binds 127.0.0.1:53 on UDP and TCP and nothing else. Port 53 is privileged,
+# which is the only reason this unit holds a capability at all; the routing
+# document's two servers are the whole of what it listens on, and
+# installer/tests/test_units.py checks that address with its port rather than
+# checking that 53 appears.
+#
+# It is started after the resolver it forwards to and pulls it in with Wants
+# rather than Requires. A resolver that failed to start must not take the router
+# down with it: the router is the machine's only DNS path, and a host whose
+# resolver is stopped has no DNS at all, while a router whose foreign branch
+# cannot be reached still serves the China branch and fails closed on the rest.
+#
+# Nothing here makes the network a start requirement. network.target is an
+# ordering edge with no Wants and no Requires, and the target that waits for a
+# configured connection is not named anywhere in this package: the router binds
+# loopback and has to come up on a machine NetworkManager does not call online.
+# What guarantees DNS is ready is the installer's ordering, not a target.
+#
+# The state directories are root:mosdns 2750 with a default ACL granting the
+# group rwx, provisioned by the package's postinst and recreated by its
+# tmpfiles.d entry. Nothing here creates them: a ReadWritePaths entry naming a
+# directory that is absent fails this unit at start with a mount-namespace error,
+# which is the loud failure this unit would rather have than a router that
+# silently cannot write its ECH state.
+
+[Unit]
+Description=mosdns-router DNS router (loopback only)
+After=dnscrypt-proxy.service network.target
+Wants=dnscrypt-proxy.service
+
+[Service]
+Type=simple
+User=mosdns
+Group=mosdns
+ExecStart=/usr/lib/mosdns-router/mosdns-router start -c /etc/mosdns/mosdns.yaml
+# CAP_NET_BIND_SERVICE is in both directives on purpose. AmbientCapabilities is
+# what the process holds; CapabilityBoundingSet is what stops anything from
+# raising it, so the bounding set is the limit and not the grant.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Everything this router creates lands in a directory the other service identity
+# has to be able to read and replace, so 0007 and never 0077: the umask must not
+# clear group access, and must not open a file to the world.
+UMask=0007
+# A router that stays down after a crash leaves the host with no resolver. The
+# default start rate limit bounds the retries, so a permanently missing
+# prerequisite -- the Cloudflare prefix list is a hard start requirement -- ends in
+# a visible failed unit with the reason in the journal rather than in a loop.
+Restart=on-failure
+RestartSec=5s
+
+# The sandbox every service in this package gets, and each line is here because
+# this program does not use the thing it takes away. NoNewPrivileges because
+# nothing here execs anything; PrivateTmp and PrivateDevices because there is no
+# temporary file and no device; ProtectSystem=strict because every document this
+# reads is under /etc and everything it writes is named in ReadWritePaths;
+# ProtectHome because there is nothing of the operator's in /home worth reading;
+# the Protect* kernel directives because a DNS forwarder changes no kernel
+# setting, loads no module and reads no log; ProtectProc and ProcSubset because
+# no other process on the host is any of this program's business; and the
+# Restrict* and Lock* lines because nothing here changes identity, opens a
+# namespace, touches the clock or takes a real-time priority.
+#
+# SystemCallFilter is deliberately absent. A seccomp filter cannot be proven
+# against these binaries from a build host, and a filter that denies one syscall
+# mosdns v5.3.4 or Go needs is an outage on the machine's only DNS path. The
+# bounding set, the address-family list and ProtectSystem=strict are the
+# confinement this package can stand behind.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# The router dials IPv4 and IPv6, and the DHCP-provided upstreams are whatever
+# the lease said, so no narrower list is possible. It never enumerates interfaces
+# -- this repository has no net.Interfaces call, and mosdns v5.3.4's only one is
+# the QUIC stateless-reset key helper, which this configuration never reaches --
+# so AF_NETLINK is not granted here. It reads a UNIX socket for nothing in
+# particular either, and AF_UNIX costs nothing to keep.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Per identity, and checked against the write table in
+# installer/tests/test_units.py: a directory nothing this unit writes is not
+# writable here. The ECH state the rewriter publishes is the router's only write,
+# and it lives in the runtime directory. /run is granted beside it although nothing
+# in the router writes there today -- the DHCP state the forwarder reads is
+# published by the bridge, which runs as root from a NetworkManager dispatcher --
+# because that is the directory the router's own state arrives in and a unit that
+# could not have written it could not report a state it had to change. The test
+# says so, and it is the first entry to go if that stops being true.
+ReadWritePaths=/var/lib/mosdns/runtime /run/mosdns
+
+[Install]
+WantedBy=multi-user.target

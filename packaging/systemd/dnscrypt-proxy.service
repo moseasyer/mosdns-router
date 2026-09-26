@@ -1,0 +1,78 @@
+# The foreign resolver: DNSCrypt on loopback, unprivileged, started before the
+# router that forwards to it.
+#
+# It binds 127.0.0.1:15353 on UDP and TCP and nothing else. Port 15353 is
+# unprivileged, so this unit needs no capability: the bounding set is emptied
+# rather than inherited, because a resolver that runs no privileged operation has
+# nothing for a bug in it to use. The document it reads is the renderer's own
+# output file, and its own listener line is checked with its port rather than
+# checked for containing 15353.
+#
+# It creates no file: cache is off in the shipped document and the log goes to
+# the journal. That is why it names no writable path at all and why its umask is
+# 0077 -- anything it were to create would belong to this identity alone, and this
+# identity shares no state with the router's.
+#
+# network.target appears as an ordering and nothing else. The resolver must not
+# require the network to be online: it resolves DNSCrypt provider names through
+# pinned bootstrap resolvers rather than the system resolver, and a machine whose
+# network is not up is a machine this unit still has to start on.
+
+[Unit]
+Description=DNSCrypt resolver for mosdns-router (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+User=dnscrypt-proxy
+Group=dnscrypt-proxy
+ExecStart=/usr/lib/mosdns-router/dnscrypt-proxy -config /etc/mosdns/dnscrypt-proxy.toml
+CapabilityBoundingSet=
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+
+# The same sandbox the router gets, for the same reasons: this is a Go program
+# that reads one document under /etc, opens sockets and holds no state on disk.
+# NoNewPrivileges because nothing here execs anything; PrivateTmp and
+# PrivateDevices because there is no temporary file and no device;
+# ProtectSystem=strict because the one file it reads is read-only to it;
+# ProtectHome because nothing of the operator's in /home concerns it; the
+# Protect* kernel directives because a resolver changes no kernel setting, loads
+# no module and reads no log; ProtectProc and ProcSubset because no other process
+# on the host is its business; and the Restrict*, Lock* and SystemCallArchitectures
+# lines because it changes no identity, opens no namespace, touches no clock, takes
+# no real-time priority and has no use for a foreign instruction set.
+#
+# SystemCallFilter is absent here for the same reason it is absent from the
+# router's unit: a filter that cannot be proven against this binary from a build
+# host is an outage waiting for a systemd release.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# AF_NETLINK is here and not in the router's list, and the reason is in this
+# program rather than in this project: dnscrypt-proxy 2.1.18 enumerates the
+# host's interfaces in its network-change monitor to detect a network that moved
+# and rotate its client state (dnscrypt-proxy/netmon.go, snapshotNetworkInterfaces
+# calls net.Interfaces, which opens a netlink socket). Without the family the
+# fingerprint loses every interface and a change of network is missed, silently.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

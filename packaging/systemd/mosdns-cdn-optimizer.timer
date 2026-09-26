@@ -1,0 +1,36 @@
+# The nightly optimizer schedule.
+#
+# 03:00 local time, which is policy.yaml's schedule field, and Persistent so a
+# machine that was asleep or off at three in the morning runs the night's
+# measurement when it comes up rather than skipping the day. It is a measurement,
+# not a report: a day that is missed is a day nobody chose a CDN address for, and
+# the address in service stays the one the last run proved.
+#
+# To move the schedule, change it in policy.yaml AND drop it in over this unit:
+#
+#   mkdir -p /etc/systemd/system/mosdns-cdn-optimizer.timer.d
+#   printf '[Timer]\nOnCalendar=*-*-* 04:30:00\n' \
+#     > /etc/systemd/system/mosdns-cdn-optimizer.timer.d/schedule.conf
+#   systemctl daemon-reload
+#   systemctl restart mosdns-cdn-optimizer.timer
+#
+# The drop-in is a change to the TIMER, so daemon-reload is what makes systemd
+# read it, and restarting the timer is what makes the new calendar take effect --
+# a reloaded timer that is already running keeps the elapse it had. Editing
+# policy.yaml alone changes nothing about when this runs: the CLI reads the policy
+# for the measurement, not for the schedule.
+#
+# OnCalendar here is the whole schedule and nothing else, which is what makes a
+# test able to hold it: no RandomizedDelaySec, no OnUnitActiveSec, no second
+# trigger that could start a second measurement beside the first.
+
+[Unit]
+Description=Nightly CDN optimizer schedule
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+Unit=mosdns-cdn-optimizer.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,85 @@
+# The nightly measurement and publication: mosdns-cdnctl test --apply.
+#
+# One invocation, and it is the whole nightly: the measurement phases and the
+# final identity proof, so the address that is published was proved against what
+# was just measured rather than against a report written two hours ago. It runs
+# under the second service identity, mosdns-cdn, whose primary group is the shared
+# state group -- one group for both service users, because the state directories'
+# default ACL grants by group and per-service groups would let only one identity
+# replace the other's files.
+#
+# It is Type=oneshot because it exits after doing its work, and it is not enabled:
+# its timer starts it. There is no [Install] section here on purpose.
+#
+# network.target is an ordering and not a requirement. A measurement that cannot
+# reach the network fails and says so, which is a different thing from not being
+# allowed to start.
+
+[Unit]
+Description=CDN optimizer: measure the candidates and publish a winner
+After=network.target
+
+[Service]
+Type=oneshot
+User=mosdns-cdn
+Group=mosdns
+ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl test --apply
+# The shipped policy allows 512 candidates at 3 seconds and 10 MiB each, so the
+# transfers alone are up to 25 minutes before the identity and proof phases. The
+# 90-second default for a oneshot would kill the nightly a quarter of the way
+# through and leave the day's selection unmeasured.
+TimeoutStartSec=3600
+# Exit 4 is the shared control lock, and the CLI itself calls that a different
+# answer from a failure: "the other one got there first" (cdnExitCode in
+# cmd/mosdns-cdnctl/main.go). A pin, an apply or an update-lists the operator is
+# running by hand races this timer, and a race is not a broken unit.
+#
+# Nothing else is excused. A run that collected nothing, a run where no candidate
+# qualified, and a run whose final proof was refused all exit 3 and all fail this
+# unit, because each of them is a night this router measured nothing and a timer
+# that saw them succeed would record it as a night the router was fine.
+#
+# A budget-exhausted run is not in that list and needs no exception: a day with
+# nothing left still names a winner in every group, keeps every mapping and
+# refuses every switch, so the command exits 0 by construction ("a full budget is
+# not a failed run", internal/optimizer).
+SuccessExitStatus=4
+CapabilityBoundingSet=
+# 0007 for the same reason the router's is: the documents this command publishes
+# are replaced by the health check's identity, and a file either of them creates
+# has to stay readable and replaceable by the other.
+UMask=0007
+
+# The same sandbox the router gets. This command reads documents under /etc,
+# writes the selector, the budget and the ranges cache, and opens sockets; it uses
+# no temporary file, no device, no kernel setting, no process list and no
+# namespace, and it changes no identity, no clock and no real-time priority.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# It dials candidates and identity hosts over IPv4 and IPv6 and resolves through
+# the system resolver, which may be a UNIX socket, and it enumerates no interface.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Exactly the two directories this command writes in: the selector, the daily
+# bandwidth budget and the control lock in the runtime directory, and the
+# published range cache in the lists directory. /var/lib/mosdns as a whole is not
+# writable here, and neither is /run, because nothing in this command writes
+# either.
+ReadWritePaths=/var/lib/mosdns/runtime /var/lib/mosdns/lists

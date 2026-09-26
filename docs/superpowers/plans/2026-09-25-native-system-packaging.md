@@ -33,6 +33,12 @@
 
 ## File Map
 
+`packaging/config/mosdns.yaml` and `packaging/config/dnscrypt-proxy.toml` are named
+here as the files the package installs; per the preflight ruling they are produced
+by `mosdns-cdnctl render` at build time and held to a byte comparison against a
+fresh production render, so they are outputs of Task 6's build rather than
+hand-maintained copies in this repository.
+
 ```text
 packaging/systemd/mosdns-router.service
 packaging/systemd/dnscrypt-proxy.service
@@ -42,7 +48,7 @@ packaging/systemd/mosdns-cdn-health.service
 packaging/systemd/mosdns-cdn-health.timer
 packaging/systemd/mosdns-list-check.service
 packaging/systemd/mosdns-list-check.timer
-packaging/config/config.yaml
+packaging/config/mosdns.yaml
 packaging/config/dnscrypt-proxy.toml
 packaging/config/force-ech-domains.txt
 packaging/config/cloudflare.txt
@@ -147,7 +153,22 @@ git commit -m "feat: capture current DHCP DNS during install"
 
 - [ ] **Step 1: Write a unit-policy test script**
 
-Create a temporary test in `installer/tests/test_units.py` that parses unit text and asserts executable paths, users, loopback config references, `After=dnscrypt-proxy.service`, capabilities, sandbox properties, and timer `Persistent=true`.
+Create a test in `installer/tests/test_units.py` that parses unit text and asserts
+executable paths, users and groups, loopback config references, the loopback form
+of every address the units and the shipped configs name, `After=` and `Wants=`
+against `dnscrypt-proxy.service`, capabilities, sandbox properties, the three
+pinned schedules, and the writable paths of each unit against the table of what
+that identity writes.
+
+Every property is also checked for teeth: a unit with a hardening directive
+removed, a capability added, a bounding set widened, a non-loopback address named
+or a writable directory granted that the identity does not write has to make the
+check fail, because a check that accepts any of those is not a check. The test
+runs `systemd-analyze verify` on each unit file individually, against a fake root
+holding the units, a copy of the host's own systemd unit directory and a stub
+executable for every path the ExecStart lines name, so no test needs a running
+systemd or a live bus; the harness is itself run against deliberately broken units
+so a gate that cannot fail is visible.
 
 - [ ] **Step 2: Run the test and verify failure**
 
@@ -159,12 +180,13 @@ Expected: missing unit files.
 
 - [ ] **Step 3: Create MOSDNS and DNSCrypt service units**
 
-Use:
+The router's config path is `/etc/mosdns/mosdns.yaml` -- the renderer's own output
+file name, not `config.yaml`, which this plan first wrote. Use:
 
 ```ini
 User=mosdns
 Group=mosdns
-ExecStart=/usr/lib/mosdns-router/mosdns-router start -c /etc/mosdns/config.yaml
+ExecStart=/usr/lib/mosdns-router/mosdns-router start -c /etc/mosdns/mosdns.yaml
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -174,18 +196,35 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-ReadWritePaths=/var/lib/mosdns /run/mosdns
+ReadWritePaths=/var/lib/mosdns/runtime /run/mosdns
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-DNSCrypt runs as `dnscrypt-proxy`, uses `/etc/mosdns/dnscrypt-proxy.toml`, needs no capability, and starts before MOSDNS.
+`ReadWritePaths` is per identity and is not one list repeated: the router writes
+the ECH state, the optimizer and the health check write the selector, the budget,
+the health document and the published range cache, the bridge publishes the DHCP
+state, and the list check and the resolver write nothing at all. The test checks
+each unit against that table, so a unit granting a directory its identity does not
+write fails.
+
+DNSCrypt runs as `dnscrypt-proxy`, uses `/etc/mosdns/dnscrypt-proxy.toml`, needs
+no capability -- 15353 is unprivileged, so its bounding set is emptied rather than
+inherited -- and names no writable directory because it creates no file. Its
+address-family list is `AF_UNIX AF_INET AF_INET6 AF_NETLINK`: dnscrypt-proxy
+2.1.18 enumerates interfaces in its network-change monitor, and Go's
+`net.Interfaces` opens a netlink socket, so without the family a change of network
+is missed silently. It starts before MOSDNS, which wants and is ordered after it
+with `Wants` rather than `Requires`, so a resolver that failed to start does not
+take the machine's only DNS path down with it.
 
 - [ ] **Step 4: Create timer/service units**
 
-- Optimizer: initial `OnCalendar=*-*-* 03:00:00`, generated from `policy.yaml`, `Persistent=true`, service runs `mosdns-cdnctl test --apply`. A later schedule change is made with a systemd drop-in and the same value in `policy.yaml`, followed by `systemctl daemon-reload` and `systemctl restart mosdns-cdn-optimizer.timer`.
-- Health: every 2 minutes, runs `mosdns-cdnctl health-check`.
-- List check: daily after 03:00, runs `mosdns-cdnctl update-lists --check` and is report-only.
-- Router and DNSCrypt must not use `network-online.target` as a hard start requirement.
+- Optimizer: initial `OnCalendar=*-*-* 03:00:00`, generated from `policy.yaml`, `Persistent=true`, service runs `mosdns-cdnctl test --apply`. A later schedule change is a drop-in over the TIMER -- `/etc/systemd/system/mosdns-cdn-optimizer.timer.d/schedule.conf` holding the new `[Timer] OnCalendar=` -- together with the same value in `policy.yaml`, applied by `systemctl daemon-reload` (which makes systemd read the drop-in) followed by `systemctl restart mosdns-cdn-optimizer.timer` (which makes the new calendar take effect, because a reloaded timer that is already running keeps the elapse it had). Editing `policy.yaml` alone changes nothing about when this runs.
+- Health: every 2 minutes (`OnBootSec=2min` and `OnUnitActiveSec=2min`), runs `mosdns-cdnctl health-check`, and is deliberately NOT `Persistent=true`: a two-minute cadence with persistence replays a backlog of every check the machine missed, and a check two minutes late is still a check.
+- List check: daily at `OnCalendar=*-*-* 03:30:00` with `Persistent=true` -- half an hour after the optimizer's window, and persistent for the opposite reason the health timer is not, because a report nobody will ever be shown is not a report. It runs `mosdns-cdnctl update-lists --check` and is report-only.
+- The optimizer, health and list-check services are `Type=oneshot` and are not enabled; their timers start them. Each service sets a `TimeoutStartSec` above what its command can legitimately spend, because the 90-second default for a oneshot would kill the nightly run and cut a slow origin off before it could report that it was slow.
+- The exit-code policy is one decision, and the test holds it: `SuccessExitStatus=4` on the optimizer and the health check, because 4 is the CLI's own answer for the shared control lock ("the other one got there first") and a race with an operator's own pin or apply is not a broken unit. Every other non-zero exit fails the unit, including a refusal to publish. A budget-exhausted run needs no exception: a full day still names a winner in every group and keeps every mapping, so the command exits 0 by construction. The list check excuses nothing, because it takes no lock, so 4 is unreachable, and its exit 3 is a run that produced no report at all.
+- Router and DNSCrypt must not use `network-online.target` as a hard start requirement, and no unit may pull in `network.target` with `Wants=` or `Requires=`. `network.target` appears as an ordering edge only.
 
 - [ ] **Step 5: Run static tests**
 
@@ -193,7 +232,7 @@ DNSCrypt runs as `dnscrypt-proxy`, uses `/etc/mosdns/dnscrypt-proxy.toml`, needs
 python3 -m unittest installer.tests.test_units -v
 ```
 
-Expected: PASS.
+Expected: PASS, with `systemd-analyze verify` clean for each of the eight files.
 
 - [ ] **Step 6: Commit**
 
@@ -447,7 +486,7 @@ Add a test that builds a staging root and asserts binaries, units, configs, inst
 
 Use:
 
-- `/etc/mosdns/config.yaml`
+- `/etc/mosdns/mosdns.yaml`
 - `/etc/mosdns/dnscrypt-proxy.toml`
 - `/etc/mosdns/policy.yaml`
 - empty `/etc/mosdns/force-ech-domains.txt`

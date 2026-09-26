@@ -1,0 +1,81 @@
+# The two-minute health check of the address in service: mosdns-cdnctl
+# health-check.
+#
+# This is the only command in the project whose job is to take an address out of
+# service. It proves the published winner and every published CloudFront mapping
+# against their own identity profiles, records the verdict in the health document,
+# refreshes the proof window the response rewriter gates on while the address
+# keeps passing, and moves the selector to the fallback when the winner has failed
+# at the policy's threshold. It spends no bandwidth budget and cannot: the prober
+# it is given offers no transfer.
+#
+# It runs as the same second identity as the optimizer, because it publishes into
+# the same documents and the default ACL on the state directories is what lets
+# either of them replace the other's files.
+#
+# It is Type=oneshot, it is not enabled, and its timer starts it.
+
+[Unit]
+Description=CDN health check: prove the address in service
+After=network.target
+
+[Service]
+Type=oneshot
+User=mosdns-cdn
+Group=mosdns
+ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl health-check
+# A pass is bounded at 60 seconds by internal/health and a transition's proof at
+# 15, so 110 is above everything this command can legitimately spend and below the
+# two-minute cadence. A check that hangs is killed before the next elapse instead
+# of overlapping it, and a check that overlaps itself is measuring a state the
+# previous check already changed.
+TimeoutStartSec=110
+# Exit 4 is the shared control lock, for the same reason it is excused in the
+# optimizer's unit: "the other one got there first" is a race with an operator's
+# own pin or apply, and the timer asks again in two minutes. Every other non-zero
+# exit fails this unit, and that includes a refused transition -- an address in
+# service that is failing and that this command could not move is the one outcome
+# an operator has to be told about.
+SuccessExitStatus=4
+CapabilityBoundingSet=
+# 0007 for the same reason as the optimizer's: the health document and the
+# selector are both this identity's and the optimizer's to replace.
+UMask=0007
+
+# The same sandbox the router gets. This command reads documents under /etc,
+# writes the health document and the selector, and opens sockets; it uses no
+# temporary file, no device, no kernel setting, no process list and no namespace.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# It proves addresses over IPv4 and IPv6 and resolves through the system resolver,
+# which may be a UNIX socket. It enumerates no interface.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# The runtime directory is what this command writes in: the health document, the
+# selector it may transition, and the control lock.
+#
+# The lists directory is granted beside it although nothing in this command writes
+# there -- the prober it proves with offers no transfer and no cache. It is granted
+# because this unit and the optimizer's unit are one identity with one access set,
+# so a control operation cannot be refused by a mount that another control
+# operation needed. That is a deliberate over-grant and the test says so: if the
+# health check is ever confirmed to write nothing in the lists directory, this
+# entry is the first thing to go.
+ReadWritePaths=/var/lib/mosdns/runtime /var/lib/mosdns/lists
