@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -513,7 +514,7 @@ func servicesFor(prober optimizer.Prober, set candidate.CandidateSet, moment tim
 		documents:   productionDocumentPaths(),
 		documentOps: defaultDocumentOps(),
 		newProber:   func() optimizer.Prober { return prober },
-		readCandidates: func(candidateSource) (candidate.CandidateSet, error) {
+		readCandidates: func(context.Context, candidateSource) (candidate.CandidateSet, error) {
 			return set, nil
 		},
 		now: func() time.Time { return moment },
@@ -550,6 +551,38 @@ func TestTestCommandSaysHowMuchOfTheDayIsLeft(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "budget-remaining-bytes: 101711872") {
 		t.Errorf("the report does not say what is left of the day:\n%s", stdout.String())
+	}
+}
+
+// The collection phase of `test` is the one part of a run that fetches over the
+// network, so the command's own context has to reach it: a cancelled `test` that
+// spent its client's full timeout collecting candidates would ignore the operator's
+// Ctrl-C and keep going. This drives the real reader against a local origin that
+// never answers, with the context already cancelled, so the only thing that can end
+// the request is the context.
+func TestCandidateCollectionIsCancellable(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		time.Sleep(30 * time.Second)
+	}))
+	defer origin.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := readOfficialAndUserCandidates(ctx, candidateSource{
+		// The origin is TLS because the source refuses anything else, and the
+		// server's own client is the one that trusts its certificate.
+		Client:    origin.Client(),
+		BaseURL:   origin.URL,
+		CachePath: filepath.Join(t.TempDir(), "cloudflare-ips.json"),
+		UserList:  filepath.Join(t.TempDir(), "cloudflare.txt"),
+		Limit:     512,
+		Moment:    fixedMoment,
+	})
+	if err == nil {
+		t.Fatal("a cancelled collection returned candidates, want the context's error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the collection returned %v, want an error that is context.Canceled", err)
 	}
 }
 

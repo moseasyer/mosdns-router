@@ -698,7 +698,7 @@ func runCDNTest(ctx context.Context, args []string, stdout, stderr io.Writer, se
 		writeCLIError(stderr, "test: %v", err)
 		return exitInvalidCLI
 	}
-	collected, err := services.readCandidates(candidateSource{
+	collected, err := services.readCandidates(ctx, candidateSource{
 		Client:    services.newHTTPClient(),
 		BaseURL:   options.rangesURL,
 		CachePath: options.rangesCache,

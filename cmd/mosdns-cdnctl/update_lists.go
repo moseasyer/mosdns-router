@@ -62,8 +62,11 @@ type services struct {
 	// newProber builds the prober a measurement run measures with.
 	newProber func() optimizer.Prober
 	// readCandidates reads the official range document and the user's own list, and
-	// is the only thing that puts an address a run will measure into existence.
-	readCandidates func(candidateSource) (candidate.CandidateSet, error)
+	// is the only thing that puts an address a run will measure into existence. It
+	// takes the caller's context because it is the one part of a measurement that
+	// fetches over the network, and a fetch that ignored the context would make the
+	// collection phase of `test` uncancellable.
+	readCandidates func(context.Context, candidateSource) (candidate.CandidateSet, error)
 	// now is the clock. Every timestamp a report and a selector carry comes from
 	// it, so all of them are one reading in production.
 	now func() time.Time
@@ -98,7 +101,12 @@ func productionServices() services {
 // The two are returned as one set carrying the official set's stale marker, because
 // that is the fact a report has to show: an operator reading "12 candidates" needs
 // to know whether they are today's or the last ones this build accepted.
-func readOfficialAndUserCandidates(source candidateSource) (candidate.CandidateSet, error) {
+//
+// The context is the caller's, and it is the whole of the cancellation story for
+// this phase: the range fetch is the only network I/O a measurement run does
+// outside the prober, so a `test` whose operator pressed Ctrl-C would otherwise
+// wait out the HTTP client's own timeout before it noticed.
+func readOfficialAndUserCandidates(ctx context.Context, source candidateSource) (candidate.CandidateSet, error) {
 	if source.Client == nil {
 		return candidate.CandidateSet{}, errors.New("a candidate source needs an HTTP client")
 	}
@@ -106,7 +114,7 @@ func readOfficialAndUserCandidates(source candidateSource) (candidate.CandidateS
 	if err != nil {
 		return candidate.CandidateSet{}, err
 	}
-	set, err := official.Candidates(context.Background(), source.Limit, source.Moment)
+	set, err := official.Candidates(ctx, source.Limit, source.Moment)
 	if err != nil {
 		return candidate.CandidateSet{}, err
 	}
