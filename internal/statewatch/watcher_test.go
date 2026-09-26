@@ -1852,6 +1852,16 @@ func TestTextWatcherIsSafeUnderConcurrentSnapshotAndReload(t *testing.T) {
 	close(done)
 	readers.Wait()
 
+	// The watcher is settled by waiting for the file's own content to be what it
+	// serves, not by asserting on the last reload: a poll read that read the
+	// three-name list can store it after the writer's last reload of the one-name
+	// list, and the next tick restores it. That window is the one the poller's
+	// comment describes, and a test that ignored it would be asserting an ordering
+	// the watcher does not promise.
+	waitFor(t, "the watcher to settle on the list the writer published last", func() bool {
+		snapshot := watcher.Snapshot()
+		return len(snapshot) == 1 && snapshot[0] == "example.com"
+	})
 	assertList(t, watcher.Snapshot(), []string{"example.com"})
 }
 
