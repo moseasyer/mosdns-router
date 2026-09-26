@@ -370,6 +370,13 @@ func marshal(value any) ([]byte, error) {
 
 // header explains where the document came from, so the file an operator reads is
 // not mistaken for the one they should edit.
+//
+// It also says where the log level comes from, because the rest of the header
+// sends the reader to the policy for everything and the level is the one value in
+// this document with no policy field: it is the renderer's own logLevel constant
+// (the level the plugin logs a generation it adopts at, which the warnings above it
+// report through), not something an operator can choose. Naming it here is what
+// stops "edit the policy" from being advice that cannot be followed.
 func header(policyPath string) string {
 	return fmt.Sprintf(`# mosdns-router routing configuration for MOSDNS v5.3.4.
 #
@@ -377,7 +384,10 @@ func header(policyPath string) string {
 # Edit the policy or the paths, not this file: configs/mosdns.yaml is the
 # committed output of Render(config.Defaults(), ProductionPaths()) and a test
 # compares the two byte for byte, so a hand edit here is an edit the project
-# stops being able to explain.
+# stops being able to explain. The one value here with no policy field is the log
+# level: it is the renderer's own constant (logLevel in
+# internal/mosdnsconfig/render.go), and a level is a diagnostic an operator reads
+# rather than a setting a policy chooses.
 #
 # Two branches and no third. A name the pinned China list matches goes to the
 # DNS servers DHCP published, and every other name goes to the loopback DNSCrypt

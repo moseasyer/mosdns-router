@@ -761,12 +761,22 @@ func packedLength(message *dns.Msg) int {
 	return len(wire)
 }
 
-// recordWire is the packed form of one record, so an answer can be compared
-// against the record that was supposed to produce it byte for byte instead of
-// field by field: a byte that changed in transit has to fail here too. A message
-// whose only content is that record has an all-zero header, so comparing two of
-// them compares the record and nothing else.
-func recordWire(t *testing.T, record dns.RR) []byte {
+// recordPacked is one record re-packed into a DNS message, so an answer can be
+// compared against the record that was supposed to produce it without comparing it
+// field by field: a field the router rebuilt differently has to fail here too. A
+// message whose only content is that record has an all-zero header, so comparing
+// two of them compares the record and nothing else.
+//
+// It is packed-form equality, not wire-byte equality, and the distinction is worth
+// keeping in the name. The record that came back was decoded off the socket and
+// re-packed here, and so was the expectation, so both sides go through the same
+// encoder: a difference the DNS wire format does not distinguish -- a differently
+// compressed name that decodes to the same labels, say -- is invisible to this
+// comparison, and so is any encoder bug shared by both sides. What it does catch
+// is a router that changed the record's content or its TTL or its type, which is
+// what these cases are about. A wire-byte comparison would have to keep the
+// received bytes and the sent bytes, which this harness does not do.
+func recordPacked(t *testing.T, record dns.RR) []byte {
 	t.Helper()
 	message := new(dns.Msg)
 	message.Answer = []dns.RR{record}
@@ -1350,13 +1360,19 @@ func TestAForeignFailureNeverFallsBackToTheDomesticBranch(t *testing.T) {
 	}
 }
 
-// TestArbitraryQTypesRoundTripByteForByte asks for a record shape nothing in
-// this project knows how to build. Type 65 is not a type the router interprets:
-// it is a type it has to carry, and a router that rebuilt, filtered or dropped an
-// answer it did not recognise would show up here as a SERVFAIL or as a record
-// that came back different. The comparison is the packed bytes of the whole
-// record, so a byte that changed in transit fails this too.
-func TestArbitraryQTypesRoundTripByteForByte(t *testing.T) {
+// TestAnArbitraryQTypeSurvivesTheRouterInPackedForm asks for a record shape
+// nothing in this project knows how to build. Type 65 is not a type the router
+// interprets: it is a type it has to carry, and a router that rebuilt, filtered or
+// dropped an answer it did not recognise would show up here as a SERVFAIL or as a
+// record that came back different.
+//
+// The comparison is packed-form equality of the whole record -- the record that
+// came back and the record that was supposed to produce it are each re-packed by
+// the same encoder and compared byte for byte. That is not the same as the wire
+// bytes being identical, and the name says so: both sides went through a pack, so
+// a difference the wire format does not distinguish is invisible here. What it does
+// catch is a router that changed the record's own content, which is the claim.
+func TestAnArbitraryQTypeSurvivesTheRouterInPackedForm(t *testing.T) {
 	h := newHarness(t, publishedState)
 	h.waitUntilAnswering(t)
 
@@ -1375,9 +1391,9 @@ func TestArbitraryQTypesRoundTripByteForByte(t *testing.T) {
 	// The expectation is the record the resolver was configured to answer with,
 	// rebuilt here rather than read back out of the answer.
 	want := foreignRecord(dns.Question{Name: foreignName, Qtype: dns.TypeHTTPS, Qclass: dns.ClassINET})
-	if got := recordWire(t, response.Answer[0]); !bytes.Equal(got, recordWire(t, want)) {
+	if got := recordPacked(t, response.Answer[0]); !bytes.Equal(got, recordPacked(t, want)) {
 		t.Errorf("the %s answer came back as\n %s\nwant\n %s",
-			dns.TypeToString[dns.TypeHTTPS], got, recordWire(t, want))
+			dns.TypeToString[dns.TypeHTTPS], got, recordPacked(t, want))
 	}
 }
 
@@ -1410,8 +1426,8 @@ func TestALargeAnswerRoundTripsOverTheForeignTransport(t *testing.T) {
 	if size := dns.Len(want); size <= minimumUDPPayload {
 		t.Fatalf("the fixture TXT record is %d bytes, which fits a %d-byte datagram, so this case would not be testing a large answer", size, minimumUDPPayload)
 	}
-	if got := recordWire(t, response.Answer[0]); !bytes.Equal(got, recordWire(t, want)) {
-		t.Errorf("the large TXT came back as\n %s\nwant\n %s", got, recordWire(t, want))
+	if got := recordPacked(t, response.Answer[0]); !bytes.Equal(got, recordPacked(t, want)) {
+		t.Errorf("the large TXT came back as\n %s\nwant\n %s", got, recordPacked(t, want))
 	}
 	if got := h.foreign.Count(testdns.ProtocolUDP, foreignName); got != 0 {
 		t.Errorf("the foreign resolver received %d queries for the large %s over udp, want 0", got, dns.TypeToString[dns.TypeTXT])
@@ -1438,8 +1454,8 @@ func TestATruncatedDomesticAnswerIsRetriedOverTCPByThePlugin(t *testing.T) {
 		t.Fatalf("the large answer carried %d records, want 1: %+v", len(response.Answer), response.Answer)
 	}
 	want := largeTXT(chinaName)
-	if got := recordWire(t, response.Answer[0]); !bytes.Equal(got, recordWire(t, want)) {
-		t.Errorf("the large domestic TXT came back as\n %s\nwant\n %s", got, recordWire(t, want))
+	if got := recordPacked(t, response.Answer[0]); !bytes.Equal(got, recordPacked(t, want)) {
+		t.Errorf("the large domestic TXT came back as\n %s\nwant\n %s", got, recordPacked(t, want))
 	}
 
 	if got := h.domestic.Count(testdns.ProtocolUDP, chinaName); got != 1 {

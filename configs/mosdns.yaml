@@ -4,7 +4,10 @@
 # Edit the policy or the paths, not this file: configs/mosdns.yaml is the
 # committed output of Render(config.Defaults(), ProductionPaths()) and a test
 # compares the two byte for byte, so a hand edit here is an edit the project
-# stops being able to explain.
+# stops being able to explain. The one value here with no policy field is the log
+# level: it is the renderer's own constant (logLevel in
+# internal/mosdnsconfig/render.go), and a level is a diagnostic an operator reads
+# rather than a setting a policy chooses.
 #
 # Two branches and no third. A name the pinned China list matches goes to the
 # DNS servers DHCP published, and every other name goes to the loopback DNSCrypt
