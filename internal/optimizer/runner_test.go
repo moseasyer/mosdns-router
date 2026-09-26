@@ -1834,6 +1834,56 @@ func TestApplyRefusesWhileTheSelectorIsPinnedByHand(t *testing.T) {
 	mustBeUnchanged(t, selectorPath, before)
 }
 
+// A disabled selector is an operator's statement, not a state a command may
+// resolve by writing over it. Nothing in this project writes `disabled` - it is
+// reachable only by a hand edit - and an automatic apply that published over one
+// would put every user's answers back on a CDN the operator had just taken out of
+// service, while reporting a success. The health check already honours the mode;
+// this is the other two commands reaching the same conclusion, with a named
+// refusal rather than a string.
+func TestApplyRefusesWhileTheSelectorIsDisabled(t *testing.T) {
+	fixtures, candidates := threeGlobals()
+	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(fixtures))
+	disabled := mustSelector(t, 7, "104.16.2.1", "104.16.1.1")
+	disabled.Mode = "disabled"
+	before := writeSelector(t, selectorPath, disabled)
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.2.1")
+
+	applied, published, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	if !errors.Is(err, ErrModeDisabled) {
+		t.Fatalf("Apply against a disabled selector returned %v, want %v", err, ErrModeDisabled)
+	}
+	if published.WinnerIP != "" || published.Generation != 0 {
+		t.Errorf("a refused apply returned a published selector: %+v", published)
+	}
+	if applied.Outcome != OutcomeRefused {
+		t.Errorf("a refused apply's report outcome is %q, want %q", applied.Outcome, OutcomeRefused)
+	}
+	for index := range applied.Groups {
+		if applied.Groups[index].Outcome == OutcomePublished {
+			t.Errorf("group %d says it was published by a refused apply: %+v", index, applied.Groups[index])
+		}
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestPinRefusesWhileTheSelectorIsDisabled(t *testing.T) {
+	// The other half of the same rule, and the more dangerous one: Pin writes
+	// `mode: manual`, so without the guard it would re-enable a disabled selector
+	// by side effect and the operator would never be told.
+	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(map[string]*addressFixture{
+		"104.16.9.9": served(10, 1, 0, 5*mib),
+	}))
+	disabled := mustSelector(t, 7, "104.16.2.1", "104.16.1.1")
+	disabled.Mode = "disabled"
+	before := writeSelector(t, selectorPath, disabled)
+
+	if _, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrModeDisabled) {
+		t.Fatalf("Pin against a disabled selector returned %v, want %v", err, ErrModeDisabled)
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
 func TestApplyRefusesAReportWhoseRecordedSwitchTheConfigurationDoesNotAgreeWith(t *testing.T) {
 	// The recorded decision is an integrity claim, not an input. An apply
 	// recomputes it from the report's own numbers and the threshold in force, and a

@@ -1594,6 +1594,9 @@ func TestACheckOnADisabledSelectorProbesNothing(t *testing.T) {
 	if w.healthFileExists() {
 		t.Error("a disabled selector wrote a health document")
 	}
+	if result.RefreshedProof || !result.ProofUntil.IsZero() {
+		t.Errorf("a disabled selector reported a refreshed proof: refreshed=%v, until %s", result.RefreshedProof, result.ProofUntil)
+	}
 	if after := w.readSelectorBytes(); after != before {
 		t.Error("a disabled selector's document was changed")
 	}

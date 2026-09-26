@@ -249,6 +249,15 @@ var (
 	// is refused rather than quietly unpinning by side effect.
 	ErrModeManual = errors.New("the selector is pinned by hand; unpin before applying an automatic selection")
 
+	// ErrModeDisabled reports a command against a selector an operator has
+	// disabled. Nothing in this project writes that mode, so it is reachable only
+	// by a hand edit, and a command that published over one would undo the
+	// operator's statement by side effect - Pin would re-enable it by writing
+	// `manual` - while reporting success. So it is refused the way a manual pin is,
+	// and the health check's own honouring of the mode is the third command
+	// reaching the same conclusion.
+	ErrModeDisabled = errors.New("the selector is disabled; re-enable it by editing its mode in the selector document before applying or pinning")
+
 	// ErrControlLocked reports that another process holds the control lock. It is
 	// a conflict rather than a failure: the caller is told at once and changes
 	// nothing, which is the whole point of taking the lock at all.
@@ -1237,6 +1246,14 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (a
 	if current.Mode == "manual" {
 		return report, state.Selector{}, fmt.Errorf("%w: %s is pinned to %s", ErrModeManual, r.options.SelectorPath, current.WinnerIP)
 	}
+	// A disabled selector is the operator's decision in the other direction, and it
+	// is the more dangerous of the two to overwrite: whatever address the document
+	// still names, the operator has said that none of it is in service. Apply
+	// publishes, so it refuses. Unpin already refuses any mode but manual, and Pin
+	// carries the same guard.
+	if current.Mode == "disabled" {
+		return report, state.Selector{}, fmt.Errorf("%w: %s is in mode %q", ErrModeDisabled, r.options.SelectorPath, current.Mode)
+	}
 	if !publishedAnywhere {
 		// Every group kept its mapping, so there is nothing to write: no generation
 		// move for a run that changed nothing, and no refreshed proof for a winner
@@ -1681,6 +1698,15 @@ func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles)
 		return state.Selector{}, err
 	}
 	defer func() { _ = lock.Close() }()
+
+	// A disabled selector is refused before a socket is opened, and it is the guard
+	// this command most needs: Pin writes `mode: manual`, so without it a pin would
+	// re-enable a selector an operator had taken out of service and report a
+	// successful pin. The operator re-enables it by editing the document, which is
+	// the only way that mode is reachable at all.
+	if current.Mode == "disabled" {
+		return state.Selector{}, fmt.Errorf("%w: %s is in mode %q", ErrModeDisabled, r.options.SelectorPath, current.Mode)
+	}
 
 	// The proof is bounded by the same deadline an apply's is, and for the same
 	// reason: it runs under the control lock. Its metrics are discarded, because a
