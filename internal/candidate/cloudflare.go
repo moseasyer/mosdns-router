@@ -114,32 +114,19 @@ func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localD
 	if err != nil {
 		return CandidateSet{}, err
 	}
-	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath, validatorRequired)
+	// The fetch, the validation and the publication are the same ones Refresh
+	// performs, reached through the same three functions, so a run that measures
+	// and a refresh that only publishes can never disagree about which document
+	// was accepted or how it is rendered. See refresh.go.
+	document, fetched, err := s.read(ctx)
 	if err != nil {
-		return CandidateSet{}, err
-	}
-	document, err := parseCloudflareDocument(s.baseURL, fetched.Body)
-	if err != nil {
-		// A body that arrived and does not parse is a hard error, stale or not:
-		// the cache is not quietly substituted for a document this build does not
-		// understand.
 		return CandidateSet{}, err
 	}
 	blocks, err := document.blocks()
 	if err != nil {
 		return CandidateSet{}, err
 	}
-	// The document is only stored once it has been accepted, so the cache never
-	// holds a body this run refused. A stale document is already stored.
-	if err := storeDocument(s.cachePath, fetched); err != nil {
-		return CandidateSet{}, err
-	}
-	// The same accepted document is published as a plain prefix list beside the
-	// envelope, for the response rewriter that classifies answers against it. It
-	// is written from the document this run just validated rather than from the
-	// cache file, so the list and the envelope can never describe different
-	// documents, and it costs no second request: see publishPrefixList.
-	if err := publishPrefixList(s.cachePath, document); err != nil {
+	if _, err := s.publish(document, fetched); err != nil {
 		return CandidateSet{}, err
 	}
 	if len(blocks) == 0 {

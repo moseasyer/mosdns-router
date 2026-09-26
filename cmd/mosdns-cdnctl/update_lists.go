@@ -146,36 +146,56 @@ func readUserCandidates(path string) ([]candidate.Candidate, error) {
 
 // updateListOptions are the parsed command line of update-lists.
 type updateListOptions struct {
-	check       bool
-	pinRemote   string
-	sourceLock  string
-	listFile    string
-	controlLock string
+	check         bool
+	pinRemote     string
+	refreshRanges bool
+	sourceLock    string
+	listFile      string
+	controlLock   string
+	rangesURL     string
+	rangesCache   string
 }
 
-// parseUpdateListOptions parses and validates the command line. One of --check
-// and --pin-remote is required, they are mutually exclusive, and the only
-// accepted ref is the literal HEAD: a pin names no branch, tag or commit, so the
-// reviewed source is always the repository's default branch.
+// parseUpdateListOptions parses and validates the command line. Exactly one of
+// --check, --pin-remote HEAD and --refresh-ranges is required, they are mutually
+// exclusive, and the only accepted ref is the literal HEAD: a pin names no branch,
+// tag or commit, so the reviewed source is always the repository's default branch.
+//
+// --refresh-ranges is a mode of its own rather than a flag on either of the other
+// two, and that shape is the point. The prefix list it publishes is what the
+// response rewriter refuses to construct without, so an installation needs it
+// before the router starts; the two modes it might have been folded into are the
+// wrong carriers. `--check` is documented to write nothing and takes no lock, so
+// it cannot publish, and `--pin-remote` re-pins the China list, which ruling 59
+// forbids during an install.
 func parseUpdateListOptions(args []string) (updateListOptions, error) {
 	flags := flag.NewFlagSet("update-lists", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	check := flags.Bool("check", false, "report whether the pinned source has changed, writing nothing")
 	pinRemote := flags.String("pin-remote", "", "accept the current reviewed default-branch commit and publish it")
+	refreshRanges := flags.Bool("refresh-ranges", false, "refresh the published Cloudflare ranges and their prefix list, measuring nothing")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
 	listFile := flags.String("list-file", defaultListFilePath, "path to the converted list")
 	controlLock := flags.String("control-lock", defaultControlLockPath, "path to the shared control lock")
+	rangesURL := flags.String("ranges-url", candidate.DefaultCloudflareBaseURL, "the published Cloudflare range document")
+	rangesCache := flags.String("ranges-cache", candidate.DefaultCloudflareCachePath, "where the published range document is cached; its prefix list is written beside it")
 	if err := flags.Parse(args); err != nil {
 		return updateListOptions{}, err
 	}
 	if flags.NArg() != 0 {
 		return updateListOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
+	modes := 0
+	for _, selected := range []bool{*check, *pinRemote != "", *refreshRanges} {
+		if selected {
+			modes++
+		}
+	}
 	switch {
-	case *check && *pinRemote != "":
-		return updateListOptions{}, errors.New("--check and --pin-remote are mutually exclusive")
-	case !*check && *pinRemote == "":
-		return updateListOptions{}, errors.New("one of --check or --pin-remote HEAD is required")
+	case modes == 0:
+		return updateListOptions{}, errors.New("one of --check, --pin-remote HEAD or --refresh-ranges is required")
+	case modes > 1:
+		return updateListOptions{}, errors.New("--check, --pin-remote and --refresh-ranges are mutually exclusive")
 	case *pinRemote != "" && *pinRemote != pinRef:
 		return updateListOptions{}, fmt.Errorf("--pin-remote accepts only %s, not %q", pinRef, *pinRemote)
 	}
@@ -183,17 +203,22 @@ func parseUpdateListOptions(args []string) (updateListOptions, error) {
 		{"--source-lock", *sourceLock},
 		{"--list-file", *listFile},
 		{"--control-lock", *controlLock},
+		{"--ranges-url", *rangesURL},
+		{"--ranges-cache", *rangesCache},
 	} {
 		if strings.TrimSpace(path.value) == "" {
 			return updateListOptions{}, fmt.Errorf("%s must not be empty", path.name)
 		}
 	}
 	return updateListOptions{
-		check:       *check,
-		pinRemote:   *pinRemote,
-		sourceLock:  *sourceLock,
-		listFile:    *listFile,
-		controlLock: *controlLock,
+		check:         *check,
+		pinRemote:     *pinRemote,
+		refreshRanges: *refreshRanges,
+		sourceLock:    *sourceLock,
+		listFile:      *listFile,
+		controlLock:   *controlLock,
+		rangesURL:     *rangesURL,
+		rangesCache:   *rangesCache,
 	}, nil
 }
 
@@ -203,10 +228,14 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitInvalidCLI
 	}
-	if options.check {
+	switch {
+	case options.check:
 		return runCheckLists(ctx, options, stdout, stderr, services)
+	case options.refreshRanges:
+		return runRefreshRanges(ctx, options, stdout, stderr, services)
+	default:
+		return runPinRemote(ctx, options, stdout, stderr, services)
 	}
-	return runPinRemote(ctx, options, stdout, stderr, services)
 }
 
 // runCheckLists reports whether the source the gateway runs on is still the one
@@ -250,6 +279,15 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	writeReportLine(&report, "locked-list-sha256: %s\n", published.ListSHA256)
 	writeReportLine(&report, "remote-commit: %s\n", remote.Commit)
 
+	// The Cloudflare ranges are reported here, in the same report, and they cost
+	// no request: ReadPublished reads the two artifacts off the disk and says
+	// whether they are there and whether they agree. The check already makes a
+	// request for the China list's sake, and a report that reached a third origin
+	// to say "the file is there" would be a request whose only effect is to be
+	// able to fail -- and a daily timer acting on this report would then fail on
+	// an API outage while the files it is reporting about are perfectly fine.
+	reportRanges(&report, options)
+
 	if remote.Commit == published.Commit {
 		// The remote still publishes the commit the list was converted from, so
 		// the archive is not fetched at all.
@@ -266,6 +304,43 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	writeReportLine(&report, "remote-archive-sha256: %s\n", drifted.SHA256)
 	writeReportLine(&report, "up-to-date: false\n")
 	return writeReport(stdout, stderr, report.Bytes())
+}
+
+// reportRanges writes what the two published range artifacts currently hold into
+// a check's report.
+//
+// It is deliberately separate from the China half and deliberately silent about
+// the origin. The China half answers "has the source this gateway runs on moved",
+// which is a question only the origin can answer; the ranges half answers "is the
+// file the rewriter refuses to start without actually there, and does it still
+// describe the envelope beside it", which is a question the disk answers. A check
+// that fetched the ranges to compare them would publish nothing -- it is
+// report-only -- so the request would buy a fresh number nobody stores and a new
+// way for a daily timer to fail.
+//
+// The absence of a prefix list is reported rather than treated as a failure. It is
+// a fact about the installation, not about the check's ability to do its job, and
+// the check still exits 0 on drift per ruling 50; a reader that wants a refusal
+// asks for one with `update-lists --refresh-ranges`, which is the only command
+// here that writes.
+func reportRanges(report *bytes.Buffer, options updateListOptions) {
+	published, err := candidate.ReadPublished(options.rangesCache)
+	if err != nil {
+		// A path that cannot be read at all is a question this report cannot
+		// answer, and it is stated as one rather than as an absence.
+		writeReportLine(report, "ranges-unreadable: %v\n", err)
+		return
+	}
+	writeReportLine(report, "ranges-cache: %s\n", published.CachePath)
+	writeReportLine(report, "ranges-prefix-list: %s\n", published.PrefixPath)
+	writeReportLine(report, "ranges-published: %t\n", published.Present)
+	if !published.Present {
+		writeReportLine(report, "ranges-missing: %s\n", published.Missing)
+		return
+	}
+	writeReportLine(report, "ranges-consistent: %t\n", published.Consistent)
+	writeReportLine(report, "ranges-prefixes: %d\n", published.Prefixes)
+	writeReportLine(report, "ranges-prefix-list-sha256: %s\n", published.SHA256)
 }
 
 // runPinRemote accepts the current reviewed default-branch commit and publishes
@@ -315,6 +390,54 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	writeReportLine(stdout, "pinned-rules: %d\n", countListRules(list))
 	writeReportLine(stdout, "published-source-lock: %s\n", options.sourceLock)
 	writeReportLine(stdout, "published-list: %s\n", options.listFile)
+	return exitSuccess
+}
+
+// runRefreshRanges publishes the response rewriter's prefix list, and nothing
+// else. It is the mode a package installation runs before the router starts,
+// because the rewriter refuses to construct without that list and the only
+// producer it had was a measurement run that spends the day's bandwidth budget.
+//
+// What it does not do is the part that makes it safe to run at install time. It
+// builds no prober, opens no socket to a candidate address, and never constructs
+// an optimizer Runner, so there is no measurement and no budget charge: a fresh
+// installation cannot starve the first nightly with a file it needs before the
+// nightly exists. The single HTTP request it makes is the range document itself,
+// and the two files it writes -- the cache envelope and the prefix list beside it
+// -- are both rendered from that one in-memory document, so they cannot describe
+// different days. internal/candidate holds that: Refresh is the fetch half of
+// Candidates with the sampling removed, sharing the read and the publication.
+//
+// It takes no control lock. The two files are each replaced by a same-directory
+// temporary and a rename, so a reader never sees half of one, and a lock held
+// across a network request would keep the router's own control operations out
+// while an origin is slow. It also touches nothing the China list owns: a
+// separate mode rather than a flag is what keeps an install from re-pinning that
+// list, which ruling 59 forbids.
+func runRefreshRanges(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	source, err := candidate.NewCloudflareSource(services.newHTTPClient(), options.rangesURL, options.rangesCache)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitInvalidCLI
+	}
+	refreshed, err := source.Refresh(ctx)
+	if err != nil {
+		// Nothing is reported on failure, because nothing was published: a report
+		// naming a file that is not there is how an installer concludes it has the
+		// prefix list when the router will refuse to start without it.
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	writeReportLine(stdout, "ranges-url: %s\n", refreshed.URL)
+	writeReportLine(stdout, "ranges-etag: %s\n", refreshed.ETag)
+	writeReportLine(stdout, "ranges-prefixes: %d\n", refreshed.Prefixes)
+	// The stale flag is what tells an operator the ranges are the last ones this
+	// build accepted rather than the ones the origin publishes today, and a
+	// router that starts on a stale list is a router classifying against
+	// yesterday's space.
+	writeReportLine(stdout, "ranges-stale: %t\n", refreshed.Stale)
+	writeReportLine(stdout, "published-ranges-cache: %s\n", refreshed.CachePath)
+	writeReportLine(stdout, "published-prefix-list: %s\n", refreshed.PrefixPath)
 	return exitSuccess
 }
 

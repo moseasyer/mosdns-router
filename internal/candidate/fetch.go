@@ -172,6 +172,21 @@ func storeDocument(cachePath string, fetched fetchedDocument) error {
 // the run that follows writes to the same path and reports the write error if the
 // path really is unusable.
 func readCache(cachePath, sourceURL string) (cacheDocument, bool) {
+	document, ok := readAnyCache(cachePath)
+	if !ok || document.URL != sourceURL {
+		return cacheDocument{}, false
+	}
+	return document, true
+}
+
+// readAnyCache returns the cached document at a path for whatever endpoint it
+// records, and reports false for anything it cannot use. It is readCache without
+// the endpoint check, and it exists so the report that names the two published
+// artifacts applies the same gates this build applies to a cache it is about to
+// revalidate against: a second set of weaker rules here would report a document
+// as published that the next fetch would refuse to use, which is the one thing a
+// report about a start requirement must not do.
+func readAnyCache(cachePath string) (cacheDocument, bool) {
 	contents, err := os.ReadFile(cachePath)
 	if err != nil {
 		return cacheDocument{}, false
@@ -186,7 +201,7 @@ func readCache(cachePath, sourceURL string) (cacheDocument, bool) {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return cacheDocument{}, false
 	}
-	if document.SchemaVersion != cacheSchemaVersion || document.URL != sourceURL {
+	if document.SchemaVersion != cacheSchemaVersion {
 		return cacheDocument{}, false
 	}
 	if document.ETag == "" {

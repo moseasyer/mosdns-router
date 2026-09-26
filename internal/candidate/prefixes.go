@@ -23,9 +23,10 @@ import (
 // two cannot disagree because there is only one document they both come from.
 const DefaultCloudflarePrefixFileName = "cloudflare-prefixes.txt"
 
-// publishPrefixList writes the document's IPv4 ranges beside the cache envelope, in
-// the form the rewriter reads: one prefix per line, masked, deduplicated, and in
-// ascending order so two days of the file can be diffed by a person.
+// renderPrefixList is the plain prefix list this package publishes beside the
+// document it cached, in the form the rewriter reads: one prefix per line, masked,
+// deduplicated, and in ascending order so two days of the file can be diffed by a
+// person.
 //
 // Every prefix goes through the same parse the sample uses, so a range this
 // package would not sample from is a range this package will not publish: the two
@@ -33,19 +34,25 @@ const DefaultCloudflarePrefixFileName = "cloudflare-prefixes.txt"
 // classification depends on. A range the document lists more than once is written
 // once.
 //
-// The write is a temporary file in the same directory and a rename, with the same
-// mode discipline the cache uses, because this file is replaced while a router is
+// It renders rather than writes, because HTTPCloudflareSource.publish is what
+// writes, and it writes this beside the envelope it stores in the same call. That
+// write is a temporary file in the same directory and a rename, with the same mode
+// discipline the cache uses, because this file is replaced while a router is
 // reading it and a reader must never see half of it. A stale document publishes
 // too: it is the last document this build accepted, so its ranges are the ones a
 // classification should be made against, and refusing to publish them would leave
 // the rewriter with whatever it had before, which may be nothing at all.
-func publishPrefixList(cachePath string, document cloudflareRanges) error {
+//
+// The report about the two published artifacts renders with this same function, so
+// "is the file on disk what this document would publish" is answered by the
+// renderer that writes the file rather than by a second one free to drift from it.
+func renderPrefixList(document cloudflareRanges) ([]byte, error) {
 	prefixes := make([]netip.Prefix, 0, len(document.Result.IPv4CIDRs))
 	seen := make(map[netip.Prefix]struct{}, len(document.Result.IPv4CIDRs))
 	for index, cidr := range document.Result.IPv4CIDRs {
 		prefix, err := parseIPv4Prefix(cidr)
 		if err != nil {
-			return fmt.Errorf("ipv4_cidrs[%d]: %w", index, err)
+			return nil, fmt.Errorf("ipv4_cidrs[%d]: %w", index, err)
 		}
 		if _, duplicate := seen[prefix]; duplicate {
 			continue
@@ -63,7 +70,7 @@ func publishPrefixList(cachePath string, document cloudflareRanges) error {
 		contents = append(contents, prefix.String()...)
 		contents = append(contents, '\n')
 	}
-	return writeTextFile(prefixPathFor(cachePath), contents)
+	return contents, nil
 }
 
 // prefixPathFor is where the parsed list lives for a given cache path, which is
