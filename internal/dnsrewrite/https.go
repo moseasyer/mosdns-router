@@ -216,6 +216,9 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	if err := checkSelected(in.Selected); err != nil {
 		return keepOrRefuse(in, question.Name, fmt.Errorf("%w: %s", ErrNoSelectedAddress, err))
 	}
+	if err := bypassable(clone); err != nil {
+		return keepOrRefuse(in, question.Name, err)
+	}
 	found := classify(published)
 	if found.aliases > 0 {
 		return keepOrRefuse(in, question.Name, aliasRefusal(question.Name, found))
@@ -226,16 +229,19 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	}
 	record, dropped := synthesized(question, found, list, in.Selected)
 
-	// The record goes in where the records of this name were, whether there were
-	// any or not, and the addresses of this name go from wherever they were.
+	// The answer is positive whatever the upstream said, because the record in it is
+	// this router's and not the upstream's.
+	intoPositiveAnswer(clone)
+	// The record goes in where the records of this name were, whether there were any
+	// or not, and the addresses of this name go from wherever they were. Neither
+	// cares which branch this is.
 	clone.Answer = replaceAt(clone.Answer, question.Name, record)
 	dropAddressesOf(clone, question.Name)
 	if len(published) == 0 {
-		// Nothing was published for this name, so the whole answer is the
-		// synthesized record and the sections that described the answer that is not
-		// being sent go with it. The address removal above has already run: it does
-		// not care which branch this is.
-		intoPositiveAnswer(clone)
+		// Nothing was published for this name, so the whole answer is the synthesized
+		// record and the sections that described the answer that is not being sent go
+		// with it.
+		discardSupersededSections(clone)
 	}
 	// The record in the message is not the record that was signed, so the message
 	// says so: the signature over the HTTPS RRset this router replaced describes
@@ -349,6 +355,9 @@ func delegated(msg *dns.Msg, name string) error {
 func httpsQuestion(in HTTPSInput) (dns.Question, error) {
 	if in.Response == nil {
 		return dns.Question{}, errors.New("dnsrewrite: there is no response to rewrite")
+	}
+	if !in.Response.Response {
+		return dns.Question{}, errors.New("dnsrewrite: the message is a query, not a response, and answering it would produce a message that says nothing about being a response")
 	}
 	if len(in.Response.Question) == 0 {
 		return dns.Question{}, errors.New("dnsrewrite: the response carries no question, so there is no name to synthesize for")
@@ -705,6 +714,16 @@ func mandatoryList(record []dns.SVCBKeyValue, usable []*dns.HTTPS) []dns.SVCBKey
 // router wrote from nothing. A record with no lifetime behind it should not be
 // cached as though the upstream had said it was good for any, and a TTL invented here
 // would be a claim nobody made.
+//
+// This is where the package disagrees with Address on purpose, and the disagreement is
+// worth stating rather than papering over. Address refuses to replace a record set whose
+// TTL is zero, because it has to invent a lifetime for the replacement and a record with
+// no lifetime is one it cannot make any claim about. Nothing is invented here: a zero is
+// either the shortest of the TTLs the records being replaced carried -- the upstream
+// saying it does not want these cached, which the replacement repeats -- or the zero a
+// record made from nothing carries because there was no lifetime to inherit. Both are
+// somebody else's claim, or the absence of one, and neither is a number this router
+// chose. A record the upstream said not to cache is therefore not cached.
 func shortestTTL(usable []*dns.HTTPS) uint32 {
 	shortest := uint32(0)
 	for i, record := range usable {
@@ -751,29 +770,60 @@ func replaceAt(section []dns.RR, name string, record *dns.HTTPS) []dns.RR {
 	return out
 }
 
-// intoPositiveAnswer turns the copy of a response that published nothing for the name
-// into the shell the synthesized record is then the answer in: NOERROR, because the
-// upstream's failure is not this router's answer to give, the client's own recursion
-// and checking-disabled bits as the upstream echoed them, no authority section, and
-// the client's OPT as the only thing left in the additional section.
+// bypassable reports whether the upstream's answer is one this router may replace with
+// a synthesized record, and refuses the ones that are not.
 //
-// The authority section goes because a synthesized positive answer claims no denial of
-// existence and no negative caching TTL, and an SOA saying "no records of this type
-// for this name" beside a record that this router just published is a statement the
-// message contradicts. The additional section keeps the client's OPT and nothing
-// else, because every other record in it described the answer being replaced.
+// The distinction is between an absence and a statement. A NODATA, a SERVFAIL and a
+// REFUSED with nothing in the answer are absences: the resolver had nothing to say about
+// the name, and the ECH source lookup and the selected address do not depend on what it
+// would have said, so there is nothing here to be faithful to and no reason to hand a
+// force-ECH client nothing. Everything else is a statement. NXDOMAIN says the name does
+// not exist, and manufacturing a service binding for a name the authoritative data
+// denies is not this router's decision to make. A FORMERR or a NOTIMP says the resolver
+// could not do what was asked, and reading a service mode out of that is reading
+// something the upstream never said. A failure that carries records is refused as well,
+// because a SERVFAIL with an answer in it is not a failure this router can see past and
+// the records in it belong to a question nobody answered.
 //
-// The AA bit is cleared with it, and deliberately: the synthesized record is not the
-// zone's data, it is this router's, so leaving the authoritative-answer bit set
-// would tell a client the answer came from the authoritative server. No client acts
-// on the bit -- RFC 1035 defines it for a resolver-to-resolver conversation and this
-// response is resolver-to-stub -- so clearing it is free, and the bits that are the
-// client's own, the recursion and checking-disabled bits, are left exactly as the
-// upstream echoed them.
+// A record the upstream did publish is never in this position: a response that carries
+// an HTTPS record for the name is being replaced, not turned into a positive answer out
+// of nothing, so the rcode is left as the upstream set it.
+func bypassable(msg *dns.Msg) error {
+	switch msg.Rcode {
+	case dns.RcodeSuccess:
+		return nil
+	case dns.RcodeServerFailure, dns.RcodeRefused:
+		if len(msg.Answer) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: the upstream answered %s, and a service mode for this name would be an answer it did not give",
+		ErrUpstreamDenial, dns.RcodeToString[msg.Rcode])
+}
+
+// intoPositiveAnswer makes the message say what it now is. The rcode goes to NOERROR
+// because the record in the answer is this router's, not the upstream's. The AA bit is
+// cleared deliberately: the synthesized record is not the zone's data, so leaving the
+// authoritative-answer bit set would tell a client the answer came from the
+// authoritative server. No client acts on that bit -- RFC 1035 defines it for a
+// resolver-to-resolver conversation and this response is resolver-to-stub -- so clearing
+// it costs nothing, and the bits that are the client's own, the recursion and
+// checking-disabled ones, are left exactly as the upstream echoed them. A truncated
+// message is not a message this router may add a record to.
 func intoPositiveAnswer(msg *dns.Msg) {
 	msg.Rcode = dns.RcodeSuccess
 	msg.Authoritative = false
 	msg.Truncated = false
+}
+
+// discardSupersededSections drops what the message carried for an answer that is no
+// longer being sent, once a synthesized record has taken the answer's place. The
+// authority section goes because a synthesized positive answer claims no denial of
+// existence and no negative caching TTL, and an SOA saying "no records of this type for
+// this name" beside a record this router just published is a statement the message
+// contradicts. The additional section keeps the client's OPT and nothing else, because
+// every other record in it described the answer being replaced.
+func discardSupersededSections(msg *dns.Msg) {
 	msg.Ns = nil
 	kept := make([]dns.RR, 0, 1)
 	for _, rr := range msg.Extra {

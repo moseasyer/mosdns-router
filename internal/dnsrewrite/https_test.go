@@ -385,6 +385,14 @@ func TestHTTPSRefusesACallerItCannotConfirm(t *testing.T) {
 		msg.Answer = []dns.RR{httpsRecord("cdn.example.", 300, 1, ".", &dns.SVCBAlpn{Alpn: []string{"h2"}})}
 		return msg
 	}()
+	// A well-formed query: the client's own message, which happens to carry the
+	// question this function would answer. Answering it would produce a message that
+	// says nothing about being a response at all.
+	aQuery := func() *dns.Msg {
+		msg := new(dns.Msg)
+		msg.SetQuestion("cdn.example.", dns.TypeHTTPS)
+		return msg
+	}()
 
 	with := func(msg *dns.Msg, name string) HTTPSInput {
 		return HTTPSInput{
@@ -401,6 +409,7 @@ func TestHTTPSRefusesACallerItCannotConfirm(t *testing.T) {
 	}{
 		{name: "no response at all", in: with(nil, "cdn.example.")},
 		{name: "a response with no question", in: with(noQuestion, "cdn.example.")},
+		{name: "a query rather than a response", in: with(aQuery, "cdn.example.")},
 		{name: "a question type this function does not own", in: with(answeredAAAA, "cdn.example.")},
 		{name: "no confirmed name", in: with(answerHTTPS, "")},
 		{name: "a name this response does not answer", in: with(answeredOther, "cdn.example.")},
@@ -1300,14 +1309,18 @@ func TestHTTPSLeavesNoSignatureOnTheRecordItWrote(t *testing.T) {
 		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
 		&dns.SVCBPort{Port: 443},
 	))
+	// A signed NODATA: the shape a validating resolver sends when the name has no
+	// HTTPS record, with the denial of existence and its signature in the authority
+	// section and an address for the name left in the additional section. It is the
+	// realistic starting point for the path where this router makes the record
+	// itself, and it carries everything a rewrite has to remove.
 	synthesized := response("cdn.example.", dns.TypeHTTPS)
-	synthesized.Rcode = dns.RcodeServerFailure
 	synthesized.AuthenticatedData = true
 	synthesized.CheckingDisabled = true
-	synthesized.Answer = []dns.RR{signature("cdn.example.", "example.net.", dns.TypeHTTPS, 300)}
 	synthesized.Ns = []dns.RR{
 		answerSOA(),
 		nsec("example.net.", "example.org.", dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC),
+		nsec3("example.net.", 1, 0, "a1b2", dns.TypeRRSIG, dns.TypeHTTPS),
 		signature("example.net.", "example.net.", dns.TypeSOA, 3600),
 	}
 	synthesized.Extra = []dns.RR{answerOPT(), answerA("cdn.example.", "104.16.1.1", 300)}
@@ -1318,7 +1331,7 @@ func TestHTTPSLeavesNoSignatureOnTheRecordItWrote(t *testing.T) {
 		checkingDisabled bool
 	}{
 		{name: "a rewritten record set", in: rewritten},
-		{name: "a record synthesized from an upstream failure", in: synthesized, checkingDisabled: true},
+		{name: "a record synthesized over a signed NODATA", in: synthesized, checkingDisabled: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			before := packed(t, tt.in)
@@ -1594,4 +1607,218 @@ func TestHTTPSFallsBackToTheOriginalWhenTheSelectorHasNoAddress(t *testing.T) {
 			t.Error("AD was cleared on a response this router did not modify")
 		}
 	})
+}
+
+// TestHTTPSRefusesAnUpstreamAnswerItMustNotTurnIntoAPositiveOne is the boundary
+// between an absence and a statement. The ECH source lookup and the selected address
+// do not depend on what the upstream had, so an upstream that had nothing to say --
+// a NODATA, a SERVFAIL, a REFUSED -- is no reason to hand a force-ECH client nothing,
+// and those are the rcodes this router will build an answer on top of.
+//
+// Everything else is a statement about the name. NXDOMAIN says the name does not
+// exist, and manufacturing a service binding for a name the authoritative data denies
+// is not this router's decision to make; a FORMERR or a NOTIMP says the resolver could
+// not do what was asked, and reading a synthesized service mode out of that is reading
+// something the upstream never said. A failure that carries records is refused too:
+// a SERVFAIL with an answer in it is not a failure this router can see past, and the
+// records in it are for a question whose answer nobody has.
+//
+// The fallback arm is checked for the case where the client is better served by the
+// upstream's own denial: an NXDOMAIN is an answer, a client caches it, and forwarding it
+// is what the client would have got without this router in the path.
+func TestHTTPSRefusesAnUpstreamAnswerItMustNotTurnIntoAPositiveOne(t *testing.T) {
+	denial := func() *dns.Msg {
+		msg := response("cdn.example.", dns.TypeHTTPS)
+		msg.Rcode = dns.RcodeNameError
+		msg.Ns = []dns.RR{answerSOA()}
+		return msg
+	}
+
+	for _, tt := range []struct {
+		name    string
+		in      *dns.Msg
+		wantErr error
+	}{
+		{
+			name: "NOERROR with nothing published for the name",
+			in:   response("cdn.example.", dns.TypeHTTPS),
+		},
+		{
+			name: "a SERVFAIL with no records",
+			in: func() *dns.Msg {
+				msg := response("cdn.example.", dns.TypeHTTPS)
+				msg.Rcode = dns.RcodeServerFailure
+				return msg
+			}(),
+		},
+		{
+			name: "a REFUSED with no records",
+			in: func() *dns.Msg {
+				msg := response("cdn.example.", dns.TypeHTTPS)
+				msg.Rcode = dns.RcodeRefused
+				return msg
+			}(),
+		},
+		{
+			name:    "an NXDOMAIN",
+			in:      denial(),
+			wantErr: ErrUpstreamDenial,
+		},
+		{
+			name: "a FORMERR",
+			in: func() *dns.Msg {
+				msg := response("cdn.example.", dns.TypeHTTPS)
+				msg.Rcode = dns.RcodeFormatError
+				return msg
+			}(),
+			wantErr: ErrUpstreamDenial,
+		},
+		{
+			name: "a NOTIMP",
+			in: func() *dns.Msg {
+				msg := response("cdn.example.", dns.TypeHTTPS)
+				msg.Rcode = dns.RcodeNotImplemented
+				return msg
+			}(),
+			wantErr: ErrUpstreamDenial,
+		},
+		{
+			name: "a SERVFAIL that carries records anyway",
+			in: func() *dns.Msg {
+				msg := response("cdn.example.", dns.TypeHTTPS, answerA("other.example.", "104.16.1.1", 300))
+				msg.Rcode = dns.RcodeServerFailure
+				return msg
+			}(),
+			wantErr: ErrUpstreamDenial,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := HTTPS(httpsInput(t, tt.in))
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("HTTPS refused an answer it may build on: %v", err)
+				}
+				if got.Rcode != dns.RcodeSuccess {
+					t.Errorf("the answer is %s, want NOERROR", dns.RcodeToString[got.Rcode])
+				}
+				if ech := echOf(t, httpsIn(t, got.Answer)); !reflect.DeepEqual(ech, echFixture(t)) {
+					t.Errorf("ech = %d bytes, want the %d validated bytes, byte for byte", len(ech), len(echFixture(t)))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("HTTPS turned the upstream's answer into a positive one: %s", answered(got))
+			}
+			if got != nil {
+				t.Fatalf("HTTPS returned a message beside the error: %s", answered(got))
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want one a caller can recognise as %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("a fallback caller forwards the upstream's own denial", func(t *testing.T) {
+		upstream := denial()
+		before := packed(t, upstream)
+
+		got, err := HTTPS(HTTPSInput{
+			Response: upstream,
+			QName:    "cdn.example.",
+			Selected: selected(),
+			ECH:      echFixture(t),
+			Policy:   FallbackToOriginal,
+		})
+		if !errors.Is(err, ErrUpstreamDenial) {
+			t.Errorf("error = %v, want %v beside the message", err, ErrUpstreamDenial)
+		}
+		if got != upstream {
+			t.Fatalf("HTTPS built a new message where the policy was to keep the upstream's own: %s", answered(got))
+		}
+		if after := packed(t, upstream); string(after) != string(before) {
+			t.Errorf("HTTPS changed the response it was given:\n before %s\n after  %s", before, after)
+		}
+	})
+}
+
+// TestHTTPSRoundTripsTheMinimalRecordThroughTheWire is the wire check for the path
+// with no upstream record to copy anything from, which is the one a browser in a
+// strict domain is most likely to meet: the resolver had nothing, and the answer was
+// made here. Everything about the record is written out as a literal, including the
+// order the keys reach the wire in, which is mandatory(0), alpn(1), ipv4hint(4),
+// ech(5) -- the library's packer sorts them, and this package does not choose.
+func TestHTTPSRoundTripsTheMinimalRecordThroughTheWire(t *testing.T) {
+	upstream := response("cdn.example.", dns.TypeHTTPS)
+	upstream.Extra = []dns.RR{answerOPT()}
+
+	got, err := HTTPS(httpsInput(t, upstream))
+	if err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	out := httpsIn(t, roundTripped(t, got).Answer)
+
+	if keys := carried(out); keys != "mandatory alpn ipv4hint ech" {
+		t.Errorf("the record carries %s, want mandatory alpn ipv4hint ech in the order the wire requires", keys)
+	}
+	if out.Hdr.Name != "cdn.example." || out.Hdr.Class != dns.ClassINET || out.Hdr.Ttl != 0 {
+		t.Errorf("the record is %q %d/%d TTL %d, want cdn.example. IN TTL 0", out.Hdr.Name, out.Hdr.Class, out.Hdr.Rrtype, out.Hdr.Ttl)
+	}
+	if out.Priority != 1 || out.Target != "." {
+		t.Errorf("the record is priority %d target %q, want priority 1 target \".\"", out.Priority, out.Target)
+	}
+	if alpn := alpnOf(t, out); !reflect.DeepEqual(alpn, []string{"h2", "h3"}) {
+		t.Errorf("alpn = %v, want [h2 h3]", alpn)
+	}
+	if hints := hintOf(t, out); !reflect.DeepEqual(hints, []string{selectedIP}) {
+		t.Errorf("ipv4hint = %v, want exactly [%s]", hints, selectedIP)
+	}
+	if ech := echOf(t, out); !reflect.DeepEqual(ech, echFixture(t)) {
+		t.Errorf("ech = %d bytes, want the %d validated bytes, byte for byte", len(ech), len(echFixture(t)))
+	}
+	if mandatory := mandatoryOf(t, out); !reflect.DeepEqual(mandatory, []dns.SVCBKey{dns.SVCB_ECHCONFIG}) {
+		t.Errorf("mandatory = %v, want [ech]", mandatory)
+	}
+	if carried(out) == carried(&dns.HTTPS{SVCB: dns.SVCB{}}) {
+		t.Error("the round trip produced an empty record")
+	}
+	selfConsistent(t, out)
+}
+
+// TestHTTPSKeepsAZeroLifetimeTheUpstreamPublished is where this package and the
+// address rewrite disagree on purpose, and the disagreement is worth stating rather
+// than papering over. Address refuses to replace a record set whose TTL is zero,
+// because it has to invent a lifetime for the replacement and a record with no
+// lifetime is a record it cannot make any claim about. This function has no such
+// problem: a TTL of zero here is never invented. It is either the shortest of the TTLs
+// the records being replaced carried -- the upstream saying it does not want these
+// cached, which the replacement repeats -- or the zero a record made from nothing
+// carries because there was no lifetime to inherit. Both are claims somebody else made,
+// or the absence of one, and neither is a lifetime this router chose.
+func TestHTTPSKeepsAZeroLifetimeTheUpstreamPublished(t *testing.T) {
+	zero := httpsRecord("cdn.example.", 0, 1, ".", &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}})
+	live := httpsRecord("cdn.example.", 300, 1, ".", &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}})
+	mixed := httpsRecord("cdn.example.", 120, 1, "svc.example.net.", &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}})
+
+	for _, tt := range []struct {
+		name    string
+		records []dns.RR
+		want    uint32
+	}{
+		{name: "one record that says do not cache it", records: []dns.RR{zero}, want: 0},
+		{name: "one of two says do not cache it", records: []dns.RR{live, zero}, want: 0},
+		{name: "one of two says cache it longer", records: []dns.RR{zero, live}, want: 0},
+		{name: "neither says anything about caching", records: []dns.RR{live, mixed}, want: 120},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := response("cdn.example.", dns.TypeHTTPS, tt.records...)
+
+			got, err := HTTPS(httpsInput(t, upstream))
+			if err != nil {
+				t.Fatalf("HTTPS refused a record set over its lifetime: %v", err)
+			}
+			if out := httpsIn(t, got.Answer); out.Hdr.Ttl != tt.want {
+				t.Errorf("TTL = %d, want %d", out.Hdr.Ttl, tt.want)
+			}
+		})
+	}
 }
