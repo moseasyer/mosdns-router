@@ -164,6 +164,29 @@ func TestParseUserListRejectsAnAddressARewriteTargetMustNotUse(t *testing.T) {
 	}
 }
 
+func TestParseUserListRefusesAPrefixThatCoversReservedSpace(t *testing.T) {
+	// A prefix can be entirely public at its network address and still cover a
+	// reserved range further in: 203.0.112.0/23 is 203.0.112.0/24 and
+	// 203.0.113.0/24, and the second is documentation space. Nothing about the
+	// prefix itself is wrong, so it passes the network-address rule, and two
+	// blocks is well inside the list bound, so the bound cannot be what refuses
+	// it either. The per-block check is the only thing left, and the list is
+	// refused whole rather than truncated to the good half: a caller must never
+	// get a partial list out of the error return.
+	for _, line := range []string{
+		"203.0.112.0/23",
+		"203.0.0.0/17",
+	} {
+		got, err := ParseUserList(strings.NewReader("104.16.0.1\n" + line + "\n"))
+		if err == nil {
+			t.Errorf("ParseUserList accepted %q and returned %v", line, got)
+		}
+		if len(got) != 0 {
+			t.Errorf("ParseUserList returned %d candidates alongside the error for %q: %v", len(got), line, got)
+		}
+	}
+}
+
 func TestParseUserListRejectsMalformedInput(t *testing.T) {
 	for name, line := range map[string]string{
 		"not an address":           "example.test",
