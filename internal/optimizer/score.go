@@ -175,11 +175,22 @@ type CandidateResult struct {
 	// TCP is the connect measurement, which carries the latency, the jitter and
 	// the loss.
 	TCP measure.TCPMetrics
-	// HTTP is what the address proved about itself, and it is the only field
-	// that can make a candidate eligible. A caller that reached this file
-	// without one has not proved anything, and the selectors here do not read
-	// it: eligibility is the caller's condition and this package scores the
-	// candidates that already passed it.
+	// HTTP is what the address proved about itself over a verified connection.
+	//
+	// No selector in this file reads it, and that is the design rather than a
+	// gap. The phase order is collect, TCP, HTTPS identity, latency shortlist,
+	// bandwidth, score, final proof: a candidate only reaches the scorer if it
+	// has already completed the identity probe for the hostname it is being
+	// scored for, and the proof is run again on the winner before anything is
+	// published. A Status check here would be a third gate over a fact two
+	// others already hold, and it would be the one a caller could most easily
+	// mistake for the gate itself.
+	//
+	// The consequence is a contract on the caller, and it is written down rather
+	// than assumed: a candidate that arrives here without having passed the
+	// identity probe will be scored, and scored well, for an address that cannot
+	// serve the hostname. Task 4 runs the probe in its own phase and re-runs it
+	// through SwitchAllowed's companion before writing.
 	HTTP measure.HTTPMetrics
 	// Download is what the address delivered within its limits. A run whose
 	// daily budget ran out leaves BytesPerSecond at zero, which is not an
@@ -731,14 +742,22 @@ func stabilityOrder(first, second CandidateResult) int {
 	return chainOrder(first, second)
 }
 
-// chainOrder is the documented tie-break, in the order the brief fixes: lower
-// loss, then lower jitter, then the lower address.
+// chainOrder is the documented tie-break, in the order the ruling fixed it:
+// lower loss, then lower jitter, then the lower address.
 //
-// The brief's second term is a p10 speed, and TenthPercentileSpeed is the
-// group's own tenth percentile: a property of the group, identical on both
-// sides of every comparison this chain makes. It cannot separate two candidates
-// of one group, so it is reported rather than compared, and a reader who wants
-// to see it reads TenthPercentileSpeed.
+// The brief originally listed a p10 speed as the second term. It is not a term,
+// because every reading that makes it one is either degenerate or a no-op: a p10
+// is a property of the group, so comparing two candidates' p10 values compares a
+// number with itself and is always equal, and the one predicate reading — at or
+// above the group's p10 — is satisfied by every candidate while the group holds
+// ten or fewer, which is the common case. A tie-break that cannot change an order
+// is worse than no tie-break, so the p10 is a reported figure for Task 4 through
+// TenthPercentileSpeed and the second term is the jitter.
+//
+// Each term is load-bearing and the mutation run proves it: removing the loss
+// term fails TestScoreEqualCombinedScoresSortByLowerLoss, removing the jitter
+// term fails TestScoreEqualCombinedScoresSortByLowerJitter, and removing the
+// address term fails TestScoreEqualCombinedScoresSortByTheLowerAddress.
 //
 // candidate.Compare is the last term rather than a bare address comparison
 // because it is the package's own total order of candidates, and a chain that
