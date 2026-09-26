@@ -824,8 +824,32 @@ func bypassable(msg *dns.Msg) error {
 // authoritative server. No client acts on that bit -- RFC 1035 defines it for a
 // resolver-to-resolver conversation and this response is resolver-to-stub -- so clearing
 // it costs nothing, and the bits that are the client's own, the recursion and
-// checking-disabled ones, are left exactly as the upstream echoed them. A truncated
-// message is not a message this router may add a record to.
+// checking-disabled ones, are left exactly as the upstream echoed them.
+//
+// The truncated bit goes the same way, and this is the one place where the direction of
+// the change was a decision rather than an obviousness. What is in the message is now
+// the whole of the answer: one record this router built, replacing whatever the
+// upstream published for this name rather than sitting beside it, so a TC=1 answer
+// would tell the client to come back over TCP for a message this router has finished
+// writing. What a truncated upstream answer leaves unseen is whatever the upstream had
+// not sent: an alias at the owner, a second service binding, anything that would have
+// made this a refusal. That is the same position a NODATA or an empty SERVFAIL puts
+// the synthesis in, which is why bypassable treats those as an absence rather than a
+// statement, and it is corroborated elsewhere on this path: the pinned cache refuses
+// to store a truncated response either, so nothing downstream of this plugin treats
+// one as an answer to keep.
+//
+// The direction is still fail-closed, because every parameter in the record is one this
+// router chose: the key from a source it validated and the address from a selector that
+// proved it. A partial view of the upstream cannot become a connection in the clear
+// here, and the client is not sent to an address the health check did not prove. The
+// cost is the other one, and it is real rather than hidden: a name whose service
+// description this router never saw in full is answered with a record describing the
+// selected address, which may not be the service the upstream meant to publish.
+// Refusing TC=1 was the alternative and was rejected, because it turns a transport
+// condition into a strict-mode SERVFAIL over a name whose ECH key and proved address
+// are both sitting right there, and buys nothing on either side. A caller that wants
+// the other trade is ErrUpstreamDenial, and it decides for itself.
 func intoPositiveAnswer(msg *dns.Msg) {
 	msg.Rcode = dns.RcodeSuccess
 	msg.Authoritative = false
