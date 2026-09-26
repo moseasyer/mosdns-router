@@ -536,6 +536,23 @@ carries no address for the published ranges to classify, so there is nothing the
 plugin could inspect instead of the A answer it is waiting for — and the two halves
 are pinned by one test that runs the pair in both orders.
 
+**A fallback forced domain's A becomes the selected IPv4 only when its response is
+Cloudflare-classified, and the spec says both things.** Spec §12.4 lists the
+fallback arm's `A → 当前优选 IPv4` with no condition on it, while §10.1 item 3 admits
+a response to the Cloudflare verdict only when every terminal address is inside the
+published ranges. The two cannot both hold for a forced domain whose A answer is
+not Cloudflare-served, and the code follows the narrower of them — the classification
+— because §10.1 is the section that decides what may be rewritten at all, and
+because installing a selected address into an answer belonging to some other network
+is the failure the whole classification exists to prevent. This is recorded here so
+nobody reads plan against spec and concludes the difference was a silent
+re-interpretation: it is a deliberate choice between two spec sentences, and the
+consequence is that a forced domain fronted by a CDN this router does not publish
+ranges for keeps its upstream address and gets its ECHConfig anyway. The
+per-hostname CloudFront arm is a separate authorisation and is not in question
+here: a mapping installs the distribution's own proved address, not the global
+selected IPv4.
+
 **A per-hostname CloudFront mapping authorises the QUERY, and the addresses it
 replaces are the ones at the end of the response's CNAME chain.** A distribution
 reached through an alias is the ordinary shape of a per-hostname mapping, and
@@ -978,11 +995,20 @@ Create a direct client with `upstream.NewUpstream(ForeignUpstream, upstream.Opt{
 - [ ] **Step 7: Implement recursive execution order**
 
 ```text
-strict force + A/AAAA -> synthesize NODATA, do not call next
+strict force + A/AAAA -> synthesize NOERROR with an empty Answer and NO SOA, do not call next
 strict force + HTTPS   -> call next, use compatible upstream parameters when present, otherwise synthesize minimal h2,h3 ServiceMode
 all other supported    -> call next, classify/mutate
 unsupported qtype      -> call next unchanged
 ```
+
+**No SOA, and that is the whole of the difference from a NODATA.** An SOA in the
+authority section is a negative caching claim, and its SOA.MINIMUM is a TTL this
+router would then be vouching for on a name it deliberately refused to resolve.
+An empty answer with an empty authority section claims no lifetime, is recomputed
+for free on every query, and cannot be cached against this router's word. The word
+in this line was NODATA until the final review, which is the plan's own earlier
+ruling being read as a label rather than as the claim it makes; the code and the
+ruling agree with the line above.
 
 A nil downstream response becomes SERVFAIL through plugin error handling. Never call the main sequence recursively for ECH source lookups.
 
