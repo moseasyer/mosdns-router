@@ -874,14 +874,19 @@ func runCDNPin(ctx context.Context, args []string, stdout, stderr io.Writer, ser
 		writeCLIError(stderr, "pin: %v", err)
 		return exitInvalidCLI
 	}
-	published, err := world.runner.Pin(ctx, address.Unmap(), world.profiles)
+	pinned, err := world.runner.Pin(ctx, address.Unmap(), world.profiles)
+	// The uncharged identity bytes are printed before the error, on the same
+	// grounds as `health-check`: a pin that is refused has still spent the
+	// operator's data allowance proving the address, and nothing on disk accounts
+	// for it.
+	writeReportLine(stdout, "identity-body-bytes: %d\n", pinned.IdentityBytes)
 	if err != nil {
 		writeCLIError(stderr, "pin: %v", err)
 		return cdnExitCode(err)
 	}
 	writeReportLine(stdout, "pinned: %s\n", address)
 	if err := renderNamespaced(stdout, "selector", func(writer io.Writer) error {
-		return status.RenderSelector(writer, published)
+		return status.RenderSelector(writer, pinned.Selector)
 	}); err != nil {
 		writeCLIError(stderr, "pin: write report: %v", err)
 		return exitStateUnavailable
@@ -1028,9 +1033,17 @@ func writeCDNReport(output io.Writer, report optimizer.Report, published *state.
 			}
 		}
 	}
-	if report.FinalProofPassed {
+	// The final proof gets the answer it deserves, and there are three: it passed,
+	// it ran and did not, or it never ran. A report-only run never proves the winner
+	// again, so "not run" is the truth for it; a proof that ran and was refused is
+	// the line that says the address stopped serving, and printing "not run" beside
+	// it read as though nothing had been proved and nothing was at stake.
+	switch {
+	case report.FinalProofPassed:
 		writeReportLine(output, "final-proof: passed at %s\n", report.ProofedAt.Format(time.RFC3339))
-	} else {
+	case report.FinalProofRefused != "":
+		writeReportLine(output, "final-proof: %s, this report publishes nothing\n", report.FinalProofRefused)
+	default:
 		writeReportLine(output, "final-proof: not run, this report publishes nothing\n")
 	}
 	return nil
@@ -1039,12 +1052,19 @@ func writeCDNReport(output io.Writer, report optimizer.Report, published *state.
 // writePartialReport is what a cancelled or failed run leaves behind: the document
 // it did produce, on stdout, and the error on stderr. Publishing is not on the
 // table for a run that did not finish.
+//
+// A partial report is not written to --report, and the error says so in those terms
+// rather than surfacing the writer's validation complaint: the phases that never ran
+// have no boundaries, so the document is not one this build will write and not one an
+// apply could read - which is the right refusal, and a bare "the identity phase has
+// no recorded boundaries" tells an operator nothing about where the document they
+// asked for went.
 func writePartialReport(options cdnOptions, report optimizer.Report, stdout, stderr io.Writer) {
 	if report.Groups == nil && report.Phases.Collect.StartedAt.IsZero() {
 		return
 	}
 	if err := writeReportFile(options.report, report); err != nil {
-		writeCLIError(stderr, "test: %v", err)
+		writeCLIError(stderr, "test: the run did not finish, so no report document was written to %s: %v; the partial report is on stdout", options.report, err)
 	}
 	_ = writeCDNReport(stdout, report, nil)
 }

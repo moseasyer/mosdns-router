@@ -871,6 +871,40 @@ func TestPinCommandStoresAManualWinnerAndUnpinRestoresAutomaticSelection(t *test
 	}
 }
 
+// A pin's identity proofs are outside the daily bandwidth budget, so the bytes
+// they read are the operator's data allowance and nothing on disk accounts for
+// them. `health-check` already prints its total; `pin` now prints its own, on a
+// successful pin and on a refused one alike, because a refused proof is exactly the
+// case where bytes were spent and no address was stored.
+func TestPinCommandReportsTheUnchargedIdentityBytesItSpent(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"pin", "104.16.9.9"}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("pin exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "identity-body-bytes: 512") {
+		t.Errorf("the pin does not account for the uncharged body bytes:\n%s", stdout.String())
+	}
+
+	// And on the refused path, where the bytes were spent and nothing was stored.
+	fixture = newCDNFixture(t, 4, "104.16.1.1")
+	refusing := newStubProber()
+	refusing.identityErr = errors.New("104.16.9.9 does not serve speed.cloudflare.com: connection refused")
+	stdout.Reset()
+	stderr.Reset()
+	args = append([]string{"pin", "104.16.9.9"}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(refusing, threeCloudflareCandidates(), fixedMoment)); code == exitSuccess {
+		t.Fatal("a pin whose proof was refused reported success")
+	}
+	if !strings.Contains(stdout.String(), "identity-body-bytes: 512") {
+		t.Errorf("a refused pin does not account for the bytes it spent:\n%s", stdout.String())
+	}
+}
+
 func TestPinCommandRefusesAnAddressTheRulesDoNotAllowWithoutChangingTheFile(t *testing.T) {
 	// The same rule a candidate is held to, reached through the command an operator
 	// would use to get it wrong, and the file does not move.
@@ -1009,6 +1043,47 @@ func TestTestCommandSaysNothingQualifiedAndPublishesNothing(t *testing.T) {
 	}
 }
 
+// A final proof that ran and was refused is the one line in a report that says the
+// address stopped serving, so it must not be printed as "not run" - which is what
+// the report used to say for every proof that did not pass, and which reads as
+// "nothing was proved and nothing was at stake".
+func TestTheReportSaysAFinalProofThatRanAndWasRefusedWasRefused(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	stub := newStubProber()
+	// The run proves the winner; the apply's second proof of the same address is
+	// refused, which is an address that stopped serving between the two moments.
+	stub.finalProofRefused = map[string]error{
+		"104.16.0.1": errors.New("104.16.0.1 does not serve speed.cloudflare.com: connection refused"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"test", "--apply"}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code == exitSuccess {
+		t.Fatalf("test --apply whose final proof was refused reported success:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "final-proof: refused") {
+		t.Errorf("the report does not say the final proof was refused:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "final-proof: not run") {
+		t.Errorf("a final proof that ran is reported as never having run:\n%s", stdout.String())
+	}
+}
+
+// A report-only run never proves the winner again, so "not run" is the truth for it
+// and has to stay reachable.
+func TestTheReportSaysTheFinalProofDidNotRunOnAReportOnlyRun(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"test"}, fixture.flags()...), &stdout, &stderr,
+		servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("test exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "final-proof: not run") {
+		t.Errorf("a report-only run does not say the final proof did not run:\n%s", stdout.String())
+	}
+}
+
 func TestTestCommandPublishesNothingWhenTheRunIsCancelled(t *testing.T) {
 	// A cancelled run returns what it measured and publishes nothing, whichever way
 	// the cancellation arrived. The partial report is on stdout, the error on
@@ -1035,6 +1110,45 @@ func TestTestCommandPublishesNothingWhenTheRunIsCancelled(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "applied: nothing") {
 		t.Errorf("the output does not say that nothing was published:\n%s", stdout.String())
+	}
+}
+
+// A run that did not finish cannot produce a document this build will write: the
+// phases that never ran have no boundaries, so the partial report is refused by
+// the writer's own validation. That is the right refusal - a partial report is not
+// an applyable one - but the error must say what happened and where the document
+// is, rather than surfacing a field the operator never sees and leaving the --report
+// path empty with no explanation.
+func TestACancelledRunWithAReportPathSaysWhereThePartialReportIs(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"test", "--report", fixture.reportPath}, fixture.flags()...)
+	code := runWithContext(ctx, args, &stdout, &stderr,
+		servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment))
+	if code == exitSuccess {
+		t.Fatal("a cancelled test reported success")
+	}
+	if _, err := os.Stat(fixture.reportPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a partial report was written to %s (stat error %v): it is not a document an apply can read", fixture.reportPath, err)
+	}
+	if !strings.Contains(stderr.String(), "did not finish") {
+		t.Errorf("the error does not say the run did not finish: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "stdout") {
+		t.Errorf("the error does not say the partial report is on stdout: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "final-proof") && !strings.Contains(stderr.String(), "phase") {
+		t.Errorf("the error is a bare validation complaint with no shape the operator can act on: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "generated-at:") {
+		t.Errorf("the partial report is not on stdout:\n%s", stdout.String())
+	}
+	if after := string(mustReadFile(t, fixture.selectorPath)); after != before {
+		t.Errorf("a cancelled run changed the selector:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
 

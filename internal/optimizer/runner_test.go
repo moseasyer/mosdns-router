@@ -2332,14 +2332,76 @@ func TestPinProvesAGlobalAddressOnlyAgainstTheGlobalProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pin of an address the CloudFront profile refuses: %v", err)
 	}
-	if pinned.WinnerIP != "104.16.9.9" {
-		t.Errorf("the pinned winner is %q, want 104.16.9.9", pinned.WinnerIP)
+	if pinned.Selector.WinnerIP != "104.16.9.9" {
+		t.Errorf("the pinned winner is %q, want 104.16.9.9", pinned.Selector.WinnerIP)
 	}
 	// One proof: the global profile. The CloudFront hostname is never asked about a
 	// global address.
 	if got := len(fake.profiledCalls()); got != 1 {
 		t.Errorf("the prober was asked for %d identity proofs, want 1: the global profile only", got)
 	}
+}
+
+func TestPinReportsTheUnchargedIdentityBytesItSpent(t *testing.T) {
+	// A pin's proofs are identity probes, which are deliberately outside the daily
+	// budget for the same reason a health check's are, so nothing on disk accounts
+	// for the bodies they read. The health check already reports its total; a pin
+	// spent the operator's data allowance to reach the same verdict and reported
+	// none of it, which is the gap this closes.
+	//
+	// Three global profiles, 2048 bytes each: 6144 in total.
+	fake := newFakeProber(map[string]*addressFixture{
+		"104.16.9.9": served(10, 1, 0, 5*mib),
+	})
+	runner, selectorPath := newTestRunnerWithSelector(t, fake)
+	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	profiles := []candidate.ProbeProfile{
+		testProfile("speed.example.test", 443),
+		testProfile("secure.example.test", 443),
+		testProfile("strict.example.test", 443),
+	}
+
+	pinned, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), globalProfiles(profiles...))
+	if err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	if pinned.IdentityBytes != 3*runnerIdentityBytes {
+		t.Errorf("the pin reports %d uncharged identity bytes, want %d: three probes of %d each",
+			pinned.IdentityBytes, 3*runnerIdentityBytes, runnerIdentityBytes)
+	}
+}
+
+// A refused pin spends the same bytes and publishes nothing, so it reports them
+// too: a refused probe is exactly the case where money was spent and no address
+// was stored, which is why the sum is taken before the error is looked at.
+func TestARefusedPinReportsTheUnchargedIdentityBytesItSpent(t *testing.T) {
+	fake := newFakeProber(map[string]*addressFixture{
+		"104.16.9.9": served(10, 1, 0, 5*mib),
+	})
+	// The second profile refuses, so the pin is refused after one proof has already
+	// read its body and one has read its way to a refusal.
+	fake.fixtures["104.16.9.9"].identityRefusedFor = map[string]error{
+		"secure.example.test": errors.New("the certificate presented is not for secure.example.test"),
+	}
+	runner, selectorPath := newTestRunnerWithSelector(t, fake)
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	profiles := []candidate.ProbeProfile{
+		testProfile("speed.example.test", 443),
+		testProfile("secure.example.test", 443),
+	}
+
+	pinned, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), globalProfiles(profiles...))
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Fatalf("Pin of an address one profile refuses returned %v, want %v", err, ErrIdentityRefused)
+	}
+	if pinned.IdentityBytes != 2*runnerIdentityBytes {
+		t.Errorf("the refused pin reports %d uncharged identity bytes, want %d: both probes read their body, refused or not",
+			pinned.IdentityBytes, 2*runnerIdentityBytes)
+	}
+	if pinned.Selector.WinnerIP != "" || pinned.Selector.Generation != 0 {
+		t.Errorf("a refused pin returned a published selector: %+v", pinned.Selector)
+	}
+	mustBeUnchanged(t, selectorPath, before)
 }
 
 func TestPinStoresAManualWinnerAfterProvingItAgainstEveryGlobalProfile(t *testing.T) {
@@ -2365,26 +2427,26 @@ func TestPinStoresAManualWinnerAfterProvingItAgainstEveryGlobalProfile(t *testin
 	if got := len(fake.addressesOf("https")); got != 3 {
 		t.Errorf("the prober was asked for %d identity proofs, want 3: one per configured profile", got)
 	}
-	if pinned.Mode != "manual" {
-		t.Errorf("the pinned selector's mode is %q, want manual", pinned.Mode)
+	if pinned.Selector.Mode != "manual" {
+		t.Errorf("the pinned selector's mode is %q, want manual", pinned.Selector.Mode)
 	}
-	if pinned.WinnerIP != "104.16.9.9" {
-		t.Errorf("the pinned winner is %q, want 104.16.9.9", pinned.WinnerIP)
+	if pinned.Selector.WinnerIP != "104.16.9.9" {
+		t.Errorf("the pinned winner is %q, want 104.16.9.9", pinned.Selector.WinnerIP)
 	}
-	if pinned.FallbackIP != "104.16.1.1" {
-		t.Errorf("the pinned fallback is %q, want the address that was in service, 104.16.1.1", pinned.FallbackIP)
+	if pinned.Selector.FallbackIP != "104.16.1.1" {
+		t.Errorf("the pinned fallback is %q, want the address that was in service, 104.16.1.1", pinned.Selector.FallbackIP)
 	}
-	if pinned.Generation != 5 {
-		t.Errorf("the pinned selector is generation %d, want 5: a pin is one generation on", pinned.Generation)
+	if pinned.Selector.Generation != 5 {
+		t.Errorf("the pinned selector is generation %d, want 5: a pin is one generation on", pinned.Selector.Generation)
 	}
-	if pinned.Provider != string(candidate.ProviderCloudflare) {
-		t.Errorf("the pinned selector names provider %q, want cloudflare", pinned.Provider)
+	if pinned.Selector.Provider != string(candidate.ProviderCloudflare) {
+		t.Errorf("the pinned selector names provider %q, want cloudflare", pinned.Selector.Provider)
 	}
-	if !pinned.LastSuccess.Equal(runnerNow) || !pinned.WinnerProofUntil.After(pinned.LastSuccess) {
-		t.Errorf("the pinned selector records success at %s and a proof until %s, want the run's clock and a later proof", pinned.LastSuccess, pinned.WinnerProofUntil)
+	if !pinned.Selector.LastSuccess.Equal(runnerNow) || !pinned.Selector.WinnerProofUntil.After(pinned.Selector.LastSuccess) {
+		t.Errorf("the pinned selector records success at %s and a proof until %s, want the run's clock and a later proof", pinned.Selector.LastSuccess, pinned.Selector.WinnerProofUntil)
 	}
-	if pinned.ConfigSHA256 != runnerSHA256 {
-		t.Errorf("the pinned selector carries config digest %q, want %q", pinned.ConfigSHA256, runnerSHA256)
+	if pinned.Selector.ConfigSHA256 != runnerSHA256 {
+		t.Errorf("the pinned selector carries config digest %q, want %q", pinned.Selector.ConfigSHA256, runnerSHA256)
 	}
 	if got := readSelector(t, selectorPath); got.Mode != "manual" || got.WinnerIP != "104.16.9.9" {
 		t.Errorf("the file on disk holds %+v, want a manual 104.16.9.9", got)
@@ -3553,6 +3615,50 @@ func TestApplyRefusesWhenTheFinalProofWouldOutliveItsDeadline(t *testing.T) {
 		t.Errorf("the refusal %q does not name the profile that did not answer", err)
 	}
 	mustBeUnchanged(t, selectorPath, before)
+}
+
+// A report has to say which of the three things happened to its final proof: it
+// never ran, it ran and was refused, or it ran and ran out of time. A reader that
+// cannot tell the second from the third is reading "not run" for a proof that ran,
+// which is what the CLI used to print - and a proof that ran and was refused is the
+// important one, because it says the address stopped serving.
+func TestARefusedFinalProofIsRecordedAsRefusedAndATimeoutAsTimedOut(t *testing.T) {
+	// Refused: the winner serves the run and refuses the apply's second proof.
+	fixtures, candidates := threeGlobals()
+	fixtures["104.16.0.1"].identityCallsBeforeFailure = 1
+	runner, _ := newTestRunnerWithSelector(t, newFakeProber(fixtures))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	refused, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Fatalf("Apply whose proof was refused returned %v, want %v", err, ErrIdentityRefused)
+	}
+	if refused.FinalProofRefused != "refused" {
+		t.Errorf("a refused final proof is recorded as %q, want %q", refused.FinalProofRefused, "refused")
+	}
+	if refused.FinalProofPassed {
+		t.Error("a refused final proof is recorded as passed")
+	}
+	if refused.Phases.FinalProof.StartedAt.IsZero() {
+		t.Error("a refused final proof recorded no start, so the phase cannot be told from one that never ran")
+	}
+
+	// Timed out: the same run against a host that cannot answer in time.
+	fixtures, candidates = threeGlobals()
+	fixtures["104.16.0.1"].proofDelay = 2 * time.Second
+	fixtures["104.16.0.1"].proofDelayAfterCalls = 1
+	slow, _ := newTestRunnerWithSelector(t, newFakeProber(fixtures), func(tuning *runnerTuning) {
+		tuning.options.ProofTimeout = 100 * time.Millisecond
+	})
+	report = mustRunWithIncumbent(t, slow, candidates, "104.16.1.1")
+
+	timedOut, _, err := slow.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	if !errors.Is(err, ErrProofTimeout) {
+		t.Fatalf("Apply whose proof ran out of time returned %v, want %v", err, ErrProofTimeout)
+	}
+	if timedOut.FinalProofRefused != "timed out" {
+		t.Errorf("a final proof that ran out of time is recorded as %q, want %q", timedOut.FinalProofRefused, "timed out")
+	}
 }
 
 func TestApplyProvesEveryProfileOfAGlobalAddressConcurrently(t *testing.T) {

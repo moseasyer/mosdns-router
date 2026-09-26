@@ -155,6 +155,25 @@ const (
 	ReasonProfilePortsDiffer = "the identity profiles of this group name different ports"
 )
 
+// The three ways a final proof that ran can end without passing, as the tokens
+// Report.FinalProofRefused carries. They are named constants for the same reason
+// the reasons above are: a caller matches on the value rather than on its wording,
+// and a document that is refused a proof records which of the three it was.
+const (
+	// ProofRefused is a probe that answered and the answer was not a proof: a chain
+	// that is not for the hostname, a status the profile does not expect, a required
+	// header that is missing, or a body that is not the document the profile names.
+	ProofRefused = "refused"
+
+	// ProofTimedOut is the phase's deadline expiring, which is a statement about this
+	// build's patience and not about the host.
+	ProofTimedOut = "timed out"
+
+	// ProofCancelled is the caller going away, which is neither a verdict about the
+	// host nor this build running out of road.
+	ProofCancelled = "cancelled"
+)
+
 // The two reasons a group produced no winner at all, as named constants for the
 // same reason. They are different failures and a report has to tell them apart: a
 // run where nothing was proved and a run where everything was over a ceiling are
@@ -626,6 +645,17 @@ type Report struct {
 	// control lock. A report read back from disk never has it, which is exactly
 	// why apply has to run the proof itself.
 	FinalProofPassed bool `json:"final_proof_passed"`
+	// FinalProofRefused names how a final proof that ran ended without passing, and
+	// is empty on every other path. It exists because "the final proof did not pass"
+	// and "the final proof never ran" are different facts about the address, and a
+	// reader shown only the second would conclude the first never happened: a proof
+	// that ran and was refused is the one that says the address stopped serving.
+	//
+	//   - ProofRefused: a probe answered and the answer was not a proof.
+	//   - ProofTimedOut: the phase's deadline expired, which is this build's
+	//     patience rather than a verdict about the host.
+	//   - ProofCancelled: the caller went away, which is neither.
+	FinalProofRefused string `json:"final_proof_refused,omitempty"`
 	// ProofedAt is when that second proof completed.
 	ProofedAt time.Time `json:"proofed_at,omitzero"`
 	// Outcome is what the apply did with the report as a whole: published if any
@@ -801,6 +831,18 @@ func (r Report) Validate() error {
 	}
 	if r.IdentityBytes < 0 || r.BudgetUsed < 0 || r.BudgetLimit < 0 || r.BudgetRemaining < 0 {
 		return errors.New("identity_body_bytes, budget_used_bytes, budget_limit_bytes and budget_remaining_bytes must not be negative")
+	}
+	switch r.FinalProofRefused {
+	case "":
+	case ProofRefused, ProofTimedOut, ProofCancelled:
+		if r.FinalProofPassed {
+			return errors.New("a report cannot record a final proof that both passed and was refused")
+		}
+		if r.Phases.FinalProof.StartedAt.IsZero() {
+			return fmt.Errorf("a report records the final proof as %q with no recorded start", r.FinalProofRefused)
+		}
+	default:
+		return fmt.Errorf("final_proof_refused must be %q, %q or %q, got %q", ProofRefused, ProofTimedOut, ProofCancelled, r.FinalProofRefused)
 	}
 	if err := validatePhases(r.Phases); err != nil {
 		return err
@@ -1283,6 +1325,7 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (a
 		report.IdentityBytes += metrics.BodyBytes
 		if err != nil {
 			report.Phases.FinalProof.EndedAt = r.now()
+			report.FinalProofRefused = proofOutcome(err)
 			cancelProof()
 			return report, state.Selector{}, err
 		}
@@ -1339,6 +1382,22 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (a
 		return report, state.Selector{}, err
 	}
 	return report, published, nil
+}
+
+// proofOutcome is which of the three ways a final proof can end without passing
+// this one was, decided by the error the walk returned rather than by asking
+// whether the context happens to be done. A refusal and a timeout can be in the
+// same phase, and reading the context relabelled a slow host as a refusing one -
+// so the two are told apart here, once, and a report records the difference.
+func proofOutcome(err error) string {
+	switch {
+	case errors.Is(err, ErrProofTimeout):
+		return ProofTimedOut
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return ProofCancelled
+	default:
+		return ProofRefused
+	}
 }
 
 // groupDecision is what one group decided, before any proof and before any write.
@@ -1664,6 +1723,22 @@ func fallbackAfter(winner string, current state.Selector) string {
 	return ""
 }
 
+// PinResult is what one pin published and what it cost. It is a named type rather
+// than a bare selector because a pin spends uncharged bytes before it knows whether
+// it will publish anything, and a caller that cannot be handed those has nowhere to
+// report them - which is the gap this closes, the same one the health check already
+// reports its own way through.
+type PinResult struct {
+	// Selector is the document this pin wrote, and is the zero value on every path
+	// that wrote none: a pin that was refused, and a pin that could not take the
+	// control lock. The error is what tells those apart from each other.
+	Selector state.Selector
+	// IdentityBytes is every uncharged body byte this pin's proofs read, refusals
+	// included. Nothing on disk accounts for it, because identity probes are
+	// deliberately outside the daily bandwidth budget.
+	IdentityBytes int64
+}
+
 // Pin stores an address as the manual winner, after proving that it serves
 // everything this configuration will ask it to serve.
 //
@@ -1682,7 +1757,13 @@ func fallbackAfter(winner string, current state.Selector) string {
 // the proof immediately, or the file records an address that was proved at some
 // other time. It is bounded by the prober's probe timeout, and a pin is a manual
 // action, so seconds under the lock is the right trade.
-func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles) (state.Selector, error) {
+//
+// The result carries the identity bytes the proof read whether or not the pin was
+// published, because the sum is taken before the error is looked at: a refused
+// proof is exactly the case where the operator's data allowance was spent and no
+// address was stored.
+func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles) (PinResult, error) {
+	result := PinResult{}
 	subject := candidate.Candidate{
 		Provider: candidate.ProviderCloudflare,
 		IP:       address,
@@ -1691,11 +1772,11 @@ func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles)
 		Source: candidate.SourceUser,
 	}
 	if err := subject.Validate(); err != nil {
-		return state.Selector{}, fmt.Errorf("%w: %s: %v", ErrNotPublishable, address, err)
+		return result, fmt.Errorf("%w: %s: %v", ErrNotPublishable, address, err)
 	}
 	lock, current, err := r.holdControlLock()
 	if err != nil {
-		return state.Selector{}, err
+		return result, err
 	}
 	defer func() { _ = lock.Close() }()
 
@@ -1705,18 +1786,19 @@ func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles)
 	// successful pin. The operator re-enables it by editing the document, which is
 	// the only way that mode is reachable at all.
 	if current.Mode == "disabled" {
-		return state.Selector{}, fmt.Errorf("%w: %s is in mode %q", ErrModeDisabled, r.options.SelectorPath, current.Mode)
+		return result, fmt.Errorf("%w: %s is in mode %q", ErrModeDisabled, r.options.SelectorPath, current.Mode)
 	}
 
 	// The proof is bounded by the same deadline an apply's is, and for the same
-	// reason: it runs under the control lock. Its metrics are discarded, because a
-	// pin has no report to account identity bytes in - the gap Task 2 named - and
-	// the bytes are the operator's data allowance either way, bounded by the
-	// identity body cap on each probe.
+	// reason: it runs under the control lock. Its body bytes are the one thing the
+	// result keeps, because the daily budget does not pay for an identity probe and
+	// the operator's data allowance did.
 	proof, cancel := context.WithTimeout(ctx, r.options.ProofTimeout)
 	defer cancel()
-	if _, err := r.proveAddress(proof, subject, profiles); err != nil {
-		return state.Selector{}, err
+	metrics, err := r.proveAddress(proof, subject, profiles)
+	result.IdentityBytes = metrics.BodyBytes
+	if err != nil {
+		return result, err
 	}
 	published := current
 	published.SchemaVersion = state.SchemaVersion
@@ -1730,9 +1812,10 @@ func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles)
 	published.WinnerProofUntil = r.now().Add(WinnerProofTTL)
 	published.LastFailure = ""
 	if err := state.WriteJSONAtomic(r.options.SelectorPath, published); err != nil {
-		return state.Selector{}, err
+		return result, err
 	}
-	return published, nil
+	result.Selector = published
+	return result, nil
 }
 
 // Unpin restores automatic selection, and keeps the address that was pinned as the
