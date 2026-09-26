@@ -258,7 +258,10 @@ type Result struct {
 	// empty when it could. It is reported rather than swallowed because a count
 	// that starts at the policy's threshold has to say that it did.
 	FailedClosed string
-	// Health is the document this check wrote.
+	// Health is the document this check wrote, and the last one it wrote: a check that
+	// published a transition stamps it again for the address that is now in service, so
+	// this field describes the published selection rather than the address that left
+	// it. It is the zero value when the check wrote none.
 	Health state.HealthState
 	// Transition is the selector this check published, or nil when it published
 	// none.
@@ -400,8 +403,9 @@ func NewChecker(prober Prober, options Options) (*Checker, error) {
 //  4. take the control lock, read the selector again under it, and refuse if it was
 //     published again in the meantime;
 //  5. read the health document under the lock, apply the verdict, and write it
-//     atomically at mode 0640 - a same-directory temporary file, a flush, and a
-//     rename;
+//     through state.WriteReplacementJSONAtomic - the state package's own atomic write,
+//     which is this one because a corrupt health document has to be replaceable and
+//     nothing else does;
 //  6. only if the counter has reached the threshold, prove the fallback and write
 //     the selector through state.WriteJSONAtomic, both under the lock that is still
 //     held.
