@@ -706,7 +706,7 @@ func runCDNTest(ctx context.Context, args []string, stdout, stderr io.Writer, se
 			writeCLIError(stderr, "test: %v", applyErr)
 			return cdnExitCode(applyErr)
 		}
-		published = &selector
+		published = publishedSelector(report, selector)
 	}
 	if err := writeReportFile(options.report, report); err != nil {
 		writeCLIError(stderr, "test: %v", err)
@@ -773,11 +773,30 @@ func runCDNApply(ctx context.Context, args []string, stdout, stderr io.Writer, s
 		writeCLIError(stderr, "apply: %v", err)
 		return exitStateUnavailable
 	}
-	if err := writeCDNReport(stdout, applied, &published); err != nil {
+	if err := writeCDNReport(stdout, applied, publishedSelector(applied, published)); err != nil {
 		writeCLIError(stderr, "apply: write report: %v", err)
 		return exitStateUnavailable
 	}
 	return exitSuccess
+}
+
+// publishedSelector is what an apply wrote, or nil when it wrote nothing.
+//
+// An apply in which every group kept its mapping succeeds, and the address in
+// service is unchanged - which is an outcome and not a failure, so the exit code
+// says success. It is not a publication, though, and the output has to say so: the
+// selector it did not write still holds the address that was already there, and a
+// timer or a script that read "applied: <ip>" off that output would record a
+// publication on the one night nobody reads a report twice.
+//
+// The report's own outcome is what is asked, rather than the selector's fields,
+// because the outcome is the documented statement of what the apply did. The zero
+// selector Apply returns in that case is the same fact from the other side.
+func publishedSelector(report optimizer.Report, written state.Selector) *state.Selector {
+	if report.Outcome != optimizer.OutcomePublished {
+		return nil
+	}
+	return &written
 }
 
 // runCDNPin stores an address as the manual winner, after a real identity proof

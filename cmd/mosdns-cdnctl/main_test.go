@@ -1198,3 +1198,80 @@ func TestTestCommandProvesAGlobalAddressOnceWhenTheIdentityListNamesTheRepresent
 		t.Errorf("the prober was asked for %d identity proofs, want 3: the representative domain listed twice is one profile", got)
 	}
 }
+
+// A night on which every group kept its mapping is a night the file was not
+// touched. The output has to say that, because a timer or a script reading
+// "applied: <ip>" would otherwise record a publication that never happened - and it
+// would do so on the one night the run said the address in service was still the
+// right one, which is exactly the night nobody looks at the output of.
+func assertNoPublicationClaimed(t *testing.T, output string) {
+	t.Helper()
+	if !strings.Contains(output, "applied: nothing") {
+		t.Errorf("the output does not say that nothing was applied:\n%s", output)
+	}
+	if !strings.Contains(output, "outcome: kept") {
+		t.Errorf("the output does not carry the kept outcome:\n%s", output)
+	}
+	for _, claimed := range []string{"applied: 104.16.1.1", "generation: 4", "fallback: "} {
+		if strings.Contains(output, claimed) {
+			t.Errorf("the output claims %q for a run that wrote nothing:\n%s", claimed, output)
+		}
+	}
+}
+
+func TestTestCommandClaimsNoPublicationWhenEveryGroupKeptItsMapping(t *testing.T) {
+	// `test --apply` measures and applies in one invocation, and the apply is what
+	// prints. With nothing publishable in any group the apply keeps everything, and
+	// the report it hands back describes a selector nobody wrote.
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	// The selector as it is before the run, so the case can show that nothing wrote
+	// it and, separately, that nothing claimed to.
+	before := string(mustReadFile(t, fixture.selectorPath))
+	stub := newStubProber()
+	// Nothing in the run can be proved, so the group produces no winner at all and
+	// the apply has nothing to publish.
+	stub.identityErr = errors.New("the response is a 521, which the profile does not expect")
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"test", "--apply"}, fixture.flags()...)
+	code := runWithContext(t.Context(), args, &stdout, &stderr, servicesFor(stub, threeCloudflareCandidates(), fixedMoment))
+	// The run measured nothing, which the command reports as such; the question this
+	// case asks is what it printed on the way out.
+	if code != exitStateUnavailable {
+		t.Fatalf("test --apply of an unprovable run exit = %d, want %d (stdout: %s)", code, exitStateUnavailable, stdout.String())
+	}
+	assertNoPublicationClaimed(t, stdout.String())
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("the selector changed on a run that published nothing:\n%s", got)
+	}
+}
+
+func TestApplyCommandClaimsNoPublicationWhenEveryGroupKeptItsMapping(t *testing.T) {
+	// The same night seen through `apply`: a report written earlier whose every group
+	// kept its mapping. The apply succeeds, because keeping the address in service is
+	// an outcome and not a failure - and it must not print the address as one it
+	// applied.
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	// The report is written by a run that could prove nothing, which exits 3 after
+	// writing the report: the document exists and says there was no winner.
+	measuring := newStubProber()
+	measuring.identityErr = errors.New("the response is a 521, which the profile does not expect")
+	var measureOut, measureErr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"test", "--report", fixture.reportPath}, fixture.flags()...),
+		&measureOut, &measureErr, servicesFor(measuring, threeCloudflareCandidates(), fixedMoment)); code != exitStateUnavailable {
+		t.Fatalf("test of an unprovable run exit = %d, want %d (stdout: %s)", code, exitStateUnavailable, measureOut.String())
+	}
+
+	applied := filepath.Join(fixture.directory, "applied.json")
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"apply", fixture.reportPath, "--report", applied}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("apply of an all-kept report exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	assertNoPublicationClaimed(t, stdout.String())
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("the selector changed on an apply that published nothing:\n%s", got)
+	}
+}

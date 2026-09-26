@@ -1094,6 +1094,15 @@ func PolicyDigest(document []byte) string {
 // rather than for the minutes a measurement run takes. That is also why a run
 // itself never takes this lock: it would block apply, pin and the health timer
 // behind a download.
+//
+// The returned selector is what this call wrote, and the zero selector means it
+// wrote nothing: an apply in which every group kept its mapping succeeds, returns
+// the zero selector, and returns a report whose Outcome is OutcomeKept. Handing
+// back the selector as it stands in that case would be indistinguishable from a
+// publication to a caller that prints what it was given - and a timer reading
+// "applied: <ip>" off a night the file was not touched records a publication that
+// never happened. A caller that wants the selector either way reads it from
+// Options.SelectorPath.
 func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (Report, state.Selector, error) {
 	if err := report.Validate(); err != nil {
 		return report, state.Selector{}, fmt.Errorf("%w: %v", ErrInvalidReport, err)
@@ -1152,8 +1161,10 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	if !publishedAnywhere {
 		// Every group kept its mapping, so there is nothing to write: no generation
 		// move for a run that changed nothing, and no refreshed proof for a winner
-		// this apply did not touch.
-		return report, current, nil
+		// this apply did not touch. The zero selector is what says so - see the
+		// note on the return value above - and the report's OutcomeKept is the
+		// other half of the same fact.
+		return report, state.Selector{}, nil
 	}
 
 	// The final proof, for every published group, under the lock, before the write.

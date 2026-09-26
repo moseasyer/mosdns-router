@@ -2072,9 +2072,7 @@ func TestApplyKeepsTheSelectorWhenTheReportHasNoWinnerAtAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply of a report with no winner anywhere: %v", err)
 	}
-	if published.WinnerIP != "104.16.1.1" {
-		t.Errorf("the published winner is %q, want the 104.16.1.1 that was in service", published.WinnerIP)
-	}
+	mustBeNothingWritten(t, published)
 	if applied.Outcome != OutcomeKept {
 		t.Errorf("the apply's outcome is %q, want %q", applied.Outcome, OutcomeKept)
 	}
@@ -3188,10 +3186,26 @@ func TestApplyWritesNothingWhenEveryGroupIsKept(t *testing.T) {
 	if applied.Outcome != OutcomeKept {
 		t.Errorf("the apply's overall outcome is %q, want %q", applied.Outcome, OutcomeKept)
 	}
-	if published.Generation != 4 {
-		t.Errorf("the published selector is generation %d, want the 4 it already had", published.Generation)
-	}
+	mustBeNothingWritten(t, published)
 	mustBeUnchanged(t, frontPath, before)
+}
+
+// mustBeNothingWritten asserts that an apply handed back no selector at all, which
+// is how it says it wrote nothing.
+//
+// The returned document is checked against the state package's own rules as well as
+// field by field, because that is the stronger claim and the one a caller can rely
+// on: the zero selector is not a document any writer of this project would produce,
+// so a caller that prints what it was given cannot print an address in service as
+// one it applied. (The struct holds a map, so it cannot be compared with ==.)
+func mustBeNothingWritten(t *testing.T, published state.Selector) {
+	t.Helper()
+	if published.WinnerIP != "" || published.FallbackIP != "" || published.Generation != 0 {
+		t.Errorf("an apply that published nothing returned the selector %+v, want no selector at all: a caller that prints it would claim a write that did not happen", published)
+	}
+	if err := published.Validate(); err == nil {
+		t.Error("the selector an apply that published nothing returned is one the state package accepts, so it reads as a written document rather than as nothing")
+	}
 }
 
 // groupOutcome and groupOutcomeReason read one group's decision out of an applied
