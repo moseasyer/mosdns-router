@@ -2,6 +2,7 @@ package prober
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net"
@@ -26,6 +27,12 @@ type Dialer func(ctx context.Context, network, address string) (net.Conn, error)
 // Options are the numbers one prober's measurements are bounded by. The zero
 // value is the production configuration, so a caller with nothing to change
 // passes Options{}.
+//
+// There is deliberately no option here for the trust anchors a certificate is
+// verified against. That is what this type is for: everything a production caller
+// may bound, and nothing a production caller may weaken. The anchors a proof is
+// checked against are the host's own, and the only way to reach them is
+// newProber, which is not exported.
 type Options struct {
 	// TCPTimeout bounds one connect sample.
 	TCPTimeout time.Duration
@@ -40,12 +47,6 @@ type Options struct {
 	ProbeTimeout time.Duration
 	// MaxIdentityBodyBytes bounds the body an identity probe reads for a digest.
 	MaxIdentityBodyBytes int64
-	// RootCAs is the trust anchor a certificate chain is verified against. Nil
-	// means the host's own system roots, which is what the router uses: an
-	// identity probe that trusts whatever it is shown, or trusts a pool its
-	// caller chose, is not a proof of anything. It is a parameter so a test can
-	// show the difference between a chain the anchors carry and one they do not.
-	RootCAs *x509.CertPool
 	// Dialer opens connections; nil means the standard dialer.
 	Dialer Dialer
 }
@@ -70,18 +71,67 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// reviewed: the prober's unexported identity trust anchors
+//
+// This is the one file in the module that may name the anchors a certificate is
+// verified against, and the source scan says so by name. The field is unexported
+// and the only way to set it is newProber, which is not exported, so a production
+// caller cannot reach it at all: production identity proofs are verified against
+// the host's own roots, and a test in this package can prove the difference
+// between a chain those roots carry and one they do not. anchors() is the single
+// place the value leaves this struct, so the whole of the trust decision is one
+// reviewed file and one method.
+type probeOptions struct {
+	// RootCAs overrides the trust anchors, for a test that must verify a chain
+	// the host's roots cannot know about. A nil value means the system roots.
+	RootCAs *x509.CertPool
+}
+
+// anchors are the trust roots an identity proof is verified against.
+func (o probeOptions) anchors() *x509.CertPool {
+	return o.RootCAs
+}
+
+// clientConfig is the TLS configuration every identity proof is verified with.
+//
+// It is here, in the one file the source scan exempts, so that the whole trust
+// decision is one reviewed place: the name a certificate is checked against, the
+// roots it is checked against, and the floor version. A caller cannot reach any
+// of it, and the only way to have a different set of roots is newProber, which is
+// not exported.
+func (o probeOptions) clientConfig(hostname string) *tls.Config {
+	return &tls.Config{
+		// The name in the handshake is the one the profile names, so the
+		// certificate is checked against the name that will be published for the
+		// address rather than against whatever the address resolves to.
+		ServerName: hostname,
+		// These are the host's own trust roots in production. A probe that trusts
+		// an arbitrary anchor proves nothing about anything.
+		RootCAs:    o.RootCAs,
+		MinVersion: tls.VersionTLS12,
+	}
+}
+
 // NetworkProber measures over real sockets. It holds no per-candidate state: a
 // call that is refused leaves nothing behind for the next one to trust.
 type NetworkProber struct {
-	options Options
+	options   Options
+	anchoring probeOptions
 }
 
 var _ Prober = (*NetworkProber)(nil)
 
 // New returns a prober that measures with the standard dialer unless Options
-// names one.
+// names one, and that verifies certificates against the host's own trust roots.
+// There is no way to ask it for a different set.
 func New(options Options) *NetworkProber {
-	return &NetworkProber{options: options.withDefaults()}
+	return newProber(options, probeOptions{})
+}
+
+// newProber is New with the identity anchors named, which only a test in this
+// package can do.
+func newProber(options Options, anchoring probeOptions) *NetworkProber {
+	return &NetworkProber{options: options.withDefaults(), anchoring: anchoring}
 }
 
 // dial opens one connection with the configured dialer, falling back to the

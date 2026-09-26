@@ -22,6 +22,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1020,14 +1021,143 @@ func TestHTTPSNeverReadsMoreThanTheIdentityCapAllows(t *testing.T) {
 	}
 }
 
+// TestTheSourceScanFailsOnForbiddenCode is the scan's own test, and it exists
+// because a guard that cannot fail is not a guard. It runs the same scanner the
+// module-wide test runs, over a tree it builds here, and requires each of the
+// scanner's rules to fire on the file that breaks it and to stay quiet on the
+// files that do not.
+//
+// The two forbidden names are built from halves so that this test file is not
+// itself a match for either of them.
+func TestTheSourceScanFailsOnForbiddenCode(t *testing.T) {
+	forbiddenVerification := "InsecureSkip" + "Verify"
+	forbiddenAnchors := "Root" + "CAs"
+	const reviewedMarker = "// " + reviewMarker + "\n"
+	// A file that names the anchors, one that skips verification, and one that does
+	// neither, so each rule has something to tell apart from the others.
+	namesAnchors := "package anchor\n\nvar identity = struct{ " + forbiddenAnchors + " *x509.CertPool }{}\n"
+	skipsVerification := "package loose\n\nvar loose = tls.Config{" + forbiddenVerification + ": true}\n"
+
+	for name, table := range map[string]struct {
+		files map[string]string
+		want  []string
+	}{
+		"a file that skips certificate verification is reported": {
+			files: map[string]string{
+				"clean.go":      "package clean\n",
+				"loose.go":      skipsVerification,
+				"clean_test.go": "package clean\n",
+			},
+			want: []string{"loose.go"},
+		},
+		"a test file that skips certificate verification is reported too": {
+			files: map[string]string{"loose_test.go": skipsVerification},
+			want:  []string{"loose_test.go"},
+		},
+		"a production file that names the trust anchors is reported": {
+			files: map[string]string{"anchor.go": namesAnchors},
+			want:  []string{"anchor.go"},
+		},
+		"a test file may name the trust anchors, because that is how an identity proof is proved": {
+			files: map[string]string{"anchor_test.go": namesAnchors},
+		},
+		"the one reviewed file may name the trust anchors": {
+			files: map[string]string{"options.go": reviewedMarker + namesAnchors},
+		},
+		"the marker is a line of its own, not a word inside one": {
+			files: map[string]string{
+				"options.go": "package options // " + reviewMarker + "\n\nvar identity = struct{ " + forbiddenAnchors + " *x509.CertPool }{}\n",
+			},
+			want: []string{"options.go"},
+		},
+		"a reviewed file that skips certificate verification is still reported": {
+			files: map[string]string{"options.go": reviewedMarker + skipsVerification},
+			want:  []string{"options.go"},
+		},
+		"both rules fire in one tree": {
+			files: map[string]string{
+				"anchor.go":   namesAnchors,
+				"loose.go":    skipsVerification,
+				"reviewed.go": reviewedMarker + namesAnchors,
+				"clean.go":    "package clean\n",
+			},
+			want: []string{"anchor.go", "loose.go"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			for path, contents := range table.files {
+				if err := os.WriteFile(filepath.Join(root, path), []byte(contents), 0o600); err != nil {
+					t.Fatalf("write %s: %v", path, err)
+				}
+			}
+			found, err := scanModuleSource(root, forbiddenVerification, forbiddenAnchors)
+			if err != nil {
+				t.Fatalf("scan the tree: %v", err)
+			}
+			reported := make([]string, 0, len(found))
+			for _, path := range found {
+				relative, relErr := filepath.Rel(root, path)
+				if relErr != nil {
+					t.Fatalf("relativise %s: %v", path, relErr)
+				}
+				reported = append(reported, relative)
+			}
+			if !slices.Equal(reported, table.want) {
+				t.Fatalf("the scan reported %v, want %v", reported, table.want)
+			}
+		})
+	}
+}
+
+// TestPackageSourceNeverSkipsCertificateVerification is the standing check
+// behind the identity probes: nothing in this module may turn certificate
+// verification off, and nothing outside a test may name the trust anchors a
+// verification is made against. Every other test here proves that the
+// verification this package does is strict, and this one proves there is no
+// second, looser path waiting to be taken by a later change.
+//
+// The two names it looks for are built from halves in the test below, so that
+// this test file is not itself a match for either of them.
 func TestPackageSourceNeverSkipsCertificateVerification(t *testing.T) {
-	forbidden := "InsecureSkip" + "Verify"
+	forbiddenVerification := "InsecureSkip" + "Verify"
+	forbiddenAnchors := "Root" + "CAs"
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatalf("locate the module root: %v", err)
 	}
-	var matches []string
-	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	found, err := scanModuleSource(root, forbiddenVerification, forbiddenAnchors)
+	if err != nil {
+		t.Fatalf("scan the module: %v", err)
+	}
+	if len(found) > 0 {
+		t.Fatalf("these files weaken certificate verification: %v. A file may not turn verification off, and a file outside a test may not name the trust roots, except the one file carrying the %q marker", found, reviewMarker)
+	}
+}
+
+// reviewMarker is the one exemption in the source scan, and it is a line of its
+// own that exactly one file in this module carries: the prober's own identity
+// anchors. It names where the trust anchors live so that the scan is what keeps
+// them there, rather than a reviewer having to notice on their own.
+const reviewMarker = "reviewed: the prober's unexported identity trust anchors"
+
+// scanModuleSource returns every Go file under root that weakens certificate
+// verification, sorted by path.
+//
+// The rule is deliberately blunt: any file, test or not, that sets the setting
+// that disables verification is reported, because a test that skips
+// verification proves nothing and a production file that does is the failure
+// this whole project exists to prevent. Trust anchors are reported only outside
+// tests, because naming them is how a test proves that a chain is checked and a
+// chain that is not checked. The one production file allowed to name them must
+// carry reviewMarker on a line of its own, so the exemption is a reviewed
+// decision in that file rather than a package name in this one.
+//
+// The names are arguments rather than constants so that this test file, which
+// contains them, is not a match for the scan it drives.
+func scanModuleSource(root, forbiddenVerification, forbiddenAnchors string) ([]string, error) {
+	var findings []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1035,7 +1165,7 @@ func TestPackageSourceNeverSkipsCertificateVerification(t *testing.T) {
 		if entry.IsDir() {
 			// Only the module's own source is in scope. The build output and the
 			// version control directory are not source, and the planning documents
-			// name the forbidden setting in prose because it is a prohibition.
+			// name the forbidden settings in prose because they are prohibitions.
 			if path != root && (name == ".git" || name == "build" || name == ".superpowers" || name == ".worktrees") {
 				return filepath.SkipDir
 			}
@@ -1048,17 +1178,34 @@ func TestPackageSourceNeverSkipsCertificateVerification(t *testing.T) {
 		if readErr != nil {
 			return readErr
 		}
-		if bytes.Contains(contents, []byte(forbidden)) {
-			matches = append(matches, path)
+		isTest := strings.HasSuffix(name, "_test.go")
+		weakensVerification := bytes.Contains(contents, []byte(forbiddenVerification))
+		namesAnchors := !isTest && !carriesReviewMarker(contents) && bytes.Contains(contents, []byte(forbiddenAnchors))
+		if weakensVerification || namesAnchors {
+			findings = append(findings, path)
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walk the module: %v", err)
+		return nil, err
 	}
-	if len(matches) > 0 {
-		t.Fatalf("these files set %s, so an unverified certificate could reach a candidate: %v", forbidden, matches)
+	slices.Sort(findings)
+	return findings, nil
+}
+
+// carriesReviewMarker reports whether a file claims the one exemption the anchor
+// rule allows. The marker has to be a whole line: a comment that merely mentions
+// it, or one that trails the end of a sentence, is not a reviewed decision in
+// that file, and a scan that accepted either would be a scan anyone could talk
+// past.
+func carriesReviewMarker(contents []byte) bool {
+	marker := "// " + reviewMarker
+	for _, line := range bytes.Split(contents, []byte("\n")) {
+		if string(bytes.TrimSpace(line)) == marker {
+			return true
+		}
 	}
+	return false
 }
 
 // The download measurements below run against a TLS server on a loopback port
@@ -1675,22 +1822,26 @@ func mustIdentityServer(t *testing.T, authority *testAuthority, hostname string,
 // mustProberFor returns a prober that trusts the given authority's pool, or the
 // host's own roots when the authority is nil, and a dialer that records what it
 // was asked to connect to while sending the connection to the local server.
+//
+// The anchors go in through the unexported construction, because that is the only
+// way in: no production caller can ask a prober to trust anything but the host's
+// own roots, which is what TestHTTPSRefusesAnEphemeralAuthorityWhenTheSystemRootsAreTheOne
+// shows and what the source scan keeps true.
 func mustProberFor(t *testing.T, authority *testAuthority, server *httptest.Server) (*NetworkProber, *dialLog) {
 	t.Helper()
 	dialled := new(dialLog)
 	local := server.Listener.Addr().String()
-	measure := New(Options{
+	measure := newProber(Options{
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second,
 		ProbeTimeout:          10 * time.Second,
 		MaxIdentityBodyBytes:  DefaultMaxIdentityBodyBytes,
-		RootCAs:               authority.trust(),
 		Dialer: func(ctx context.Context, network, target string) (net.Conn, error) {
 			dialled.add(target)
 			var standard net.Dialer
 			return standard.DialContext(ctx, network, local)
 		},
-	})
+	}, probeOptions{RootCAs: authority.trust()})
 	return measure, dialled
 }
 
@@ -1700,13 +1851,12 @@ func mustProberFor(t *testing.T, authority *testAuthority, server *httptest.Serv
 func mustProberWithOnly(t *testing.T, authority *testAuthority, server *httptest.Server) *NetworkProber {
 	t.Helper()
 	local := server.Listener.Addr().String()
-	return New(Options{
-		RootCAs: authority.trust(),
+	return newProber(Options{
 		Dialer: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var standard net.Dialer
 			return standard.DialContext(ctx, network, local)
 		},
-	})
+	}, probeOptions{RootCAs: authority.trust()})
 }
 
 // requestFacts is what one request looked like from the server's side.

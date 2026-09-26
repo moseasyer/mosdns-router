@@ -280,16 +280,7 @@ func (p *NetworkProber) dialTLSFor(subject candidate.Candidate, profile candidat
 		if err != nil {
 			return nil, err
 		}
-		client := tls.Client(connection, &tls.Config{
-			// The name in the handshake is the profile's, so the certificate is
-			// checked against the name that will be published for this address.
-			ServerName: profile.Hostname,
-			// No RootCAs means the host's own trust anchors. That is the production
-			// configuration and the only one this package can be built with: a
-			// probe that trusts an arbitrary anchor proves nothing about anything.
-			RootCAs:    p.options.RootCAs,
-			MinVersion: tls.VersionTLS12,
-		})
+		client := tls.Client(connection, p.anchoring.clientConfig(profile.Hostname))
 		began := time.Now()
 		if err := client.HandshakeContext(handshake); err != nil {
 			_ = connection.Close()
