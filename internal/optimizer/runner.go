@@ -1411,21 +1411,50 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 		return measure.HTTPMetrics{}, fmt.Errorf("%w: %s is proved against none of the %d configured profiles %s",
 			ErrNoProfile, subject.IP, len(profiles.all()), kind)
 	}
-	// Each profile's answer is kept in its own place, and the walk afterwards is in
+	// Each profile's answer is kept in its own slot, and the walk afterwards is in
 	// profile order: the bytes are summed whatever happened, and the refusal named is
 	// the first profile's rather than whichever goroutine lost the race.
+	//
+	// The slot carries a state and not only an error, because "no error" cannot mean
+	// "proved" here. The dispatcher may stop without ever handing an index to a
+	// worker - a context that is already done when the phase starts, or a deadline
+	// that arrives while the feeder is blocked - and an untouched slot is then
+	// indistinguishable from a successful one if success is the absence of an error.
+	// That was a fail-open in the gate immediately before an address reaches DNS
+	// answers: with the context already done, every worker returned before calling
+	// the prober, not one index was fed, every slot read as a silent pass, and
+	// Apply and Pin both wrote. So a slot is marked answered only when a worker has
+	// actually run the profile's probe, and the walk treats anything else as a
+	// refusal.
 	answers := make([]proofAnswer, len(applicable))
-	if err := forEachIndex(ctx, len(applicable), proofConcurrency, func(ctx context.Context, index int) error {
+	// forEachIndex's error is deliberately not consulted. It is only ever the
+	// context's error, so it says whether the run was cut short and not which
+	// profiles were reached; the per-slot state is what says that, and it is the one
+	// guard here because it cannot be satisfied by a slot nobody filled.
+	_ = forEachIndex(ctx, len(applicable), proofConcurrency, func(ctx context.Context, index int) error {
 		metrics, err := r.prober.HTTPS(ctx, subject, applicable[index])
-		answers[index] = proofAnswer{metrics: metrics, err: err}
+		answers[index] = proofAnswer{state: proofAnswered, metrics: metrics, err: err}
 		return nil
-	}); err != nil && ctx.Err() == nil {
-		// The phase's own deadline is done and no profile has said why yet, which is
-		// the case a deadline is for: a host that will not answer in time.
-		return measure.HTTPMetrics{}, fmt.Errorf("%w: the proof of %s did not finish within the deadline", ErrProofTimeout, subject.IP)
-	}
+	})
 	summed := measure.HTTPMetrics{}
+	attempted := 0
 	for index, answer := range answers {
+		hostname := applicable[index].Hostname
+		if answer.state != proofAnswered {
+			// A slot no worker filled. This is a refusal and not a pass, and it is
+			// named with the profile that went unproved and how many of the list were
+			// reached, because the operator's only way to act on it is to trim the
+			// list or wait for a host that answers in time.
+			reached := fmt.Errorf("the final proof reached %d of the %d profiles it is held to and never asked about this one",
+				attempted, len(applicable))
+			if err := ctx.Err(); err != nil {
+				return summed, fmt.Errorf("%w: %s was never proved against %s: %w: %w",
+					ErrIdentityRefused, subject.IP, hostname, reached, err)
+			}
+			return summed, fmt.Errorf("%w: %s was never proved against %s: %s",
+				ErrIdentityRefused, subject.IP, hostname, reached)
+		}
+		attempted++
 		// Summed before the error is looked at, for the same reason the run sums
 		// them: a refused proof still spent the bytes it read to reach its verdict,
 		// and the report is the only place that can say so.
@@ -1436,17 +1465,22 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 			summed.Colocation = answer.metrics.Colocation
 			continue
 		}
-		hostname := applicable[index].Hostname
+		// The three verdicts are told apart by what this one probe returned, and not
+		// by asking whether the context happens to be done. A refusal and a timeout
+		// can be in the same phase, and asking the context relabelled an ordinary
+		// refusal as a cut-short proof whenever a slower profile's timeout landed
+		// first - so a host that had stopped serving looked like a host that was
+		// slow.
 		switch {
 		case errors.Is(answer.err, context.DeadlineExceeded):
 			// The phase's deadline, which is this build's patience rather than a
 			// verdict about the host: a slow host is not a refusing host.
 			return summed, fmt.Errorf("%w: %s did not answer for %s within %s",
 				ErrProofTimeout, subject.IP, hostname, r.options.ProofTimeout)
-		case ctx.Err() != nil:
-			// The caller's own context is done - the run was cancelled - which is
-			// likewise not a statement about the host.
-			return summed, fmt.Errorf("the proof of %s against %s was cut short: %w", subject.IP, hostname, ctx.Err())
+		case errors.Is(answer.err, context.Canceled):
+			// The caller went away, which is likewise not a statement about the host
+			// and is not this build's patience either.
+			return summed, fmt.Errorf("the proof of %s against %s was cut short: %w", subject.IP, hostname, answer.err)
 		default:
 			return summed, fmt.Errorf("%w: %s does not serve %s: %v", ErrIdentityRefused, subject.IP, hostname, answer.err)
 		}
@@ -1454,9 +1488,26 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 	return summed, nil
 }
 
-// proofAnswer is one profile's answer to a proof: what it measured, and what it
-// said if it refused.
+// proofState is what a slot in a proof's answers holds, and it is a named type
+// rather than a bool so that "not attempted" cannot be read as "not refused".
+type proofState int
+
+const (
+	// proofNotAttempted is the zero value: no worker ever ran this profile's probe.
+	// The walk must treat it as a refusal. It is the zero value deliberately - a
+	// slot that is never written has to land here rather than anywhere that could
+	// read as success.
+	proofNotAttempted proofState = iota
+
+	// proofAnswered is a slot a worker filled by running the profile's probe, which
+	// either served it or refused it. The err field says which.
+	proofAnswered
+)
+
+// proofAnswer is one profile's answer to a proof: whether its probe ran at all, what
+// it measured, and what it said if it refused.
 type proofAnswer struct {
+	state   proofState
 	metrics measure.HTTPMetrics
 	err     error
 }

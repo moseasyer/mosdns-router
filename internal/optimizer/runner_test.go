@@ -177,6 +177,13 @@ type addressFixture struct {
 	// that served the run and then stopped answering quickly: the run's proof is
 	// quick and the apply's is not.
 	proofDelayAfterCalls int
+	// proofOutlivesDeadline makes a delayed proof answer in full even after the
+	// caller's deadline, which is the shape of a transfer that has already started:
+	// the bytes crossed the wire, so the prober reports them rather than pretending
+	// it read nothing. It exists so a case can have a wave of proofs that all
+	// succeed after the deadline, which is the only way to reach an un-fed tail in
+	// the walk without the earlier profiles refusing first.
+	proofOutlivesDeadline bool
 }
 
 // probeCall is one call the fake prober received, in the order it arrived.
@@ -275,16 +282,22 @@ func (f *fakeProber) HTTPS(ctx context.Context, subject candidate.Candidate, pro
 		f.peak = f.inFlight
 	}
 	f.mutex.Unlock()
-	if fixture.proofDelay > 0 && (fixture.proofDelayAfterCalls == 0 || answered > fixture.proofDelayAfterCalls) {
+	_, refuses := fixture.identityRefusedFor[profile.Hostname]
+	if fixture.proofDelay > 0 && !refuses &&
+		(fixture.proofDelayAfterCalls == 0 || answered > fixture.proofDelayAfterCalls) {
 		// A slow host, and a prober that gives up when the caller's deadline is
 		// done, exactly as the real one does.
-		timer := time.NewTimer(fixture.proofDelay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			f.settle()
-			return measure.HTTPMetrics{BodyBytes: fixture.identityBodyBytes}, ctx.Err()
+		if fixture.proofOutlivesDeadline {
+			time.Sleep(fixture.proofDelay)
+		} else {
+			timer := time.NewTimer(fixture.proofDelay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				f.settle()
+				return measure.HTTPMetrics{BodyBytes: fixture.identityBodyBytes}, ctx.Err()
+			}
 		}
 	}
 	f.settle()
@@ -3469,4 +3482,197 @@ func TestRunnerFinalisesAPartialReportSoItsAccountOfTheDayIsTrue(t *testing.T) {
 	if report.Phases.Identity.EndedAt.IsZero() {
 		t.Error("the partial report is missing the identity phase's end, so the run got no further than the fixtures claim")
 	}
+}
+
+// echProfiles is a global identity profile per forced-ECH domain, named by its
+// index, so a case can say exactly which of them a proof did and did not reach.
+func echProfiles(count int) []candidate.ProbeProfile {
+	profiles := make([]candidate.ProbeProfile, 0, count)
+	for index := 0; index < count; index++ {
+		profiles = append(profiles, testProfile(fmt.Sprintf("ech-%d.example.test", index), 443))
+	}
+	return profiles
+}
+
+func TestApplyRefusesWhenTheContextIsAlreadyDoneBeforeTheProof(t *testing.T) {
+	// The final proof is the last gate before an address reaches DNS answers, so a
+	// proof that never ran is not a proof. A context that is already done when the
+	// phase starts is the shape that used to publish: every worker returns before it
+	// calls the prober, not one index is fed, and every slot in the answer slice is
+	// left in its zero value - which the walk then reads as a silent pass.
+	//
+	// Nothing may be written here, and nothing may be asked of the network.
+	fixtures, candidates := threeGlobals()
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake)
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+	asked := len(fake.profiledCalls())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, err := runner.Apply(ctx, report, globalProfiles(echProfiles(3)...))
+	if err == nil {
+		t.Fatal("Apply whose context was already done published, want a refusal: a proof that never ran is not a proof")
+	}
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Errorf("Apply of a proof that never ran returned %v, want %v", err, ErrIdentityRefused)
+	}
+	if got := len(fake.profiledCalls()); got != asked {
+		t.Errorf("the prober was asked for %d proofs after the context was done, want the %d it had already answered: a proof that cannot run must not dial", got-asked, asked)
+	}
+	// The refusal names a profile, because an operator has to know which one went
+	// unproved to be able to act on it.
+	if !strings.Contains(err.Error(), "ech-0.example.test") {
+		t.Errorf("the refusal %q does not name the profile that went unproved", err)
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestApplyRefusesWhenTheDeadlineFiresWhileTheProfilesAreStillBeingFed(t *testing.T) {
+	// More profiles than the concurrency limit means the dispatcher feeds the list
+	// in waves, and the deadline can arrive while it is blocked waiting for a worker
+	// to free. Everything from that point on was never handed to a worker, so its
+	// slot is untouched - and an untouched slot read as a pass is how a host that was
+	// never asked for four of its twenty names would have been published.
+	//
+	// The first wave answers in full even after the deadline, which is the shape
+	// that puts the un-fed tail in the walk: the sixteen that ran succeeded, so the
+	// walk reaches index sixteen, and index sixteen is the one that must refuse.
+	count := proofConcurrency + 4
+	profiles := echProfiles(count)
+	fixtures, candidates := threeGlobals()
+	// The winner answers every profile slowly and in full. It is the apply's proofs
+	// that are slow: the run's own proof of it is quick.
+	fixtures["104.16.0.1"].proofDelay = 200 * time.Millisecond
+	fixtures["104.16.0.1"].proofDelayAfterCalls = 1
+	fixtures["104.16.0.1"].proofOutlivesDeadline = true
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake, func(tuning *runnerTuning) {
+		tuning.options.ProofTimeout = 50 * time.Millisecond
+	})
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	_, _, err := runner.Apply(t.Context(), report, globalProfiles(profiles...))
+	if err == nil {
+		t.Fatal("Apply whose deadline arrived with four profiles un-fed published, want a refusal")
+	}
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Errorf("Apply with an un-fed tail returned %v, want %v", err, ErrIdentityRefused)
+	}
+	// The refusal names the first profile the dispatcher never reached, and says how
+	// far it got, so an operator can see which names went unasked.
+	if !strings.Contains(err.Error(), "ech-16.example.test") {
+		t.Errorf("the refusal %q does not name the first profile that was never reached", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("of the %d profiles", count)) {
+		t.Errorf("the refusal %q does not say how many of the %d profiles were proved", err, count)
+	}
+	// Exactly one wave was asked, and it was the first sixteen: the prober is the
+	// record of which names this router actually put to the network. The set is
+	// compared as a set, because the wave's own order is the dispatcher's business
+	// and the gate's only claim is about which names it reached.
+	asked := fake.profiledCalls()
+	if len(asked) != 3+proofConcurrency {
+		t.Fatalf("the prober was asked for %d proofs, want %d: the run's three and one full wave of %d", len(asked), 3+proofConcurrency, proofConcurrency)
+	}
+	names := make([]string, 0, len(asked)-3)
+	for _, call := range asked[3:] {
+		names = append(names, call.Hostname)
+	}
+	slices.Sort(names)
+	want := make([]string, 0, proofConcurrency)
+	for index := 0; index < proofConcurrency; index++ {
+		want = append(want, fmt.Sprintf("ech-%d.example.test", index))
+	}
+	slices.Sort(want)
+	if !slices.Equal(names, want) {
+		t.Errorf("the one wave asked for was %v,\nwant %v: the wave must be the first %d profiles and no other", names, want, proofConcurrency)
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestApplyProvesEveryConfiguredProfileAndNamesTheOneThatRefused(t *testing.T) {
+	// The ordinary case, stated per profile rather than as a total: every configured
+	// profile is put to the network, the one that refuses is named, and the refusal
+	// does not stop the others from being asked. A walk that skipped an index would
+	// satisfy a count and fail this.
+	//
+	// The refusing profile is in the middle of the list rather than at either end,
+	// because a walk that stopped at the first failure would then leave the tail
+	// unasked - which is the shape the sentinel has to survive too.
+	profiles := echProfiles(5)
+	refused := profiles[2].Hostname
+	fixtures, candidates := threeGlobals()
+	fixtures["104.16.0.1"].identityRefusedFor = map[string]error{
+		refused: errors.New("the response is a 403, which the profile does not expect"),
+	}
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake)
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	_, _, err := runner.Apply(t.Context(), report, globalProfiles(profiles...))
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Fatalf("Apply with a refusing profile returned %v, want %v", err, ErrIdentityRefused)
+	}
+	if !strings.Contains(err.Error(), refused) {
+		t.Errorf("the refusal %q does not name the profile that refused", err)
+	}
+	// All five were asked, and the refusing one is among them: the refusal is a
+	// verdict about the host, not an excuse to ask about fewer names. The proofs of
+	// one address run concurrently, so this compares the set of names rather than
+	// their order - the order is proofConcurrency's business, not this gate's.
+	asked := fake.profiledCalls()[3:]
+	names := make([]string, 0, len(asked))
+	for _, call := range asked {
+		names = append(names, call.Hostname)
+	}
+	if len(names) != len(profiles) {
+		t.Fatalf("the prober was asked for %d proofs in the apply, want one per profile: %d", len(names), len(profiles))
+	}
+	slices.Sort(names)
+	for index, profile := range profiles {
+		if names[index] != profile.Hostname {
+			t.Errorf("profile %d of the apply was %q, want %q: every configured profile is proved, not a prefix of them", index, names[index], profile.Hostname)
+		}
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestApplyNamesAHostRefusalEvenWhenTheProofRanOutOfTimeBesideIt(t *testing.T) {
+	// A refusal and a timeout can be in the same proof phase, and the report has to
+	// name which of them happened. A walk that classified by asking the context
+	// whether it was done relabelled an ordinary refusal as "cut short" whenever a
+	// slower profile's timeout happened first - so a host that stopped serving looked
+	// like a host that was slow.
+	profiles := echProfiles(2)
+	refused := profiles[0].Hostname
+	fixtures, candidates := threeGlobals()
+	// The first profile is refused outright. The second is slow past the deadline, so
+	// the context is done by the time the walk reaches either of them.
+	fixtures["104.16.0.1"].identityRefusedFor = map[string]error{
+		refused: errors.New("the response is a 403, which the profile does not expect"),
+	}
+	fixtures["104.16.0.1"].proofDelay = 2 * time.Second
+	fixtures["104.16.0.1"].proofDelayAfterCalls = 1
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake, func(tuning *runnerTuning) {
+		tuning.options.ProofTimeout = 100 * time.Millisecond
+	})
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	_, _, err := runner.Apply(t.Context(), report, globalProfiles(profiles...))
+	if !errors.Is(err, ErrIdentityRefused) {
+		t.Fatalf("Apply with one refused profile beside one slow profile returned %v, want %v: the host refused, it was not merely slow", err, ErrIdentityRefused)
+	}
+	if strings.Contains(err.Error(), "cut short") {
+		t.Errorf("the refusal %q blames the context, want the profile the host refused", err)
+	}
+	if !strings.Contains(err.Error(), refused) {
+		t.Errorf("the refusal %q does not name the profile the host refused", err)
+	}
+	mustBeUnchanged(t, selectorPath, before)
 }
