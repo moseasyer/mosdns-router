@@ -120,14 +120,23 @@ func oneOptions(path string, options []Options) (Options, error) {
 // the type a caller is holding.
 //
 // A read and a store are one sequence per goroutine, and a poll tick and a
-// caller's own ReloadNow may run at the same time. When they do, a tick that read
-// the file before the caller published can store its older document last, and
-// the value a caller reloaded goes back for up to one poll interval before the
-// next tick restores it. That is left as it is on purpose: the stored value is
-// always a document this build accepted, the window is bounded by the poll
-// interval, and the alternative -- refusing to store a document whose generation
-// is lower than the one in hand -- is a policy this package is not given, since
-// a restored state directory would then be ignored for ever.
+// caller's own ReloadNow may run at the same time. Two properties of that are
+// pinned by tests: a reload the caller asked for is stored even while a poll read
+// is in flight, and the caller's document is what the watcher ends up serving
+// once that read has finished. One is not, and it is stated here rather than left
+// for the next reader to assume.
+//
+// Between a tick that read the file before the caller published, and the next
+// tick, the watcher can serve the document that tick read: the older one, for up
+// to one poll interval. The window is bounded by the interval, the value in it is
+// always a document this build accepted, and the alternative -- refusing to store
+// a document older than the one in hand -- is a policy this package is not given,
+// since a restored state directory would then be ignored for ever. No test
+// asserts the window, and one cannot without racing the tick that closes it: at a
+// poll interval of a few milliseconds the window is a few milliseconds wide, so
+// observing it is a coin toss against the very tick that ends it. A plugin that
+// writes a state file and needs it served before the next query should therefore
+// not treat a ReloadNow as an ordering barrier against a tick already in flight.
 type poller struct {
 	path     string
 	interval time.Duration
@@ -137,11 +146,12 @@ type poller struct {
 	done     chan struct{}
 	once     sync.Once
 
-	// reported is the failure the handler was last given. It needs no lock
-	// because it is only ever written where reload is called: in the
-	// constructor, before the poll goroutine exists, and in the poll goroutine
-	// itself. A ReloadNow from the caller's own goroutine never reports.
-	reported error
+	// reporting guards reported, which three goroutines can write: the
+	// constructor, the poll goroutine, and a caller running ReloadNow. It is
+	// held only to decide whether to report, never while the handler runs, so a
+	// handler that calls back into the watcher cannot deadlock on it.
+	reporting sync.Mutex
+	reported  error
 }
 
 // init validates the construction a caller asked for and prepares the half a
@@ -191,17 +201,33 @@ func (p *poller) run() {
 // episode. A reload that succeeds clears the episode, so the next failure is
 // reported whatever it is.
 func (p *poller) reportRefusal(err error) {
+	p.reporting.Lock()
 	if err == nil {
 		p.reported = nil
+		p.reporting.Unlock()
 		return
 	}
 	if p.reported != nil && p.reported.Error() == err.Error() {
+		p.reporting.Unlock()
 		return
 	}
 	p.reported = err
-	if p.report != nil {
-		p.report(err)
+	report := p.report
+	p.reporting.Unlock()
+	if report != nil {
+		report(err)
 	}
+}
+
+// endEpisode forgets the failure the handler was last given. A reload the caller
+// asked for does not report -- the caller has the refusal as a return value -- but
+// a successful one is still a repair, and a file that breaks again after a repair
+// has to be reported as the new problem it is. Without this, a caller who fixes a
+// file and then breaks it again gets silence.
+func (p *poller) endEpisode() {
+	p.reporting.Lock()
+	defer p.reporting.Unlock()
+	p.reported = nil
 }
 
 // stopPolling ends the background poll and waits for the goroutine to finish.
@@ -277,12 +303,24 @@ func (w *Watcher[T]) Snapshot() T {
 // Close does not prevent it: closing stops the background poll, and a caller's
 // own read of the file it is holding is still the caller's to make.
 func (w *Watcher[T]) ReloadNow() error {
-	return w.reload()
+	if err := w.reload(); err != nil {
+		return err
+	}
+	w.poller.endEpisode()
+	return nil
 }
 
 // Close stops the background poll and waits for it to finish. It is idempotent
 // and safe from several goroutines. It is not the end of the value: Snapshot
 // keeps answering with the last document this build accepted.
+//
+// Two things it does not do. It does not wait for a ReloadNow the CALLER started
+// -- that read belongs to the caller's goroutine, and the only one Close waits
+// for is the poll goroutine's. And calling Close from inside the caller's own
+// validate deadlocks: validate runs on the poll goroutine, and Close waits for
+// that goroutine, so a handler that closes the watcher it is being called by
+// waits for itself. Neither is a mistake a plugin can make by accident, and both
+// are mistakes worth naming.
 func (w *Watcher[T]) Close() error { return w.stopPolling() }
 
 // reload is one read of the document. The order is the rule: the state's own
@@ -312,32 +350,82 @@ func (w *Watcher[T]) store(value T) {
 	w.value = w.clone(value)
 }
 
-// documentCloner returns the copy function for one document type, chosen once
-// at construction so that neither Snapshot nor a reload pays for the choice on
-// every query.
+// documentName is the name of a state document, and is how a document type
+// becomes the key documentCloners is written in. It returns the empty string for
+// a type that is not one of the documents, which is a program that put something
+// other than a state document into Document.
+func documentName(value any) string {
+	switch value.(type) {
+	case state.DHCPState:
+		return "DHCPState"
+	case state.Selector:
+		return "Selector"
+	case state.ECHState:
+		return "ECHState"
+	case state.BandwidthBudgetState:
+		return "BandwidthBudgetState"
+	case state.HealthState:
+		return "HealthState"
+	}
+	return ""
+}
+
+// documentCloners is every document the watcher can copy, one entry per document
+// and the only list of them there is: the count of its keys is the number of
+// documents a caller can hand to a watcher, and the snapshot-isolation test
+// requires a subtest for each.
 //
 // The copies are the fields a caller could reach through the value it was
 // handed: a DHCP record's upstream slice and a selector's CloudFront map. The
-// documents that hold only strings, times, numbers and booleans need no case,
-// because a struct assignment already copied everything there is to copy -- a
-// time.Time does carry a shared *time.Location, and no method on it writes
-// through that pointer. A document added to Document that holds a map or a
-// slice needs a case here, or its snapshots will share it with the watcher.
+// other three hold only strings, times, numbers and booleans, and need no
+// copying, because a struct assignment already copied everything there is to copy
+// -- a time.Time does carry a shared *time.Location, and no method on it writes
+// through that pointer. They are here anyway, because a document with a map or a
+// slice in it has to be found here rather than at the query that first hands one
+// out.
+var documentCloners = map[string]func(any) any{
+	"DHCPState": func(value any) any {
+		cloned := value.(state.DHCPState)
+		cloned.Upstreams = slices.Clone(cloned.Upstreams)
+		return cloned
+	},
+	"Selector": func(value any) any {
+		cloned := value.(state.Selector)
+		cloned.CloudFront = maps.Clone(cloned.CloudFront)
+		return cloned
+	},
+	"ECHState": func(value any) any {
+		// No map and no slice: a struct assignment copies all of it.
+		return value
+	},
+	"BandwidthBudgetState": func(value any) any {
+		// No map and no slice: a struct assignment copies all of it.
+		return value
+	},
+	"HealthState": func(value any) any {
+		// No map and no slice: a struct assignment copies all of it.
+		return value
+	},
+}
+
+// documentCloner returns the copy function for one document type, resolved once
+// at construction so that neither Snapshot nor a reload pays for the lookup on
+// every query.
+//
+// A document type with no entry here is refused loudly. Go cannot check that a
+// type switch over a type set is exhaustive, so a state document added to
+// Document without an entry here would otherwise fall through to a copy that
+// shares everything, and the first sign of it would be a plugin editing the
+// router's live state from inside a query. Failing at construction is the
+// direction to fail in: the router does not start, rather than starting and
+// answering from a value a caller can edit.
 func documentCloner[T Document]() func(T) T {
-	switch any(*new(T)).(type) {
-	case state.DHCPState:
-		return func(value T) T {
-			cloned := any(value).(state.DHCPState)
-			cloned.Upstreams = slices.Clone(cloned.Upstreams)
-			return any(cloned).(T)
-		}
-	case state.Selector:
-		return func(value T) T {
-			cloned := any(value).(state.Selector)
-			cloned.CloudFront = maps.Clone(cloned.CloudFront)
-			return any(cloned).(T)
-		}
-	default:
-		return func(value T) T { return value }
+	name := documentName(*new(T))
+	copier, known := documentCloners[name]
+	if !known {
+		panic(fmt.Sprintf("statewatch: no snapshot copy for %T; give it an entry in documentCloners and a subtest in the isolation test", *new(T)))
+	}
+	return func(value T) T {
+		return any(copier(any(value))).(T)
 	}
 }

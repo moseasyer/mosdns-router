@@ -24,6 +24,14 @@ import (
 // it could read and says which line stopped it. Losing strict ECH silently is a
 // censorship-resistance regression; a loud refusal that keeps the last good list
 // is an operator's problem for ten seconds.
+//
+// Two of the rules are about what the operator has to WRITE, not about what the
+// router accepts. A name is written in the DNS's own ASCII form, so a domain
+// with an accent in it is refused and its punycode spelling is what belongs in
+// the file -- whoever writes /etc/mosdns/force-ech-domains.txt needs to know
+// that before their first entry is refused. And to stop forcing ECH for a set of
+// domains the operator writes a line that is only a comment, because an empty
+// file is a file whose write was interrupted.
 const (
 	// maximumDomainLength and maximumDomainLabelLength are the limits a DNS name
 	// has to live within: 253 characters for the name as written and 63 for one
@@ -80,8 +88,9 @@ type TextWatcher struct {
 // The file is read whole and validated whole: comments and blank lines are
 // dropped, every remaining name is trimmed and lowercased, duplicates are
 // removed keeping the first occurrence, and a line that is not a domain refuses
-// the entire file with a LineError naming it. A refusal of any kind leaves the
-// last valid list in place, including the list the caller passed as initial,
+// the entire file with a LineError naming it. A file of no bytes at all is
+// refused too, for the reason readDomainList gives. A refusal of any kind leaves
+// the last valid list in place, including the list the caller passed as initial,
 // which is copied so a caller that keeps using its own slice does not find it
 // edited.
 func NewTrimmedLines(path string, initial []string, options ...Options) (*TextWatcher, error) {
@@ -115,11 +124,20 @@ func (w *TextWatcher) Snapshot() []string {
 // Close does not prevent it: closing stops the background poll, and a caller's
 // own read of the file it is holding is still the caller's to make.
 func (w *TextWatcher) ReloadNow() error {
-	return w.reload()
+	if err := w.reload(); err != nil {
+		return err
+	}
+	w.poller.endEpisode()
+	return nil
 }
 
 // Close stops the background poll and waits for it to finish. It is idempotent
 // and safe from several goroutines, and it leaves the list in place.
+//
+// Two things it does not do, and both are the same two it does not do on a
+// Watcher: it does not wait for a ReloadNow the CALLER started, and calling it
+// from inside the caller's own validate deadlocks, because validate runs on the
+// poll goroutine that Close is waiting for.
 func (w *TextWatcher) Close() error { return w.stopPolling() }
 
 func (w *TextWatcher) reload() error {
@@ -141,12 +159,31 @@ func readDomainList(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: read domain list: %w", path, err)
 	}
+	// A file of no bytes at all is refused, and this is the one refusal the
+	// line rules cannot make. The force-ECH list is not producer-written, so the
+	// temp-and-rename rule every other state file in this project follows does
+	// not cover it: a shell redirect, an sed -i, or an editor that truncates
+	// before it writes all leave exactly zero bytes there for as long as the
+	// write takes, and a zero-byte file has no line to complain about. Accepted,
+	// it would drop every domain the operator chose to force ECH for, silently,
+	// which is the one direction this file exists to prevent.
+	//
+	// A comments-only file, or one of blank lines, is not refused: that is how
+	// the operator turns forcing off, and it says so unambiguously where zero
+	// bytes says nothing at all. So the rule is the byte count, not the entry
+	// count, and it is checked here rather than in parseDomainList so that the
+	// distinction between the two stays visible at the read.
+	if len(content) == 0 {
+		return nil, fmt.Errorf("%s: the domain list is empty, which is what a write interrupted before its first byte looks like; "+
+			"to turn forcing off, write a line that starts with %s instead", path, commentPrefix)
+	}
 	return parseDomainList(path, string(content))
 }
 
 // parseDomainList turns the file's text into the list, or refuses it. A file
 // with no entries in it is a file the operator emptied and is not a failure, so
-// it parses to an empty list rather than to no list at all.
+// it parses to an empty list rather than to no list at all -- with one exception
+// the caller has to make before it gets here.
 func parseDomainList(path, content string) ([]string, error) {
 	lines := strings.Split(content, "\n")
 	entries := make([]string, 0, len(lines))

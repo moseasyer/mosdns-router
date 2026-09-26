@@ -410,6 +410,40 @@ func TestWatchersRefuseASecondOptionsValue(t *testing.T) {
 	})
 }
 
+// TestACallerRepairClearsTheEpisodeSoTheNextBreakIsReported: an operator who
+// fixes the file themselves and then breaks it again has to hear about the second
+// time. The file is broken now and nothing else will say so, and the message the
+// poll would send is byte for byte the one it already sent, so a repair that does
+// not end the episode leaves the router reporting nothing for a file that is
+// broken.
+func TestACallerRepairClearsTheEpisodeSoTheNextBreakIsReported(t *testing.T) {
+	path := statePath(t, "selector.json")
+	replaceFile(t, path, documentBytes(t, publishedSelector(1, "198.51.100.7")))
+	refused := &refusals{}
+	watcher, err := NewJSON(path, nil, state.Selector{},
+		Options{PollInterval: fastPoll, ReloadError: refused.record})
+	if err != nil {
+		t.Fatalf("NewJSON(%s): %v", path, err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	corrupt := corruptMode(t, publishedSelector(2, "203.0.113.8"))
+	replaceFile(t, path, corrupt)
+	waitFor(t, "the first corruption to be reported", func() bool { return refused.count() == 1 })
+
+	// The repair is the caller's, not the poll's: they wrote the file and asked
+	// for it to be read straight away. ReloadNow hands the refusal back rather
+	// than reporting it, so the episode has to end here or the next break of the
+	// same file is silence.
+	replaceFile(t, path, documentBytes(t, publishedSelector(3, "198.51.100.21")))
+	if err := watcher.ReloadNow(); err != nil {
+		t.Fatalf("the caller's own reload refused a valid selector: %v", err)
+	}
+
+	replaceFile(t, path, corrupt)
+	waitFor(t, "the second corruption to be reported", func() bool { return refused.count() == 2 })
+}
+
 // TestWatchersUseTheDocumentedPollIntervalWhenGivenNoOptions pins the shipped
 // poll rate, which no other case can reach because every other case injects its
 // own. The break it catches is a default lowered to make a test fast, which
@@ -727,8 +761,9 @@ func TestJSONWatcherRefusesWhatTheStatePackageRefuses(t *testing.T) {
 	path := statePath(t, "selector.json")
 	replaceFile(t, path, documentBytes(t, last))
 
-	// The poll is parked for the length of the case, so the count of reads is
-	// exactly the ones this case asks for.
+	// The poll is parked for the length of the case: at fastPoll the background
+	// read would race the one ReloadNow below, and the case is about which door
+	// refuses the document, not about who got there first.
 	watcher, err := NewJSON(path, func(state.Selector) error { return nil }, state.Selector{},
 		Options{PollInterval: idlePoll})
 	if err != nil {
@@ -843,7 +878,27 @@ func TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold(t *testing.T) 
 	health := publishedHealth()
 
 	documents := map[string]func(t *testing.T){
-		"selector": func(t *testing.T) {
+		"DHCPState": func(t *testing.T) {
+			path := statePath(t, "dhcp.json")
+			replaceFile(t, path, documentBytes(t, dhcp))
+			watcher := watch(t, path, state.DHCPState{}, Options{PollInterval: fastPoll})
+
+			snapshot := watcher.Snapshot()
+			snapshot.SchemaVersion = 9
+			snapshot.Generation = 9999
+			snapshot.Interface = "spoofed0"
+			snapshot.ConnectionUUID = "spoofed"
+			snapshot.Upstreams[0] = "9.9.9.9"
+			snapshot.Upstreams = snapshot.Upstreams[:1]
+			snapshot.ObservedAt = observedAt.Add(time.Hour)
+			snapshot.Source = "spoofed"
+			snapshot.LastGood = false
+
+			if got := watcher.Snapshot(); !dhcpEqual(got, dhcp) {
+				t.Fatalf("the watcher was edited through a returned DHCP record: %+v, want %+v", got, dhcp)
+			}
+		},
+		"Selector": func(t *testing.T) {
 			path := statePath(t, "selector.json")
 			replaceFile(t, path, documentBytes(t, selector))
 			watcher := watch(t, path, state.Selector{}, Options{PollInterval: fastPoll})
@@ -866,27 +921,7 @@ func TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold(t *testing.T) 
 				t.Fatalf("the watcher was edited through a returned selector: %+v, want %+v", got, selector)
 			}
 		},
-		"dhcp": func(t *testing.T) {
-			path := statePath(t, "dhcp.json")
-			replaceFile(t, path, documentBytes(t, dhcp))
-			watcher := watch(t, path, state.DHCPState{}, Options{PollInterval: fastPoll})
-
-			snapshot := watcher.Snapshot()
-			snapshot.SchemaVersion = 9
-			snapshot.Generation = 9999
-			snapshot.Interface = "spoofed0"
-			snapshot.ConnectionUUID = "spoofed"
-			snapshot.Upstreams[0] = "9.9.9.9"
-			snapshot.Upstreams = snapshot.Upstreams[:1]
-			snapshot.ObservedAt = observedAt.Add(time.Hour)
-			snapshot.Source = "spoofed"
-			snapshot.LastGood = false
-
-			if got := watcher.Snapshot(); !dhcpEqual(got, dhcp) {
-				t.Fatalf("the watcher was edited through a returned DHCP record: %+v, want %+v", got, dhcp)
-			}
-		},
-		"ech": func(t *testing.T) {
+		"ECHState": func(t *testing.T) {
 			path := statePath(t, "ech.json")
 			replaceFile(t, path, documentBytes(t, ech))
 			watcher := watch(t, path, state.ECHState{}, Options{PollInterval: fastPoll})
@@ -906,7 +941,7 @@ func TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold(t *testing.T) 
 				t.Fatalf("the watcher was edited through a returned ECH state: %+v, want %+v", got, ech)
 			}
 		},
-		"bandwidth budget": func(t *testing.T) {
+		"BandwidthBudgetState": func(t *testing.T) {
 			path := statePath(t, "budget.json")
 			replaceFile(t, path, documentBytes(t, budget))
 			watcher := watch(t, path, state.BandwidthBudgetState{}, Options{PollInterval: fastPoll})
@@ -921,7 +956,7 @@ func TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold(t *testing.T) 
 				t.Fatalf("the watcher was edited through a returned budget: %+v, want %+v", got, budget)
 			}
 		},
-		"health": func(t *testing.T) {
+		"HealthState": func(t *testing.T) {
 			path := statePath(t, "health.json")
 			replaceFile(t, path, documentBytes(t, health))
 			watcher := watch(t, path, state.HealthState{}, Options{PollInterval: fastPoll})
@@ -937,6 +972,29 @@ func TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold(t *testing.T) 
 				t.Fatalf("the watcher was edited through a returned health state: %+v, want %+v", got, health)
 			}
 		},
+	}
+
+	// The union in the production type, the keys of documentCloners, and the map
+	// above are three lists of the same thing, and Go cannot check that a type
+	// switch over a type set is exhaustive -- so a sixth state document added to
+	// Document would compile and nothing would fail. The two checks below are the
+	// reminders the compiler cannot give.
+	//
+	// One: a document with no entry in documentCloners cannot be watched at all,
+	// because documentCloner refuses to build a copy function for it. A document
+	// that holds no map and no slice does not need an entry for correctness, so
+	// it has to be named in the map below all the same.
+	//
+	// Two: every document the watcher can hold has a case in the table above, so
+	// a document nobody thought about cannot sit in the union unwatched.
+	if got, want := len(documentCloners), len(documents); got != want {
+		t.Fatalf("a watcher can hold %d documents and this test covers %d, want one subtest each: a document added to Document needs a subtest here, and the compiler will not say so",
+			got, want)
+	}
+	for name := range documents {
+		if _, known := documentCloners[name]; !known {
+			t.Fatalf("this test has a subtest for %q, which is not a document documentCloners can copy", name)
+		}
 	}
 
 	for name, check := range documents {
@@ -998,16 +1056,23 @@ func TestJSONWatcherCloseIsSafeFromSeveralGoroutines(t *testing.T) {
 func TestJSONWatcherCloseWaitsForAReloadInFlight(t *testing.T) {
 	gate := newReloadGate()
 	t.Cleanup(gate.open)
+	first := publishedSelector(1, "198.51.100.7")
+	replacement := publishedSelector(2, "203.0.113.8")
 	path := statePath(t, "selector.json")
-	replaceFile(t, path, documentBytes(t, publishedSelector(1, "198.51.100.7")))
+	replaceFile(t, path, documentBytes(t, first))
 
 	watcher, err := NewJSON(path, gate.pass, state.Selector{}, Options{PollInterval: fastPoll})
 	if err != nil {
 		t.Fatalf("NewJSON(%s): %v", path, err)
 	}
 
+	// The replacement is published before the gate is armed, so the reload the
+	// gate parks is one that has already read the NEW document in hand. Parking a
+	// reload that read the constructor's document would store a value the watcher
+	// was already serving, and the assertion below could not fail.
+	replaceFile(t, path, documentBytes(t, replacement))
 	gate.arm()
-	waitFor(t, "a reload to reach the caller's check", func() bool {
+	waitFor(t, "a reload to reach the caller's check holding the new document", func() bool {
 		select {
 		case <-gate.entered:
 			return true
@@ -1015,6 +1080,9 @@ func TestJSONWatcherCloseWaitsForAReloadInFlight(t *testing.T) {
 			return false
 		}
 	})
+	if snapshot := watcher.Snapshot(); !selectorEqual(snapshot, first) {
+		t.Fatalf("the watcher already stored %+v, so the parked reload has nothing left to store", snapshot)
+	}
 
 	closed := make(chan error, 1)
 	go func() { closed <- watcher.Close() }()
@@ -1028,9 +1096,75 @@ func TestJSONWatcherCloseWaitsForAReloadInFlight(t *testing.T) {
 	if err := <-closed; err != nil {
 		t.Fatalf("Close reported %v", err)
 	}
-	if snapshot := watcher.Snapshot(); snapshot.Generation != 1 {
-		t.Fatalf("Close returned before the in-flight reload stored its document: served generation %d, want 1",
-			snapshot.Generation)
+	// Close returned, so the parked reload has finished, so the new document is
+	// stored. A Close that returned while the reload was in flight would leave
+	// this one short of the value the router is serving.
+	if snapshot := watcher.Snapshot(); !selectorEqual(snapshot, replacement) {
+		t.Fatalf("Close returned before the in-flight reload stored its document: served %+v, want %+v",
+			snapshot, replacement)
+	}
+}
+
+// TestJSONWatcherKeepsACallerReloadThroughAPollReadInFlight is the ordering case,
+// and it is the part of the ordering that is deterministic. A poll read that is
+// still in flight when the caller publishes a newer document must not stop the
+// caller's reload from being stored: the read cannot be holding the write lock,
+// because it is still reading. And once that read finishes and stores what it
+// read, the value is the caller's again, because the next tick reads the file as
+// it now is.
+//
+// What is NOT pinned here is the window in between. Between the parked read
+// storing its older document and the next tick restoring the newer one, the
+// watcher serves the older one for up to one poll interval. Observing that
+// intermediate state is a race against the very tick that ends it -- at the
+// interval this test injects, the window is a few milliseconds wide -- so the
+// window is reasoned about in the poller's comment rather than asserted here.
+func TestJSONWatcherKeepsACallerReloadThroughAPollReadInFlight(t *testing.T) {
+	gate := newReloadGate()
+	t.Cleanup(gate.open)
+	path := statePath(t, "selector.json")
+	replaceFile(t, path, documentBytes(t, publishedSelector(1, "198.51.100.7")))
+
+	watcher, err := NewJSON(path, gate.pass, state.Selector{}, Options{PollInterval: fastPoll})
+	if err != nil {
+		t.Fatalf("NewJSON(%s): %v", path, err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	gate.arm()
+	waitFor(t, "a poll read to be in flight", func() bool {
+		select {
+		case <-gate.entered:
+			return true
+		default:
+			return false
+		}
+	})
+
+	// The caller's reload runs to completion with the poll read still parked, so
+	// whatever that read does when it resumes, the caller's document was stored
+	// rather than lost.
+	newer := publishedSelector(2, "203.0.113.8")
+	replaceFile(t, path, documentBytes(t, newer))
+	if err := watcher.ReloadNow(); err != nil {
+		t.Fatalf("the caller's own reload refused a valid selector: %v", err)
+	}
+	if snapshot := watcher.Snapshot(); !selectorEqual(snapshot, newer) {
+		t.Fatalf("with a poll read in flight the caller's reload did not take effect: served %+v, want %+v",
+			snapshot, newer)
+	}
+
+	// The parked read resumes and stores what it read, and the next tick puts the
+	// caller's document back. Which of the two happens first is the window, and
+	// this only requires that the caller's document is what the watcher ends up
+	// serving.
+	gate.open()
+	waitFor(t, "the watcher to settle on the caller's document", func() bool {
+		snapshot := watcher.Snapshot()
+		return selectorEqual(snapshot, newer)
+	})
+	if snapshot := watcher.Snapshot(); !selectorEqual(snapshot, newer) {
+		t.Fatalf("after the in-flight read finished the watcher settled on %+v, want %+v", snapshot, newer)
 	}
 }
 
@@ -1108,6 +1242,59 @@ func TestWatchersStillReadOnACallerReloadAfterClose(t *testing.T) {
 // Reporting a refusal
 // ---------------------------------------------------------------------------
 
+// TestJSONWatcherIsUndisturbedByAFileNobodyIsChanging is the brief's unchanged
+// content case, and the only one that exercises episode suppression on the
+// success path. Nothing is written for many poll intervals, so the snapshot must
+// stay the published document and the refusal channel must stay silent: a
+// successful reload reports nothing, and a watcher that mistook a valid file for
+// something to complain about would fill the router's log twice a second for as
+// long as it runs.
+func TestJSONWatcherIsUndisturbedByAFileNobodyIsChanging(t *testing.T) {
+	published := publishedSelector(1, "198.51.100.7")
+	path := statePath(t, "selector.json")
+	replaceFile(t, path, documentBytes(t, published))
+	refused := &refusals{}
+	watcher, err := NewJSON(path, nil, state.Selector{},
+		Options{PollInterval: fastPoll, ReloadError: refused.record})
+	if err != nil {
+		t.Fatalf("NewJSON(%s): %v", path, err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	// Long enough for many ticks at the injected interval, and for the file's
+	// own timestamp to be the same across all of them.
+	time.Sleep(50 * fastPoll)
+
+	if snapshot := watcher.Snapshot(); !selectorEqual(snapshot, published) {
+		t.Fatalf("a file nobody changed was served as %+v, want the published %+v", snapshot, published)
+	}
+	if count := refused.count(); count != 0 {
+		t.Fatalf("a valid file nobody changed was reported %d times, the first reading %v", count, refused.all()[0])
+	}
+}
+
+// TestTextWatcherIsUndisturbedByAListNobodyIsChanging is the same case for the
+// allowlist, where the silence matters as much: a report on every tick of a file
+// that is fine would bury the one report an operator needs to read.
+func TestTextWatcherIsUndisturbedByAListNobodyIsChanging(t *testing.T) {
+	path := statePath(t, "force-ech-domains.txt")
+	replaceFile(t, path, []byte("example.com\nexample.org\n"))
+	refused := &refusals{}
+	watcher, err := NewTrimmedLines(path, nil,
+		Options{PollInterval: fastPoll, ReloadError: refused.record})
+	if err != nil {
+		t.Fatalf("NewTrimmedLines(%s): %v", path, err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	time.Sleep(50 * fastPoll)
+
+	assertList(t, watcher.Snapshot(), []string{"example.com", "example.org"})
+	if count := refused.count(); count != 0 {
+		t.Fatalf("a valid list nobody changed was reported %d times, the first reading %v", count, refused.all()[0])
+	}
+}
+
 // TestJSONWatcherReportsARefusalOncePerEpisode: a selector that stays corrupt is
 // one problem, not two hundred a second, and one that is repaired and breaks
 // again is a new problem. A handler called on every tick would bury the log; a
@@ -1177,12 +1364,22 @@ func TestJSONWatcherIsSafeUnderConcurrentSnapshotAndReload(t *testing.T) {
 		}()
 	}
 
+	// The document for each generation is built up front, because encoding one
+	// calls t.Fatalf and FailNow may only be called from the test's own
+	// goroutine.
+	generations := make([][]byte, 0, 38)
+	for generation := uint64(2); generation < 40; generation++ {
+		generations = append(generations, documentBytes(t, publishedSelector(generation, "203.0.113.8")))
+	}
 	var writers sync.WaitGroup
 	writers.Add(1)
 	go func() {
 		defer writers.Done()
-		for generation := uint64(2); generation < 40; generation++ {
-			replaceFile(t, path, documentBytes(t, publishedSelector(generation, "203.0.113.8")))
+		for _, document := range generations {
+			if err := publish(path, document); err != nil {
+				t.Errorf("publish a replacement: %v", err)
+				return
+			}
 			_ = watcher.ReloadNow()
 		}
 	}()
@@ -1383,6 +1580,99 @@ func TestTextWatcherRefusesWhatIsNotADomain(t *testing.T) {
 	}
 }
 
+// TestTextWatcherRefusesAZeroByteFileAndKeepsTheLastValidList is the truncation
+// case, and the one refusal the whole-file rule alone does not catch. An
+// operator's in-place write -- a shell redirect, sed -i, an editor that truncates
+// before it writes -- leaves a zero-byte file for as long as the write takes. A
+// zero-byte file parses to no entries and no complaint, so the list would be
+// dropped for the length of that window: every domain the operator had chosen to
+// force ECH for stops being forced, with nothing in any log to say so. The last
+// valid list has to survive it, loudly.
+func TestTextWatcherRefusesAZeroByteFileAndKeepsTheLastValidList(t *testing.T) {
+	path := statePath(t, "force-ech-domains.txt")
+	replaceFile(t, path, []byte("example.com\nexample.org\n"))
+	refused := &refusals{}
+	watcher, err := NewTrimmedLines(path, nil,
+		Options{PollInterval: fastPoll, ReloadError: refused.record})
+	if err != nil {
+		t.Fatalf("NewTrimmedLines(%s): %v", path, err)
+	}
+	t.Cleanup(func() { _ = watcher.Close() })
+
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
+		t.Fatalf("truncate the allowlist in place: %v", err)
+	}
+	if err := watcher.ReloadNow(); err == nil {
+		t.Fatal("a zero-byte allowlist was accepted, so the router stopped forcing ECH for every domain in it")
+	}
+	assertList(t, watcher.Snapshot(), []string{"example.com", "example.org"})
+
+	// The refusal has to be as loud as a line refusal, and it has to name the
+	// file: an operator reading the log is the only one who can tell a truncated
+	// write from a file they emptied.
+	waitFor(t, "the truncated allowlist to be reported", func() bool { return refused.count() > 0 })
+	reported := refused.all()[0]
+	if !strings.Contains(reported.Error(), path) {
+		t.Fatalf("the report reads %q, which does not say which file is broken", reported)
+	}
+	if snapshot := watcher.Snapshot(); len(snapshot) != 2 {
+		t.Fatalf("the poll published the truncated file: serving %v, want the two domains it published", snapshot)
+	}
+}
+
+// TestTextWatcherAcceptsACommentsOnlyFileAsTheIntentionalEmpty is the other half
+// of the ruling, and it is what the operator has instead: the router must be
+// able to stop forcing ECH, and a file whose every line is a comment says so
+// unambiguously. A file of blank lines says the same thing.
+func TestTextWatcherAcceptsACommentsOnlyFileAsTheIntentionalEmpty(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		list string
+	}{
+		{name: "comments", list: "# forcing is off while the keys are fetched\n"},
+		{name: "blank lines", list: "\n\n   \n\t\n"},
+		{name: "comments and blank lines", list: "\n# off\n\n  # still off\n\n"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := statePath(t, "force-ech-domains.txt")
+			replaceFile(t, path, []byte("example.com\n"))
+			watcher := watchText(t, path, nil, Options{PollInterval: fastPoll})
+
+			replaceFile(t, path, []byte(testCase.list))
+			if err := watcher.ReloadNow(); err != nil {
+				t.Fatalf("a list the operator emptied on purpose was refused: %v", err)
+			}
+			if snapshot := watcher.Snapshot(); snapshot == nil {
+				t.Fatal("the emptied list reads as no list at all, so a caller cannot tell it from a watcher that never loaded one")
+			}
+			assertList(t, watcher.Snapshot(), []string{})
+		})
+	}
+}
+
+// TestTextWatcherAdoptsAFileRepairedFromZeroBytes is the retry the truncation
+// refusal has to survive: the operator's write finishes, the file has content
+// again, and the router has to be enforcing what they wrote. A refusal that
+// outlived its cause would pin the router to the list it had before the
+// truncating editor opened.
+func TestTextWatcherAdoptsAFileRepairedFromZeroBytes(t *testing.T) {
+	path := statePath(t, "force-ech-domains.txt")
+	replaceFile(t, path, []byte("example.com\n"))
+	watcher := watchText(t, path, nil, Options{PollInterval: fastPoll})
+
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
+		t.Fatalf("truncate the allowlist in place: %v", err)
+	}
+	waitFor(t, "the truncation to be refused", func() bool {
+		return watcher.ReloadNow() != nil
+	})
+	assertList(t, watcher.Snapshot(), []string{"example.com"})
+
+	replaceFile(t, path, []byte("example.com\nexample.net\n"))
+	waitFor(t, "the finished write to be adopted", func() bool { return len(watcher.Snapshot()) == 2 })
+	assertList(t, watcher.Snapshot(), []string{"example.com", "example.net"})
+}
+
 // TestTextWatcherAdoptsAValidReplacement: the operator fixes the file and the
 // next poll publishes what they wrote. A refusal has to be temporary, or a
 // router serves a list its owner can never change.
@@ -1414,20 +1704,29 @@ func TestTextWatcherSnapshotIsIndependentOfTheWatchersList(t *testing.T) {
 	assertList(t, watcher.Snapshot(), []string{"example.com", "example.org"})
 }
 
-// TestTextWatcherSnapshotIsIndependentOfTheInitialListTheCallerPassed covers the
-// other direction: the list a watcher is constructed with belongs to whoever
-// built it, and a caller still holding its own slice must not find it edited.
-func TestTextWatcherSnapshotIsIndependentOfTheInitialListTheCallerPassed(t *testing.T) {
+// TestTextWatcherIsIndependentOfTheInitialListTheCallerPassed covers the
+// constructor's copy. The list a watcher is built with belongs to whoever built
+// it, and a plugin that keeps using its own slice afterwards -- reordering it,
+// trimming it, reusing the buffer for the next file it reads -- must not be
+// editing the list the router is enforcing.
+//
+// Two things make this case about the constructor. The file is ABSENT when the
+// watcher is built, because the constructor reads the file once and a readable
+// file would replace the caller's list before the case began. And the mutation
+// is applied to the CALLER's slice rather than to a snapshot, because the
+// snapshot's own copy is what TestTextWatcherSnapshotIsIndependentOfTheWatchersList
+// is about; only the caller's own slice reaches the constructor's copy.
+func TestTextWatcherIsIndependentOfTheInitialListTheCallerPassed(t *testing.T) {
 	initial := []string{"example.com", "example.org"}
-	path := statePath(t, "force-ech-domains.txt")
-	replaceFile(t, path, []byte("beta.example\n"))
-	watcher := watchText(t, path, initial, Options{PollInterval: fastPoll})
+	watcher := watchText(t, statePath(t, "absent.txt"), initial, Options{PollInterval: fastPoll})
 
-	watcher.Snapshot()[0] = "injected.example"
+	// The caller's list is the live one, or this case is not about it.
+	assertList(t, watcher.Snapshot(), initial)
 
-	if initial[0] != "example.com" {
-		t.Fatalf("the caller's own list was edited through a snapshot: it now starts with %q", initial[0])
-	}
+	initial[0] = "injected.example"
+	initial = append(initial, "appended.example")
+
+	assertList(t, watcher.Snapshot(), []string{"example.com", "example.org"})
 }
 
 // TestTextWatcherKeepsTheLastValidListWhenTheOperatorFixesTheBadLine is the
@@ -1534,10 +1833,18 @@ func TestTextWatcherIsSafeUnderConcurrentSnapshotAndReload(t *testing.T) {
 	writers.Add(1)
 	go func() {
 		defer writers.Done()
+		// publish rather than replaceFile, which calls t.Fatalf: FailNow may only
+		// be called from the test's own goroutine.
 		for round := 0; round < 40; round++ {
-			replaceFile(t, path, []byte("example.com\nexample.org\nexample.net\n"))
+			if err := publish(path, []byte("example.com\nexample.org\nexample.net\n")); err != nil {
+				t.Errorf("publish a longer list: %v", err)
+				return
+			}
 			_ = watcher.ReloadNow()
-			replaceFile(t, path, []byte("example.com\n"))
+			if err := publish(path, []byte("example.com\n")); err != nil {
+				t.Errorf("publish a shorter list: %v", err)
+				return
+			}
 			_ = watcher.ReloadNow()
 		}
 	}()
