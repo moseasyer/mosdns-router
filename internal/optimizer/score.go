@@ -463,9 +463,18 @@ func CombinedScore(subject CandidateResult, group []CandidateResult, weights Wei
 
 // TenthPercentileSpeed is the group's tenth-percentile transfer speed, by the
 // nearest-rank method the prober's own percentiles use: with n speeds in
-// descending order it is the one at index ceil(0.10*n)-1, computed as
-// (10*n+99)/100 in integer arithmetic, which is the fastest candidate for ten
-// candidates or fewer.
+// ASCENDING order it is the one at index ceil(0.10*n)-1, computed as
+// (10*n+99)/100 in integer arithmetic with no interpolation between neighbours —
+// the same shape as measure.TCPMetrics' p50 and p95.
+//
+// It is the lower tail, which is the only reading that makes the name true and
+// the report useful: for ten candidates or fewer it is the slowest speed
+// measured, and a "group floor" that was the fastest candidate in the group would
+// be a ceiling. Taking the index into a descending slice gives the
+// ceil(0.10*n)-th *fastest* instead, which is the 90th percentile; the function
+// did that once and
+// TestScoreTheTenthPercentileSpeedIsTheNearestRankOfTheGroup now pins n = 10 and
+// n = 21, the two sizes at which the conventions are told apart.
 //
 // It is a property of the group, not of a candidate, and it is reported for the
 // operator rather than compared between candidates: two candidates of one group
@@ -491,7 +500,6 @@ func TenthPercentileSpeed(group []CandidateResult) float64 {
 		speeds = append(speeds, result.Download.BytesPerSecond)
 	}
 	slices.Sort(speeds)
-	slices.Reverse(speeds)
 	rank := (10*len(speeds) + 99) / 100
 	if rank < 1 {
 		rank = 1

@@ -1055,45 +1055,72 @@ func TestScoreDifferentWeightsOrderTheSameCandidatesDifferently(t *testing.T) {
 
 // The p10 speed is the group's own tenth percentile of the download speeds, by
 // the nearest-rank method the prober's own percentiles use: with n speeds in
-// descending order it is the one at index ceil(0.10*n)-1, which for ten
-// candidates or fewer is the fastest.
+// ASCENDING order it is the one at index ceil(0.10*n)-1, computed as
+// (10*n+99)/100 in integer arithmetic with no interpolation between neighbours.
+// That is the same shape as measure.TCPMetrics' p50 and p95, which are the
+// sample at that index of an ascending slice.
+//
+// It is the *lower* tail. Taking the index into a descending slice instead would
+// give the ceil(0.10*n)-th *fastest*, which for n <= 10 is the maximum speed: a
+// "group floor" that is the fastest candidate measured is not a floor. The two
+// conventions differ from n = 11 onwards, and n = 10 and n = 21 are pinned here
+// because they are the cases that tell them apart.
 func TestScoreTheTenthPercentileSpeedIsTheNearestRankOfTheGroup(t *testing.T) {
-	// Twenty-one strictly decreasing speeds, so the nearest-rank index at each
-	// group size lands on a different, named candidate.
+	// Twenty-one strictly increasing speeds, so a prefix of n of them is the n
+	// slowest candidates measured and the nearest-rank index reads straight into
+	// that prefix. Ascending they read:
+	//	0.25 0.5 1 2 3 4 5 6 7 8 9 10 20 30 40 50 60 70 80 90 100
 	speeds := []float64{
-		100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
-		0.5, 0.25,
+		0.25, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80,
+		90, 100,
 	}
 	var group []CandidateResult
 	for index, speed := range speeds {
 		group = append(group, measured(candidate.ProviderCloudflare, "", fmt.Sprintf("104.16.%d.1", index), 10, float64(10+index), 20, 1, 0.00, speed*mib))
 	}
 	for size, want := range map[int]float64{
+		// ceil(0.10*n) is 1 for n = 1 through 10, so for ten candidates or fewer
+		// the tenth percentile is the slowest one measured.
 		0:  0,
-		1:  100 * mib, // ceil(0.10) = 1: the only speed
-		2:  100 * mib, // ceil(0.20) = 1
-		5:  100 * mib, // ceil(0.50) = 1
-		10: 100 * mib, // ceil(1.00) = 1
-		11: 90 * mib,  // ceil(1.10) = 2
-		12: 90 * mib,  // ceil(1.20) = 2
-		20: 90 * mib,  // ceil(2.00) = 2
-		21: 80 * mib,  // ceil(2.10) = 3
+		1:  0.25 * mib, // ceil(0.10) = 1: the only speed
+		2:  0.25 * mib, // ceil(0.20) = 1
+		3:  0.25 * mib, // ceil(0.30) = 1
+		5:  0.25 * mib, // ceil(0.50) = 1
+		10: 0.25 * mib, // ceil(1.00) = 1
+		// ceil(0.10*n) is 2 from n = 11, and the second slowest is 0.5.
+		11: 0.5 * mib, // ceil(1.10) = 2
+		12: 0.5 * mib, // ceil(1.20) = 2
+		20: 0.5 * mib, // ceil(2.00) = 2
+		// ceil(0.10*n) is 3 at n = 21, and the third slowest is 1. Under the
+		// rejected descending convention this size returned 80, the third
+		// fastest, which is the 90th percentile and not a tenth.
+		21: 1 * mib, // ceil(2.10) = 3
 	} {
 		if got := TenthPercentileSpeed(group[:size]); got != want {
 			t.Errorf("the p10 speed of %d candidates = %v, want %v", size, got, want)
 		}
 	}
 	// The order the speeds arrived in does not matter, because a percentile is
-	// a statement about the group's sizes and not about the order of a list.
-	// The reversed group still holds all twenty-one candidates, so its p10 is
-	// still the third fastest.
+	// a statement about the group's sizes and not about the order of a list. The
+	// reversed group still holds all twenty-one candidates, so its p10 is still
+	// the third slowest.
 	shuffled := slices.Clone(group)
 	slices.Reverse(shuffled)
-	if got, want := TenthPercentileSpeed(shuffled), float64(80*mib); got != want {
+	if got, want := TenthPercentileSpeed(shuffled), float64(1*mib); got != want {
 		t.Errorf("the p10 speed of the reversed group = %v, want %v", got, want)
 	}
+	// A p10 is a floor and never above the fastest candidate, and never below the
+	// slowest, whatever the group size. The group is built slowest first, so its
+	// slowest is the first entry and its fastest is the last of the prefix.
+	for size := 1; size <= len(group); size++ {
+		got := TenthPercentileSpeed(group[:size])
+		slowest, fastest := group[0].Download.BytesPerSecond, group[size-1].Download.BytesPerSecond
+		if got < slowest || got > fastest {
+			t.Errorf("the p10 speed of %d candidates is %v, outside the group's own range %v..%v", size, got, slowest, fastest)
+		}
+	}
 	// A group where nothing was measured reports zero, not a division by zero
-	// or the slowest speed.
+	// and not a fabricated floor.
 	if got := TenthPercentileSpeed([]CandidateResult{measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 0)}); got != 0 {
 		t.Errorf("the p10 speed of one unmeasured candidate = %v, want 0", got)
 	}
