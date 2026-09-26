@@ -114,7 +114,9 @@ Support either dispatcher environment mode or `--capture-current INTERFACE`; rej
 
 Capture-current is the dispatcher's publication path with an explicit interface, not a second writer: it calls `collect_dns_with_source(env, interface, run)` and `publish_if_changed(...)` with the addresses and the source that answered, so an install that captures the current lease and the first `up` event that follows it record one state instead of two generations. It never invents a source of its own: `installer-current` is not a token any collector can produce, and a state naming it would be a document the router's source vocabulary does not cover.
 
-`CONNECTION_UUID` comes from the environment when the caller has it, and otherwise from `nmcli -g GENERAL.CONNECTION device show INTERFACE`, because a state with upstreams must record the connection the lease belongs to and an empty one would be refused as invalid. The result must pass `internal/dhcpstate.VerifyFixture` in integration tests.
+`CONNECTION_UUID` comes from the environment when the caller has it, and otherwise from `nmcli -g GENERAL.CON-UUID device show INTERFACE`, because a state with upstreams must record the connection the lease belongs to and an empty one would be refused as invalid. The field is `GENERAL.CON-UUID` and not the `GENERAL.CONNECTION` this plan first named: `GENERAL.CONNECTION` holds the connection's *name* (`netplan-ens33` on a machine whose profile is called that) and `device show` does not offer `GENERAL.CONNECTION-UUID` at all, so the original token returns a value the publisher refuses and every install-time capture would exit 2.
+
+The result must pass `internal/dhcpstate.VerifyFixture`, and that check lives in the Go suite rather than in the packaging integration tests: `TestVerifyFixtureAcceptsACapture` verifies the bytes a real capture published — both the dual-stack lease and the readable-but-empty one — and `TestCaptureBytesAreTheStateWriterEmits` holds those bytes against `state.DHCPState` marshalled by the Go writer, so a hand-edited or stale literal fails instead of passing as a document the reader happens to like. The Python suite holds the other half: `bridge/tests/test_fixture.py` pins the publisher's bytes to the committed fixture and `test_capture_current.py` pins what a capture records. The field has no runtime consumer — `dhcp_forward` reads `LastGood`, `Generation`, `Upstreams` and `Interface`, and `DHCPState.Validate` does not check the connection — so the mandatory lookup rests on the publisher refusing a state with resolvers and no connection, and on `connection_uuid` being part of the identity the publisher compares: omitting it from a capture that found no resolvers would force a generation advance when the first event arrives.
 
 - [ ] **Step 4: Run tests**
 
@@ -327,7 +329,23 @@ Use the package version and schema version. Write a `managed-by: mosdns-router` 
 
 Keep a list of applied mutating actions. On exception, execute reverse-order restoration; never stop a unit that was active before installation. Return separate errors for original operation and rollback.
 
-- [ ] **Step 7: Implement NM mutation**
+- [ ] **Step 7: Implement the capture call and the NM mutation**
+
+Invoke the capture as an argument array, never a shell string:
+
+```text
+python3 -m mosdns_dhcp_bridge.cli --capture-current INTERFACE --state-file /run/mosdns/dhcp-upstreams.json --lock-file /run/mosdns/dhcp-bridge.lock
+```
+
+with an environment scrubbed of exactly four names: `NM_DISPATCHER_ACTION`, `DHCP4_DOMAIN_NAME_SERVERS`, `DHCP6_DOMAIN_NAME_SERVERS` and `CONNECTION_UUID`. `CommandRunner.run(args, check=True)` has no `env=` parameter, so the caller's environment is inherited by default and each of the four changes what the capture records:
+
+- `NM_DISPATCHER_ACTION`: any exported value, empty included, makes `--capture-current` a usage error and exits 2 before a single command runs.
+- `DHCP4_DOMAIN_NAME_SERVERS` and `DHCP6_DOMAIN_NAME_SERVERS`: the collector ranks them below the raw NetworkManager fields but above the effective device DNS and resolved, so a stale exported value is recorded as the source `dispatcher-env`. NetworkManager builds the real event's own environment and never puts those names in it, so no later event can reproduce that state — a guaranteed generation advance, and a cache flush, at the moment there must be none.
+- `CONNECTION_UUID`: the environment wins over the authoritative `nmcli -g GENERAL.CON-UUID` lookup, so a stale exported value makes the capture name the *wrong* connection and skip the query while the first real `up` event names the true one. That is a certain second generation over a state which briefly claims a lease the router is not following.
+
+`DEVICE_IP_IFACE`, `INTERFACE` and `DEVICE` need no scrubbing: `_capture` never reads them.
+
+The connection lookup is mandatory even when the lease named no resolver, so a first-install capture that cannot read the connection exits 4 and publishes nothing: the state file keeps the generation it had, and the resolvers the collector had already read are discarded. That is the fail-closed choice — a state carrying resolvers and no connection is refused by the publisher anyway — but exit 4 is a defined outcome of this step rather than an unexpected one, and the discarded addresses are real: the machine had a lease and the capture could not record which connection it belonged to. The failure-injection test in Step 2 has to treat that outcome as a rollback point like any other.
 
 Use three exact mutation calls: `nmcli connection modify UUID ipv4.ignore-auto-dns yes`, `nmcli connection modify UUID ipv6.ignore-auto-dns yes`, and `nmcli connection modify UUID ipv4.dns 127.0.0.1`, passing UUID as a separate argument. Do not set a public DNS. Reapply the connection without rebooting NetworkManager globally; use `nmcli connection up UUID` only after dnscrypt/MOSDNS units are installed, enabled, and locally healthy.
 
