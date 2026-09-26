@@ -537,11 +537,21 @@ class CaptureInterfaceTests(CaptureCase):
 class CaptureConnectionTests(CaptureCase):
     """The connection a capture's resolvers belong to, and what happens without it.
 
-    A state that names resolvers has to name the connection they came from: the
-    router reads that field to decide whether a lease is the one it is following,
-    and the publisher refuses a state with upstreams and no connection at all.
-    The lookup is therefore part of the capture rather than a convenience, and a
-    machine that cannot answer it publishes nothing.
+    Two rules make the lookup mandatory. The publisher refuses a state that names
+    resolvers and no connection, so a capture has to have one in hand before it can
+    publish any addresses at all. And ``connection_uuid`` is one of the fields the
+    publisher compares when it decides whether an event changed anything, so the
+    capture looks the connection up even when the lease named no resolver: a
+    disabled capture that recorded no connection, followed by the first event that
+    records the real one, would be two generations for a single observation, and
+    that is the cache flush the whole capture path exists to avoid.
+
+    Nothing at runtime decides anything on that field, and it is worth being plain
+    about it so nobody goes looking for the check. ``dhcp_forward`` reads
+    ``LastGood``, ``Generation``, ``Upstreams`` and ``Interface``;
+    ``state.DHCPState.Validate`` does not mention the connection at all; and the
+    only thing that reads it is the status display. The one refusal that does
+    mention it is the publisher's own, which is why the rule lives on this side.
     """
 
     def test_a_connection_that_could_not_be_read_publishes_nothing(self):
