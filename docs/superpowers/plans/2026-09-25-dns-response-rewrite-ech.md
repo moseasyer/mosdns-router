@@ -98,17 +98,36 @@ func Address(in AddressInput) (*dns.Msg, error)
 func StripModifiedDNSSEC(msg *dns.Msg)
 
 package statewatch
-type Watcher[T any] struct { /* private */ }
-func NewJSON[T any](path string, validate func(T) error, initial T) *Watcher[T]
+// Document is the union of the five state documents state.ReadJSON accepts as a
+// destination. It is a constraint and not `any` because the watcher decodes with
+// state.ReadJSON, so a second opinion about what a valid state document is has
+// nowhere to be expressed -- a plugin cannot pass its own reader.
+type Document interface {
+    state.DHCPState | state.Selector | state.ECHState | state.BandwidthBudgetState | state.HealthState
+}
+// DefaultPollInterval is 500ms. Options.PollInterval of zero means it; a negative
+// interval is refused rather than rounded, because time.NewTicker panics on one.
+type Options struct {
+    PollInterval time.Duration
+    // ReloadError is called once per episode of failed reloads, from the poll.
+    // It is how a refusal that happens without the caller asking is still loud.
+    ReloadError func(error)
+}
+type Watcher[T Document] struct { /* private */ }
+func NewJSON[T Document](path string, validate func(T) error, initial T, options ...Options) (*Watcher[T], error)
 func (w *Watcher[T]) Snapshot() T
 func (w *Watcher[T]) ReloadNow() error
 func (w *Watcher[T]) Close() error
 
 type TextWatcher struct { /* private */ }
-func NewTrimmedLines(path string, initial []string) *TextWatcher
+func NewTrimmedLines(path string, initial []string, options ...Options) (*TextWatcher, error)
 func (w *TextWatcher) Snapshot() []string
 func (w *TextWatcher) ReloadNow() error
 func (w *TextWatcher) Close() error
+
+// LineError names the line a force-ECH list was refused for. A value, so a caller
+// holding one cannot edit what the watcher recorded.
+type LineError struct { Path string; Line int; Text string; Reason string }
 ```
 
 ```go
@@ -124,6 +143,67 @@ type Args struct {
     CloudflareCIDRFile string `yaml:"cloudflare_cidr_file"`
 }
 ```
+
+### Amendments from Task 4
+
+Task 4 shipped the watchers, and the `statewatch` block above is its shipped
+shape. Four departures from the block this plan first wrote, each forced by a
+ruling or by a refusal the original did not anticipate. A Task 5 author must read
+this section, not the plan's original block.
+
+- **`T` is constrained to the `Document` union rather than `any`.** The plan's
+  ruling was that the watcher's decode-and-validate step IS `state.ReadJSON`, and
+  `state.ReadJSON` accepts only those five document types as a destination. The
+  constraint is what makes that ruling structural rather than a convention: a
+  caller that could name any type at all would be able to ask for a watcher with a
+  second opinion about what a valid state document is. A caller's `validate` is
+  still accepted and is applied AFTER `state.ReadJSON`, so it may only ADD a
+  refusal, never remove one.
+- **Both constructors return an error.** An empty path and a negative
+  `PollInterval` are programming errors, and `time.NewTicker` panics on a
+  non-positive interval inside the poll goroutine, after the router has started.
+  A plugin's `Init` already returns an error, so the cost to Task 5 is one `if`.
+- **One optional `Options` value, variadic.** Zero `Options` means the documented
+  500 ms and no reporting, so a production call site reads as
+  `NewJSON[state.Selector](path, validate, initial)`. A second `Options` value is
+  refused rather than half-honoured.
+- **`Options.ReloadError`.** The plan's own ruling is that a malformed force-ECH
+  list "keeps the last valid list, logs the offending line, and is caught at
+  startup". The poll happens inside the watcher, so without a callback the plugin
+  cannot learn of a failure except through `ReloadNow`, which it does not call on
+  a timer. The handler is called once per episode of the same failure, and is not
+  called for a `ReloadNow` the caller asked for, because the caller has that
+  error as a return value. **Task 5 must pass a handler that logs**, or a
+  corrupt-allowlist replacement will be refused silently in production.
+
+Two behaviours Task 5 depends on that the plan did not state, both pinned by
+tests in `internal/statewatch`:
+
+- **A failed reload changes nothing.** The last valid document stays, whether the
+  refusal was a missing file, a truncated write, a schema version this build does
+  not know, or the caller's own check. A corrupt replacement never reaches a query.
+- **A force-ECH list is refused whole, and a zero-byte file is refused too.** One
+  malformed line keeps the last valid list and reports the line. A file of **no
+  bytes** is refused as well, because the list is not producer-written and an
+  operator's in-place write (`> file`, `sed -i`, a truncating editor) leaves
+  exactly zero bytes there for as long as the write takes; accepting it would drop
+  every forced domain silently. A **comments-only or blank-lines-only file is
+  accepted** as the intentional empty list, so the operator can still turn forcing
+  off. Names must be written punycoded; a domain with a non-ASCII character is
+  refused.
+
+Three obligations for whoever adds a state document to `state`, which the
+compiler will **not** remind them of for the last two:
+
+- add it to the `Document` union in `internal/statewatch/watcher.go`;
+- give it an entry in `documentCloners` in the same file, and clone its map and
+  slice fields there -- `documentCloner` refuses to build a copy function for a
+  document with no entry, so a new document cannot be watched until it has one,
+  and that refusal is the only thing standing between a new document and a silent
+  shallow copy;
+- add a subtest to `TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold`,
+  which fails on a count mismatch, so a document nobody thought about cannot sit
+  in the union unwatched.
 
 ### Amendments from Task 2
 
