@@ -582,6 +582,135 @@ func TestACounterFromAPreviousWinnerDoesNotCountAgainstTheNewOne(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the proof window the response rewriter gates on
+// ---------------------------------------------------------------------------
+
+// The contract the rewriter plan gates on: a check whose winner's proof completed
+// is itself a certificate, Host and SNI proof of the address in service, so it is
+// the check that keeps that window open. The window therefore advances to this
+// check's own instant plus five minutes - 04:00 becomes 04:05, written out as
+// literals rather than computed from the package's constant - the generation does
+// not move, because nothing about the selection changed, and the document is one
+// the state package accepts. Every other field is the address that was already in
+// service, untouched.
+func TestASuccessfulCheckRefreshesThePublishedWinnersProofWindow(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+
+	result := w.check()
+	if result.Winner.Verdict != health.VerdictHealthy {
+		t.Fatalf("the verdict = %v, want %v (detail: %s)", result.Winner.Verdict, health.VerdictHealthy, result.Winner.Detail)
+	}
+	if !result.RefreshedProof {
+		t.Fatal("a check that proved the winner reports no refreshed proof window, so a reader cannot tell the window is still open")
+	}
+	if !result.ProofUntil.Equal(time.Date(2026, 9, 26, 4, 5, 0, 0, time.UTC)) {
+		t.Errorf("the result reports the window closing at %s, want 2026-09-26T04:05:00Z: the proof completed at 04:00", result.ProofUntil)
+	}
+
+	published := w.readSelector()
+	if !published.LastSuccess.Equal(baseMoment) {
+		t.Errorf("the refreshed selector records its last success at %s, want %s: the proof completed at 04:00", published.LastSuccess, baseMoment)
+	}
+	if !published.WinnerProofUntil.Equal(time.Date(2026, 9, 26, 4, 5, 0, 0, time.UTC)) {
+		t.Errorf("the refreshed selector's proof expires at %s, want 2026-09-26T04:05:00Z", published.WinnerProofUntil)
+	}
+	if published.Generation != 4 {
+		t.Errorf("a proof refresh moved the generation to %d, want 4: no address, mapping or mode changed", published.Generation)
+	}
+	if published.WinnerIP != winnerIP || published.FallbackIP != fallbackIP {
+		t.Errorf("a proof refresh changed the addresses: winner %q, fallback %q", published.WinnerIP, published.FallbackIP)
+	}
+	if published.CloudFront[cloudFrontHostname] != "104.16.2.10" {
+		t.Errorf("a proof refresh changed the CloudFront mapping: %v", published.CloudFront)
+	}
+	if err := published.Validate(); err != nil {
+		t.Errorf("the refreshed selector is not one the state package accepts: %v", err)
+	}
+}
+
+// A pinned address is proved against the same profiles a winner is, by the same
+// walk, in the same pass - so its window is refreshed on the same rule. A pin is
+// the operator's decision about the address, not a decision about the window, and
+// a check that refreshed one and not the other would leave a manual selector's
+// proof to expire on a router where everything is answering.
+func TestASuccessfulCheckRefreshesTheProofOfAPinnedAddress(t *testing.T) {
+	pinned := publishedSelector()
+	pinned.Mode = "manual"
+	w := newWorld(t, pinned, profilesFor(), 3)
+
+	result := w.check()
+	if !result.RefreshedProof {
+		t.Fatalf("a healthy check of a pinned address reports no refreshed proof (verdict %v, detail %s)", result.Winner.Verdict, result.Winner.Detail)
+	}
+	published := w.readSelector()
+	if !published.WinnerProofUntil.Equal(time.Date(2026, 9, 26, 4, 5, 0, 0, time.UTC)) {
+		t.Errorf("the pinned selector's proof expires at %s, want 2026-09-26T04:05:00Z", published.WinnerProofUntil)
+	}
+	if published.Mode != "manual" || published.Generation != 4 {
+		t.Errorf("refreshing a pinned proof changed the selection: mode %q, generation %d", published.Mode, published.Generation)
+	}
+	if err := published.Validate(); err != nil {
+		t.Errorf("the refreshed selector is not one the state package accepts: %v", err)
+	}
+}
+
+// A refusal is not a proof, so it refreshes nothing: the window keeps the instant
+// of the last proof that passed, and the document is byte-for-byte what it was. A
+// check that advanced the window on a failure would be keeping an address's proof
+// alive with a verdict that says it is not serving.
+func TestAFailedCheckRefreshesNoProof(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.prober.answer = refusingWinner(12)
+	before := w.readSelectorBytes()
+
+	result := w.check()
+	if result.RefreshedProof {
+		t.Error("a failed check reported a refreshed proof window")
+	}
+	if !result.ProofUntil.IsZero() {
+		t.Errorf("a failed check reports a window closing at %s, want none", result.ProofUntil)
+	}
+	if after := w.readSelectorBytes(); after != before {
+		t.Errorf("a failed check changed the selector:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// The two paths that stamp a window are mutually exclusive, and the transition's
+// is its own: it stamps the window of the address it just moved to, four minutes
+// and five minutes out, and reports itself as a transition rather than as a
+// refresh - so a reader is never told a window was refreshed when what happened
+// was a different address taking service.
+func TestTheTransitionRefreshesTheProofOfTheAddressItPublishedAndOnlyThat(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.prober.answer = refusingWinner(12)
+	w.check()
+	w.moment = baseMoment.Add(2 * time.Minute)
+	w.check()
+	w.moment = baseMoment.Add(4 * time.Minute)
+
+	result := w.check()
+	if result.Transition == nil {
+		t.Fatalf("the third failure published no transition, detail: %s", result.Winner.Detail)
+	}
+	if result.RefreshedProof {
+		t.Error("a transition also reported a refreshed proof window, so the two paths are not exclusive")
+	}
+	if !result.ProofUntil.IsZero() {
+		t.Errorf("a transition reports a proof window of %s, want none: the window it wrote belongs to the transition", result.ProofUntil)
+	}
+	published := w.readSelector()
+	if !published.LastSuccess.Equal(time.Date(2026, 9, 26, 4, 4, 0, 0, time.UTC)) {
+		t.Errorf("the transitioned selector records its last success at %s, want the transition's own 04:04", published.LastSuccess)
+	}
+	if !published.WinnerProofUntil.Equal(time.Date(2026, 9, 26, 4, 9, 0, 0, time.UTC)) {
+		t.Errorf("the transitioned selector's proof expires at %s, want 2026-09-26T04:09:00Z", published.WinnerProofUntil)
+	}
+	if published.Generation != 5 {
+		t.Errorf("the transitioned selector is generation %d, want 5", published.Generation)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // success, failure, and the difference between them and not knowing
 // ---------------------------------------------------------------------------
 
@@ -1697,8 +1826,12 @@ func TestThePassDeadlineScalesWithTheNumberOfWaves(t *testing.T) {
 
 // The hazard the scaling exists for: a long list on a slow edge is a healthy winner,
 // and a deadline that cannot cover its waves turns it into three failures and a
-// rollback onto the fallback. Three passes of the same list must leave the selector
+// rollback onto the fallback. Three passes of the same list must leave the selection
 // exactly as it was.
+//
+// "The selection" is the address, the fallback, the mapping and the generation. The
+// proof window is not part of it and moves on every pass, which is the contract the
+// rewriter gates on: three healthy passes end with the window open until 04:11.
 func TestALongListOnASlowEdgeDoesNotTripTheThreshold(t *testing.T) {
 	w := newWorld(t, publishedSelector(), globalProfilesOf(20), 3)
 	w.prober.delay = 30 * time.Millisecond
@@ -1706,7 +1839,6 @@ func TestALongListOnASlowEdgeDoesNotTripTheThreshold(t *testing.T) {
 	// 200ms budget. A serial walk would need 600ms of it and would be cut short.
 	w.options.WaveTimeout = 100 * time.Millisecond
 	w.rebuild()
-	before := w.readSelectorBytes()
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		w.moment = baseMoment.Add(time.Duration(attempt) * 2 * time.Minute)
@@ -1721,8 +1853,16 @@ func TestALongListOnASlowEdgeDoesNotTripTheThreshold(t *testing.T) {
 			t.Fatalf("check %d published a transition: %+v", attempt, *result.Transition)
 		}
 	}
-	if after := w.readSelectorBytes(); after != before {
-		t.Errorf("three healthy passes changed the selector:\nbefore:\n%s\nafter:\n%s", before, after)
+	published := w.readSelector()
+	if published.Generation != 4 || published.WinnerIP != winnerIP || published.FallbackIP != fallbackIP {
+		t.Errorf("three healthy passes changed the selection: generation %d, winner %q, fallback %q",
+			published.Generation, published.WinnerIP, published.FallbackIP)
+	}
+	if published.CloudFront[cloudFrontHostname] != "104.16.2.10" {
+		t.Errorf("three healthy passes changed the CloudFront mapping: %v", published.CloudFront)
+	}
+	if !published.WinnerProofUntil.Equal(time.Date(2026, 9, 26, 4, 11, 0, 0, time.UTC)) {
+		t.Errorf("the proof window closes at %s, want 2026-09-26T04:11:00Z: the last pass proved the winner at 04:06", published.WinnerProofUntil)
 	}
 }
 

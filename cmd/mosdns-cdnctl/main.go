@@ -1121,6 +1121,11 @@ func runCDNHealthCheck(ctx context.Context, args []string, stdout, stderr io.Wri
 //   - the health document, but only when this check wrote one. A counter it did not
 //     write is not a fact about the router, and a cancellation prints no counter at
 //     all.
+//   - winner-proof, on every path, because the response rewriter gates on the
+//     window and a report that said nothing about it would leave an operator unable
+//     to tell an open window from an expired one. It names the instant the window
+//     closes when this check refreshed it, and says it refreshed nothing when it did
+//     not - which is what a failing or a cancelled check means.
 //   - failed-closed, when the previous document could not be read, because the count
 //     that follows starts at the policy's threshold and would otherwise look like a
 //     fourth consecutive failure of its own accord.
@@ -1149,6 +1154,15 @@ func writeHealthReport(output io.Writer, result health.Result) {
 	if result.WroteHealth() {
 		writeReportLine(output, "consecutive-failures: %d\n", result.Health.ConsecutiveFailures)
 		writeReportLine(output, "healthy: %t\n", result.Health.Healthy)
+	}
+	// The window the rewriter gates on, and whether this check moved it. A
+	// transition stamps the window of the address it moved to and is reported as the
+	// transition it is, so the two lines are never read as one refresh of one
+	// address.
+	if result.RefreshedProof {
+		writeReportLine(output, "winner-proof: refreshed, until %s\n", result.ProofUntil.Format(time.RFC3339))
+	} else {
+		writeReportLine(output, "winner-proof: not refreshed\n")
 	}
 	if result.Transition != nil {
 		writeReportLine(output, "transition: %s at generation %d\n", result.Transition.WinnerIP, result.Transition.Generation)

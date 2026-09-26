@@ -203,12 +203,17 @@ const MaxReportAge = 2 * time.Hour
 
 // WinnerProofTTL is how long a published winner's proof is good for.
 //
-// The state package refuses a proof that does not follow the last success, and
-// the health check is what refreshes both, so the only question this answers is
-// how stale a proof may get before the rewriter stops trusting it. Five minutes
-// covers the shipped 120 second health interval with margin, and if an operator
-// raises the interval this is the fail-closed direction: a shorter TTL than the
-// interval needs only makes the address be re-proved more often.
+// The state package refuses a proof that does not follow the last success, and the
+// window is refreshed by everything that actually re-proves the address in service:
+// an apply, a pin, a health transition, and - every two minutes, on the shipped
+// interval - a health check whose own pass succeeded. A health check's pass is the
+// same certificate, Host and SNI proof an apply's final proof is, against the same
+// profiles, so it is the same kind of evidence; that is why the check writes the
+// window rather than only reporting on the address. Which means the only question
+// this constant answers is how stale a proof may get before the rewriter stops
+// trusting it. Five minutes covers the shipped 120 second interval with margin, and
+// if an operator raises the interval this is the fail-closed direction: a shorter
+// TTL than the interval needs only makes the address be re-proved more often.
 const WinnerProofTTL = 5 * time.Minute
 
 // The refusals an apply can return. They are named so a caller matches them with

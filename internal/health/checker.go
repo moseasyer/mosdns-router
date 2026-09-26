@@ -28,10 +28,21 @@
 //     takes seconds, and holding a shared lock for that would put every apply,
 //     pin and unpin behind a health check. So the selector is read without the
 //     lock, the addresses are proved without it, and the lock is taken only for
-//     the read-validate-change-write of the health document and, when one is
-//     required, of the selector. The one exception is the fallback's proof inside
-//     a transition, which runs under the lock and is bounded by one deadline,
-//     because the store has to follow the proof immediately.
+//     the read-validate-change-write of the health document, for the proof
+//     window a successful pass refreshes, and, when one is required, for the
+//     transition. The one exception is the fallback's proof inside a transition,
+//     which runs under the lock and is bounded by one deadline, because the store
+//     has to follow the proof immediately.
+//
+//   - A pass keeps the proof window open, because the pass is a proof. The check
+//     this file runs every two minutes is the same certificate, Host and SNI proof
+//     an apply's final proof is, held to the same profiles of the same address, so
+//     the window it stamps is the one the response rewriter gates on. A verdict of
+//     healthy writes last_success and winner_proof_until from one reading under the
+//     lock and leaves the generation where it was; a refusal or an unknown writes
+//     neither. A check that only reported would leave the window the nightly apply
+//     stamped to expire twenty-three hours and fifty-five minutes after 03:00,
+//     with this file's own document saying healthy in the meantime.
 //
 // One of the brief's cases belongs to the response rewriter rather than to this
 // file, and the boundary is worth naming because it is a safety one. For a strict
@@ -263,6 +274,22 @@ type Result struct {
 	// this field describes the published selection rather than the address that left
 	// it. It is the zero value when the check wrote none.
 	Health state.HealthState
+	// RefreshedProof reports whether this check rewrote the proof window of the
+	// address that was already in service, which is what a successful pass does and
+	// what nothing else does. It is the WroteHealth rule applied to the selector: a
+	// caller that prints a window it did not write is printing a claim about a
+	// proof that did not happen.
+	//
+	// A transition is the other path that stamps a window, and it is not reported
+	// here. The two cannot both happen in one check - a transition needs a failure
+	// at the threshold and a refresh needs a success - and the transition's own
+	// stamp belongs to the address it moved to, which is a publication rather than a
+	// refresh and is reported as one.
+	RefreshedProof bool
+	// ProofUntil is the window this check published, and is the zero value when it
+	// published none. It is the instant of the proof plus the optimizer's proof
+	// TTL, and it is the number the response rewriter gates on.
+	ProofUntil time.Time
 	// Transition is the selector this check published, or nil when it published
 	// none.
 	Transition *state.Selector
@@ -390,7 +417,8 @@ func NewChecker(prober Prober, options Options) (*Checker, error) {
 }
 
 // Check proves every address the selector has published, records this check's
-// verdict on the winner in the health document, and moves the resolver to the
+// verdict on the winner in the health document, refreshes the published winner's
+// proof window when that verdict is a pass, and moves the resolver to the
 // fallback when the winner has failed at the policy's threshold.
 //
 // The order is the whole of the safety argument:
@@ -406,7 +434,10 @@ func NewChecker(prober Prober, options Options) (*Checker, error) {
 //     through state.WriteReplacementJSONAtomic - the state package's own atomic write,
 //     which is this one because a corrupt health document has to be replaceable and
 //     nothing else does;
-//  6. only if the counter has reached the threshold, prove the fallback and write
+//  6. a pass refreshes the winner's proof window, under the same lock, because a
+//     completed proof of the address in service is exactly what that window is
+//     meant to record;
+//  7. only if the counter has reached the threshold, prove the fallback and write
 //     the selector through state.WriteJSONAtomic, both under the lock that is still
 //     held.
 //
@@ -414,7 +445,12 @@ func NewChecker(prober Prober, options Options) (*Checker, error) {
 // counter at the threshold so the next check tries again, and a counter that was
 // never stored would start the count over and never reach the threshold at all.
 //
-// The two deadlines are the two phases'. Step 6 is given the caller's context and
+// Steps 6 and 7 cannot both run: a refresh needs a completed proof and a
+// transition needs a refusal at the threshold, and a selector has one verdict at a
+// time. The two are the only paths in this project that write the window, so
+// whichever one runs is the only one that can be said to have refreshed it.
+//
+// The two deadlines are the two phases'. Step 7 is given the caller's context and
 // its own ProofTimeout, not the watch deadline: the watch deadline was spent proving
 // the address that just failed, and a transition that had to finish inside what is
 // left of it would be refused by the check that was slow rather than by the host.
@@ -505,6 +541,23 @@ func (c *Checker) Check(ctx context.Context) (result Result, err error) {
 		return result, err
 	}
 	result.Health = updated
+
+	if winner.Verdict == VerdictHealthy {
+		// The proof completed, so the window the rewriter gates on is refreshed. A
+		// failed or an unknown verdict reaches neither this nor the transition below,
+		// which is why the two paths cannot both run and why the result can say
+		// which one it was.
+		refreshed, err := c.refreshWinnerProof(fresh, moment)
+		if err != nil {
+			// The health document is already written and says the check passed, so the
+			// window not following it is reported as what it is: the address is
+			// proved, the count is cleared, and the document the rewriter reads still
+			// carries the previous proof. The next check tries again in two minutes.
+			return result, fmt.Errorf("the winner %s is serving, but its proof window could not be refreshed: %w", fresh.WinnerIP, err)
+		}
+		result.RefreshedProof = true
+		result.ProofUntil = refreshed.WinnerProofUntil
+	}
 
 	if winner.Verdict != VerdictFailed || updated.ConsecutiveFailures < c.options.FailureThreshold {
 		return result, nil
@@ -640,16 +693,62 @@ func applyVerdict(previous state.HealthState, verdict Verdict, moment time.Time,
 // The document has no address and no generation of its own - it holds the four
 // fields the plan documents and nothing else - so the attribution is made from the
 // two timestamps it does have against the selector's own: the selector's
-// last_success is the instant its current winner was proved, and every verdict this
-// package writes is stamped after that. Strictly after, and not at or after, so
-// the transition's own write - which stamps the same instant on both documents -
-// counts as a new winner rather than as a verdict about the old one.
+// last_success is the instant its current winner was last proved, and every verdict
+// this package writes is stamped at or after that. Strictly after, and not at or
+// after, so the case where the two are equal is read as "about an address that is
+// no longer in service" - which costs nothing, because the two ways they can be
+// equal are a successful pass and a transition, and both leave a count of zero
+// behind: a pass clears the count, and a transition's own document starts at zero.
 func describesPublishedAddress(document state.HealthState, publishedAt time.Time) bool {
 	latest := document.LastFailure
 	if document.LastSuccess.After(latest) {
 		latest = document.LastSuccess
 	}
 	return latest.After(publishedAt)
+}
+
+// refreshWinnerProof is the successful pass's half of the proof window, and it is
+// a selector write like any other: state.WriteJSONAtomic, under the control lock
+// this check is already holding, with the generation left where it was.
+//
+// Why the health check is the writer of the window is the whole point of the
+// change, and it is not a convenience. The response rewriter gates on
+// winner_proof_until, and a health check's own pass is a certificate, Host and SNI
+// proof of the address in service - the same proof an apply's final proof is, held
+// to the same profiles. So the window it maintains is the window the rewriter reads,
+// and it stays open exactly as long as the address keeps answering under the check
+// and closes within the TTL once the check stops or the address fails. A nightly
+// apply that stamps the window once a day and a health check that only reports would
+// leave the rewriter refusing a healthy address for the other twenty-three hours
+// and fifty-five minutes.
+//
+// The fields it moves are two, and the rest is carried over untouched, because a
+// pass changes nothing about the selection:
+//
+//   - last_success is the instant the pass completed, which is the moment read
+//     under the lock after the proofs - the same reading the health document
+//     carries, so the two documents cannot disagree about when the address was
+//     last proved;
+//   - winner_proof_until is that instant plus the optimizer's proof TTL, because a
+//     proof may not precede the success it was issued for and the state package
+//     refuses one that does not;
+//   - the generation does not move. A refreshed window is not a new selection, and
+//     a reader that watched the generation would read a change that did not
+//     happen; the next check's own generation comparison is unaffected either way.
+//
+// It is written with the strict writer, not the health one: the selector is the
+// last-known-good address, and a document this build cannot read is not one to
+// overwrite. A refusal returns before the write, so the file is left exactly as it
+// was found.
+func (c *Checker) refreshWinnerProof(current state.Selector, provedAt time.Time) (state.Selector, error) {
+	refreshed := current
+	refreshed.SchemaVersion = state.SchemaVersion
+	refreshed.LastSuccess = provedAt
+	refreshed.WinnerProofUntil = provedAt.Add(optimizer.WinnerProofTTL)
+	if err := state.WriteJSONAtomic(c.options.SelectorPath, refreshed); err != nil {
+		return state.Selector{}, err
+	}
+	return refreshed, nil
 }
 
 // moveToFallback is the transition: the resolver moves to the fallback, and the

@@ -1423,12 +1423,17 @@ func TestTestCommandWithApplyReportsARefusalRatherThanAPublication(t *testing.T)
 // ---------------------------------------------------------------------------
 
 // A health check that finds the published winner serving writes the health
-// document and nothing else. The timer runs this every two minutes, so a check
-// that republished the selector on a healthy address would be rewriting every
-// user's DNS answers continuously and for no reason.
-func TestHealthCheckReportsAHealthyWinnerWithoutPublishing(t *testing.T) {
+// document and refreshes the published winner's proof window, and publishes
+// nothing else. The timer runs this every two minutes, so what it must not do is
+// change the selection: no address, no mapping, no mode and no generation move on
+// a healthy pass.
+//
+// The window is the one thing that does move, because the check's own probe is a
+// proof of the address in service and the rewriter gates on it. The clock is fixed
+// at 03:00, so the window closes at 03:05 - five minutes, written out rather than
+// computed from the package's constant.
+func TestHealthCheckReportsAHealthyWinnerAndRefreshesItsProofWindow(t *testing.T) {
 	fixture := newCDNFixture(t, 4, "104.16.1.1")
-	before := string(mustReadFile(t, fixture.selectorPath))
 
 	var stdout, stderr bytes.Buffer
 	if code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
@@ -1444,13 +1449,34 @@ func TestHealthCheckReportsAHealthyWinnerWithoutPublishing(t *testing.T) {
 	if strings.Contains(stdout.String(), "transition:") {
 		t.Errorf("a healthy check reported a transition:\n%s", stdout.String())
 	}
+	// The report says whether the window was refreshed, and which window: the
+	// rewriter gates on it, so a report that stayed silent would leave an operator
+	// unable to tell an open window from an expired one.
+	want := "winner-proof: refreshed, until 2026-09-26T03:05:00Z"
+	if !strings.Contains(stdout.String(), want) {
+		t.Errorf("the report does not say %q:\n%s", want, stdout.String())
+	}
 	// The uncharged identity bytes are reported whether or not anything was
 	// published, because nothing on disk accounts for them.
 	if !strings.Contains(stdout.String(), "identity-body-bytes: 512") {
 		t.Errorf("the report does not account for the uncharged body bytes:\n%s", stdout.String())
 	}
-	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
-		t.Errorf("a healthy check changed the selector:\nbefore:\n%s\nafter:\n%s", before, got)
+
+	published := state.Selector{}
+	if err := state.ReadJSON(fixture.selectorPath, &published); err != nil {
+		t.Fatal(err)
+	}
+	if !published.LastSuccess.Equal(fixedMoment) {
+		t.Errorf("the refreshed selector records its last success at %s, want the check's own %s", published.LastSuccess, fixedMoment)
+	}
+	if !published.WinnerProofUntil.Equal(fixedMoment.Add(5 * time.Minute)) {
+		t.Errorf("the refreshed selector's proof expires at %s, want %s", published.WinnerProofUntil, fixedMoment.Add(5*time.Minute))
+	}
+	if published.Generation != 4 || published.WinnerIP != "104.16.1.1" || published.Mode != "auto" {
+		t.Errorf("a healthy check changed the selection: generation %d, winner %q, mode %q", published.Generation, published.WinnerIP, published.Mode)
+	}
+	if err := published.Validate(); err != nil {
+		t.Errorf("the refreshed selector is not one the state package accepts: %v", err)
 	}
 	documented := state.HealthState{}
 	if err := state.ReadJSON(fixture.healthPath, &documented); err != nil {
@@ -1458,6 +1484,30 @@ func TestHealthCheckReportsAHealthyWinnerWithoutPublishing(t *testing.T) {
 	}
 	if !documented.Healthy {
 		t.Errorf("the written document does not report a healthy winner: %+v", documented)
+	}
+}
+
+// A check that found the winner failing says so about the window too, because a
+// report that only said "refreshed" or nothing at all would leave a reader unable
+// to tell an expired window from one nobody refreshed.
+func TestHealthCheckSaysWhenItRefreshedNoProof(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	stub := newStubProber()
+	stub.identityRefusedForAddress = map[string]error{
+		"104.16.1.1": errors.New("104.16.1.1 does not serve speed.cloudflare.com: connection refused"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+		&stdout, &stderr, servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("health-check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "winner-proof: not refreshed") {
+		t.Errorf("a failing check does not say it refreshed no proof:\n%s", stdout.String())
+	}
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("a failing check changed the selector:\nbefore:\n%s\nafter:\n%s", before, got)
 	}
 }
 
