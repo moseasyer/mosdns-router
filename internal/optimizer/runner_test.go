@@ -3544,6 +3544,15 @@ func TestReadReportRefusesAnOutcomeThatDoesNotMatchItsGroups(t *testing.T) {
 			report.Groups[0].Outcome = OutcomeKept
 			report.Groups[0].OutcomeReason = "the winner is the address already in service"
 		},
+		// The one incoherent document no command in this project writes, which is
+		// the point of it: an apply that was refused rewrites every published group
+		// to kept with the refusal as its reason, so a reader keying on the group
+		// rather than on the error beside it cannot be shown a publication that
+		// never happened. A hand-edited or machine-edited document saying both is
+		// refused rather than believed.
+		"a refused report with a published group": func(report *Report) {
+			report.Outcome = OutcomeRefused
+		},
 	}
 	for name, edit := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -301,6 +301,16 @@ func (p *NetworkProber) dialTLSFor(subject candidate.Candidate, profile candidat
 // probeTimings is when each part of one request happened. The three numbers a
 // caller reads are all differences of these, and nothing is measured from a
 // moment the caller has to guess.
+//
+// Two of its fields are written from a goroutine this package does not own, and
+// the reason that is safe is worth stating because it looks like a race and is not.
+// The transport calls the hooks in `GetConn` and `GotFirstResponseByte` on the
+// connection's own goroutine, and `Do` returns only after those hooks have
+// returned for the request it made, so the writes happen-before the read here.
+// There is one goroutine per probe and one probe per roundTrip, so nothing else
+// writes this value. It is a claim about net/http's ordering rather than something
+// this file enforces, which is why `-race` runs the identity and download suites
+// rather than the assertion standing alone.
 type probeTimings struct {
 	started   time.Time
 	written   time.Time
