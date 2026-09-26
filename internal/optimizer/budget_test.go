@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,67 +108,298 @@ func TestBudgetReturnsUnusedReservation(t *testing.T) {
 	}
 }
 
+// TestBudgetNeverNegative is about the direction of every refusal, because a
+// total that dips below the real spend is free traffic and a total that dips
+// below zero is a budget with more than its limit left in it. Every case states
+// the exact total, not only its sign, and the settle cases go through Settle so
+// that the refusal is visible to the caller as well as to the total.
 func TestBudgetNeverNegative(t *testing.T) {
-	// Every malformed or repeated consume ends at a total of zero at worst. A
-	// negative total would be a budget with more than its limit left in it, so
-	// each case below states the exact total rather than only its sign.
-	for name, want := range map[string]struct {
-		setup func(*testing.T, *Budget) int64
-		used  int64
+	for name, table := range map[string]struct {
+		setup    func(*testing.T, *Budget) (int64, error)
+		wantUsed int64
+		wantErr  error
 	}{
-		"a negative byte count hands nothing back": {
-			setup: func(t *testing.T, budget *Budget) int64 {
+		"a settle inside the reservation hands back the difference": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
 				reserved := mustReserve(t, budget, perCandidateBytes)
-				budget.Consume(reserved, -1)
-				return 0
+				return reserved, budget.Settle(reserved, 2*mib)
 			},
-			used: perCandidateBytes,
+			wantUsed: 2 * mib,
 		},
-		"a byte count above the reservation hands nothing back": {
-			setup: func(t *testing.T, budget *Budget) int64 {
+		"a byte count above the reservation is charged as the reservation": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
 				reserved := mustReserve(t, budget, 4*mib)
-				budget.Consume(reserved, 9*mib)
-				return 0
+				return reserved, budget.Settle(reserved, 9*mib)
 			},
-			used: 4 * mib,
+			wantUsed: 4 * mib,
 		},
-		"a second consume of one reservation stops at zero": {
-			setup: func(t *testing.T, budget *Budget) int64 {
+		"a second settle of one reservation is refused and hands nothing back": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
 				reserved := mustReserve(t, budget, perCandidateBytes)
-				budget.Consume(reserved, 2*mib)
-				budget.Consume(reserved, 2*mib)
-				return 0
+				if err := budget.Settle(reserved, 2*mib); err != nil {
+					t.Fatalf("the first settle: %v", err)
+				}
+				return reserved, budget.Settle(reserved, 2*mib)
 			},
-			used: 0,
+			wantUsed: 2 * mib,
+			wantErr:  ErrNoReservation,
 		},
-		"a consume of a reservation that was never made stops at zero": {
-			setup: func(t *testing.T, budget *Budget) int64 {
-				budget.Consume(perCandidateBytes, 1*mib)
-				return 0
+		"a settle of a reservation that was never made is refused": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
+				return perCandidateBytes, budget.Settle(perCandidateBytes, 1*mib)
 			},
-			used: 0,
+			wantUsed: 0,
+			wantErr:  ErrNoReservation,
 		},
-		"a refund larger than everything charged stops at zero": {
-			setup: func(t *testing.T, budget *Budget) int64 {
+		"a negative byte count is refused and leaves the reservation outstanding": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
 				reserved := mustReserve(t, budget, perCandidateBytes)
-				budget.Consume(reserved, 1*mib)
-				budget.Consume(2*mib, 0)
-				return 0
+				return reserved, budget.Settle(reserved, -1)
 			},
-			used: 0,
+			wantUsed: perCandidateBytes,
+			wantErr:  ErrNotATransfer,
+		},
+		"a settle of no bytes at all is refused": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
+				return 0, budget.Settle(0, 0)
+			},
+			wantUsed: 0,
+			wantErr:  ErrNoReservation,
+		},
+		"a refused settle between two good ones leaves the rest alone": {
+			setup: func(_ *testing.T, budget *Budget) (int64, error) {
+				first := mustReserve(t, budget, 4*mib)
+				if err := budget.Settle(first, 1*mib); err != nil {
+					t.Fatalf("the first settle: %v", err)
+				}
+				second := mustReserve(t, budget, 2*mib)
+				return second, budget.Settle(second, -1)
+			},
+			wantUsed: 3 * mib,
+			wantErr:  ErrNotATransfer,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			budget := NewBudget(perCandidateBytes)
-			want.setup(t, budget)
-			if used := budget.Used(); used != want.used {
-				t.Fatalf("Used() = %d, want %d", used, want.used)
+			_, err := table.setup(t, budget)
+			switch {
+			case table.wantErr == nil && err != nil:
+				t.Fatalf("the settle failed: %v", err)
+			case table.wantErr != nil && !errors.Is(err, table.wantErr):
+				t.Fatalf("the settle failed with %v, want %v", err, table.wantErr)
+			}
+			if used := budget.Used(); used != table.wantUsed {
+				t.Fatalf("Used() = %d, want %d", used, table.wantUsed)
 			}
 			if used := budget.Used(); used < 0 {
 				t.Fatalf("Used() = %d, which is a budget with more than its limit left in it", used)
 			}
 		})
 	}
+}
+
+func TestBudgetSettlesAReservationOnlyOnce(t *testing.T) {
+	// The one-shot rule on its own, with the reserved amount as the only identity
+	// the plan's interface carries. A settle is matched to an outstanding
+	// reservation and removes it, so the same bytes can never be handed back
+	// twice, whatever the caller does with the value it was given.
+	budget := NewBudget(dailyBudgetBytes)
+	reserved := mustReserve(t, budget, perCandidateBytes)
+	half := mustReserve(t, budget, perCandidateBytes)
+
+	if err := budget.Settle(reserved, 2*mib); err != nil {
+		t.Fatalf("settle the first reservation with 2 MiB: %v", err)
+	}
+	if err := budget.Settle(half, 2*mib); err != nil {
+		t.Fatalf("settle the second reservation with 2 MiB: %v", err)
+	}
+	if used := budget.Used(); used != 4*mib {
+		t.Fatalf("Used() = %d, want the %d really spent by two reservations", used, 4*mib)
+	}
+	for _, exhausted := range []int64{reserved, half} {
+		if err := budget.Settle(exhausted, 2*mib); !errors.Is(err, ErrNoReservation) {
+			t.Errorf("settling the already settled %d bytes again failed with %v, want %v", exhausted, err, ErrNoReservation)
+		}
+	}
+	if used := budget.Used(); used != 4*mib {
+		t.Fatalf("Used() = %d after settling exhausted reservations, want the unchanged %d", used, 4*mib)
+	}
+}
+
+func TestBudgetKeepsAReservationOutstandingAfterARefusedSettle(t *testing.T) {
+	// A refused settle changes nothing at all, including the reservation: a
+	// negative count is not a transfer, and the caller that sent it may still have
+	// a real one to report.
+	budget := NewBudget(perCandidateBytes)
+	reserved := mustReserve(t, budget, perCandidateBytes)
+
+	if err := budget.Settle(reserved, -1); !errors.Is(err, ErrNotATransfer) {
+		t.Fatalf("a negative count failed with %v, want %v", err, ErrNotATransfer)
+	}
+	if used := budget.Used(); used != perCandidateBytes {
+		t.Fatalf("Used() = %d after a refused settle, want the %d still reserved", used, perCandidateBytes)
+	}
+	if err := budget.Settle(reserved, 1*mib); err != nil {
+		t.Fatalf("the real transfer after a refused one: %v", err)
+	}
+	if used := budget.Used(); used != 1*mib {
+		t.Fatalf("Used() = %d, want the %d really spent", used, 1*mib)
+	}
+}
+
+func TestBudgetRefusesTwoSettlesOfOneReservationAtOnce(t *testing.T) {
+	// Two callers settling the same reservation at the same time is the race the
+	// one-shot rule exists for. Exactly one may succeed, and the total must be
+	// what the one real transfer cost, however the two interleave.
+	budget := NewBudget(perCandidateBytes)
+	reserved := mustReserve(t, budget, perCandidateBytes)
+
+	results := make(chan error, 2)
+	release := make(chan struct{})
+	for attempt := 0; attempt < 2; attempt++ {
+		go func() {
+			<-release
+			results <- budget.Settle(reserved, 2*mib)
+		}()
+	}
+	close(release)
+
+	var accepted, refused int
+	for attempt := 0; attempt < 2; attempt++ {
+		err := <-results
+		switch {
+		case err == nil:
+			accepted++
+		case errors.Is(err, ErrNoReservation):
+			refused++
+		default:
+			t.Fatalf("a concurrent settle failed with %v, want a refusal or success", err)
+		}
+	}
+	if accepted != 1 || refused != 1 {
+		t.Fatalf("%d settles were accepted and %d refused, want exactly one of each", accepted, refused)
+	}
+	if used := budget.Used(); used != 2*mib {
+		t.Fatalf("Used() = %d after a contended settle, want the %d one real transfer cost", used, 2*mib)
+	}
+}
+
+func TestBudgetSettlesConcurrentReservationsWithoutLosingASpend(t *testing.T) {
+	// Every reservation in a concurrent run is settled once and the run's total
+	// is the sum of what the transfers really moved. This is the case a refund
+	// that fires twice, or not at all, would break, and it is the one a run of ten
+	// candidates actually looks like.
+	const candidates = 20
+	reserved := int64(perCandidateBytes / 10)
+	transferred := reserved / 2
+	budget := NewBudget(dailyBudgetBytes)
+
+	var group sync.WaitGroup
+	for candidate := 0; candidate < candidates; candidate++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			settled, err := budget.Reserve(reserved)
+			if err != nil {
+				t.Errorf("reserve %d bytes: %v", reserved, err)
+				return
+			}
+			if err := budget.Settle(settled, transferred); err != nil {
+				t.Errorf("settle %d of %d bytes: %v", transferred, reserved, err)
+			}
+		}()
+	}
+	group.Wait()
+
+	if used := budget.Used(); used != candidates*transferred {
+		t.Fatalf("Used() = %d after %d concurrent transfers of %d bytes, want %d", used, candidates, transferred, candidates*transferred)
+	}
+}
+
+func TestBudgetReleaseHandsBackAWholeReservation(t *testing.T) {
+	// A caller that abandons a reservation before it reads anything has spent
+	// nothing, and saying so is one call. It is one-shot like a settle, because a
+	// release is exactly as capable of handing back the same bytes twice.
+	budget := NewBudget(dailyBudgetBytes)
+	reserved := mustReserve(t, budget, perCandidateBytes)
+
+	if err := budget.Release(reserved); err != nil {
+		t.Fatalf("release a reservation that was never used: %v", err)
+	}
+	if used := budget.Used(); used != 0 {
+		t.Fatalf("Used() = %d after releasing an unused reservation, want 0", used)
+	}
+	if err := budget.Release(reserved); !errors.Is(err, ErrNoReservation) {
+		t.Errorf("releasing the same reservation again failed with %v, want %v", err, ErrNoReservation)
+	}
+	if err := budget.Settle(reserved, 0); !errors.Is(err, ErrNoReservation) {
+		t.Errorf("settling a released reservation failed with %v, want %v", err, ErrNoReservation)
+	}
+	if used := budget.Used(); used != 0 {
+		t.Fatalf("Used() = %d, want 0", used)
+	}
+}
+
+func TestBudgetReleaseIsNotATransfer(t *testing.T) {
+	// A caller that reads bytes and then releases the reservation would be handed
+	// money it spent, so a reservation that was already settled is not released
+	// either.
+	budget := NewBudget(dailyBudgetBytes)
+	reserved := mustReserve(t, budget, perCandidateBytes)
+	if err := budget.Settle(reserved, 4*mib); err != nil {
+		t.Fatalf("settle 4 MiB of a 10 MiB reservation: %v", err)
+	}
+
+	if err := budget.Release(reserved); !errors.Is(err, ErrNoReservation) {
+		t.Errorf("releasing a settled reservation failed with %v, want %v", err, ErrNoReservation)
+	}
+	if used := budget.Used(); used != 4*mib {
+		t.Errorf("Used() = %d, want the %d really spent", used, 4*mib)
+	}
+}
+
+func TestBudgetReleaseLeavesTheChargeGoneForTheNextRun(t *testing.T) {
+	// A released reservation is not a crash: the next run opens a document that
+	// says nothing was spent, because nothing was.
+	directory := t.TempDir()
+	run := mustNewPersistentBudget(t, directory, dailyBudgetBytes, testNoon)
+	reserved := mustReserve(t, run, perCandidateBytes)
+	if err := run.Release(reserved); err != nil {
+		t.Fatalf("release the reservation: %v", err)
+	}
+
+	restarted := mustNewPersistentBudget(t, directory, dailyBudgetBytes, testNoon)
+	if used := restarted.Used(); used != 0 {
+		t.Fatalf("Used() = %d after a released reservation, want 0", used)
+	}
+	if reserved := mustReserve(t, restarted, perCandidateBytes); reserved != perCandidateBytes {
+		t.Fatalf("the new run reserved %d bytes, want %d", reserved, perCandidateBytes)
+	}
+}
+
+func TestBudgetSettlesThroughTheProberInterfaceOnlyOnceToo(t *testing.T) {
+	// The prober's interface has no way to report a refusal, so the guarantee has
+	// to live in the budget: a caller that settles twice through the interface
+	// still gets one settle and one refusal, and the total is the real spend.
+	var budget ByteBudgetUnderTest = NewBudget(perCandidateBytes)
+	reserved, err := budget.Reserve(perCandidateBytes)
+	if err != nil {
+		t.Fatalf("reserve 10 MiB: %v", err)
+	}
+	budget.Consume(reserved, 3*mib)
+	budget.Consume(reserved, 3*mib)
+
+	if used := budget.Used(); used != 3*mib {
+		t.Fatalf("Used() = %d after settling one reservation twice through the interface, want the %d really spent", used, 3*mib)
+	}
+}
+
+// ByteBudgetUnderTest is the prober's budget interface with the reporting Used
+// attached, so this test can hold the budget to the one-shot rule from outside
+// the package that defines it.
+type ByteBudgetUnderTest interface {
+	prober.ByteBudget
+	Used() int64
 }
 
 func TestBudgetRefusesANonPositiveReservation(t *testing.T) {
@@ -189,6 +421,31 @@ func TestBudgetRefusesANonPositiveReservation(t *testing.T) {
 		if used := budget.Used(); used != 0 {
 			t.Errorf("Used() = %d after refusing Reserve(%d), want 0", used, requested)
 		}
+	}
+}
+
+// TestBudgetConsumeNeverRefundsTheSameReservationTwice is the behaviour the
+// review found inverted. Consume only knows how many bytes were reserved, so it
+// cannot by itself tell a second settle from a first one, and the floor that
+// keeps the total from going negative turns that confusion into free traffic:
+// settling one 10 MiB reservation with 2 MiB twice took the day from 10 MiB to
+// 2 MiB to 0, and 2 MiB really had crossed the wire. The total after a repeated
+// settle must be what was really spent.
+func TestBudgetConsumeNeverRefundsTheSameReservationTwice(t *testing.T) {
+	budget := NewBudget(perCandidateBytes)
+	reserved, err := budget.Reserve(perCandidateBytes)
+	if err != nil {
+		t.Fatalf("reserve 10 MiB: %v", err)
+	}
+	budget.Consume(reserved, 2*mib)
+	if used := budget.Used(); used != 2*mib {
+		t.Fatalf("Used() = %d after the first settle, want the %d really spent", used, 2*mib)
+	}
+
+	budget.Consume(reserved, 2*mib)
+
+	if used := budget.Used(); used != 2*mib {
+		t.Fatalf("Used() = %d after settling one reservation twice, want the %d really spent: the second settle handed back bytes that were never handed out", used, 2*mib)
 	}
 }
 

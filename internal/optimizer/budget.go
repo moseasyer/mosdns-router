@@ -6,9 +6,10 @@
 // it might read, the request is persisted before a single byte is transferred,
 // and the caller settles afterwards with what it really read. Every clause here
 // exists because the other one is unsafe: the reservation is written before any
-// I/O so a crash costs one candidate's limit and not a whole day's, the settle
-// can never hand back more than it took, and the total is never negative, so
-// Used() can never report more room than the limit allows.
+// I/O so a crash costs one candidate's limit and not a whole day's, a reservation
+// is settled exactly once so the same bytes can never be handed back twice, and
+// the total is never negative, so Used() can never report more room than the
+// limit allows.
 package optimizer
 
 import (
@@ -63,6 +64,17 @@ const (
 // only needs the verdict matches it with errors.Is.
 var ErrBudgetExhausted = errors.New("bandwidth budget exhausted")
 
+// ErrNoReservation reports that a settle or a release names a reservation this
+// budget never handed out, or already settled. It is the refusal that keeps a
+// repeated settle from handing back the same bytes twice, and it refuses the
+// call without moving the total.
+var ErrNoReservation = errors.New("there is no outstanding reservation of that size")
+
+// ErrNotATransfer reports that a settle named a negative number of transferred
+// bytes. No reservation is claimed and no total moves, because a caller that
+// miscounted may still have a real transfer to report.
+var ErrNotATransfer = errors.New("a transfer is not a negative number of bytes")
+
 // errLockTimeout reports that the budget lock stayed held by another process
 // for longer than a persist is willing to wait. It is not ErrBudgetExhausted:
 // the day may well have room, and the caller must not conclude otherwise.
@@ -70,7 +82,10 @@ var errLockTimeout = errors.New("the bandwidth budget lock is held by another pr
 
 // counter is where a Budget's byte total lives. The in-memory counter and the
 // file-backed one below share every rule about what a total may be, and differ
-// only in where the number survives.
+// only in where the number survives. Neither refund can take a total below zero
+// or above the day's limit: a settle is matched to an outstanding reservation, so
+// a refund is always smaller than the charge it came from, and the two clamps
+// are there for a document somebody else wrote.
 type counter interface {
 	// reserve adds requested bytes to the total when that many are still
 	// available, persists the new total, and returns it.
@@ -86,6 +101,12 @@ type counter interface {
 // to call from more than one goroutine, and the zero value is not usable: build
 // one with NewBudget for an in-process account, or NewPersistentBudget for the
 // one the router and its CLI share.
+//
+// Every reservation this budget hands out is remembered until it is settled or
+// released, and it is remembered once: a second settle of the same reservation is
+// refused rather than allowed to hand back the same bytes again. The remembered
+// set belongs to this value alone, so a run must spend through one Budget for a
+// document rather than opening a second one to settle the first one's work.
 type Budget struct {
 	mutex   sync.Mutex
 	counter counter
@@ -93,6 +114,10 @@ type Budget struct {
 	// location and moment decide which local date a reservation belongs to.
 	location *time.Location
 	moment   time.Time
+	// outstanding counts the reservations handed out and not yet settled, by the
+	// amount each one reserved. The amount is the only identity the plan's
+	// interface carries, so two reservations of the same size are two entries.
+	outstanding map[int64]int
 	// lastKnown is the most recent total this budget could establish. A total it
 	// can no longer read is reported from here rather than as an unverified
 	// zero, so a reader that lost the file does not learn there is budget left.
@@ -105,10 +130,11 @@ type Budget struct {
 // made, and a forgotten reservation is a day the cap does not hold.
 func NewBudget(limit int64) *Budget {
 	return &Budget{
-		counter:  &memoryCounter{},
-		limit:    limit,
-		location: time.Local,
-		moment:   time.Now(),
+		counter:     &memoryCounter{},
+		limit:       limit,
+		location:    time.Local,
+		moment:      time.Now(),
+		outstanding: make(map[int64]int),
 	}
 }
 
@@ -161,10 +187,11 @@ func newPersistentBudget(path, lockPath string, limit int64, location *time.Loca
 		moment = time.Now()
 	}
 	budget := &Budget{
-		counter:  &fileCounter{path: path, lockPath: lockPath, wait: wait},
-		limit:    limit,
-		location: location,
-		moment:   moment,
+		counter:     &fileCounter{path: path, lockPath: lockPath, wait: wait},
+		limit:       limit,
+		location:    location,
+		moment:      moment,
+		outstanding: make(map[int64]int),
 	}
 	// Read once here so a document that is not usable is reported by the caller
 	// that opened the budget, not by the first probe that happened to spend.
@@ -195,31 +222,113 @@ func (b *Budget) Reserve(requested int64) (int64, error) {
 		return 0, err
 	}
 	b.lastKnown = used
+	// The reservation is remembered before the caller is handed the number, so
+	// the one settle that may follow it can be matched to it.
+	b.outstanding[requested]++
 	return requested, nil
 }
 
-// Consume settles a reservation with what was really transferred and hands the
-// difference back.
+// Settle closes a reservation with what was really transferred and hands the
+// difference back. It is the honest form of the prober's Consume: it reports
+// which reservation it settled and refuses the two calls that could otherwise
+// hand back bytes that were never handed out.
 //
-// The settle is one-sided on purpose. An actual count outside [0, reserved] is
-// refused and changes nothing, so a reader that miscounts can never hand back
-// more than it took, and a refund is floored at zero so the total cannot go
-// below it. A persist that fails leaves the reservation charged: over-counting
-// costs the user budget, under-counting costs the user money, and the first is
-// the smaller mistake. There is no error to return, because the plan's interface
-// has none and because the failure direction is the safe one.
-func (b *Budget) Consume(reserved, actual int64) {
-	refund := refundFor(reserved, actual)
-	if refund == 0 {
-		return
+// The rules, in the order they are applied:
+//
+//   - A negative actual is not a transfer at all (ErrNotATransfer). Nothing
+//     changes, including the reservation, because the caller that miscounted may
+//     still have a real transfer to report.
+//   - An amount with no outstanding reservation is refused (ErrNoReservation).
+//     This is the one that matters: a second settle of the same reservation
+//     would otherwise hand back the difference a second time, turning real
+//     spending into free budget.
+//   - An actual above the reservation is charged as the reservation. A reader
+//     cannot be believed past what it was given, and the reader can never hand
+//     back more than it took.
+//   - Anything else in [0, reserved] settles the reservation and hands back
+//     reserved - actual.
+//
+// The reservation is claimed before the document is written, so two settles of
+// one reservation racing in two goroutines produce one settle and one refusal
+// whatever the interleaving. A write that fails leaves the reservation claimed
+// and its bytes charged: over-counting costs the user budget and under-counting
+// costs the user money, and the first is the smaller mistake.
+func (b *Budget) Settle(reserved, actual int64) error {
+	if actual < 0 {
+		return fmt.Errorf("%w: got %d for a reservation of %d", ErrNotATransfer, actual, reserved)
 	}
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
+	if b.outstanding[reserved] == 0 {
+		return fmt.Errorf("%w of %d bytes, with %d still reserved", ErrNoReservation, reserved, b.reserved())
+	}
+	b.claim(reserved)
+	// The reader cannot be believed past the reservation, so the charge is capped
+	// there rather than growing to whatever it claimed.
+	charge := min(actual, reserved)
+	refund := reserved - charge
+	if refund == 0 {
+		// The document already records the whole charge, so there is nothing to
+		// persist and no reason to take the lock.
+		return nil
+	}
 	used, err := b.counter.refund(b.day(), b.limit, refund)
 	if err != nil {
-		return
+		return err
 	}
 	b.lastKnown = used
+	return nil
+}
+
+// Release hands back a whole reservation that the caller will not use, because a
+// reservation it never read against has cost nothing. It is one-shot for the same
+// reason a settle is: a release is exactly as able as a settle to hand back the
+// same bytes twice, and settling a released reservation is refused.
+func (b *Budget) Release(reserved int64) error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if b.outstanding[reserved] == 0 {
+		return fmt.Errorf("%w of %d bytes, with %d still reserved", ErrNoReservation, reserved, b.reserved())
+	}
+	b.claim(reserved)
+	used, err := b.counter.refund(b.day(), b.limit, reserved)
+	if err != nil {
+		return err
+	}
+	b.lastKnown = used
+	return nil
+}
+
+// Consume settles a reservation, and cannot report a refusal because the prober's
+// budget interface gives it no way to. It is Settle for a caller with nowhere to
+// put an error; a caller that has one should call Settle, because a refused
+// settle is a real outcome a run may want to see rather than swallow.
+//
+// The one-shot rule does not depend on which of the two is called: a repeated
+// Consume of one reservation hands back nothing the second time, exactly as a
+// repeated Settle is refused.
+func (b *Budget) Consume(reserved, actual int64) {
+	_ = b.Settle(reserved, actual)
+}
+
+// claim removes one outstanding reservation of the given size. The caller holds
+// the lock and has already established that there is one.
+func (b *Budget) claim(reserved int64) {
+	if b.outstanding[reserved] <= 1 {
+		delete(b.outstanding, reserved)
+		return
+	}
+	b.outstanding[reserved]--
+}
+
+// reserved reports how many bytes are still reserved and unsettled, which is what
+// a refusal names so that a caller can see what it should have settled instead.
+func (b *Budget) reserved() int64 {
+	var total int64
+	for amount, count := range b.outstanding {
+		total += amount * int64(count)
+	}
+	return total
 }
 
 // Used reports how many bytes of the day's limit are already spent. It reads the
@@ -258,17 +367,6 @@ func (b *Budget) LockPath() string {
 // day is the local date every reservation of this budget belongs to.
 func (b *Budget) day() string {
 	return b.moment.In(b.location).Format(localDateLayout)
-}
-
-// refundFor returns how many bytes a settle may hand back, which is never more
-// than the reservation and never a negative amount. An actual count below zero
-// or above the reservation is refused: the first is not a transfer, and the
-// second is a transfer the reservation never covered.
-func refundFor(reserved, actual int64) int64 {
-	if reserved <= 0 || actual < 0 || actual > reserved {
-		return 0
-	}
-	return reserved - actual
 }
 
 // dayRule decides what a recorded document means for the caller's day. It
