@@ -128,6 +128,10 @@ func (w *TextWatcher) Close() error
 // LineError names the line a force-ECH list was refused for. A value, so a caller
 // holding one cannot edit what the watcher recorded.
 type LineError struct { Path string; Line int; Text string; Reason string }
+// UnsupportedDocument names a state document the watcher cannot hold, because
+// documentCloners has no entry for it. Returned by NewJSON, never panicked: a
+// plugin's Init is the only caller and nothing recovers from a panic there.
+type UnsupportedDocument struct { Document string }
 ```
 
 ```go
