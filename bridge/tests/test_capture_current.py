@@ -340,6 +340,10 @@ class ModeExclusivityTests(CaptureCase):
                 self.assertEqual(code, 2)
                 self.assertIn("NM_DISPATCHER_ACTION", stderr)
                 self.assertIn("--capture-current", stderr)
+                # Every refusal that is about which mode to run in shows the two
+                # legal invocations, because the operator's next move is to pick
+                # one of them.
+                self.assertIn("usage:", stderr)
                 # A known option in a combination this program refuses is not an
                 # option it has never heard of, and saying so is the difference
                 # between an installer typo and a misconfigured call.
@@ -360,6 +364,7 @@ class ModeExclusivityTests(CaptureCase):
         self.assertEqual(code, 2)
         self.assertIn("NM_DISPATCHER_ACTION", stderr)
         self.assertIn("--capture-current", stderr)
+        self.assertIn("usage:", stderr)
         self.assertEqual(runner.calls, [])
         self.assertFalse(self.state_path.exists())
 
@@ -368,20 +373,27 @@ class ModeExclusivityTests(CaptureCase):
         self.assertEqual(code, 2)
         self.assertIn("NM_DISPATCHER_ACTION", stderr)
         self.assertIn("--capture-current", stderr)
+        self.assertIn("usage:", stderr)
         self.assertEqual(runner.calls, [])
         self.assertFalse(self.state_path.exists())
 
-    def test_an_empty_dispatcher_action_is_not_an_event_a_capture_may_join(self):
-        """An exported but empty action names no event, so the capture stands.
+    def test_an_exported_dispatcher_action_is_an_event_even_when_it_is_empty(self):
+        """The variable's presence is what says a dispatcher run; its value is not.
 
-        NetworkManager always exports a real action of its own; an empty value is
-        an environment that happens to hold the variable, and refusing a capture
-        beside it would fail an installation run from a shell that had exported
-        it earlier.
+        NetworkManager always exports an action of its own, so an exported but
+        empty value is a malformed event rather than an absent one. Accepting a
+        capture beside it would let a shell that exported the variable once decide
+        which mode this program runs in, which is the opposite of the exclusivity
+        the two modes need.
         """
-        code, _, _ = self.capture({CONNECTION: UUID + "\n"}, env={"NM_DISPATCHER_ACTION": ""})
-        self.assertEqual(code, 0)
-        self.assertEqual(self.published()["interface"], INTERFACE)
+        code, stderr, runner = self.capture(
+            {CONNECTION: UUID + "\n"}, env={"NM_DISPATCHER_ACTION": ""}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("NM_DISPATCHER_ACTION", stderr)
+        self.assertIn("--capture-current", stderr)
+        self.assertEqual(runner.calls, [])
+        self.assertFalse(self.state_path.exists())
 
     def test_a_capture_needs_one_interface(self):
         for tail in [

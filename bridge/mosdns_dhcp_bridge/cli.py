@@ -143,17 +143,18 @@ EXIT_STATE = 4
 
 
 class _Request(NamedTuple):
-    """The command line as one mode: a capture interface, or a dispatcher's arguments.
+    """The command line as one mode: an interface to capture, or a dispatcher's arguments.
 
-    ``capture`` is the interface an installation named and is None when the
-    dispatcher runs the program. That is the whole of the mode, and it is decided
-    here, before any command runs, because the two invocations read different
-    things and neither may act as the other.
+    ``capture`` is the interface an installation named and is empty when the
+    dispatcher runs the program, which it can only be: a capture with no interface
+    is refused while the command line is read. That is the whole of the mode, and it
+    is decided here, before any command runs, because the two invocations read
+    different things and neither may act as the other.
     """
 
     state_file: str
     lock_file: str
-    capture: Optional[str]
+    capture: str
     positionals: List[str]
 
 
@@ -177,30 +178,38 @@ def main(argv: Sequence[str], env: Mapping[str, str], run: CommandRunner) -> int
     except ValueError as error:
         return _fail(EXIT_INVALID_INPUT, str(error))
 
-    action = env.get(ACTION_VARIABLE, "")
-    # An exported but empty action names no event, and neither does one that is not
-    # text: both are the same as an absent one, so a capture may be run from an
-    # environment that happens to hold the variable, and a dispatcher run may not
-    # claim to be a capture.
-    event = action if isinstance(action, str) and action else ""
+    # The variable's presence is what says this is a dispatcher run, not its value:
+    # NetworkManager always exports an action of its own, so an exported but empty
+    # one is a malformed event rather than an absent one. Reading presence rather
+    # than content is what makes the two modes exactly exclusive -- a shell that
+    # exported the variable once cannot decide which mode this program runs in.
+    exported = ACTION_VARIABLE in env
 
-    if request.capture is not None:
-        if event:
+    if request.capture:
+        if exported:
             return _fail(
                 EXIT_INVALID_INPUT,
                 f"{CAPTURE_OPTION} and {ACTION_VARIABLE} are two ways to run this "
                 f"program and cannot both be given: a capture has no dispatcher "
-                f"event, and an event is told its interface by NetworkManager",
+                f"event, and an event is told its interface by NetworkManager; "
+                f"{USAGE}",
             )
-        return _capture(request.capture, request, env, run)
-    if not event:
+        return _capture(request, env, run)
+    if not exported:
         return _fail(
             EXIT_INVALID_INPUT,
             f"{ACTION_VARIABLE} is not set, so this is neither a dispatcher event "
             f"nor a capture; an installation with no event names the interface "
-            f"with {CAPTURE_OPTION}",
+            f"with {CAPTURE_OPTION}; {USAGE}",
         )
-    return _dispatcher(request, env, event, run)
+    action = env[ACTION_VARIABLE]
+    if not isinstance(action, str) or not action:
+        return _fail(
+            EXIT_INVALID_INPUT,
+            f"{ACTION_VARIABLE} is set but names no action, so this is not a "
+            f"dispatcher event; {USAGE}",
+        )
+    return _dispatcher(request, env, action, run)
 
 
 def _dispatcher(
@@ -247,9 +256,7 @@ def _dispatcher(
     )
 
 
-def _capture(
-    interface: str, request: _Request, env: Mapping[str, str], run: CommandRunner
-) -> int:
+def _capture(request: _Request, env: Mapping[str, str], run: CommandRunner) -> int:
     """Publish the lease in use right now on an interface an installation named.
 
     This is the dispatcher's publication path with an explicit interface, not a
@@ -261,6 +268,7 @@ def _capture(
     own would make every later event a new generation for resolvers that did not
     change.
     """
+    interface = request.capture
     # The name is checked here rather than left to the collector, for the same
     # reason the event's own interface is: it reaches fixed argument arrays and the
     # published document, and refusing it is still free because nothing has run.
@@ -414,7 +422,7 @@ def _options(argv: Sequence[str]) -> _Request:
     return _Request(
         state_file=values["--state-file"],
         lock_file=values["--lock-file"],
-        capture=values.get(CAPTURE_OPTION),
+        capture=values.get(CAPTURE_OPTION, ""),
         positionals=positionals,
     )
 
