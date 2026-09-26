@@ -389,6 +389,17 @@ func newHarness(t *testing.T, fixture stateFixture) *harness {
 
 	directory := t.TempDir()
 	h.cnList = copyChinaList(t, directory)
+	// The readiness probe's name must not be in the China list, or the poll's
+	// query is a domestic one: it would be answered by the domestic resolver, so
+	// the counter the cases compare -- which expects the domestic resolver's first
+	// answer to be 198.51.100.1 -- would be one along before the case asked
+	// anything, and every assertion about a numbered answer would be off. True of
+	// the committed list today, and asserted here so a list that started matching
+	// it fails the harness rather than every case's arithmetic.
+	if inCommittedChinaList(t, h.cnList, readinessName) {
+		t.Fatalf("the China list matches the readiness probe name %s, so the poll's own query would be answered by the domestic resolver and the numbered answers every case compares would be one along",
+			readinessName)
+	}
 	h.stateFile = filepath.Join(directory, "dhcp-upstreams.json")
 	switch fixture {
 	case publishedState:
@@ -1060,6 +1071,27 @@ func inCommittedChinaList(t *testing.T, listPath, name string) bool {
 	}
 	_, matched := matcher.Match(dns.Fqdn(name))
 	return matched
+}
+
+// TestTheReadinessProbeNameIsNotInTheChinaList is the guard the harness relies on
+// and states on itself. The poll asks for a name; if the list matched it, that
+// query is a domestic one, the domestic resolver's answer counter moves before any
+// case asks anything, and every assertion comparing an answer against a numbered
+// address is one along -- and would look like a routing defect rather than a list
+// that grew a rule.
+//
+// The control is the other half: a name the list does match has to come back as
+// matched, so this is not a case that passes because the matcher is broken.
+func TestTheReadinessProbeNameIsNotInTheChinaList(t *testing.T) {
+	directory := t.TempDir()
+	list := copyChinaList(t, directory)
+
+	if inCommittedChinaList(t, list, readinessName) {
+		t.Errorf("the committed China list matches the readiness probe name %s, so the poll's query is a domestic one", readinessName)
+	}
+	if !inCommittedChinaList(t, list, chinaName) {
+		t.Errorf("the committed China list does not match %s, so the classification this harness relies on is not working at all", chinaName)
+	}
 }
 
 // reserveAttempts is how often a free port is chosen again when the transport
