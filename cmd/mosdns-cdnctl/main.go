@@ -3,13 +3,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/netip"
 	"os"
 	"strings"
+	"time"
 
+	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/config"
+	"mosdns-router/internal/measure"
+	"mosdns-router/internal/optimizer"
+	"mosdns-router/internal/prober"
 	"mosdns-router/internal/state"
 	"mosdns-router/internal/status"
 )
@@ -61,6 +69,14 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 		return runUpdateLists(ctx, args[1:], stdout, stderr, services)
 	case "render":
 		return runRender(args[1:], stdout, stderr, services)
+	case "test":
+		return runCDNTest(ctx, args[1:], stdout, stderr, services)
+	case "apply":
+		return runCDNApply(ctx, args[1:], stdout, stderr, services)
+	case "pin":
+		return runCDNPin(ctx, args[1:], stdout, stderr, services)
+	case "unpin":
+		return runCDNUnpin(args[1:], stdout, stderr, services)
 	default:
 		writeCLIError(stderr, "unknown command %q", args[0])
 		return exitInvalidCLI
@@ -223,4 +239,658 @@ func renderNamespaced(output io.Writer, namespace string, render func(io.Writer)
 
 func writeCLIError(output io.Writer, format string, args ...any) {
 	_, _ = fmt.Fprintf(output, format+"\n", args...)
+}
+
+// ---------------------------------------------------------------------------
+// test, apply, pin and unpin
+// ---------------------------------------------------------------------------
+
+// The paths the CDN commands read by default, which are the ones the packaged
+// service installs. Every one is a flag so a test, a second installation or an
+// operator with a different layout names its own, and so no command here can be
+// pointed at /etc or /var/lib by accident.
+const (
+	defaultPolicyPath             = "/etc/mosdns/policy.yaml"
+	defaultUserCandidatesPath     = "/etc/mosdns/cloudflare.txt"
+	defaultCloudFrontProfilesPath = "/etc/mosdns/cloudfront-domains.yaml"
+	defaultIdentityDomainsPath    = "/etc/mosdns/force-ech-domains.txt"
+	defaultRepresentativeDomain   = "speed.cloudflare.com"
+	defaultSelectorPath           = optimizer.DefaultSelectorPath
+	defaultBandwidthBudgetPath    = optimizer.DefaultBudgetPath
+	defaultCloudflareRangesURL    = candidate.DefaultCloudflareBaseURL
+	defaultCloudflareRangesCache  = "/var/lib/mosdns/lists/cloudflare-ips.json"
+)
+
+// identityPort and identityPath are what a global Cloudflare identity profile asks
+// for: the HTTPS port every CDN serves on, and the root of the hostname.
+//
+// The expected status is 200 and no body digest is named, which is the whole of
+// what can be claimed about a hostname this project did not choose: a chain
+// verified for the name, the name in SNI and Host, and a 200 from it. A domain that
+// answers something else is a domain to take out of the list rather than a reason
+// to weaken the check, and the profile is held to that rule before it is used.
+const (
+	identityPort = 443
+	identityPath = "/"
+)
+
+// cdnOptions is the parsed command line of test, apply, pin and unpin. They share
+// one set of flags because they are one set of inputs: the same policy, the same
+// selector, the same budget and the same identity profiles, read once each and
+// used for whichever command the operator asked for.
+type cdnOptions struct {
+	policy         string
+	selector       string
+	budget         string
+	controlLock    string
+	profiles       string
+	identities     string
+	candidates     string
+	representative string
+	rangesURL      string
+	rangesCache    string
+	report         string
+	apply          bool
+	// argument is the command's positional argument: the report to apply, or the
+	// address to pin. It is empty for test and unpin.
+	argument string
+}
+
+// parseCDNOptions parses and validates the shared flags. Every path is required to
+// be non-empty rather than silently falling back, because a mistyped path here is
+// an operator measuring the wrong thing or publishing to the wrong file, and a
+// refusal at the command line is cheaper than either.
+//
+// The command's argument comes before its flags, as `apply REPORT.json` and
+// `pin IPV4` are written, and the flag package stops parsing at the first argument
+// that is not a flag - so the leading argument is taken off first and everything
+// after it is parsed as flags. A second positional is still refused, because a
+// command that took two paths would be taking one of them by accident.
+func parseCDNOptions(name string, args []string, positional int) (cdnOptions, error) {
+	var leading []string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		leading, args = args[:1], args[1:]
+	}
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	options := cdnOptions{}
+	flags.StringVar(&options.policy, "policy", defaultPolicyPath, "path to the policy document")
+	flags.StringVar(&options.selector, "selector", defaultSelectorPath, "path to the selector state")
+	flags.StringVar(&options.budget, "budget", defaultBandwidthBudgetPath, "path to the daily bandwidth budget")
+	flags.StringVar(&options.controlLock, "control-lock", defaultControlLockPath, "path to the shared control lock")
+	flags.StringVar(&options.profiles, "profiles", defaultCloudFrontProfilesPath, "path to the CloudFront profile document")
+	flags.StringVar(&options.identities, "identity-domains", defaultIdentityDomainsPath, "path to the newline-separated hostnames a global address is proved against")
+	flags.StringVar(&options.candidates, "candidates", defaultUserCandidatesPath, "path to the user's own candidate list")
+	flags.StringVar(&options.representative, "representative-domain", defaultRepresentativeDomain, "the provider domain a global address is proved against")
+	flags.StringVar(&options.rangesURL, "ranges-url", defaultCloudflareRangesURL, "the published Cloudflare range document")
+	flags.StringVar(&options.rangesCache, "ranges-cache", defaultCloudflareRangesCache, "where the published range document is cached")
+	flags.StringVar(&options.report, "report", "", "write the report document to this path")
+	flags.BoolVar(&options.apply, "apply", false, "publish the winner once the final identity proof has passed")
+	if err := flags.Parse(args); err != nil {
+		return cdnOptions{}, err
+	}
+	rest := append(leading, flags.Args()...)
+	switch {
+	case len(rest) < positional:
+		if positional == 1 {
+			return cdnOptions{}, errors.New("a report path or an address is required")
+		}
+		return cdnOptions{}, errors.New("no arguments are accepted")
+	case len(rest) > positional:
+		return cdnOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(rest, " "))
+	}
+	if len(rest) == 1 {
+		options.argument = rest[0]
+	}
+	for _, required := range []struct{ name, value string }{
+		{"--policy", options.policy},
+		{"--selector", options.selector},
+		{"--budget", options.budget},
+		{"--control-lock", options.controlLock},
+		{"--profiles", options.profiles},
+		{"--identity-domains", options.identities},
+		{"--candidates", options.candidates},
+		{"--representative-domain", options.representative},
+		{"--ranges-url", options.rangesURL},
+		{"--ranges-cache", options.rangesCache},
+	} {
+		if strings.TrimSpace(required.value) == "" {
+			return cdnOptions{}, fmt.Errorf("%s must not be empty", required.name)
+		}
+	}
+	return options, nil
+}
+
+// candidateSource is where a run's candidates come from. It is a value rather than
+// four parameters because it is a services field, and a field with a signature
+// nobody can read at the call site is a field nobody keeps right.
+type candidateSource struct {
+	// Client reaches the published range document.
+	Client *http.Client
+	// BaseURL and CachePath are the operator's, so a test never touches the real
+	// endpoint and never writes to the production cache.
+	BaseURL   string
+	CachePath string
+	// UserList is the operator's own candidate file.
+	UserList string
+	// Limit is cdn.cloudflare.max_candidates, and Moment is the local date the
+	// daily sample is seeded from.
+	Limit  int
+	Moment time.Time
+}
+
+// cdnWorld is everything a CDN command works through: the policy and the digest of
+// the document it came from, the runner, and the profiles a proof is held to.
+type cdnWorld struct {
+	policy config.Policy
+	digest string
+	runner *optimizer.Runner
+	// cloudflareProfiles are the hostnames a global address is proved against, and
+	// cloudFrontRules the per-hostname profiles.
+	cloudflareProfiles []candidate.ProbeProfile
+	cloudFrontRules    []candidate.CloudFrontProfile
+	// profiles is every profile this configuration names, which is what a final
+	// proof and a pin are held to.
+	profiles []candidate.ProbeProfile
+}
+
+// buildCDNWorld reads the policy, the profiles and the identity domains, and
+// builds the runner they configure.
+//
+// The digest is taken from the document's own bytes and the policy is loaded from
+// the same path. That is two reads of one file, and a policy edited between them
+// would pair a digest with a parse of different content - which can only refuse
+// the next apply, never let one through: an apply compares the report's digest
+// against the digest of the file as it is then, so a stale pairing is a report
+// that will not apply. The alternative, a loader this project would have to
+// maintain beside the config package's own, is worse.
+func buildCDNWorld(options cdnOptions, services services) (cdnWorld, error) {
+	world := cdnWorld{}
+	document, err := os.ReadFile(options.policy)
+	if err != nil {
+		return world, fmt.Errorf("read the policy: %w", err)
+	}
+	world.digest = optimizer.PolicyDigest(document)
+	if world.policy, err = config.Load(options.policy); err != nil {
+		return world, err
+	}
+	if world.cloudFrontRules, err = readCloudFrontProfiles(options.profiles); err != nil {
+		return world, err
+	}
+	domains, err := readDomainList(options.identities)
+	if err != nil {
+		return world, err
+	}
+	domains = append([]string{options.representative}, domains...)
+	if world.cloudflareProfiles, err = identityProfiles(domains); err != nil {
+		return world, err
+	}
+	world.profiles = append(slicesClone(world.cloudflareProfiles), ruleProfiles(world.cloudFrontRules)...)
+	if world.runner, err = optimizer.NewRunner(world.policy, services.newProber(), optimizer.Options{
+		BudgetPath:      options.budget,
+		SelectorPath:    options.selector,
+		ControlLockPath: options.controlLock,
+		ConfigSHA256:    world.digest,
+		Now:             services.now,
+	}); err != nil {
+		return world, err
+	}
+	return world, nil
+}
+
+// readCloudFrontProfiles reads the operator's profile document. A document with no
+// profiles in it is not an error: an installation that serves only global CDN
+// addresses has no CloudFront hostnames, and refusing to measure because of that
+// would leave the whole selector unusable.
+func readCloudFrontProfiles(path string) ([]candidate.CloudFrontProfile, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read the CloudFront profile document: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	profiles, err := candidate.ParseCloudFrontProfiles(file)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return profiles, nil
+}
+
+// readDomainList reads the newline-separated hostnames a global address is proved
+// against. The shape is the forced-ECH domain list's: one name per line, a line
+// whose first non-space character is # is a comment, and a blank line is nothing.
+// The forced-ECH domains are the names a Cloudflare address has to serve besides
+// the provider's own, because a user on one of them would have every query
+// rewritten to it.
+func readDomainList(path string) ([]string, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read the identity domain list: %w", err)
+	}
+	var domains []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(contents), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// DNS names are case insensitive, so two spellings of one name are one
+		// profile, and a duplicate would prove the same thing twice.
+		name := strings.ToLower(trimmed)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		domains = append(domains, name)
+	}
+	return domains, nil
+}
+
+// identityProfiles builds one global Cloudflare identity profile per hostname, and
+// holds each to what a prober could check before a socket is opened. A hostname
+// that cannot be a profile is a refusal here rather than a proof that would fail
+// later against the network.
+func identityProfiles(domains []string) ([]candidate.ProbeProfile, error) {
+	profiles := make([]candidate.ProbeProfile, 0, len(domains))
+	for _, domain := range domains {
+		profile := candidate.ProbeProfile{
+			Hostname:       domain,
+			URL:            "https://" + domain + identityPath,
+			Method:         http.MethodGet,
+			Port:           identityPort,
+			ExpectedStatus: []int{http.StatusOK},
+		}
+		if err := (candidate.CloudFrontProfile{Profile: profile}).Validate(); err != nil {
+			return nil, fmt.Errorf("the identity domain %q is not usable: %w", domain, err)
+		}
+		profiles = append(profiles, profile)
+	}
+	return profiles, nil
+}
+
+func ruleProfiles(rules []candidate.CloudFrontProfile) []candidate.ProbeProfile {
+	profiles := make([]candidate.ProbeProfile, 0, len(rules))
+	for _, rule := range rules {
+		profiles = append(profiles, rule.Profile)
+	}
+	return profiles
+}
+
+// networkProber is the composition of the prober package's prober with the
+// optimizer's narrower interface.
+//
+// The two packages each declare their own budget interface, and an interface
+// parameter's type is part of a method's signature, so the runner's Prober cannot
+// be satisfied by the prober package's Prober directly: the optimizer may not
+// import that package, because that package's own in-package tests use this one
+// and Go forbids the cycle. This type is where the two meet, which is why it lives
+// in the command that owns the composition rather than in either package.
+//
+// It forwards, and the only thing it changes is the budget: the run's settle-once
+// budget reaches the prober through byteBudget, which forwards Reserve and Consume
+// to the same value. A transfer therefore reserves and settles against the day's
+// one budget exactly as it would without the adapter.
+type networkProber struct {
+	inner prober.Prober
+}
+
+var _ optimizer.Prober = networkProber{}
+
+func (p networkProber) TCP(ctx context.Context, address netip.Addr, port uint16, samples int) (measure.TCPMetrics, error) {
+	return p.inner.TCP(ctx, address, port, samples)
+}
+
+func (p networkProber) HTTPS(ctx context.Context, subject candidate.Candidate, profile candidate.ProbeProfile) (measure.HTTPMetrics, error) {
+	return p.inner.HTTPS(ctx, subject, profile)
+}
+
+func (p networkProber) Download(ctx context.Context, subject candidate.Candidate, profile candidate.ProbeProfile, maxBytes int64, maxDuration time.Duration, budget optimizer.ByteBudget) (measure.DownloadMetrics, error) {
+	return p.inner.Download(ctx, subject, profile, maxBytes, maxDuration, byteBudget{inner: budget})
+}
+
+// byteBudget is the run's budget seen through the prober's own narrower
+// interface. It is one value with two method calls and no state of its own.
+type byteBudget struct {
+	inner optimizer.ByteBudget
+}
+
+var _ prober.ByteBudget = byteBudget{}
+
+func (b byteBudget) Reserve(requested int64) (int64, error) { return b.inner.Reserve(requested) }
+
+func (b byteBudget) Consume(reserved, actual int64) { b.inner.Consume(reserved, actual) }
+
+// runCDNTest measures the candidates and reports, and publishes nothing unless
+// --apply was asked for.
+//
+// The two are one command on purpose. The design has the daily timer call
+// `test --apply`, which is the whole measurement and the whole publication in one
+// invocation, so the final identity proof runs inside it against what it just
+// measured. A report written earlier is never what gets published, and the report
+// file --report writes is an output for a person rather than an input to this
+// command.
+func runCDNTest(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
+	options, err := parseCDNOptions("test", args, 0)
+	if err != nil {
+		writeCLIError(stderr, "test: %v", err)
+		return exitInvalidCLI
+	}
+	world, err := buildCDNWorld(options, services)
+	if err != nil {
+		writeCLIError(stderr, "test: %v", err)
+		return exitInvalidCLI
+	}
+	collected, err := services.readCandidates(candidateSource{
+		Client:    services.newHTTPClient(),
+		BaseURL:   options.rangesURL,
+		CachePath: options.rangesCache,
+		UserList:  options.candidates,
+		Limit:     world.policy.CDN.Cloudflare.MaxCandidates,
+		Moment:    services.now(),
+	})
+	if err != nil {
+		writeCLIError(stderr, "test: %v", err)
+		return exitStateUnavailable
+	}
+	input := optimizer.Input{
+		Cloudflare:         collected.Candidates,
+		CloudflareProfiles: world.cloudflareProfiles,
+		CloudFrontRules:    world.cloudFrontRules,
+		Stale:              collected.Stale,
+	}
+	// The selector is read without the control lock, deliberately. A report-only
+	// run has to be possible while a pin or a health check is publishing, so the
+	// read is of a file that is replaced by a rename and never half written; and
+	// every use this run makes of it - the retained candidates, the incumbent
+	// score - is a measurement, not a decision. The apply that follows re-reads it
+	// under the lock and decides there.
+	input.LastGood = readSelectorForReport(options.selector)
+	report, err := world.runner.Run(ctx, input)
+	if err != nil {
+		// A run that could not finish still reports what it measured, and publishes
+		// nothing: the partial document is the operator's only record of how far it
+		// got.
+		writePartialReport(options, report, stdout, stderr)
+		return exitStateUnavailable
+	}
+	if len(report.Groups) == 0 {
+		// A report with no group is not a document this build will write or apply -
+		// it measured nothing - so it is said here rather than handed to the writer
+		// to refuse with a validation error about a field the operator never sees.
+		writeCLIError(stderr, "test: no candidate was collected, so nothing was measured and nothing was published")
+		return exitStateUnavailable
+	}
+	var published *state.Selector
+	if options.apply {
+		applied, selector, applyErr := world.runner.Apply(ctx, report, world.profiles)
+		report = applied
+		if applyErr != nil {
+			_ = writeCDNReport(stdout, report, nil)
+			writeCLIError(stderr, "test: %v", applyErr)
+			return cdnExitCode(applyErr)
+		}
+		published = &selector
+	}
+	if err := writeReportFile(options.report, report); err != nil {
+		writeCLIError(stderr, "test: %v", err)
+		return exitStateUnavailable
+	}
+	if err := writeCDNReport(stdout, report, published); err != nil {
+		writeCLIError(stderr, "test: write report: %v", err)
+		return exitStateUnavailable
+	}
+	if !reportHasWinner(report) {
+		// A run that measured nothing publishable is not a successful run: nothing
+		// was published, and a timer that saw this succeed would record a day the
+		// router measured nothing as a day it was fine. The reason is in the report.
+		writeCLIError(stderr, "test: no candidate qualified, so nothing was published; the report names the reason")
+		return exitStateUnavailable
+	}
+	return exitSuccess
+}
+
+// reportHasWinner reports whether any group named a winner at all, which is not the
+// same as any of them being allowed to publish: a report whose every switch was
+// refused has a winner and publishes nothing either.
+func reportHasWinner(report optimizer.Report) bool {
+	for _, group := range report.Groups {
+		if group.Winner != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// runCDNApply publishes a report that was written earlier.
+//
+// Everything the report says about the network is up to two hours old, and
+// everything it says about the configuration is checked against the digest of the
+// policy as it is now. What the report cannot be trusted for is the address: the
+// final identity proof runs here, under the control lock, against the profiles this
+// configuration names - not the ones the report carries, which is the whole point.
+func runCDNApply(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
+	options, err := parseCDNOptions("apply", args, 1)
+	if err != nil {
+		writeCLIError(stderr, "apply: %v", err)
+		return exitInvalidCLI
+	}
+	report, err := optimizer.ReadReport(options.argument)
+	if err != nil {
+		writeCLIError(stderr, "apply: %v", err)
+		return exitStateUnavailable
+	}
+	world, err := buildCDNWorld(options, services)
+	if err != nil {
+		writeCLIError(stderr, "apply: %v", err)
+		return exitInvalidCLI
+	}
+	applied, published, err := world.runner.Apply(ctx, report, world.profiles)
+	if err != nil {
+		writeCLIError(stderr, "apply: %v", err)
+		return cdnExitCode(err)
+	}
+	// The applied report is written out as well as the measurement it came from, so
+	// an operator who applies a report keeps the record that includes the final
+	// proof the report on disk did not have.
+	if err := writeReportFile(options.report, applied); err != nil {
+		writeCLIError(stderr, "apply: %v", err)
+		return exitStateUnavailable
+	}
+	if err := writeCDNReport(stdout, applied, &published); err != nil {
+		writeCLIError(stderr, "apply: write report: %v", err)
+		return exitStateUnavailable
+	}
+	return exitSuccess
+}
+
+// runCDNPin stores an address as the manual winner, after a real identity proof
+// against every profile this configuration names. It accepts an address and
+// nothing else: a manual pin is one operator, one address, and a decision this
+// project will not extend to a host, a prefix or a hostname it did not measure.
+func runCDNPin(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
+	options, err := parseCDNOptions("pin", args, 1)
+	if err != nil {
+		writeCLIError(stderr, "pin: %v", err)
+		return exitInvalidCLI
+	}
+	if options.report != "" {
+		// A pin measures nothing, so there is no report to write. Refusing the flag
+		// is better than accepting it and producing no file, which an operator would
+		// read as a report that says nothing is wrong.
+		writeCLIError(stderr, "pin: --report is for test and apply, which measure something")
+		return exitInvalidCLI
+	}
+	address, err := netip.ParseAddr(options.argument)
+	if err != nil {
+		writeCLIError(stderr, "pin: %q is not an address: %v", options.argument, err)
+		return exitInvalidCLI
+	}
+	world, err := buildCDNWorld(options, services)
+	if err != nil {
+		writeCLIError(stderr, "pin: %v", err)
+		return exitInvalidCLI
+	}
+	published, err := world.runner.Pin(ctx, address.Unmap(), world.profiles)
+	if err != nil {
+		writeCLIError(stderr, "pin: %v", err)
+		return cdnExitCode(err)
+	}
+	writeReportLine(stdout, "pinned: %s\n", address)
+	if err := renderNamespaced(stdout, "selector", func(writer io.Writer) error {
+		return status.RenderSelector(writer, published)
+	}); err != nil {
+		writeCLIError(stderr, "pin: write report: %v", err)
+		return exitStateUnavailable
+	}
+	return exitSuccess
+}
+
+// runCDNUnpin restores automatic selection and keeps the pinned address as the
+// fallback. It reads no policy value beyond the configuration digest it stamps into
+// the document, and it opens no socket.
+func runCDNUnpin(args []string, stdout, stderr io.Writer, services services) int {
+	options, err := parseCDNOptions("unpin", args, 0)
+	if err != nil {
+		writeCLIError(stderr, "unpin: %v", err)
+		return exitInvalidCLI
+	}
+	if options.report != "" {
+		writeCLIError(stderr, "unpin: --report is for test and apply, which measure something")
+		return exitInvalidCLI
+	}
+	world, err := buildCDNWorld(options, services)
+	if err != nil {
+		writeCLIError(stderr, "unpin: %v", err)
+		return exitInvalidCLI
+	}
+	published, err := world.runner.Unpin()
+	if err != nil {
+		writeCLIError(stderr, "unpin: %v", err)
+		return cdnExitCode(err)
+	}
+	writeReportLine(stdout, "unpinned: fallback %s\n", published.FallbackIP)
+	if err := renderNamespaced(stdout, "selector", func(writer io.Writer) error {
+		return status.RenderSelector(writer, published)
+	}); err != nil {
+		writeCLIError(stderr, "unpin: write report: %v", err)
+		return exitStateUnavailable
+	}
+	return exitSuccess
+}
+
+// cdnExitCode maps a refusal to the exit code a caller can act on. A lock conflict
+// gets its own code, because "the other one got there first" and "this one is
+// broken" are different answers to a timer and to an operator.
+func cdnExitCode(err error) int {
+	if errors.Is(err, optimizer.ErrControlLocked) {
+		return exitLockHeld
+	}
+	return exitStateUnavailable
+}
+
+// readSelectorForReport reads the selector for a report-only run. A document that
+// cannot be read is not an error here: the run's decision does not depend on it -
+// it decides from what it measures - and the apply that publishes will read it
+// again under the control lock and refuse there if it is unreadable.
+func readSelectorForReport(path string) state.Selector {
+	selector := state.Selector{}
+	if err := state.ReadJSON(path, &selector); err != nil {
+		return state.Selector{}
+	}
+	return selector
+}
+
+func writeReportFile(path string, report optimizer.Report) error {
+	if path == "" {
+		return nil
+	}
+	return optimizer.WriteReport(path, report)
+}
+
+// writeCDNReport is what an operator reads. Every line is a fact with its number on
+// it, because the report's job is to be acted on and a run that found a winner it
+// could not publish has to say so here rather than only on stderr. A nil published
+// means nothing was written, which is the case for a report-only run and for one
+// whose apply was refused.
+func writeCDNReport(output io.Writer, report optimizer.Report, published *state.Selector) error {
+	if published != nil {
+		writeReportLine(output, "applied: %s\n", published.WinnerIP)
+		writeReportLine(output, "generation: %d\n", published.Generation)
+		writeReportLine(output, "fallback: %s\n", published.FallbackIP)
+	} else {
+		writeReportLine(output, "applied: nothing\n")
+	}
+	writeReportLine(output, "generated-at: %s\n", report.GeneratedAt.Format(time.RFC3339))
+	writeReportLine(output, "config-sha256: %s\n", report.ConfigSHA256)
+	writeReportLine(output, "stale-candidates: %t\n", report.Stale)
+	writeReportLine(output, "identity-body-bytes: %d\n", report.IdentityBytes)
+	writeReportLine(output, "budget-used-bytes: %d\n", report.BudgetUsed)
+	writeReportLine(output, "budget-exhausted: %t\n", report.BudgetExhausted)
+	if len(report.SettleRefusals) > 0 {
+		for _, refusal := range report.SettleRefusals {
+			writeReportLine(output, "settle-refused: %s\n", refusal)
+		}
+	}
+	for _, skipped := range report.SkippedRetained {
+		writeReportLine(output, "skipped-retained: %s\n", skipped)
+	}
+	for _, group := range report.Groups {
+		writeReportLine(output, "group: %s\n", group.Group)
+		writeReportLine(output, "candidates: %d\n", len(group.Candidates))
+		writeReportLine(output, "p10-bytes-per-second: %g\n", group.P10BytesPerSecond)
+		for _, entry := range group.Candidates {
+			verdict := "excluded: " + entry.Reason
+			if entry.Eligible {
+				verdict = fmt.Sprintf("eligible, score %g", entry.Score)
+			}
+			writeReportLine(output, "  candidate: %s %s p50 %gms jitter %gms loss %g speed %gB/s %s\n",
+				entry.IP, entry.Source, entry.P50MS, entry.JitterMS, entry.Loss, entry.BytesPerSecond, verdict)
+			if entry.Detail != "" {
+				writeReportLine(output, "    detail: %s\n", entry.Detail)
+			}
+		}
+		switch {
+		case group.Winner != nil:
+			verdict := "switch refused: " + group.Winner.SwitchRefusal
+			if group.Winner.SwitchAllowed {
+				verdict = "switch allowed"
+			}
+			writeReportLine(output, "  winner: %s score %g %s\n", group.Winner.IP, group.Winner.Score, verdict)
+		case group.NoWinner != "":
+			writeReportLine(output, "  no-winner: %s\n", group.NoWinner)
+		}
+	}
+	if report.FinalProofPassed {
+		writeReportLine(output, "final-proof: passed at %s\n", report.ProofedAt.Format(time.RFC3339))
+	} else {
+		writeReportLine(output, "final-proof: not run, this report publishes nothing\n")
+	}
+	return nil
+}
+
+// writePartialReport is what a cancelled or failed run leaves behind: the document
+// it did produce, on stdout, and the error on stderr. Publishing is not on the
+// table for a run that did not finish.
+func writePartialReport(options cdnOptions, report optimizer.Report, stdout, stderr io.Writer) {
+	if report.Groups == nil && report.Phases.Collect.StartedAt.IsZero() {
+		return
+	}
+	if err := writeReportFile(options.report, report); err != nil {
+		writeCLIError(stderr, "test: %v", err)
+	}
+	_ = writeCDNReport(stdout, report, nil)
+}
+
+func slicesClone[T any](values []T) []T {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]T, len(values))
+	copy(cloned, values)
+	return cloned
 }
