@@ -389,6 +389,56 @@ func TestWatchersRefuseANegativePollInterval(t *testing.T) {
 	})
 }
 
+// TestJSONRefusesADocumentItHasNoCopyFor is the branch the whole
+// documentCloners lookup exists for. A state document can join the Document
+// union without anyone noticing that documentCloners has no entry for it -- Go
+// cannot check a type set -- and a watcher that held it would hand every caller a
+// value sharing the maps and slices inside it, which is the failure the
+// isolation ruling exists to prevent.
+//
+// The refusal has to be an error and not a panic. A plugin's Init is the only
+// caller, nothing in this repository and nothing in the pinned mosdns/v5 recovers
+// from a panic, so a panic there takes the router process down instead of failing
+// one plugin -- which is the same argument poller.init refuses an empty path and a
+// negative interval on, for the same class of compiler-invisible mistake.
+//
+// The key is removed and put back because the mistake under test is one nobody
+// makes at run time; no case in this file runs in parallel, so the map is this
+// case's own while it is out.
+func TestJSONRefusesADocumentItHasNoCopyFor(t *testing.T) {
+	const document = "Selector"
+	copier, known := documentCloners[document]
+	if !known {
+		t.Fatalf("this case removes %q from documentCloners, which is not one of its keys: %v", document, documentCloners)
+	}
+	delete(documentCloners, document)
+	t.Cleanup(func() { documentCloners[document] = copier })
+
+	watcher, err := NewJSON(statePath(t, "selector.json"), nil, state.Selector{})
+	if err == nil {
+		t.Fatalf("NewJSON watched %T with no copy for it, and handed back %T", state.Selector{}, watcher)
+	}
+	var refusal UnsupportedDocument
+	if !errors.As(err, &refusal) {
+		t.Fatalf("NewJSON returned %T (%v), want an UnsupportedDocument the caller can read the document out of", err, err)
+	}
+	if refusal.Document != "state.Selector" {
+		t.Fatalf("the refusal names %q, want the type the caller asked for: state.Selector", refusal.Document)
+	}
+	// The message carries the three edits, because the reader is a developer
+	// looking at a mistake the compiler did not report and the message is all
+	// they are given.
+	for _, obligation := range []string{
+		"Document",
+		"documentCloners",
+		"TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold",
+	} {
+		if !strings.Contains(refusal.Error(), obligation) {
+			t.Fatalf("the refusal reads %q, which does not name %q", refusal, obligation)
+		}
+	}
+}
+
 // TestWatchersRefuseASecondOptionsValue covers both constructors. One Options
 // is the whole of the optional argument, so a caller that passes two is a
 // mistake -- and honouring the first or the last of them silently would leave a
@@ -408,6 +458,15 @@ func TestWatchersRefuseASecondOptionsValue(t *testing.T) {
 			t.Fatal("NewTrimmedLines accepted two Options values, so one of the two poll rates the caller asked for was quietly dropped")
 		}
 	})
+}
+
+// reportedRefusal reads the failure the watcher's handler was last given, under
+// the lock the poll takes, so a case can assert that an episode has ended rather
+// than inferring it from what the handler was called with next.
+func reportedRefusal(watcher *Watcher[state.Selector]) error {
+	watcher.reporting.Lock()
+	defer watcher.reporting.Unlock()
+	return watcher.reported
 }
 
 // TestACallerRepairClearsTheEpisodeSoTheNextBreakIsReported: an operator who
@@ -435,9 +494,17 @@ func TestACallerRepairClearsTheEpisodeSoTheNextBreakIsReported(t *testing.T) {
 	// for it to be read straight away. ReloadNow hands the refusal back rather
 	// than reporting it, so the episode has to end here or the next break of the
 	// same file is silence.
+	//
+	// The episode is read directly, and immediately, because a poll tick landing
+	// between the repair and the re-break would end it too: the wait below would
+	// then see a second report whether or not ReloadNow ends an episode, and the
+	// case would pass for the wrong reason.
 	replaceFile(t, path, documentBytes(t, publishedSelector(3, "198.51.100.21")))
 	if err := watcher.ReloadNow(); err != nil {
 		t.Fatalf("the caller's own reload refused a valid selector: %v", err)
+	}
+	if still := reportedRefusal(watcher); still != nil {
+		t.Fatalf("after a successful ReloadNow the watcher is still in the episode it reported, so the next break of this file is silence: %v", still)
 	}
 
 	replaceFile(t, path, corrupt)

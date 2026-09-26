@@ -271,9 +271,17 @@ func NewJSON[T Document](path string, validate func(T) error, initial T, options
 	if err != nil {
 		return nil, err
 	}
+	// The copy function is resolved before anything else is built, because a
+	// watcher cannot hold a document it cannot copy: the value it is handed, and
+	// every snapshot it will ever hand back, would share the watcher's own maps
+	// and slices.
+	clone, err := documentCloner[T]()
+	if err != nil {
+		return nil, err
+	}
 	watcher := &Watcher[T]{
 		validate: validate,
-		clone:    documentCloner[T](),
+		clone:    clone,
 	}
 	watcher.value = watcher.clone(initial)
 	if err := watcher.poller.init(path, settings); err != nil {
@@ -408,24 +416,45 @@ var documentCloners = map[string]func(any) any{
 	},
 }
 
+// UnsupportedDocument is a refusal naming a state document the watcher cannot
+// hold. It is a value rather than a pointer so a caller holding one cannot edit
+// what the watcher recorded, and its fields are exported so a caller can read the
+// document out of it rather than out of a message.
+//
+// It exists because a state document can join the Document union with nothing
+// failing: Go cannot check that a switch over a type set is exhaustive, and the
+// document is a struct in another package. A watcher that held such a document
+// would hand every caller a value sharing the maps and slices inside it, and the
+// first sign of that would be a plugin editing the router's live state from
+// inside a query.
+type UnsupportedDocument struct {
+	// Document is the Go type the caller asked for, as %T: "state.Selector".
+	Document string
+}
+
+func (e UnsupportedDocument) Error() string {
+	return fmt.Sprintf("statewatch: no snapshot copy for %s; add it to the Document union, give it an entry in documentCloners with its map and slice fields cloned if it has any, "+
+		"and add a subtest to TestJSONWatcherSnapshotIsIndependentOfEveryDocumentItCanHold", e.Document)
+}
+
 // documentCloner returns the copy function for one document type, resolved once
 // at construction so that neither Snapshot nor a reload pays for the lookup on
 // every query.
 //
-// A document type with no entry here is refused loudly. Go cannot check that a
-// type switch over a type set is exhaustive, so a state document added to
-// Document without an entry here would otherwise fall through to a copy that
-// shares everything, and the first sign of it would be a plugin editing the
-// router's live state from inside a query. Failing at construction is the
-// direction to fail in: the router does not start, rather than starting and
-// answering from a value a caller can edit.
-func documentCloner[T Document]() func(T) T {
+// A document type with no entry in documentCloners is refused, and it is an error
+// rather than a panic. It is a refusal for the same reason poller.init refuses an
+// empty path rather than watching nothing: a plugin's Init is the only caller of
+// any of this, and nothing in this repository or in the pinned mosdns/v5 recovers
+// from a panic, so a panic there takes the router process down instead of failing
+// one plugin. The alternative to the refusal is worse than either: a copy that
+// shares the document's maps and slices with the watcher.
+func documentCloner[T Document]() (func(T) T, error) {
 	name := documentName(*new(T))
 	copier, known := documentCloners[name]
 	if !known {
-		panic(fmt.Sprintf("statewatch: no snapshot copy for %T; give it an entry in documentCloners and a subtest in the isolation test", *new(T)))
+		return nil, UnsupportedDocument{Document: fmt.Sprintf("%T", *new(T))}
 	}
 	return func(value T) T {
 		return any(copier(any(value))).(T)
-	}
+	}, nil
 }
