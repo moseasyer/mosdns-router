@@ -2,6 +2,8 @@ package state
 
 import (
 	"reflect"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -226,6 +228,69 @@ func TestDHCPStateValidationEnforcesLastGoodInterfaceSourceAndObservation(t *tes
 			t.Fatalf("empty non-last-good state rejected: %v", err)
 		}
 	})
+}
+
+// writerSourceTokens is every source token a writer in this project can put in a
+// DHCP state: the six the bridge's collector reports, plus the one the bridge
+// records for a down event, where no source answered. The list is spelled out
+// here rather than derived from the code, because the point of the case below is
+// that the reader's own diagnostic stays inside the writer's vocabulary, and a
+// list that moved with the code could not say that.
+//
+// The reader's check is a shape check -- any lowercase hyphenated token passes --
+// so the vocabulary is not something it can enforce. It lives in the writer, and
+// a diagnostic offering a token outside it teaches an operator to hand-write a
+// document no writer here can produce.
+var writerSourceTokens = []string{
+	"down",
+	"dispatcher-env",
+	"nm-dhcp",
+	"nm-dhcp4",
+	"nm-dhcp6",
+	"nm-effective",
+	"resolved",
+}
+
+// messageProse is the fixed English of the source diagnostic, so a word that is
+// not an offered token is recognised as a word rather than mistaken for one.
+var messageProse = map[string]bool{
+	"a": true, "as": true, "at": true, "be": true, "by": true, "character": true,
+	"lowercase": true, "most": true, "must": true, "of": true, "or": true,
+	"record": true, "source": true, "such": true, "the": true, "token": true,
+	"tokens": true, "writer": true,
+}
+
+// tokenWord matches every word in a diagnostic that could be a source token, so
+// an offered token cannot hide behind punctuation or capitalization.
+var tokenWord = regexp.MustCompile(`[a-z0-9]+(?:-[a-z0-9]+)*`)
+
+// A refusal that names a token no writer produces is a refusal that teaches the
+// wrong thing: an operator who follows it writes a state this project has no way
+// to produce, and the reader cannot catch it, because the check it does is the
+// shape. This is the one place the vocabulary can be kept honest.
+func TestDHCPStateSourceRefusalNamesOnlyTokensAWriterCanProduce(t *testing.T) {
+	state := validDHCPState("192.0.2.53")
+	state.Source = "DHCP4"
+
+	err := state.Validate()
+	if err == nil {
+		t.Fatal("a source that is not a lowercase token was accepted")
+	}
+	message := err.Error()
+
+	offered := 0
+	for _, word := range tokenWord.FindAllString(message, -1) {
+		if messageProse[word] {
+			continue
+		}
+		if !slices.Contains(writerSourceTokens, word) {
+			t.Errorf("the refusal names %q, which no writer of this project can publish; the writer's tokens are %v", word, writerSourceTokens)
+		}
+		offered++
+	}
+	if offered == 0 {
+		t.Errorf("the refusal offers no token a writer can publish, so it cannot be acted on: %q", message)
+	}
 }
 
 func TestSelectorValidationEnforcesWinnerFallbackAndProofConsistency(t *testing.T) {

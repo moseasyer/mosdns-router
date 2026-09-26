@@ -119,9 +119,17 @@ func NewECHState(generation uint64, source string, fetchedAt, expiresAt, staleUn
 }
 
 // Validate rejects every DHCP record a fail-closed domestic branch could not
-// use: a missing interface or observation time, a source that is not one of the
-// documented tokens, upstreams that cannot receive a forwarded query, and a
+// use: a missing interface or observation time, a source that is not a
+// well-shaped token, upstreams that cannot receive a forwarded query, and a
 // last-known-good marker with nothing behind it.
+//
+// The source rule is a shape check and not the vocabulary. Any lowercase
+// hyphenated token within the length bound is accepted here, because which
+// sources exist is the writers' business and this reader only has to refuse what
+// it could not act on: the vocabulary is the bridge collector's tokens plus the
+// one the bridge records for a down event, and the two this diagnostic offers
+// come from it, so an operator reading the refusal is not sent to hand-write a
+// state nothing in this project can produce.
 func (s DHCPState) Validate() error {
 	if err := validateSchema(s.SchemaVersion); err != nil {
 		return err
@@ -130,7 +138,7 @@ func (s DHCPState) Validate() error {
 		return fmt.Errorf("interface must be a network interface name of at most %d characters", maximumInterfaceNameLength)
 	}
 	if !validSourceToken(s.Source) {
-		return fmt.Errorf("source must be a lowercase token such as dhcp4, dhcp6, or installer-current")
+		return fmt.Errorf("source must be a lowercase token such as nm-dhcp4 or nm-effective")
 	}
 	if s.ObservedAt.IsZero() {
 		return fmt.Errorf("observed_at must record when the DHCP DNS was observed")
