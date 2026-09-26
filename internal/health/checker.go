@@ -45,6 +45,18 @@
 // a domain the rewriter had to block because the winner had stopped serving it
 // becomes serviceable again, and only ever against an address something proved.
 //
+// One consequence of that attribution is worth stating rather than leaving for the
+// next reader to re-derive. A nightly apply that publishes the address already in
+// service - the switch gate's "not better tonight" outcome - still stamps the
+// selector's last_success, so the health document's verdicts are then older than the
+// selector's proof of the address that never changed, and the count starts again. The
+// cost is bounded and is in the safe direction: with the shipped two-minute interval
+// and a threshold of three, an address that had accumulated two failures has to fail
+// three more times - six more minutes - before it is moved, and a transition still
+// re-proves the fallback before publishing it. The alternative, letting a count follow
+// an address into a new document, is a new winner inheriting a dead address's failures
+// and being moved on its first.
+//
 // The health document holds the four fields the plan documents and nothing else,
 // which is a constraint and not a choice: four fields describe one address, and
 // the one address a selector can move away from is its global winner. The
@@ -191,6 +203,14 @@ var (
 	// while the failure count stays on disk at the threshold so the next check
 	// tries again rather than starting the count over.
 	ErrFallbackRefused = errors.New("the fallback could not be published")
+
+	// ErrTransitionCancelled reports that the caller went away between the watch and
+	// the transition, so the fallback's proof was cut short and nothing was decided.
+	// It is deliberately not ErrFallbackRefused: that one is a statement about a host
+	// that is not serving, and a cancellation is a statement about this invocation
+	// running out of road. Both leave the selector alone and the count at the
+	// threshold, so the next tick tries again either way.
+	ErrTransitionCancelled = errors.New("the check was cut short before the transition could be decided")
 )
 
 // AddressReport is one published address's own verdict from one check. It is per
@@ -436,7 +456,7 @@ func (c *Checker) Check(ctx context.Context) (result Result, err error) {
 	// would be reporting cut-short walks on any list longer than the limit.
 	watch, cancelWatch := context.WithTimeout(ctx, c.passTimeout(len(current.CloudFront)))
 	defer cancelWatch()
-	winner := c.proveSubject(watch, publishedAddress(current.WinnerIP, ""))
+	winner := c.proveSubject(watch, publishedAddress(current.WinnerIP, candidate.Provider(current.Provider), ""))
 	mappings := c.proveMappings(watch, current.CloudFront)
 	result = Result{
 		Winner:     winner,
@@ -485,12 +505,31 @@ func (c *Checker) Check(ctx context.Context) (result Result, err error) {
 	if winner.Verdict != VerdictFailed || updated.ConsecutiveFailures < c.options.FailureThreshold {
 		return result, nil
 	}
-	published, proofBytes, err := c.moveToFallback(ctx, fresh, moment, winner.Detail)
-	result.Bytes += proofBytes
+	published, proof, err := c.moveToFallback(ctx, fresh, winner.Detail)
+	result.Bytes += proof.bytes
 	if err != nil {
 		return result, err
 	}
 	result.Transition = &published
+	// The address that is in service now is the one that was just proved, so the
+	// health document is stamped for it rather than left describing the address that
+	// just left. A document saying "three failures, not healthy" would be a claim about
+	// an address no reader is being sent to, and its counter would have to be read as
+	// belonging to the address that replaced it.
+	follows := state.HealthState{
+		SchemaVersion: state.SchemaVersion,
+		Healthy:       true,
+		LastSuccess:   published.LastSuccess,
+	}
+	if err := state.WriteReplacementJSONAtomic(c.options.HealthPath, follows); err != nil {
+		// The transition is already published, so this is reported as what it is: the
+		// address moved and the document that follows it did not. The error says so
+		// rather than being folded into the transition's success, and the next check
+		// re-proves the new winner and writes the document anyway.
+		return result, fmt.Errorf("the winner is now %s, but the health document could not be written for it: %w",
+			published.WinnerIP, err)
+	}
+	result.Health = follows
 	return result, nil
 }
 
@@ -578,6 +617,14 @@ func applyVerdict(previous state.HealthState, verdict Verdict, moment time.Time,
 		updated.ConsecutiveFailures++
 		updated.Healthy = false
 		updated.LastFailure = moment
+	case VerdictUnknown:
+		// Nothing was learned, so nothing is claimed and nothing is counted. Check
+		// returns before it reaches this on a cancellation, so the case is defensive:
+		// it exists so that a future edit which lets an unknown verdict through cannot
+		// republish the previous document's healthy flag as a claim this check made.
+		// The earlier success timestamp is kept, because it is a fact about an earlier
+		// check rather than about this one.
+		updated.Healthy = false
 	}
 	return updated
 }
@@ -615,7 +662,8 @@ func describesPublishedAddress(document state.HealthState, publishedAt time.Time
 // field:
 //
 //   - winner_ip becomes the address that was just proved, and last_success is the
-//     instant of that proof, because a winner with no last_success is refused;
+//     instant that proof completed - read from the clock after the proof, not before
+//     it - because a winner with no last_success is refused;
 //   - winner_proof_until is that instant plus the optimizer's proof TTL, because a
 //     proof may not precede the success it was issued for;
 //   - fallback_ip becomes the address that failed. It differs from the new winner
@@ -632,24 +680,34 @@ func describesPublishedAddress(document state.HealthState, publishedAt time.Time
 // A refusal returns before the write, so the file is left exactly as it was found
 // and the caller is told which of the three reasons it was: no fallback to move to,
 // an address a rewrite target may not name, or a proof that did not pass.
-func (c *Checker) moveToFallback(ctx context.Context, current state.Selector, moment time.Time, detail string) (state.Selector, int64, error) {
+func (c *Checker) moveToFallback(ctx context.Context, current state.Selector, detail string) (state.Selector, transitionProof, error) {
 	if current.FallbackIP == "" {
-		return state.Selector{}, 0, fmt.Errorf("%w: %s is failing and %s names none",
+		return state.Selector{}, transitionProof{}, fmt.Errorf("%w: %s is failing and %s names none",
 			ErrNoFallback, current.WinnerIP, c.options.SelectorPath)
 	}
-	subject := publishedAddress(current.FallbackIP, "")
+	subject := publishedAddress(current.FallbackIP, candidate.Provider(current.Provider), "")
 	if err := subject.Validate(); err != nil {
-		return state.Selector{}, 0, fmt.Errorf("%w: the fallback %s is not an address a rewrite target may name: %v",
+		return state.Selector{}, transitionProof{}, fmt.Errorf("%w: the fallback %s is not an address a rewrite target may name: %v",
 			ErrFallbackRefused, current.FallbackIP, err)
 	}
 	proof, cancelProof := context.WithTimeout(ctx, c.options.ProofTimeout)
 	defer cancelProof()
 	report := c.proveSubject(proof, subject)
+	proved := transitionProof{bytes: report.Bytes}
 	if report.Verdict != VerdictHealthy {
-		return state.Selector{}, report.Bytes, fmt.Errorf("%w: the fallback %s is not serving: %s",
+		if report.Verdict == VerdictUnknown {
+			return state.Selector{}, proved, fmt.Errorf("%w: the fallback %s was not proved or refused: %s",
+				ErrTransitionCancelled, current.FallbackIP, report.Detail)
+		}
+		return state.Selector{}, proved, fmt.Errorf("%w: the fallback %s is not serving: %s",
 			ErrFallbackRefused, current.FallbackIP, report.Detail)
 	}
 
+	// The clock is read here rather than where the check read it for the health
+	// document, because the proof has just spent seconds under the lock and the proof
+	// window is about the proof. A window that started before it is that much shorter
+	// than the published one claims.
+	moment := c.now()
 	published := current
 	published.SchemaVersion = state.SchemaVersion
 	published.Generation = current.Generation + 1
@@ -661,9 +719,18 @@ func (c *Checker) moveToFallback(ctx context.Context, current state.Selector, mo
 		published.LastFailure = detail
 	}
 	if err := state.WriteJSONAtomic(c.options.SelectorPath, published); err != nil {
-		return state.Selector{}, report.Bytes, err
+		return state.Selector{}, proved, err
 	}
-	return published, report.Bytes, nil
+	proved.at = moment
+	return published, proved, nil
+}
+
+// transitionProof is what a transition's own proof cost and when it completed. The
+// instant is carried rather than read again so the health document that follows the
+// transition and the selector it published cannot disagree about it.
+type transitionProof struct {
+	bytes int64
+	at    time.Time
 }
 
 // proveMappings proves every published per-hostname mapping, in hostname order so the
@@ -689,7 +756,7 @@ func (c *Checker) proveMappings(ctx context.Context, mappings map[string]string)
 	reports := make([]AddressReport, len(hostnames))
 	parallelFor(ctx, len(hostnames), c.options.ProofConcurrency, func(index int) {
 		hostname := hostnames[index]
-		reports[index] = c.proveSubject(ctx, publishedAddress(mappings[hostname], hostname))
+		reports[index] = c.proveSubject(ctx, publishedAddress(mappings[hostname], candidate.ProviderCloudFront, hostname))
 	})
 	return reports
 }
@@ -928,13 +995,17 @@ func healthProfile(profile candidate.ProbeProfile) candidate.ProbeProfile {
 
 // publishedAddress is a candidate built from an address the selector is already
 // publishing. The source is the retained one, because that is what the optimizer
-// labels an address the selector is already using with, and the group is decided
-// by whether the address is published for a hostname.
-func publishedAddress(address, hostname string) candidate.Candidate {
-	provider := candidate.ProviderCloudflare
-	if hostname != "" {
-		provider = candidate.ProviderCloudFront
-	}
+// labels an address the selector is already using with, and a per-hostname mapping is
+// a CloudFront address whatever the document's provider field says, because the
+// mapping's own hostname is what it is published for.
+//
+// A hostname-less address takes the provider the selector names. Assuming Cloudflare
+// there would be a small lie today - the two selectors this project publishes agree -
+// and a dangerous one the day they do not: a document that says its global address
+// belongs to another provider would be proved as a subject the document never
+// published. The candidate package then refuses the combination, which is the answer a
+// check should give rather than a proof of the wrong thing.
+func publishedAddress(address string, provider candidate.Provider, hostname string) candidate.Candidate {
 	return candidate.Candidate{
 		Provider: provider,
 		IP:       parseAddress(address),

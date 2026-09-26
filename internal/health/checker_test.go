@@ -225,8 +225,14 @@ type world struct {
 	lockPath     string
 	prober       *fakeProber
 	moment       time.Time
-	options      health.Options
-	checker      *health.Checker
+	// step is how far the clock moves on each reading, and readings counts them. A
+	// zero step is a fixed clock, which is what a case whose subject is a single
+	// document's contents wants; a case whose subject is *which* reading a timestamp
+	// came from needs a clock that moves.
+	step     time.Duration
+	readings int
+	options  health.Options
+	checker  *health.Checker
 }
 
 func newWorld(t *testing.T, selector state.Selector, profiles optimizer.Profiles, threshold int) *world {
@@ -247,9 +253,15 @@ func newWorld(t *testing.T, selector state.Selector, profiles optimizer.Profiles
 		SelectorPath:     w.selectorPath,
 		ControlLockPath:  w.lockPath,
 		FailureThreshold: threshold,
-		Now:              func() time.Time { return w.moment },
-		WaveTimeout:      time.Second,
-		ProofTimeout:     time.Second,
+		Now: func() time.Time {
+			if w.step == 0 {
+				return w.moment
+			}
+			w.readings++
+			return w.moment.Add(time.Duration(w.readings) * w.step)
+		},
+		WaveTimeout:  time.Second,
+		ProofTimeout: time.Second,
 	}
 	w.rebuild()
 	w.writeSelector(selector)
@@ -439,11 +451,17 @@ func TestTheThirdConsecutiveFailureMovesTheSelectorToItsFallback(t *testing.T) {
 
 	w.moment = baseMoment.Add(4 * time.Minute)
 	third := w.check()
-	if third.Health.ConsecutiveFailures != 3 {
-		t.Errorf("consecutive failures at the transition = %d, want 3", third.Health.ConsecutiveFailures)
-	}
 	if third.Transition == nil {
 		t.Fatalf("the third failure published no transition, detail: %s", third.Winner.Detail)
+	}
+	// The three failures were counted against the address that just left service, and
+	// the document this check leaves describes the one that replaced it.
+	documented := state.HealthState{}
+	if err := state.ReadJSON(w.healthPath, &documented); err != nil {
+		t.Fatalf("read the health document: %v", err)
+	}
+	if !documented.Healthy || documented.ConsecutiveFailures != 0 {
+		t.Errorf("the document after a transition = %+v, want a healthy count of 0 for the address in service", documented)
 	}
 
 	published := w.readSelector()
@@ -1014,11 +1032,22 @@ func TestAManualWinnerStillFallsBack(t *testing.T) {
 // own verdict is then added to that, which is why the count is one past the
 // threshold rather than at it: the lost history and this failure are two facts.
 func TestACorruptHealthDocumentFailsClosedToTheThreshold(t *testing.T) {
-	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	// The selector names no fallback, so the threshold the corrupt document reached
+	// cannot be acted on and the count it reached is the one left on disk - which is
+	// where the arithmetic is visible. A corrupt document that does lead to the
+	// fallback is the same path with somewhere to move to, and the document it leaves
+	// describes the address that replaced the failed one.
+	selector := publishedSelector()
+	selector.FallbackIP = ""
+	w := newWorld(t, selector, profilesFor(), 3)
 	w.writeRaw(w.healthPath, `{"schema_version": 1, "healthy": true, "consecutive_failures": 0,`)
+	before := w.readSelectorBytes()
 	w.prober.answer = refusingWinner(12)
 
-	result := w.check()
+	result, err := w.checker.Check(context.Background())
+	if !errors.Is(err, health.ErrNoFallback) {
+		t.Fatalf("the check's error = %v, want %v", err, health.ErrNoFallback)
+	}
 	if result.FailedClosed == "" {
 		t.Error("a corrupt health document was not reported as such")
 	}
@@ -1028,11 +1057,8 @@ func TestACorruptHealthDocumentFailsClosedToTheThreshold(t *testing.T) {
 	if result.Health.ConsecutiveFailures != 4 {
 		t.Errorf("consecutive failures = %d, want 4: the threshold from the lost history plus this failure", result.Health.ConsecutiveFailures)
 	}
-	if result.Transition == nil {
-		t.Fatalf("a corrupt document did not lead to the fallback, detail: %s", result.Winner.Detail)
-	}
-	if published := w.readSelector(); published.WinnerIP != fallbackIP {
-		t.Errorf("winner = %s, want the fallback %s", published.WinnerIP, fallbackIP)
+	if after := w.readSelectorBytes(); after != before {
+		t.Error("a corrupt document changed a selector that named no fallback")
 	}
 }
 
@@ -1518,8 +1544,12 @@ func TestTheFailureThresholdIsThePolicys(t *testing.T) {
 		if published := w.readSelector(); published.WinnerIP != fallbackIP {
 			t.Errorf("a threshold of %d published %s, want the fallback", threshold, published.WinnerIP)
 		}
-		if result.Health.ConsecutiveFailures != threshold {
-			t.Errorf("a threshold of %d counted %d failures", threshold, result.Health.ConsecutiveFailures)
+		// The count on disk after a transition belongs to the address that replaced
+		// the failed one, so what pins the threshold is that the transition happened on
+		// the threshold's own failure and not one before it: the document started at
+		// threshold-1 and this check added one.
+		if published := w.readSelector(); published.Generation != 5 {
+			t.Errorf("a threshold of %d published generation %d, want 5", threshold, published.Generation)
 		}
 	}
 }
@@ -1753,5 +1783,174 @@ func TestTheTransitionIsRefusedWhenItsProofRunsOutOfTime(t *testing.T) {
 	}
 	if result.Health.ConsecutiveFailures != 3 {
 		t.Errorf("consecutive failures = %d, want 3: the count has to survive for the next tick", result.Health.ConsecutiveFailures)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// which instant a check stamps
+// ---------------------------------------------------------------------------
+
+// The winner's proof window starts when the fallback was proved, not when the check
+// began: the proof can take seconds under the lock, and a window that started before
+// it is that much shorter than the published one says. The clock here moves a second
+// per reading, so the two instants are two different literals.
+func TestTheProofWindowStartsWhenTheFallbackWasProved(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.step = time.Second
+	w.prober.answer = refusingWinner(12)
+	w.writeHealth(state.HealthState{
+		SchemaVersion:       state.SchemaVersion,
+		ConsecutiveFailures: 2,
+		LastFailure:         baseMoment.Add(-2 * time.Minute),
+	})
+
+	result := w.check()
+	if result.Transition == nil {
+		t.Fatalf("no transition was published, detail: %s", result.Winner.Detail)
+	}
+	published := w.readSelector()
+	// First reading: the health document's verdict of the address that failed.
+	if !published.LastSuccess.Equal(baseMoment.Add(2 * time.Second)) {
+		t.Errorf("last success = %s, want the second reading %s", published.LastSuccess, baseMoment.Add(2*time.Second))
+	}
+	if !published.WinnerProofUntil.Equal(baseMoment.Add(2 * time.Second).Add(5 * time.Minute)) {
+		t.Errorf("winner proof until = %s, want %s", published.WinnerProofUntil,
+			baseMoment.Add(2*time.Second).Add(5*time.Minute))
+	}
+	// The document that follows the transition carries that same instant, so the two
+	// cannot drift apart.
+	if !result.Health.LastSuccess.Equal(published.LastSuccess) {
+		t.Errorf("the health document's success = %s, want the selector's own %s", result.Health.LastSuccess, published.LastSuccess)
+	}
+}
+
+// A transition leaves a new address in service, and that address was proved on the way
+// in, so the health document describes it rather than the address that just left. A
+// document left saying "three failures, not healthy" would be a claim about an address
+// that is no longer published, and the counter it holds would have to be read as
+// belonging to the address that replaced it.
+func TestTheHealthDocumentFollowsTheAddressInServiceAfterATransition(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.prober.answer = refusingWinner(12)
+	w.writeHealth(state.HealthState{
+		SchemaVersion:       state.SchemaVersion,
+		ConsecutiveFailures: 2,
+		LastFailure:         baseMoment.Add(-2 * time.Minute),
+	})
+
+	result := w.check()
+	if result.Transition == nil {
+		t.Fatalf("no transition was published, detail: %s", result.Winner.Detail)
+	}
+	documented := state.HealthState{}
+	if err := state.ReadJSON(w.healthPath, &documented); err != nil {
+		t.Fatalf("read the health document: %v", err)
+	}
+	proofed := w.readSelector().LastSuccess
+	if !documented.Healthy {
+		t.Error("the document describes the address that just left service")
+	}
+	if documented.ConsecutiveFailures != 0 {
+		t.Errorf("consecutive failures = %d, want 0: the address in service was proved on the way in", documented.ConsecutiveFailures)
+	}
+	if !documented.LastSuccess.Equal(proofed) {
+		t.Errorf("last success = %s, want the instant the new winner was proved, %s", documented.LastSuccess, proofed)
+	}
+	if result.Health.Healthy != documented.Healthy {
+		t.Errorf("the reported document = %+v, want what is on disk %+v", result.Health, documented)
+	}
+}
+
+// A caller that goes away between the watch and the transition is not a host that
+// refused, and the two must not be reported as one: the first is this invocation
+// giving up, the second is the fallback not serving, and only the second says anything
+// about the address the router would have moved to.
+func TestACancellationBeforeTheTransitionIsNotAHostRefusal(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.writeHealth(state.HealthState{
+		SchemaVersion:       state.SchemaVersion,
+		ConsecutiveFailures: 2,
+		LastFailure:         baseMoment.Add(-2 * time.Minute),
+	})
+	before := w.readSelectorBytes()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.prober.answer = func(call probeCall) (measure.HTTPMetrics, error) {
+		if call.address == fallbackIP {
+			cancel()
+			return measure.HTTPMetrics{}, context.Canceled
+		}
+		return measure.HTTPMetrics{BodyBytes: 12}, notServing
+	}
+
+	result, err := w.checker.Check(ctx)
+	if !errors.Is(err, health.ErrTransitionCancelled) {
+		t.Fatalf("the check's error = %v, want %v", err, health.ErrTransitionCancelled)
+	}
+	if errors.Is(err, health.ErrFallbackRefused) {
+		t.Errorf("a cancellation was reported as a host refusal: %v", err)
+	}
+	if result.Transition != nil {
+		t.Errorf("a cancelled transition published one: %+v", *result.Transition)
+	}
+	if after := w.readSelectorBytes(); after != before {
+		t.Errorf("a cancelled transition changed the selector:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	// The count is still recorded: the winner did fail, and the next tick has to start
+	// from where this one left it.
+	if result.Health.ConsecutiveFailures != 3 {
+		t.Errorf("consecutive failures = %d, want 3", result.Health.ConsecutiveFailures)
+	}
+}
+
+// The global winner is proved as the provider the selector names, not as a Cloudflare
+// address the checker assumed. A selector that says cloudfront while naming a
+// hostname-less winner is describing an arrangement the candidate package refuses, and
+// the check says so instead of proving a subject nobody published.
+func TestTheWinnerIsRefusedWhenTheSelectorNamesAnotherProvider(t *testing.T) {
+	selector := publishedSelector()
+	selector.Provider = "cloudfront"
+	w := newWorld(t, selector, profilesFor(), 3)
+
+	result := w.check()
+	if result.Winner.Verdict != health.VerdictFailed {
+		t.Fatalf("a mismatched provider = %v, want %v", result.Winner.Verdict, health.VerdictFailed)
+	}
+	// The mapping is a subject of its own and is still proved; the winner is not.
+	want := []string{"104.16.2.10 " + cloudFrontHostname + " HEAD"}
+	if got := w.prober.asked(); !slices.Equal(got, want) {
+		t.Errorf("proofs asked for:\n got %v\nwant %v", got, want)
+	}
+	if result.Winner.Detail == "" {
+		t.Error("a mismatched provider gave no reason")
+	}
+	if result.Health.ConsecutiveFailures != 1 {
+		t.Errorf("consecutive failures = %d, want 1", result.Health.ConsecutiveFailures)
+	}
+}
+
+// The brief's strict-ECH sentence, from this side of the boundary: a failed verdict
+// leaves the document saying the winner is not healthy, and that is the field the
+// response rewriter will read. Nothing here decides whether a strict domain stays
+// blocked - that is the rewriter's branch - but a document that reported a failing
+// address as healthy would be the half of that decision this package is responsible
+// for getting wrong.
+func TestAFailedVerdictNeverReadsAsHealthyForAStrictDomain(t *testing.T) {
+	w := newWorld(t, publishedSelector(), profilesFor(), 3)
+	w.prober.answer = refusingWinner(12)
+
+	w.check()
+	documented := state.HealthState{}
+	if err := state.ReadJSON(w.healthPath, &documented); err != nil {
+		t.Fatalf("read the health document: %v", err)
+	}
+	if documented.Healthy {
+		t.Error("the document reports a failing winner as healthy")
+	}
+	if documented.ConsecutiveFailures != 1 {
+		t.Errorf("consecutive failures = %d, want 1", documented.ConsecutiveFailures)
+	}
+	if documented.LastSuccess.After(baseMoment) {
+		t.Errorf("a check that never proved the winner stamped a success at %s", documented.LastSuccess)
 	}
 }

@@ -461,17 +461,23 @@ type cdnWorld struct {
 	cloudFrontRules []candidate.CloudFrontProfile
 }
 
-// buildCDNWorld reads the policy, the profiles and the identity domains, and
-// builds the runner they configure.
+// loadCDNConfig reads the policy, the identity profiles, the forced-ECH domains and
+// the prober a command works through, and builds nothing that measures.
 //
-// The digest is taken from the document's own bytes and the policy is loaded from
-// the same path. That is two reads of one file, and a policy edited between them
-// would pair a digest with a parse of different content - which can only refuse
-// the next apply, never let one through: an apply compares the report's digest
-// against the digest of the file as it is then, so a stale pairing is a report
-// that will not apply. The alternative, a loader this project would have to
-// maintain beside the config package's own, is worse.
-func buildCDNWorld(options cdnOptions, services services) (cdnWorld, error) {
+// This is buildCDNWorld without the runner, and it is its own function because one
+// command does not want a runner: `health-check` proves the addresses a selector has
+// published and never runs a measurement, and handing it a runner it would not use is
+// a configuration of the prober and the budget paths that has nothing to do with the
+// check it is about to make.
+//
+// The digest is taken from the document's own bytes and the policy is loaded from the
+// same path. That is two reads of one file, and a policy edited between them would
+// pair a digest with a parse of different content - which can only refuse the next
+// apply, never let one through: an apply compares the report's digest against the
+// digest of the file as it is then, so a stale pairing is a report that will not
+// apply. The alternative, a loader this project would have to maintain beside the
+// config package's own, is worse.
+func loadCDNConfig(options cdnOptions, services services) (cdnWorld, error) {
 	world := cdnWorld{}
 	document, err := os.ReadFile(options.policy)
 	if err != nil {
@@ -498,6 +504,15 @@ func buildCDNWorld(options cdnOptions, services services) (cdnWorld, error) {
 	}
 	world.profiles = optimizer.Profiles{Global: profiles, ByHostname: profilesByHostname(world.cloudFrontRules)}
 	world.prober = services.newProber()
+	return world, nil
+}
+
+// buildCDNWorld is loadCDNConfig plus the runner the four measuring commands need.
+func buildCDNWorld(options cdnOptions, services services) (cdnWorld, error) {
+	world, err := loadCDNConfig(options, services)
+	if err != nil {
+		return world, err
+	}
 	if world.runner, err = optimizer.NewRunner(world.policy, world.prober, optimizer.Options{
 		BudgetPath:      options.budget,
 		SelectorPath:    options.selector,
@@ -1057,7 +1072,10 @@ func runCDNHealthCheck(ctx context.Context, args []string, stdout, stderr io.Wri
 		writeCLIError(stderr, "health-check: --apply publishes a measurement; a health check transitions on its own")
 		return exitInvalidCLI
 	}
-	world, err := buildCDNWorld(options, services)
+	// The configuration and the prober, and no runner: a health check measures one
+	// address against the identity profiles, and a runner it never calls would only be
+	// a second thing to configure.
+	world, err := loadCDNConfig(options, services)
 	if err != nil {
 		writeCLIError(stderr, "health-check: %v", err)
 		return exitInvalidCLI
@@ -1079,10 +1097,7 @@ func runCDNHealthCheck(ctx context.Context, args []string, stdout, stderr io.Wri
 	// reader who only ever sees the error line learns nothing about which address
 	// was checked, what the failure was, or how much uncharged traffic the check
 	// spent reaching that verdict.
-	if writeErr := writeHealthReport(stdout, result); writeErr != nil {
-		writeCLIError(stderr, "health-check: write report: %v", writeErr)
-		return exitStateUnavailable
-	}
+	writeHealthReport(stdout, result)
 	if err != nil {
 		writeCLIError(stderr, "health-check: %v", err)
 		return cdnExitCode(err)
@@ -1112,7 +1127,7 @@ func runCDNHealthCheck(ctx context.Context, args []string, stdout, stderr io.Wri
 //   - transition, and only ever for a selector this check actually wrote. The check
 //     clears the field on every error path, so a refused transition cannot be
 //     reported as a publication.
-func writeHealthReport(output io.Writer, result health.Result) error {
+func writeHealthReport(output io.Writer, result health.Result) {
 	if result.Winner.Address == "" {
 		writeReportLine(output, "winner: none %s\n", result.Winner.Verdict)
 	} else {
@@ -1138,5 +1153,4 @@ func writeHealthReport(output io.Writer, result health.Result) error {
 	if result.Transition != nil {
 		writeReportLine(output, "transition: %s at generation %d\n", result.Transition.WinnerIP, result.Transition.Generation)
 	}
-	return nil
 }
