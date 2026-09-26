@@ -2,40 +2,22 @@ package candidate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/netip"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
-	"sync"
 
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	// DefaultCloudFrontBaseURL is the AWS published ranges document this release
-	// reads. It is a parameter of every source so a test can point one at a local
-	// server; an empty value means this endpoint.
-	DefaultCloudFrontBaseURL = "https://ip-ranges.amazonaws.com/ip-ranges.json"
-
-	// DefaultCloudFrontCachePath is where the production router keeps the
-	// reference document it read. It is a parameter too, so a test never writes
-	// here.
-	DefaultCloudFrontCachePath = "/var/lib/mosdns/lists/aws-ip-ranges.json"
-
 	// profileSchemaVersion is the shape of a profile document. A document of
 	// another version is refused rather than interpreted.
 	profileSchemaVersion = 1
-
-	// cloudFrontService is the service name the published document gives the
-	// ranges that are this project's reference data.
-	cloudFrontService = "CLOUDFRONT"
 
 	// httpsPort is the port a profile URL resolves to when it names none.
 	httpsPort = 443
@@ -77,6 +59,15 @@ type CloudFrontProfile struct {
 // CloudFrontSource is the CloudFront side of candidate collection. It takes no
 // limit and no date: a CloudFront group is whatever the operator wrote down, one
 // profile per hostname.
+//
+// This release ships no implementation of it, and that is the honest shape of the
+// thing rather than a gap: a per-hostname address comes from a profile, so the AWS
+// published ranges document has no consumer here - a CloudFront address means
+// nothing behind a hostname no profile names. The CLI reaches CloudFront through
+// `ParseCloudFrontProfiles` on the operator's own YAML, and the runner through the
+// `Input.CloudFrontRules` those profiles come from. An earlier build of this file
+// also fetched the AWS document and kept it as reference data; it was removed
+// rather than left as a delivered component nothing reads.
 type CloudFrontSource interface {
 	Profiles(context.Context) ([]CloudFrontProfile, error)
 }
@@ -332,153 +323,4 @@ func isLowerHex(value string, length int) bool {
 		return false
 	}
 	return true
-}
-
-// HTTPCloudFrontSource carries the operator's profiles and keeps the published
-// AWS ranges beside them as reference data.
-//
-// The AWS ranges are fetched, parsed and validated on every call, so a document
-// that has stopped being usable is reported rather than assumed, and they are
-// exposed as prefixes for an operator or a report to read. They are never
-// expanded into candidates in this release: a CloudFront address only means
-// anything behind the hostname of the profile that named it, and this package has
-// no profile for the thousands of addresses AWS announces. The candidates a
-// profile measures are the ones the profile named itself.
-type HTTPCloudFrontSource struct {
-	client    *http.Client
-	baseURL   string
-	cachePath string
-	profiles  []CloudFrontProfile
-
-	mutex     sync.Mutex
-	reference []netip.Prefix
-}
-
-var _ CloudFrontSource = (*HTTPCloudFrontSource)(nil)
-
-// NewCloudFrontSource returns a source for the given profiles. An empty base URL
-// means DefaultCloudFrontBaseURL and an empty cache path means
-// DefaultCloudFrontCachePath; the client is required, so a caller cannot
-// accidentally reach the network with a default transport it did not choose. Every
-// profile is held to the same verdict a parsed one is, so a profile built by hand
-// cannot carry an address or a hostname a parsed one would have been refused for.
-func NewCloudFrontSource(client *http.Client, baseURL, cachePath string, profiles []CloudFrontProfile) (*HTTPCloudFrontSource, error) {
-	if client == nil {
-		return nil, errors.New("an HTTP client is required to read the published AWS IP ranges")
-	}
-	if baseURL == "" {
-		baseURL = DefaultCloudFrontBaseURL
-	}
-	if cachePath == "" {
-		cachePath = DefaultCloudFrontCachePath
-	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, fmt.Errorf("cloudfront source %q: %w", baseURL, err)
-	}
-	if parsed.Scheme != "https" || parsed.Host == "" {
-		return nil, fmt.Errorf("cloudfront source %q must be an https URL", baseURL)
-	}
-	for index, profile := range profiles {
-		if err := profile.Validate(); err != nil {
-			return nil, fmt.Errorf("profiles[%d]: %w", index, err)
-		}
-	}
-	return &HTTPCloudFrontSource{client: client, baseURL: baseURL, cachePath: cachePath, profiles: profiles}, nil
-}
-
-// Profiles returns the profiles this source carries, after reading and validating
-// the published ranges it holds as reference data. It is safe to call from more
-// than one goroutine.
-func (s *HTTPCloudFrontSource) Profiles(ctx context.Context) ([]CloudFrontProfile, error) {
-	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath, validatorOptional)
-	if err != nil {
-		return nil, err
-	}
-	prefixes, err := parseReferenceRanges(s.baseURL, fetched.Body)
-	if err != nil {
-		return nil, err
-	}
-	// The document is only stored once it has been accepted, so the cache never
-	// holds a body this run refused.
-	if err := storeDocument(s.cachePath, fetched); err != nil {
-		return nil, err
-	}
-	s.mutex.Lock()
-	s.reference = prefixes
-	s.mutex.Unlock()
-	profiles := make([]CloudFrontProfile, 0, len(s.profiles))
-	for _, profile := range s.profiles {
-		clone := CloudFrontProfile{Profile: profile.Profile}
-		clone.Profile.ExpectedStatus = slices.Clone(profile.Profile.ExpectedStatus)
-		clone.Profile.RequiredHeader = maps.Clone(profile.Profile.RequiredHeader)
-		clone.Candidates = slices.Clone(profile.Candidates)
-		profiles = append(profiles, clone)
-	}
-	return profiles, nil
-}
-
-// ReferencePrefixes returns the CloudFront ranges of the last published document
-// this source read successfully, in order. They are reference data: nothing in
-// this release turns one of them into a candidate.
-func (s *HTTPCloudFrontSource) ReferencePrefixes() []netip.Prefix {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return slices.Clone(s.reference)
-}
-
-// referenceDocument is the shape AWS publishes. Only the fields this package
-// reads are declared, and a document with more is read the same way the list
-// updater reads GitHub's: the fields it does not know about are not this build's
-// business, and every field it does read is held to the same verdict.
-type referenceDocument struct {
-	SyncToken  string `json:"syncToken"`
-	CreateDate string `json:"createDate"`
-	Prefixes   []struct {
-		IPPrefix string `json:"ip_prefix"`
-		Region   string `json:"region"`
-		Service  string `json:"service"`
-	} `json:"prefixes"`
-	IPv6Prefixes []struct {
-		IPv6Prefix string `json:"ipv6_prefix"`
-		Region     string `json:"region"`
-		Service    string `json:"service"`
-	} `json:"ipv6_prefixes"`
-}
-
-// parseReferenceRanges decodes and validates one published ranges document, and
-// returns the CloudFront IPv4 ranges it announces in order. The IPv6 list is
-// parsed and not used, for the same reason the Cloudflare document's is: this
-// release selects IPv4 only.
-func parseReferenceRanges(sourceURL string, body []byte) ([]netip.Prefix, error) {
-	document := referenceDocument{}
-	decoder := json.NewDecoder(newLimitedReader(body, maximumDocumentBytes*2))
-	if err := decoder.Decode(&document); err != nil {
-		return nil, fmt.Errorf("%s: decode document: %w", sourceURL, err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%s: the document carries trailing content", sourceURL)
-	}
-	for index, entry := range document.IPv6Prefixes {
-		prefix, err := netip.ParsePrefix(entry.IPv6Prefix)
-		if err != nil {
-			return nil, fmt.Errorf("%s: ipv6_prefixes[%d] %q is not a prefix: %w", sourceURL, index, entry.IPv6Prefix, err)
-		}
-		if !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
-			return nil, fmt.Errorf("%s: ipv6_prefixes[%d] %q is not an IPv6 prefix", sourceURL, index, entry.IPv6Prefix)
-		}
-	}
-	prefixes := make([]netip.Prefix, 0, len(document.Prefixes))
-	for index, entry := range document.Prefixes {
-		prefix, err := parseIPv4Prefix(entry.IPPrefix)
-		if err != nil {
-			return nil, fmt.Errorf("%s: prefixes[%d] (%s): %w", sourceURL, index, entry.Service, err)
-		}
-		if entry.Service == cloudFrontService {
-			prefixes = append(prefixes, prefix)
-		}
-	}
-	slices.SortFunc(prefixes, func(first, second netip.Prefix) int { return first.Addr().Compare(second.Addr()) })
-	return prefixes, nil
 }

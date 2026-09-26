@@ -6,7 +6,7 @@
 
 **Architecture:** Candidate sources produce normalized candidates without trusting third-party “best IP” feeds. A prober validates TCP, certificate/SNI/Host, and response identity; a budgeted runner selects the top ten by latency, measures at most 10 MiB or 3 seconds each, computes a documented score, and atomically updates `state.Selector` under the control lock.
 
-**Tech Stack:** Go 1.25, standard `net/http`, `crypto/tls`, `miekg/dns`, Cloudflare IP API, AWS IP ranges JSON, local TCP/TLS/HTTP mocks, atomic JSON state.
+**Tech Stack:** Go 1.25, standard `net/http`, `crypto/tls`, `miekg/dns`, Cloudflare IP API, local TCP/TLS/HTTP mocks, atomic JSON state.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`
 
@@ -115,6 +115,9 @@ type CloudFrontProfile struct {
 }
 
 type CloudFrontSource interface { Profiles(context.Context) ([]CloudFrontProfile, error) }
+// CloudFrontSource has no implementation in this release: the AWS document is not
+// fetched (Task 1 Step 6), so the interface is the seam a CloudFront source would
+// satisfy and the CLI reaches CloudFront through ParseCloudFrontProfiles.
 type CloudflareSource interface { Candidates(context.Context, int, time.Time) (CandidateSet, error) }
 // CandidateSet carries the stale marker the serve-stale decision needs, so a report
 // can say the set came from an older document instead of presenting it as current.
@@ -265,7 +268,7 @@ Cloudflare source URL:
 https://api.cloudflare.com/client/v4/ips
 ```
 
-Cache raw JSON plus ETag under `/var/lib/mosdns/lists/cloudflare-ips.json`. AWS CloudFront ranges are used only as reference data; they are not expanded into global candidates in this release.
+Cache raw JSON plus ETag under `/var/lib/mosdns/lists/cloudflare-ips.json`. **This release does not fetch the AWS published ranges document at all** — it is not read, not cached, and not exposed. A per-hostname CloudFront address comes from a CloudFront profile, so the range list has no consumer: a CloudFront address means nothing behind a hostname no profile names, and the thousands of addresses AWS announces have no profile to be proved against. An earlier build of this task fetched the document, validated it and exposed it through `ReferencePrefixes`; nothing read it, so it was deleted rather than delivered as a component described as active reference data. `CloudFrontSource` is kept as the interface a CloudFront source would satisfy; the CLI reaches CloudFront through `ParseCloudFrontProfiles` on the operator's YAML.
 
 - [ ] **Step 7: Run tests**
 

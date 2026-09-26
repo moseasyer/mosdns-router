@@ -50,19 +50,21 @@ type fetchedDocument struct {
 	Stale     bool
 }
 
-// validatorPolicy is what a source expects of the origin it reads.
+// validatorPolicy is what a source expects of the origin it reads. There is one
+// expectation left in this release: a document with no validator is refused before
+// the body is read or stored. An API that documents a validator and sends none is
+// not an API this build knows how to revalidate, and a stored copy of such a
+// response could never be used again.
+//
+// It is a type rather than a boolean because a second source with a second
+// expectation is a decision, not an accident, and until one exists the only
+// honest shape is one value.
 type validatorPolicy uint8
 
 const (
-	// validatorOptional accepts whatever the origin offers. A document with no
-	// validator is still read, because the source that asks for this has other
-	// work to do with the bytes.
-	validatorOptional validatorPolicy = iota
 	// validatorRequired refuses a response with no ETag before the body is read
-	// or stored: an API that documents a validator and sends none is not the API
-	// this build knows how to revalidate, and a stored copy of such a response
-	// could never be used again.
-	validatorRequired
+	// or stored.
+	validatorRequired validatorPolicy = iota
 )
 
 // fetchDocument returns the body of an official source document, revalidating
