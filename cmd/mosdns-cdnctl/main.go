@@ -16,6 +16,7 @@ import (
 
 	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/config"
+	"mosdns-router/internal/health"
 	"mosdns-router/internal/measure"
 	"mosdns-router/internal/optimizer"
 	"mosdns-router/internal/prober"
@@ -78,6 +79,8 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 		return runCDNPin(ctx, args[1:], stdout, stderr, services)
 	case "unpin":
 		return runCDNUnpin(args[1:], stdout, stderr, services)
+	case "health-check":
+		return runCDNHealthCheck(ctx, args[1:], stdout, stderr, services)
 	default:
 		writeCLIError(stderr, "unknown command %q", args[0])
 		return exitInvalidCLI
@@ -258,6 +261,7 @@ const (
 	defaultRepresentativeDomain   = "speed.cloudflare.com"
 	defaultSelectorPath           = optimizer.DefaultSelectorPath
 	defaultBandwidthBudgetPath    = optimizer.DefaultBudgetPath
+	defaultHealthPath             = health.DefaultHealthPath
 	defaultCloudflareRangesURL    = candidate.DefaultCloudflareBaseURL
 	defaultCloudflareRangesCache  = "/var/lib/mosdns/lists/cloudflare-ips.json"
 )
@@ -283,6 +287,7 @@ type cdnOptions struct {
 	policy         string
 	selector       string
 	budget         string
+	health         string
 	controlLock    string
 	profiles       string
 	identities     string
@@ -318,6 +323,7 @@ func parseCDNOptions(name string, args []string, positional int) (cdnOptions, er
 	flags.StringVar(&options.policy, "policy", defaultPolicyPath, "path to the policy document")
 	flags.StringVar(&options.selector, "selector", defaultSelectorPath, "path to the selector state")
 	flags.StringVar(&options.budget, "budget", defaultBandwidthBudgetPath, "path to the daily bandwidth budget")
+	flags.StringVar(&options.health, "health", defaultHealthPath, "path to the winner health document")
 	flags.StringVar(&options.controlLock, "control-lock", defaultControlLockPath, "path to the shared control lock")
 	flags.StringVar(&options.profiles, "profiles", defaultCloudFrontProfilesPath, "path to the CloudFront profile document")
 	flags.StringVar(&options.identities, "identity-domains", defaultIdentityDomainsPath, "path to the newline-separated hostnames a global address is proved against")
@@ -347,6 +353,7 @@ func parseCDNOptions(name string, args []string, positional int) (cdnOptions, er
 		{"--policy", options.policy},
 		{"--selector", options.selector},
 		{"--budget", options.budget},
+		{"--health", options.health},
 		{"--control-lock", options.controlLock},
 		{"--profiles", options.profiles},
 		{"--identity-domains", options.identities},
@@ -391,6 +398,7 @@ func refuseReportCollision(name string, options *cdnOptions) error {
 		{"policy", options.policy},
 		{"selector", options.selector},
 		{"budget", options.budget},
+		{"health", options.health},
 		{"control-lock", options.controlLock},
 		{"profiles", options.profiles},
 		{"identity-domains", options.identities},
@@ -433,6 +441,13 @@ type cdnWorld struct {
 	policy config.Policy
 	digest string
 	runner *optimizer.Runner
+	// prober is the prober this world measures and proves with, kept beside the
+	// runner rather than built twice: the health check proves addresses over the
+	// same identity path a measurement run uses, and two probers would be two
+	// configurations of it. It is held as the optimizer's wider interface because
+	// that is what the services boundary produces; the health check takes the
+	// narrower one it needs out of the same value.
+	prober optimizer.Prober
 	// profiles keeps the two kinds of identity profile apart, because a proof is
 	// held to one or the other and never to both: the global profiles are the
 	// provider's representative domain and the forced-ECH domains, and each
@@ -482,7 +497,8 @@ func buildCDNWorld(options cdnOptions, services services) (cdnWorld, error) {
 		return world, err
 	}
 	world.profiles = optimizer.Profiles{Global: profiles, ByHostname: profilesByHostname(world.cloudFrontRules)}
-	if world.runner, err = optimizer.NewRunner(world.policy, services.newProber(), optimizer.Options{
+	world.prober = services.newProber()
+	if world.runner, err = optimizer.NewRunner(world.policy, world.prober, optimizer.Options{
 		BudgetPath:      options.budget,
 		SelectorPath:    options.selector,
 		ControlLockPath: options.controlLock,
@@ -1000,4 +1016,127 @@ func writePartialReport(options cdnOptions, report optimizer.Report, stdout, std
 		writeCLIError(stderr, "test: %v", err)
 	}
 	_ = writeCDNReport(stdout, report, nil)
+}
+
+// ---------------------------------------------------------------------------
+// health-check
+// ---------------------------------------------------------------------------
+
+// runCDNHealthCheck proves the addresses the selector has published and moves the
+// resolver to the fallback when the published winner has failed at the policy's
+// threshold. It is the two-minute timer's command and the only one whose job is to
+// take an address out of service.
+//
+// It reads the same policy, selector, identity profiles and forced-ECH domains the
+// other CDN commands read, and it charges no bandwidth: a check that decides whether
+// the address in service may stay there must not be able to spend the day, and the
+// uncharged body bytes it does read are reported on stdout because nothing on disk
+// accounts for them.
+//
+// The exit code is the outcome an operator can act on. Zero is a check that did what
+// it was asked, whether or not it found a problem - a failing winner below the
+// threshold is a fact, not a failure. A refused transition is exitStateUnavailable,
+// because the address in service is failing and this command could not move it. A
+// control lock held by an apply or a pin is exitLockHeld, because the answer is
+// "somebody else is publishing right now", and the timer will ask again in two
+// minutes.
+func runCDNHealthCheck(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
+	options, err := parseCDNOptions("health-check", args, 0)
+	if err != nil {
+		writeCLIError(stderr, "health-check: %v", err)
+		return exitInvalidCLI
+	}
+	// --report and --apply belong to the commands that measure something. Accepting
+	// them here would produce a command that appears to have measured or applied and
+	// did neither, which is the one impression a report line must never give.
+	if options.report != "" {
+		writeCLIError(stderr, "health-check: --report is for test and apply, which measure something")
+		return exitInvalidCLI
+	}
+	if options.apply {
+		writeCLIError(stderr, "health-check: --apply publishes a measurement; a health check transitions on its own")
+		return exitInvalidCLI
+	}
+	world, err := buildCDNWorld(options, services)
+	if err != nil {
+		writeCLIError(stderr, "health-check: %v", err)
+		return exitInvalidCLI
+	}
+	checker, err := health.NewChecker(world.prober, health.Options{
+		Profiles:         world.profiles,
+		HealthPath:       options.health,
+		SelectorPath:     options.selector,
+		ControlLockPath:  options.controlLock,
+		FailureThreshold: world.policy.CDN.Health.FailureThreshold,
+		Now:              services.now,
+	})
+	if err != nil {
+		writeCLIError(stderr, "health-check: %v", err)
+		return exitInvalidCLI
+	}
+	result, err := checker.Check(ctx)
+	// The report is printed before the error, on the same grounds as `apply`: a
+	// reader who only ever sees the error line learns nothing about which address
+	// was checked, what the failure was, or how much uncharged traffic the check
+	// spent reaching that verdict.
+	if writeErr := writeHealthReport(stdout, result); writeErr != nil {
+		writeCLIError(stderr, "health-check: write report: %v", writeErr)
+		return exitStateUnavailable
+	}
+	if err != nil {
+		writeCLIError(stderr, "health-check: %v", err)
+		return cdnExitCode(err)
+	}
+	return exitSuccess
+}
+
+// writeHealthReport is what an operator or a timer reads after a check.
+//
+// Every line is a fact this check established, and a line that would not be is left
+// out rather than printed as a zero:
+//
+//   - the winner's address and verdict, with the refusal the proof gave. An address
+//     the selector does not publish is reported as "none" rather than as a verdict
+//     about nothing.
+//   - one line per published per-hostname mapping, with its own verdict, because the
+//     document below describes the winner and nothing else would say whether the
+//     CloudFront mappings are still serving.
+//   - the uncharged identity body bytes, always, including a check that proved
+//     nothing: they are spent either way and no budget accounts for them.
+//   - the health document, but only when this check wrote one. A counter it did not
+//     write is not a fact about the router, and a cancellation prints no counter at
+//     all.
+//   - failed-closed, when the previous document could not be read, because the count
+//     that follows starts at the policy's threshold and would otherwise look like a
+//     fourth consecutive failure of its own accord.
+//   - transition, and only ever for a selector this check actually wrote. The check
+//     clears the field on every error path, so a refused transition cannot be
+//     reported as a publication.
+func writeHealthReport(output io.Writer, result health.Result) error {
+	if result.Winner.Address == "" {
+		writeReportLine(output, "winner: none %s\n", result.Winner.Verdict)
+	} else {
+		writeReportLine(output, "winner: %s %s\n", result.Winner.Address, result.Winner.Verdict)
+	}
+	if result.Winner.Detail != "" {
+		writeReportLine(output, "detail: %s\n", result.Winner.Detail)
+	}
+	for _, mapping := range result.CloudFront {
+		writeReportLine(output, "cloudfront: %s %s %s\n", mapping.Hostname, mapping.Address, mapping.Verdict)
+		if mapping.Detail != "" {
+			writeReportLine(output, "  detail: %s\n", mapping.Detail)
+		}
+	}
+	writeReportLine(output, "identity-body-bytes: %d\n", result.Bytes)
+	if result.FailedClosed != "" {
+		writeReportLine(output, "failed-closed: %s\n", result.FailedClosed)
+	}
+	if result.WroteHealth() {
+		writeReportLine(output, "consecutive-failures: %d\n", result.Health.ConsecutiveFailures)
+		writeReportLine(output, "healthy: %t\n", result.Health.Healthy)
+	}
+	if result.Transition != nil {
+		writeReportLine(output, "transition: %s at generation %d\n", result.Transition.WinnerIP, result.Transition.Generation)
+	}
+	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"os"
@@ -327,6 +328,10 @@ type stubProber struct {
 	// the rest, which is the shape a real refusal has: a Cloudflare anycast address
 	// serves the provider's domains and cannot present a chain for a CloudFront one.
 	identityRefusedFor map[string]error
+	// identityRefusedForAddress refuses the identity proof for named addresses and
+	// answers the rest, which is the shape one dead address has: it stops serving its
+	// hostnames while the anycast address beside it keeps serving the same ones.
+	identityRefusedForAddress map[string]error
 	// finalProofRefused refuses the second and later identity proofs of the named
 	// addresses and answers the first, which is the shape of a host that served the
 	// run and then stopped serving: the run finds a winner and the apply's final
@@ -354,6 +359,9 @@ func (p *stubProber) HTTPS(_ context.Context, subject candidate.Candidate, profi
 	}
 	p.httpsByAddress[address]++
 	if refused, is := p.finalProofRefused[address]; is && p.httpsByAddress[address] > 1 {
+		return prober.HTTPMetrics{BodyBytes: 512}, refused
+	}
+	if refused, is := p.identityRefusedForAddress[address]; is {
 		return prober.HTTPMetrics{BodyBytes: 512}, refused
 	}
 	if refused, is := p.identityRefusedFor[profile.Hostname]; is {
@@ -419,6 +427,7 @@ type cdnFixture struct {
 	policyPath   string
 	selectorPath string
 	budgetPath   string
+	healthPath   string
 	lockPath     string
 	profilesPath string
 	identities   string
@@ -433,6 +442,7 @@ func newCDNFixture(t *testing.T, generation uint64, winner string) *cdnFixture {
 		policyPath:   filepath.Join(directory, "policy.yaml"),
 		selectorPath: filepath.Join(directory, "cdn-selector.json"),
 		budgetPath:   filepath.Join(directory, "bandwidth-budget.json"),
+		healthPath:   filepath.Join(directory, "health.json"),
 		lockPath:     filepath.Join(directory, "control.lock"),
 		profilesPath: filepath.Join(directory, "cloudfront-domains.yaml"),
 		identities:   filepath.Join(directory, "force-ech-domains.txt"),
@@ -474,6 +484,7 @@ func (f *cdnFixture) flags() []string {
 		"--profiles", f.profilesPath,
 		"--identity-domains", f.identities,
 		"--candidates", f.candidatesPath(),
+		"--health", f.healthPath,
 	}
 }
 
@@ -1404,5 +1415,253 @@ func TestTestCommandWithApplyReportsARefusalRatherThanAPublication(t *testing.T)
 	}
 	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
 		t.Errorf("the selector changed on a refused apply:\n%s", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// health-check
+// ---------------------------------------------------------------------------
+
+// A health check that finds the published winner serving writes the health
+// document and nothing else. The timer runs this every two minutes, so a check
+// that republished the selector on a healthy address would be rewriting every
+// user's DNS answers continuously and for no reason.
+func TestHealthCheckReportsAHealthyWinnerWithoutPublishing(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+		&stdout, &stderr, servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("health-check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "winner: 104.16.1.1 healthy") {
+		t.Errorf("the report does not say the winner is healthy:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "healthy: true") || !strings.Contains(stdout.String(), "consecutive-failures: 0") {
+		t.Errorf("the report does not show the health document it wrote:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "transition:") {
+		t.Errorf("a healthy check reported a transition:\n%s", stdout.String())
+	}
+	// The uncharged identity bytes are reported whether or not anything was
+	// published, because nothing on disk accounts for them.
+	if !strings.Contains(stdout.String(), "identity-body-bytes: 512") {
+		t.Errorf("the report does not account for the uncharged body bytes:\n%s", stdout.String())
+	}
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("a healthy check changed the selector:\nbefore:\n%s\nafter:\n%s", before, got)
+	}
+	documented := state.HealthState{}
+	if err := state.ReadJSON(fixture.healthPath, &documented); err != nil {
+		t.Fatalf("the health document was not written where --health names: %v", err)
+	}
+	if !documented.Healthy {
+		t.Errorf("the written document does not report a healthy winner: %+v", documented)
+	}
+}
+
+// The policy's threshold is three, and the third check is the one that moves the
+// resolver. The output names the address the command actually wrote, which is the
+// one the file now holds.
+func TestHealthCheckMovesTheSelectorToItsFallbackAfterThreeFailures(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	writeSelectorFixture(t, fixture.selectorPath, state.Selector{
+		SchemaVersion: state.SchemaVersion,
+		Generation:    4,
+		Mode:          "auto",
+		Provider:      "cloudflare",
+		WinnerIP:      "104.16.1.1",
+		FallbackIP:    "104.16.0.1",
+		LastSuccess:   fixedMoment.Add(-time.Hour),
+	})
+	// The winner has stopped serving and the address beside it still does, which is
+	// the incident the rollback exists for. The refusal is keyed by address, because
+	// the winner and the fallback are proved against the same hostname and only one
+	// of them has stopped answering.
+	stub := newStubProber()
+	stub.identityRefusedForAddress = map[string]error{
+		"104.16.1.1": errors.New("104.16.1.1 does not serve speed.cloudflare.com: connection refused"),
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		var stdout, stderr bytes.Buffer
+		if code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+			&stdout, &stderr, servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+			t.Fatalf("health-check %d exit = %d, want %d (stderr: %s)", attempt, code, exitSuccess, stderr.String())
+		}
+		if attempt < 3 {
+			if strings.Contains(stdout.String(), "transition:") {
+				t.Fatalf("health-check %d reported a transition below the threshold:\n%s", attempt, stdout.String())
+			}
+			want := fmt.Sprintf("consecutive-failures: %d", attempt)
+			if !strings.Contains(stdout.String(), want) {
+				t.Fatalf("health-check %d does not report %q:\n%s", attempt, want, stdout.String())
+			}
+		}
+	}
+
+	published := state.Selector{}
+	if err := state.ReadJSON(fixture.selectorPath, &published); err != nil {
+		t.Fatal(err)
+	}
+	if published.WinnerIP != "104.16.0.1" || published.FallbackIP != "104.16.1.1" {
+		t.Errorf("published selector = %+v, want the fallback in service", published)
+	}
+	if published.Generation != 5 {
+		t.Errorf("generation = %d, want 5", published.Generation)
+	}
+	if err := published.Validate(); err != nil {
+		t.Errorf("the published selector is not one the state package accepts: %v", err)
+	}
+}
+
+// A transition that was not written must not be reported. The winner has failed at
+// the threshold and the selector names no fallback, so the command reports the
+// count it recorded and the refusal - and no transition.
+func TestHealthCheckReportsNoTransitionWhenTheFallbackCannotBePublished(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	stub := newStubProber()
+	stub.identityErr = errors.New("104.16.1.1 does not serve speed.cloudflare.com: connection refused")
+
+	var stdout, stderr bytes.Buffer
+	for attempt := 1; attempt <= 3; attempt++ {
+		stdout.Reset()
+		stderr.Reset()
+		code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+			&stdout, &stderr, servicesFor(stub, threeCloudflareCandidates(), fixedMoment))
+		if attempt < 3 && code != exitSuccess {
+			t.Fatalf("health-check %d exit = %d, want %d (stderr: %s)", attempt, code, exitSuccess, stderr.String())
+		}
+		if attempt == 3 {
+			if code != exitStateUnavailable {
+				t.Fatalf("a refused transition exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "fallback") {
+				t.Errorf("stderr does not name the missing fallback as the reason: %s", stderr.String())
+			}
+		}
+	}
+	if strings.Contains(stdout.String(), "transition:") {
+		t.Errorf("a refused transition was reported as published:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "consecutive-failures: 3") {
+		t.Errorf("the report does not show the count that was recorded:\n%s", stdout.String())
+	}
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("a refused transition changed the selector:\nbefore:\n%s\nafter:\n%s", before, got)
+	}
+}
+
+// A health check spends no bandwidth budget, so it must work on a router whose
+// budget document does not exist and must not create one. A check that opened the
+// budget would create the file, and the daily allowance would start being spent by
+// a timer that runs every two minutes.
+func TestHealthCheckSpendsNoBandwidthBudget(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	if _, err := os.Stat(fixture.budgetPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the fixture already has a budget document: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+		&stdout, &stderr, servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("health-check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	if _, err := os.Stat(fixture.budgetPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("health-check created or charged the budget document: %v", err)
+	}
+}
+
+// A health document that cannot be read is reported as such, because the count that
+// follows starts at the policy's threshold. This check's own failure is then added
+// to it, so the threshold is reached on the first check rather than the third - the
+// lost history and this failure are two separate facts, and the report has to show
+// both. The selector names no fallback, so that threshold is a refused transition
+// and the exit code says so.
+func TestHealthCheckReportsAHealthDocumentItCouldNotRead(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	if err := os.WriteFile(fixture.healthPath, []byte(`{"schema_version": 1, "healthy": true,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stub := newStubProber()
+	stub.identityErr = errors.New("104.16.1.1 does not serve speed.cloudflare.com: connection refused")
+
+	var stdout, stderr bytes.Buffer
+	code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+		&stdout, &stderr, servicesFor(stub, threeCloudflareCandidates(), fixedMoment))
+	if code != exitStateUnavailable {
+		t.Fatalf("a failed-closed threshold with no fallback exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "failed-closed:") {
+		t.Errorf("the report does not say the health document could not be read:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "consecutive-failures: 4") {
+		t.Errorf("the report does not show the threshold the lost history started at:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "transition:") {
+		t.Errorf("a refused transition was reported as published:\n%s", stdout.String())
+	}
+}
+
+// The flags that measure something or write a report have no meaning here, and
+// accepting them silently would be a command that appears to have done something it
+// did not.
+func TestHealthCheckRefusesFlagsThatDoNotApply(t *testing.T) {
+	for _, refused := range [][]string{{"--report", filepath.Join(t.TempDir(), "report.json")}, {"--apply"}} {
+		fixture := newCDNFixture(t, 4, "104.16.1.1")
+		var stdout, stderr bytes.Buffer
+		args := append([]string{"health-check", refused[0]}, fixture.flags()...)
+		if len(refused) == 2 {
+			args = append(args, refused[1])
+		}
+		if code := runWithContext(t.Context(), args, &stdout, &stderr,
+			servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitInvalidCLI {
+			t.Errorf("health-check %v exit = %d, want %d (stderr: %s)", refused, code, exitInvalidCLI, stderr.String())
+		}
+		// The refusal has to name the flag, or it is indistinguishable from any other
+		// command-line refusal - including the command not existing at all.
+		if !strings.Contains(stderr.String(), strings.TrimPrefix(refused[0], "--")) {
+			t.Errorf("health-check %v did not name the flag it refuses: %s", refused, stderr.String())
+		}
+	}
+}
+
+// A health check that finds the control lock held reports the conflict and writes
+// nothing. The lock is what a pin, an apply and an unpin hold while they publish,
+// so this is the two-minute timer meeting an operator's pin: its own exit code, no
+// document written, and the next tick in two minutes.
+func TestHealthCheckReportsTheControlLockConflictAndWritesNothing(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	held, err := filelock.Acquire(fixture.lockPath)
+	if err != nil {
+		t.Fatalf("take the control lock: %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	var stdout, stderr bytes.Buffer
+	code := runWithContext(t.Context(), append([]string{"health-check"}, fixture.flags()...),
+		&stdout, &stderr, servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment))
+	if code != exitLockHeld {
+		t.Fatalf("health-check with the control lock held exit = %d, want %d (stderr: %s)", code, exitLockHeld, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "control lock") {
+		t.Errorf("stderr does not name the lock as the reason: %s", stderr.String())
+	}
+	if _, err := os.Stat(fixture.healthPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a check that could not take the lock wrote a health document: %v", err)
+	}
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("a check that could not take the lock changed the selector:\n%s", got)
+	}
+	// The verdict it did reach is still reported, because the proof ran on the
+	// network before the lock was needed.
+	if !strings.Contains(stdout.String(), "winner: 104.16.1.1 healthy") {
+		t.Errorf("the report does not carry the verdict the check reached:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "consecutive-failures:") {
+		t.Errorf("a check that wrote no document reported a count:\n%s", stdout.String())
 	}
 }

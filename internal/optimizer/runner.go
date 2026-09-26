@@ -1416,9 +1416,15 @@ type Profiles struct {
 	ByHostname map[string]candidate.ProbeProfile
 }
 
-// forSubject is the profiles one address has to satisfy, and an empty result means
+// ForSubject is the profiles one address has to satisfy, and an empty result means
 // this configuration names none for it - which is a refusal, not a pass.
-func (p Profiles) forSubject(subject candidate.Candidate) []candidate.ProbeProfile {
+//
+// It is exported because it is the whole of the anti-leak rule, and the health
+// check has to hold every address it proves to exactly the profiles this method
+// names. A second copy of the rule in a second package is a second rule that can
+// drift from the first, and a proof that drifted would be a proof of the wrong
+// group.
+func (p Profiles) ForSubject(subject candidate.Candidate) []candidate.ProbeProfile {
 	if subject.Hostname == "" {
 		return p.Global
 	}
@@ -1469,7 +1475,7 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 	if err := subject.Validate(); err != nil {
 		return measure.HTTPMetrics{}, fmt.Errorf("%w: %v", ErrNotPublishable, err)
 	}
-	applicable := profiles.forSubject(subject)
+	applicable := profiles.ForSubject(subject)
 	if len(applicable) == 0 {
 		kind := "for a global address"
 		if subject.Hostname != "" {
