@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"mosdns-router/internal/candidate"
+	"mosdns-router/internal/measure"
 )
 
 // ByteBudget is the daily allowance a transfer reserves from before it reads
@@ -41,76 +42,26 @@ type ByteBudget interface {
 	Consume(reserved, actual int64)
 }
 
-// TCPMetrics is what one address's connect latency looked like. It says that
-// something was listening at a port, and nothing about who it was: no field here
-// can make a candidate eligible.
-type TCPMetrics struct {
-	// Samples is the number of handshakes that completed. A sample is one
-	// successful connect; the attempts that did not become samples are in Loss.
-	Samples int
-	// P50MS is the median of the successful samples by the nearest-rank method:
-	// of n samples in ascending order, the one at index ceil(0.50*n)-1, with no
-	// interpolation between neighbours.
-	P50MS float64
-	// P95MS is the 95th percentile of the successful samples by the same
-	// nearest-rank method, at index ceil(0.95*n)-1.
-	P95MS float64
-	// JitterMS is the mean absolute difference between consecutive successful
-	// samples in the order they were measured, which is the variation a caller
-	// feels and the median hides. It is zero for a single sample.
-	JitterMS float64
-	// Loss is the fraction of attempts that did not complete, out of every
-	// attempt this call made: refused, reset, or timed out.
-	Loss float64
-}
-
-// HTTPMetrics is what one address proved about itself over a verified TLS
-// connection. A caller may only treat the address as serving the profile's
-// hostname when the call returned no error, because every one of these fields is
-// reported by the very host that was under test.
-type HTTPMetrics struct {
-	// Status is the response status, which the profile had to expect.
-	Status int
-	// TLSMS is the TLS handshake on its own: from the first handshake byte to the
-	// handshake completing, not counting the TCP connect in front of it.
-	TLSMS float64
-	// TTFBMS is the time to first response byte after the request was written,
-	// which is what a page load calls time to first byte.
-	TTFBMS float64
-	// TotalMS is the whole probe: connect, handshake, request, and body.
-	TotalMS float64
-	// Colocation is the edge the response named for itself, from the first of
-	// x-amz-cf-pop and cf-ray the response carried. It is a label for the report
-	// and is never an input to eligibility, because the host under test writes it.
-	Colocation string
-	// BodyBytes is how many body bytes this probe read, and it is the one number
-	// here that is not a measurement of the candidate.
-	//
-	// An identity probe is deliberately not charged to the daily budget, so
-	// nothing on disk records the body bytes a run spent proving identity. This
-	// field is that record: a caller sums it across the run's probes and shows the
-	// operator what the uncharged identity traffic was, instead of leaving it as a
-	// surprise in the operator's data allowance. It is reported even when the probe
-	// is refused, because bytes that crossed the network are spent whether or not
-	// the proof succeeded.
-	//
-	// So a caller must add it in before it looks at the error. The idiomatic
-	// "metrics, err := HTTPS(...); if err != nil { continue }" throws away the only
-	// accounting this field exists for, and a refused probe is the one case where
-	// the bytes were spent and nothing was published in exchange.
-	BodyBytes int64
-}
-
-// DownloadMetrics is what one address actually delivered, and what it cost.
-type DownloadMetrics struct {
-	// Bytes is what the body reader took, never more than the reservation.
-	Bytes int64
-	// Elapsed is the wall time the transfer took, to the byte limit, the time
-	// limit, or the first read error.
-	Elapsed time.Duration
-	// BytesPerSecond is Bytes over Elapsed, and zero when no time passed.
-	BytesPerSecond float64
-}
+// The three metric types are declared in internal/measure, and named here as
+// aliases, so the declaration a caller reads and writes is unchanged. They are
+// data rather than prober behaviour, and a scorer has to be able to name them
+// without importing this package: an in-package test file cannot import a
+// package that imports the one under test, so these tests reach for
+// internal/optimizer, and the optimizer scores what these types carry. An alias
+// rather than a redefinition is what keeps the two spellings one type, so a
+// value built as prober.TCPMetrics can be assigned to a field declared as
+// measure.TCPMetrics with no conversion.
+type (
+	// TCPMetrics is what one address's connect latency looked like. See
+	// measure.TCPMetrics for the fields and what each one means.
+	TCPMetrics = measure.TCPMetrics
+	// HTTPMetrics is what one address proved about itself over a verified TLS
+	// connection. See measure.HTTPMetrics for the fields and what each one means.
+	HTTPMetrics = measure.HTTPMetrics
+	// DownloadMetrics is what one address actually delivered, and what it cost.
+	// See measure.DownloadMetrics for the fields and what each one means.
+	DownloadMetrics = measure.DownloadMetrics
+)
 
 // Prober measures candidates. TCP and HTTPS make no charge against the daily
 // budget: they are small, bounded, and a run that cannot afford them has other
