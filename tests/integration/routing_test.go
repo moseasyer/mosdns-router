@@ -350,6 +350,24 @@ const (
 	corruptStateDocument
 )
 
+// chinaListFixture is the China rule list a case renders with. The default is the
+// committed list, because a case that is not about the list must be proving
+// something about the routing and not about a fixture. A zero-rule list is the
+// other state the list can be in, and it is the only fail-open one: the list loads,
+// every name is unmatched, and every query therefore takes the foreign branch.
+type chinaListFixture int
+
+const (
+	// committedChinaList is a copy of configs/cn-domains.txt.
+	committedChinaList chinaListFixture = iota
+	// noChinaRules is a list file that resolves to no rule at all. MOSDNS loads
+	// it without complaint, so the router starts and serves, and it answers
+	// nothing to the domestic branch because nothing matches. The empty file is
+	// the shape a wiped or truncated /var/lib leaves behind, and the converter
+	// refuses to publish one -- this is the only way to get here.
+	noChinaRules
+)
+
 // harness is a router process with the two resolvers it talks to, a
 // configuration rendered for all three, and the state document the bridge
 // published.
@@ -373,6 +391,14 @@ type harness struct {
 // renders a configuration that points at all three, and starts the router on it.
 func newHarness(t *testing.T, fixture stateFixture) *harness {
 	t.Helper()
+	return newHarnessWithList(t, fixture, committedChinaList)
+}
+
+// newHarnessWithList is newHarness with the China rule list chosen by the case.
+// Splitting it out keeps every existing call site unchanged, so the cases that are
+// not about the list cannot accidentally stop using the committed bytes.
+func newHarnessWithList(t *testing.T, fixture stateFixture, list chinaListFixture) *harness {
+	t.Helper()
 	address, interfaceName := localUnicastAddress(t)
 	t.Logf("the domestic resolver answers on %s (%s), and the published state names that address and interface",
 		address, interfaceName)
@@ -388,7 +414,7 @@ func newHarness(t *testing.T, fixture stateFixture) *harness {
 	t.Cleanup(func() { _ = h.domestic.Close() })
 
 	directory := t.TempDir()
-	h.cnList = copyChinaList(t, directory)
+	h.cnList = writeChinaList(t, directory, list)
 	// The readiness probe's name must not be in the China list, or the poll's
 	// query is a domestic one: it would be answered by the domestic resolver, so
 	// the counter the cases compare -- which expects the domestic resolver's first
@@ -1052,20 +1078,42 @@ func defaultRouteInterface() string {
 
 // --- the files the router is given ---
 
-// copyChinaList copies the committed list into the case's own directory. A list
+// writeChinaList writes the China rule list the fixture calls for into the case's
+// own directory and returns its path. The committed fixture is the committed
+// bytes rather than a hand-written list, because a list that did not load would
+// fail the router and a list that loaded but held the wrong names would change what
+// the case was about.
+func writeChinaList(t *testing.T, directory string, fixture chinaListFixture) string {
+	t.Helper()
+	path := filepath.Join(directory, "cn-domains.txt")
+	var contents []byte
+	switch fixture {
+	case committedChinaList:
+		committed, err := os.ReadFile(filepath.Clean(committedCNList))
+		if err != nil {
+			t.Fatalf("read the committed %s: %v", committedCNList, err)
+		}
+		contents = committed
+	case noChinaRules:
+		// Only a comment, so the file is a list that parses and resolves to
+		// nothing rather than a file that is not a list at all -- the difference
+		// between "the list has no rules" and "the list would not load".
+		contents = []byte("# no rules at all\n")
+	default:
+		t.Fatalf("unknown China list fixture %d", fixture)
+	}
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatalf("write the China list: %v", err)
+	}
+	return path
+}
+
+// copyChinaList writes the committed list into the case's own directory. A list
 // that did not load would fail the router, and an empty one would send every name
 // abroad, so the copy is the committed bytes rather than a fixture.
 func copyChinaList(t *testing.T, directory string) string {
 	t.Helper()
-	committed, err := os.ReadFile(filepath.Clean(committedCNList))
-	if err != nil {
-		t.Fatalf("read the committed %s: %v", committedCNList, err)
-	}
-	path := filepath.Join(directory, "cn-domains.txt")
-	if err := os.WriteFile(path, committed, 0o600); err != nil {
-		t.Fatalf("copy the China list: %v", err)
-	}
-	return path
+	return writeChinaList(t, directory, committedChinaList)
 }
 
 // inCommittedChinaList reports whether the pinned MOSDNS matcher would send a
@@ -1602,6 +1650,89 @@ func TestTheForeignCacheNeverChangesWhatTheDomesticPathReturns(t *testing.T) {
 	}
 	if got := h.foreign.Count("", foreignName); got != 1 {
 		t.Errorf("the foreign resolver was asked %d times for %s, want 1: the second and third queries must be answered from the cache", got, foreignName)
+	}
+}
+
+// TestAChinaListWithNoRulesSendsEveryNameAbroad covers the one fail-open state
+// the China list can be in. The converter refuses to publish an empty list and a
+// pin never writes one, so this state is unreachable through this project's own
+// writers -- but it is reachable through a wiped or truncated /var/lib, and it does
+// not stop the router: domain_set loads a rule-less file without complaint, the
+// `qname $cn_domains` condition matches nothing, and the dispatch falls through to
+// the foreign branch for every name including the China ones.
+//
+// The consequences are what this case holds to. A China name reaches the foreign
+// resolver, which is the network the user is leaving: the domestic branch stops
+// being used without anything saying so, and the operator's China DNS set is
+// silently bypassed. The domestic resolver is asked nothing at all, so this is not a
+// misroute within the country, it is the whole domestic branch gone. And the router
+// says nothing about the list's contents, so an operator reading the log has no
+// signal that the list is the reason. That silence is the reason the list is a
+// packaging obligation -- provision it, verify its digest, never re-pin it at
+// install -- rather than a file the service can be expected to survive without.
+func TestAChinaListWithNoRulesSendsEveryNameAbroad(t *testing.T) {
+	h := newHarnessWithList(t, publishedState, noChinaRules)
+	h.waitUntilAnswering(t)
+	before := h.counts()
+
+	// The China name, the one the committed list matches, now goes abroad.
+	abroad := h.ask(t, testdns.ProtocolTCP, chinaName, dns.TypeA)
+	if got, want := answeredAddresses(t, abroad), []string{foreignAddress}; !equalStrings(got, want) {
+		t.Errorf("%s with a rule-less China list = %v, want the foreign resolver's answer %v: with no rule to match, every name takes the foreign branch",
+			chinaName, got, want)
+	}
+	if got := h.foreign.Count("", chinaName); got != 1 {
+		t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, chinaName)
+	}
+
+	// The domestic resolver saw nothing: not the China name, and nothing else
+	// either, so the whole branch is bypassed rather than partly fed.
+	if got := h.domestic.Count("", ""); got != 0 {
+		t.Errorf("the domestic resolver was asked %d times with a rule-less China list, want 0: the branch is unreachable, not merely unused", got)
+	}
+
+	// And the foreign name is unaffected, which is what makes the state hard to
+	// notice: a working foreign path is exactly what an operator sees.
+	foreign := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)
+	if got, want := answeredAddresses(t, foreign), []string{foreignAddress}; !equalStrings(got, want) {
+		t.Errorf("%s with a rule-less China list = %v, want %v", foreignName, got, want)
+	}
+	if after := h.counts().since(before); after.foreign != 2 || after.domestic != 0 {
+		t.Errorf("resolvers were asked %+d since this case began, want both names abroad and nothing domestic", after)
+	}
+
+	// The silence is part of the claim, and it is a narrow one: what the router
+	// must not say is anything about the list's contents. The fragments are the
+	// list's own file -- the only way a report could name the thing that is empty
+	// -- and phrasings a load of a rule-less file would produce.
+	//
+	// The control is in the test above: a router started on the same configuration
+	// with the committed list logs the same plugin-load lines this one does, so
+	// "cn_domains" and "domain_set" appearing here would be ordinary startup and
+	// not a report. That is why they are not in this list, and why the list's path
+	// is: no line in an ordinary run carries it.
+	for _, fragment := range []string{
+		h.cnList,
+		"cn-domains.txt",
+		"no rules",
+		"empty list",
+		"rule-less",
+		"0 rules",
+	} {
+		// Read the output directly rather than through reported, which waits out a
+		// deadline for a fragment it does not find: a silence the case is asserting
+		// would otherwise cost five seconds per fragment. The two queries above have
+		// already come back, so anything the router had to say about the list it has
+		// said by now.
+		if strings.Contains(h.router.output.String(), fragment) {
+			t.Errorf("the router reported %q about a rule-less China list, so this case is not the silent state it is about:\n%s",
+				fragment, h.router.diagnostics())
+		}
+	}
+	// The ordinary startup lines are still there, so the case is not passing
+	// because the router logged nothing at all.
+	if !h.router.reported(t, "all plugins are loaded") {
+		t.Errorf("the router logged no startup of its own, so the silence asserted above is not the router's:\n%s", h.router.diagnostics())
 	}
 }
 
