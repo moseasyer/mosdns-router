@@ -2996,6 +2996,76 @@ func TestAnOlderSnapshotIsNotPublishedOverANewerOne(t *testing.T) {
 	}
 }
 
+// --- Fix wave 1: the status on disk may not go backwards ---
+
+// The status word is not a label but a claim about how much life a key has left, and
+// within one generation that claim can only shrink: fresh, then stale, then invalid,
+// as the key passes its published lifetime and then its grace, and never back. Nothing
+// within one generation lengthens a key's life, so a publish that claims MORE life
+// than the document on disk already claims is a caller's older reading of a key that
+// has since aged.
+//
+// The file this is about is the one an operator reads, and `mosdns-cdnctl status`
+// prints, when a force-ECH domain will not connect. A document that says stale
+// while strict mode is already failing closed with ErrECHExpired is not a
+// cosmetic error: it names a key as usable when the router has stopped using it,
+// and the operator's next move is to go and look at the ECH source, which is
+// working perfectly.
+//
+// All four phases are in this one test, because any one of them alone is satisfiable
+// the wrong way. The first three are a key ageing normally and all of it published: a
+// rule that refused every claim of less life would pass a regression-only test and
+// bring back the document that froze after the first fetch, the defect the last fix
+// round closed. The fourth is the regression -- a caller that read the key while it
+// was inside its grace, arriving after the caller that watched its grace end -- and
+// the fifth is that same caller one step further out of date, reading the key as
+// fresh, which no amount of waiting can be right about: a key past its grace cannot
+// become fresh again, so the only way to see it that way is to have looked earlier.
+func TestTheStatusOnDiskNeverGoesBackwardsWithinOneGeneration(t *testing.T) {
+	h := newHarness(t)
+	key := echConfig{
+		raw:        echFixture(t),
+		source:     "cloudflare-ech.com",
+		publicName: "cloudflare-ech.com",
+		digest:     digestOf(echFixture(t)),
+		fetchedAt:  h.now,
+		expiresAt:  h.now.Add(300 * time.Second),
+		staleUntil: h.now.Add(300*time.Second + 900*time.Second),
+		generation: 1,
+	}
+
+	// A key ageing normally, all of it published.
+	for _, status := range []string{echStatusFresh, echStatusStale, echStatusInvalid} {
+		h.plugin.ech.publish(status, key)
+		if got := readECHState(t, h.echStatePath).Status; got != status {
+			t.Fatalf("after the %s snapshot the document on disk says %q: a key that has aged has to be described as it is now", status, got)
+		}
+	}
+
+	// The caller that read this key while it was still inside its grace, arriving
+	// now that the grace has ended and the strict arm has already failed closed.
+	h.plugin.ech.publish(echStatusStale, key)
+
+	document := readECHState(t, h.echStatePath)
+	if document.Status != echStatusInvalid {
+		t.Fatalf("status on disk = %q, want %q: an older reading of the same key replaced a later one, so the file an operator reads says a key is usable while the router is failing closed over it", document.Status, echStatusInvalid)
+	}
+	// The decision was made here rather than left to the state writer. The document
+	// being right is not enough to tell the two apart; the silence is.
+	if got := h.countLogged("could not be written"); got != 0 {
+		t.Fatalf("the backwards snapshot was attempted and refused %d times, want the rule to have dropped it before the write", got)
+	}
+
+	// And the same caller, having read the key even earlier, when it was fresh.
+	h.plugin.ech.publish(echStatusFresh, key)
+	if got := readECHState(t, h.echStatePath).Status; got != echStatusInvalid {
+		t.Fatalf("status on disk = %q, want %q: nothing within one generation lengthens a key's life, so a reading that claims a fresh key after its grace ended is a reading taken before it ended", got, echStatusInvalid)
+	}
+	if got := h.countLogged("could not be written"); got != 0 {
+		t.Fatalf("the fresh snapshot was attempted and refused %d times, want the rule to have dropped it before the write", got)
+	}
+}
+
 // digestOf is the digest of a list as the provider records it, so the fixtures
 // above and the provider agree without either of them re-deriving the other's rule.
 func digestOf(raw []byte) string {

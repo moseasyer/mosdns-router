@@ -585,6 +585,30 @@ func refreshAfter(ttl uint32) time.Duration {
 // writer would refuse a rollback in any case, so the loser was safe -- but a
 // refusal that logs a warning is not a mechanism.
 //
+// The generation alone is not the whole race, because a status can regress inside
+// one generation: a caller that read a key as stale before a slow failed refresh can
+// reach this function after another caller has read the same key as invalid and
+// published it. Same key, same generation, and the older claim lands last. The file
+// then says a key is usable while strict mode is failing closed over it, and this
+// document is what an operator and `mosdns-cdnctl status` read to find out why a
+// force-ECH domain will not connect -- so the one that is wrong sends them to look
+// at an ECH source that is working perfectly. The second rule is therefore the one
+// the first cannot express, and it is about the same kind of thing: a status is not
+// a word but a claim about how much life a key has left, and within one generation
+// that claim can only shrink. Fresh, then stale, then invalid, as the key passes its
+// published lifetime and then its grace, and never back -- nothing within one
+// generation lengthens a key's life, so a publish that claims MORE than the document
+// already claims is a caller's older reading of a key that has since aged. It is
+// dropped here, before the write, for the same reason the older generation is. A
+// publish that claims less is published, because that is the key ageing; refusing
+// those instead would be the document that froze after the first fetch, which is the
+// defect the last fix round closed.
+//
+// Status monotonicity as a general rule belongs to `internal/state`, which is where
+// a state document's own consistency is decided; this is the provider refusing to
+// write a claim it knows is older, which is the same place the generation rule
+// lives.
+//
 // A write that fails is reported and swallowed: the document is what an operator
 // reads, and a router that stopped serving force-ECH names because a state file
 // could not be written would trade a client's privacy for a log line nobody asked
@@ -598,6 +622,10 @@ func (e *echProvider) publish(status string, current echConfig) {
 	case current.generation < e.published.generation:
 		// A newer key is already the document on disk, so this snapshot is some
 		// caller's older reading of a key that has since been replaced.
+		e.mu.Unlock()
+		return
+	case current.generation == e.published.generation && lifeClaimed(status) > lifeClaimed(e.published.status):
+		// The same key, described as younger than the document already describes it.
 		e.mu.Unlock()
 		return
 	case current.generation == e.published.generation && status == e.published.status:
@@ -621,6 +649,25 @@ func (e *echProvider) publish(status string, current echConfig) {
 	if err := state.WriteJSONAtomic(e.statePath, document); err != nil {
 		e.logger.Warn("cdn_rewrite: the ECH state document could not be written; the key itself is unaffected",
 			zap.String("path", e.statePath), zap.Error(err))
+	}
+}
+
+// lifeClaimed ranks the three statuses by how much of a key's life each one claims,
+// which is the only order they can be in within one generation: a key is fresh until
+// its published lifetime ends, stale until its grace ends, and invalid after that,
+// and nothing moves any of those times. A word this build does not know claims
+// nothing at all, so it can never displace a real claim; it is published only when
+// the document is empty, because a first document is not a regression.
+func lifeClaimed(status string) int {
+	switch status {
+	case echStatusFresh:
+		return 2
+	case echStatusStale:
+		return 1
+	case echStatusInvalid:
+		return 0
+	default:
+		return -1
 	}
 }
 
