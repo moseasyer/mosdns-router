@@ -682,8 +682,24 @@ func inheritedParameters(usable []*dns.HTTPS) ([]dns.SVCBKeyValue, []DroppedPara
 // required to understand a parameter that is not in the record, and mandatory
 // naming itself is forbidden outright. Deduping happens here, before packing,
 // because the library sorts the keys it packs and does not deduplicate them.
+//
+// The set of keys the record carries cannot be read off `record` alone, and the
+// reason is the order the caller builds the record in: it appends the ech parameter
+// and the IPv4 hint and THIS list in one statement, so Go evaluates the operands
+// first and this function is handed the record as it stood before any of the three
+// existed. Filtering on that snapshot alone loses a key the record ends up
+// carrying -- an upstream that declared mandatory=ipv4hint has its key dropped even
+// though the record answers with the selected address in that parameter -- and the
+// degradation is invisible afterwards, because the record is usable and nobody
+// reports a missing key on a usable record. So the two parameters this router
+// installs on every synthesis are named here as well. ipv6hint is not among them,
+// and must not be: no synthesis writes one, so an endpoint that made it mandatory is
+// a key the record does not carry, which is the case the filter above exists for.
 func mandatoryList(record []dns.SVCBKeyValue, usable []*dns.HTTPS) []dns.SVCBKey {
-	present := make(map[dns.SVCBKey]bool, len(record))
+	present := map[dns.SVCBKey]bool{
+		dns.SVCB_ECHCONFIG: true,
+		dns.SVCB_IPV4HINT:  true,
+	}
 	for _, pair := range record {
 		present[pair.Key()] = true
 	}

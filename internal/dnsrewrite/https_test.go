@@ -1207,6 +1207,46 @@ func TestHTTPSMandatoryNamesOnlyTheKeysTheRecordCarries(t *testing.T) {
 	selfConsistent(t, out)
 }
 
+// TestHTTPSMandatoryKeepsAKeyThisRouterInstalled is the same rule from the other
+// side, and it exists because the two cases are indistinguishable to a reader of the
+// code that implements them. An upstream that says mandatory=ipv4hint is naming a
+// parameter that names nothing at all once this router has taken the address over:
+// the upstream's own hint is dropped, and the record carries the SELECTED address in
+// its place. The key is therefore in the record, and a mandatory list that leaves it
+// out is a degraded answer in the direction RFC 9460 Section 8 forbids -- the client
+// is no longer told that this record is unusable without its hint, which is the whole
+// reason the endpoint declared it.
+//
+// The same upstream list names ipv6hint, which this release never installs, and that
+// one must still be dropped. So one record covers both halves of the rule: a key the
+// synthesized record carries is named, a key it does not is not, and the difference
+// between the two is whether this router put the parameter there or inherited it.
+func TestHTTPSMandatoryKeepsAKeyThisRouterInstalled(t *testing.T) {
+	upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, ".",
+		&dns.SVCBMandatory{Code: []dns.SVCBKey{dns.SVCB_IPV4HINT, dns.SVCB_IPV6HINT}},
+		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+		&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.1.1").To4()}},
+		&dns.SVCBIPv6Hint{Hint: []net.IP{net.ParseIP("2606:4700::1111")}},
+	))
+
+	got, err := HTTPS(httpsInput(t, upstream))
+	if err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	out := onlyHTTPS(t, got)
+	if mandatory := mandatoryOf(t, out); !reflect.DeepEqual(mandatory, []dns.SVCBKey{dns.SVCB_ECHCONFIG, dns.SVCB_IPV4HINT}) {
+		t.Errorf("mandatory = %v, want [ech ipv4hint]: the record carries the selected address as its ipv4hint and the endpoint declared the key mandatory, while ipv6hint is named by no parameter the record has", mandatory)
+	}
+	if hints := hintOf(t, out); !reflect.DeepEqual(hints, []string{selectedIP}) {
+		t.Errorf("ipv4hint = %v, want exactly [%s]: the upstream's own hint is replaced by the selected address", hints, selectedIP)
+	}
+	if carries(out, dns.SVCB_IPV6HINT) {
+		t.Errorf("the record this router wrote carries an ipv6hint: %s", carried(out))
+	}
+	selfConsistent(t, out)
+	selfConsistent(t, onlyHTTPS(t, roundTripped(t, got)))
+}
+
 // TestHTTPSMandatoryNeverRepeatsAKeyTheUpstreamRepeated is the duplicate case, and
 // it is checked on the wire as well as in memory because a repeat is invisible in
 // the list itself: the library sorts the keys when it packs them and does not
