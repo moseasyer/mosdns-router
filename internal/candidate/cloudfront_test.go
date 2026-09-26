@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -196,10 +197,6 @@ func TestParseCloudFrontProfilesRefusesAProfileWithoutAHostname(t *testing.T) {
 		"only an address": profileFile(profileBody(
 			"ip: 13.32.0.1",
 			"expected_status: [200]")),
-		"a comment as hostname": profileFile(profileBody(
-			"hostname: \"# any host\"",
-			"url: https://cdn.example/index.html",
-			"expected_status: [200]")),
 	} {
 		if profiles, err := ParseCloudFrontProfiles(strings.NewReader(document)); err == nil {
 			t.Errorf("ParseCloudFrontProfiles accepted a profile that has %s and returned %+v", name, profiles)
@@ -244,8 +241,15 @@ func TestParseCloudFrontProfilesRefusesTwoProfilesForOneHostname(t *testing.T) {
 
 func TestParseCloudFrontProfilesRefusesAProfileThatIsInconsistentWithItself(t *testing.T) {
 	// Every case is a complete profile body that differs from the accepted one in
-	// exactly one field, so the failure names the field and not the document.
+	// exactly one field, so the failure names the field and not the document. A
+	// hostname that is present but is not a DNS name belongs here rather than with
+	// the absent hostnames: it is present, and refusing it is the hostname rule
+	// doing its job.
 	for name, document := range map[string]string{
+		"a hostname that is not a DNS name": profileFile(profileBody(
+			"hostname: \"# any host\"",
+			"url: https://"+fixtureHostname+"/index.html",
+			"expected_status: [200]")),
 		"an address that is not one": profileFile(profileBody(
 			"hostname: "+fixtureHostname, "url: https://"+fixtureHostname+"/index.html", "expected_status: [200]",
 			"ip: not-an-address")),
@@ -400,21 +404,39 @@ func TestCloudFrontSourceKeepsThePublishedRangesAsReferenceData(t *testing.T) {
 	}
 }
 
-func TestCloudFrontRangesNeverReachTheGlobalCandidateList(t *testing.T) {
-	// AWS CloudFront ranges are reference data in this release. Not one address
-	// behind one of them may become a global candidate out of the official
-	// source, because a global candidate is served for any host and a CloudFront
-	// address is not. (A user who pins such an address in a user list is naming
-	// it deliberately, which is a different thing from a source inventing it.)
+func TestCloudFrontReferenceRangesAreExposedAsPrefixesAndNeverAsCandidates(t *testing.T) {
+	// AWS CloudFront ranges are reference data in this release. The guarantee has
+	// two halves, and this test checks the half that can be checked mechanically:
+	// the ranges leave this package as prefixes and by no other route, and the only
+	// method that exposes them hands back prefixes. A CloudFront address only means
+	// anything behind the hostname of a profile that named it, and a global
+	// candidate is served for any host, so a method that turned one of these
+	// prefixes into a candidate would be the leak the spec is about. The other half
+	// is that no production code calls the accessor at all, which is a fact about
+	// the tree rather than about a run.
 	origin := newFakeOrigin(t, awsRangesDocument(), referenceETag)
 	source := newTestCloudFrontSource(t, origin, filepath.Join(t.TempDir(), "aws-ip-ranges.json"), nil)
 	if _, err := source.Profiles(context.Background()); err != nil {
 		t.Fatalf("Profiles: %v", err)
 	}
-	if !slices.Contains(source.ReferencePrefixes(), cloudFrontReferencePrefix) {
-		t.Fatalf("the reference ranges %v do not hold %v, so this test proves nothing", source.ReferencePrefixes(), cloudFrontReferencePrefix)
+	if !slices.Equal(source.ReferencePrefixes(), []netip.Prefix{cloudFrontReferencePrefix}) {
+		t.Fatalf("got the reference ranges %v, want only %v", source.ReferencePrefixes(), cloudFrontReferencePrefix)
 	}
 
+	candidateList := reflect.TypeOf([]Candidate(nil))
+	candidateSet := reflect.TypeOf(CandidateSet{})
+	exposed := reflect.TypeOf(&HTTPCloudFrontSource{})
+	for index := range exposed.NumMethod() {
+		method := exposed.Method(index)
+		if method.Type.NumOut() == 0 {
+			continue
+		}
+		if method.Type.Out(0) == candidateList || method.Type.Out(0) == candidateSet {
+			t.Errorf("%s.%s returns %v, so the CloudFront ranges could reach a candidate", exposed, method.Name, method.Type.Out(0))
+		}
+	}
+
+	// And nothing the official source produces falls inside one of them either.
 	cloudflareOrigin := newFakeOrigin(t, standardDocument(), fixtureETag)
 	official := cloudflareCandidates(t, newTestSource(t, cloudflareOrigin, filepath.Join(t.TempDir(), "cloudflare-ips.json")), 512, testDate(2026, time.September, 25))
 	got, err := Combine(official, nil, nil, 512)
