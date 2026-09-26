@@ -159,6 +159,101 @@ func reasonOf(t *testing.T, results []CandidateResult, address string) string {
 	return byAddress(t, results, address).Reason
 }
 
+// The group barrier has to hold on every exported function that takes a group,
+// not only on the three that take a slice. RankScore and CombinedScore take a
+// subject and a group *separately*, so checking the subject is not enough: the
+// subject can be a perfectly good member of a slice that also holds another
+// hostname's results, and the percentile arithmetic then compares it against
+// those foreign results. TenthPercentileSpeed takes a group alone and was
+// reporting a percentile across a mixed set.
+//
+// The reproduction is the one in the review: a global Cloudflare candidate that
+// *is* a member of a slice which also carries a CloudFront candidate for another
+// hostname, twenty times faster.
+func TestScoreAMixedGroupIsRefusedByEveryExportedFunctionThatTakesAGroup(t *testing.T) {
+	global := measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 5*mib)
+	global2 := measured(candidate.ProviderCloudflare, "", "104.16.1.1", 10, 40, 60, 9, 0.10, 1*mib)
+	foreign := measured(candidate.ProviderCloudFront, "a.example.test", "13.32.0.1", 10, 1, 5, 0.1, 0.00, 20*mib)
+	params := Params{LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 3, Weights: documentedWeights}
+
+	for name, mixed := range map[string][]CandidateResult{
+		"the foreign result last":    {global, global2, foreign},
+		"the foreign result first":   {foreign, global, global2},
+		"the foreign result between": {global, foreign, global2},
+		"one of each":                {global, foreign},
+	} {
+		// The subject is a member of the slice in every case, so the membership
+		// check cannot be what refuses it: only the group barrier can.
+		if got := RankScore(global, mixed, documentedWeights); got != 0 {
+			t.Errorf("%s: RankScore of a member of a mixed group = %d, want 0", name, got)
+		}
+		if got := RankScore(global2, mixed, documentedWeights); got != 0 {
+			t.Errorf("%s: RankScore of the other member of a mixed group = %d, want 0", name, got)
+		}
+		if got := RankScore(foreign, mixed, documentedWeights); got != 0 {
+			t.Errorf("%s: RankScore of the foreign member of a mixed group = %d, want 0", name, got)
+		}
+		if got := CombinedScore(global, mixed, documentedWeights); got != 0 {
+			t.Errorf("%s: CombinedScore of a member of a mixed group = %v, want 0", name, got)
+		}
+		if got := TenthPercentileSpeed(mixed); got != 0 {
+			t.Errorf("%s: the p10 speed of a mixed group = %v, want 0", name, got)
+		}
+		// The three slice entry points already refused the whole slice; they are
+		// here so that this test is the one place that states the whole barrier.
+		if ranking := RankLatency(mixed, 3, noLimits); len(ranking.Ranked) != 0 {
+			t.Errorf("%s: RankLatency ranked %v from a mixed group", name, addressesOf(ranking.Ranked))
+		}
+		if ranking := RankBandwidth(mixed, 3, noLimits); len(ranking.Ranked) != 0 {
+			t.Errorf("%s: RankBandwidth ranked %v from a mixed group", name, addressesOf(ranking.Ranked))
+		}
+		selection := Select(mixed, params)
+		if len(selection.Scored) != 0 {
+			t.Errorf("%s: Select scored %v from a mixed group", name, addressesOf(selection.Scored))
+		}
+		// A zero score is the one the switch gate refuses, so even a caller that
+		// ignored the return value cannot publish a mixed-group number.
+		if SwitchAllowed(CombinedScore(global, mixed, documentedWeights), 3.65, 10) {
+			t.Errorf("%s: a mixed group's score was accepted by the switch gate", name)
+		}
+		if SwitchAllowed(float64(RankScore(global, mixed, documentedWeights)), 0, 10) {
+			t.Errorf("%s: a mixed group's score won against no incumbent", name)
+		}
+	}
+
+	// The same subject against its own group scores exactly what it scored
+	// before, so the barrier refuses the mixed slice and nothing else. A group
+	// of two: 4500*2 + 4500*2 + 1000*2 = 20000, and the worse candidate
+	// 4500*1 + 4500*1 + 1000*1 = 10000.
+	own := []CandidateResult{global, global2}
+	if got, want := RankScore(global, own, documentedWeights), 20000; got != want {
+		t.Errorf("RankScore inside one group = %d, want %d", got, want)
+	}
+	if got, want := CombinedScore(global, own, documentedWeights), 2.0; got != want {
+		t.Errorf("CombinedScore inside one group = %v, want %v", got, want)
+	}
+	if got, want := RankScore(global2, own, documentedWeights), 10000; got != want {
+		t.Errorf("the other candidate's RankScore inside one group = %d, want %d", got, want)
+	}
+	// One candidate's p10 speed is that candidate's speed, whatever convention
+	// the percentile uses, so this assertion does not move with the p10 fix.
+	if got, want := TenthPercentileSpeed(own[:1]), 5.0*mib; got != want {
+		t.Errorf("the p10 speed of a group of one = %v, want %v", got, want)
+	}
+	// A group of one hostname's results is still one group, and the barrier does
+	// not fire on it.
+	perHost := []CandidateResult{
+		measured(candidate.ProviderCloudFront, "a.example.test", "13.32.0.1", 10, 2, 5, 0.1, 0.00, 20*mib),
+		measured(candidate.ProviderCloudFront, "a.example.test", "13.32.0.2", 10, 30, 50, 5, 0.10, 2*mib),
+	}
+	if got := RankScore(perHost[0], perHost, documentedWeights); got == 0 {
+		t.Error("a CloudFront candidate scored zero inside its own hostname's group")
+	}
+	if got := TenthPercentileSpeed(perHost); got == 0 {
+		t.Error("a CloudFront group of one hostname reported a p10 speed of zero")
+	}
+}
+
 // The group key is one named type with one constructor, so no call site can
 // spell "provider plus hostname" as a string and get it subtly wrong.
 func TestScoreTheGroupKeyNamesTheProviderAndTheHostname(t *testing.T) {

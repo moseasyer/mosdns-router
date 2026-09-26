@@ -409,11 +409,20 @@ func Select(group []CandidateResult, params Params) Selection {
 // for tied entries, and a tie here is a fact about two measurements, not about
 // the slice a caller built them into.
 //
-// subject must be one of the results in the group, by value. A result from
-// another group, or a value that is not in the slice at all, has no rank here
-// and scores zero, so a cross-group call cannot produce a number that could be
-// compared with a score from anywhere else.
+// subject must be one of the results in the group, by value, and the group must
+// be one group. A result from another group, or a value that is not in the slice
+// at all, has no rank here and scores zero; and a slice that holds two groups is
+// refused whole, because the percentile arithmetic compares the subject against
+// every member of the slice and a foreign hostname's member is not a comparison
+// this package may make. Checking the subject is not enough on its own: a
+// subject can be a perfectly good member of a slice that also holds another
+// hostname's results, which is how
+// TestScoreAMixedGroupIsRefusedByEveryExportedFunctionThatTakesAGroup reaches
+// this from outside.
 func RankScore(subject CandidateResult, group []CandidateResult, weights Weights) int {
+	if _, ok := singleGroup(group); !ok {
+		return 0
+	}
 	if !isMember(group, subject) {
 		return 0
 	}
@@ -441,6 +450,13 @@ func RankScore(subject CandidateResult, group []CandidateResult, weights Weights
 // Nothing in this package orders by this value. The ordering is the integer
 // RankScore, and a float that a sum of three weights might have rounded is not
 // what decides which address a user's DNS is rewritten to.
+//
+// It inherits the group barrier from RankScore rather than repeating it, and it
+// must: a mixed group scores zero here as well, because a report that printed a
+// score derived from two hostnames' candidates would be a report nobody could
+// act on. TestScoreAMixedGroupIsRefusedByEveryExportedFunctionThatTakesAGroup
+// requires the zero from this function directly, so the inheritance is a
+// contract rather than a coincidence.
 func CombinedScore(subject CandidateResult, group []CandidateResult, weights Weights) float64 {
 	return float64(RankScore(subject, group, weights)) / weightScale
 }
@@ -452,15 +468,21 @@ func CombinedScore(subject CandidateResult, group []CandidateResult, weights Wei
 // candidates or fewer.
 //
 // It is a property of the group, not of a candidate, and it is reported for the
-// operator rather than compared between candidates: the brief's tie-break list
-// names a p10 speed, and two candidates of one group share the group's p10, so
-// that term cannot separate them and the comparator below does not pretend it
-// does. The number is exported because a report has to show what the group's
-// floor was, and pinned by TestScoreTheTenthPercentileSpeedIsTheNearestRankOfTheGroup
-// because Task 4 reads it.
+// operator rather than compared between candidates: two candidates of one group
+// share the group's p10, so a term built on it cannot separate them, and the
+// comparator below does not pretend it can. The tie-break order is lower loss,
+// then lower jitter, then the lower address. The number is exported because a
+// report has to show the group's floor, and pinned by
+// TestScoreTheTenthPercentileSpeedIsTheNearestRankOfTheGroup because Task 4
+// reads it.
 //
-// An empty group, and a group in which nothing was measured, report zero.
+// A group that is not one group reports zero, on the same grounds as a score: a
+// percentile across two hostnames' candidates is a number about neither. An
+// empty group, and a group in which nothing was measured, also report zero.
 func TenthPercentileSpeed(group []CandidateResult) float64 {
+	if _, ok := singleGroup(group); !ok {
+		return 0
+	}
 	if len(group) == 0 {
 		return 0
 	}
