@@ -340,6 +340,18 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 				// whole lifetime, and every client after the first sent there
 				// whatever the health check last decided.
 				//
+				// That last property is a consequence of the order rather than the
+				// reason for it, and the reason is the `has_resp` guard two rules
+				// further down: on a cache hit it accepts and the branch ends, so
+				// behind the cache the rewriter would never run at all. A strict
+				// force-ECH A or AAAA is answered without calling `next` -- that is
+				// the whole of the short circuit -- so with a cached upstream answer
+				// in front of it the guard would accept that answer and the domain
+				// would resolve in the clear. The pinned cache copies on both store
+				// and load, so the rewriter could not reach the cached object even
+				// if it did run behind the cache: the never-cached property above is
+				// what this order buys, and it is not the reason for it.
+				//
 				// It is a recursive executable, so the cache and the forwarder are
 				// its `next` chain, and mosdns hands it exactly that. The order of
 				// the plugin list follows the order the branch runs in, so the file
