@@ -75,11 +75,17 @@ const (
 // used: it is evidence about the document it was read from and about nothing else,
 // and the run refetches.
 //
+// A transport failure or a status that is neither 200 nor 304 means the origin
+// could not be read. That is not a document this build does not understand, it is
+// no document at all, and the last one this build accepted stands in for it,
+// marked stale. With nothing cached there is nothing to stand in and the failure
+// is returned: a run that silently measured nothing is worse than a run that says
+// it could not collect. A 304 that cannot be satisfied, for the same reason, is an
+// error rather than an empty body, because a validator that revalidates nothing
+// can only mean the cache was lost.
+//
 // Nothing is written here. A document is stored by storeDocument, once the caller
 // has accepted it, so a body this build refuses never reaches the disk.
-//
-// A 304 with no usable cache is an error rather than an empty body, because a
-// validator that revalidates nothing can only mean the cache was lost.
 func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePath string, policy validatorPolicy) (fetchedDocument, error) {
 	cached, cachedOK := readCache(cachePath, sourceURL)
 
@@ -98,7 +104,7 @@ func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePat
 
 	response, err := client.Do(request)
 	if err != nil {
-		return fetchedDocument{}, fmt.Errorf("%s: %w", sourceURL, err)
+		return staleInsteadOf(cached, cachedOK, sourceURL, fmt.Errorf("%s: %w", sourceURL, err))
 	}
 	defer func() { _ = response.Body.Close() }()
 	switch response.StatusCode {
@@ -109,7 +115,7 @@ func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePat
 		}
 		return fetchedDocument{Body: cached.Body, URL: sourceURL, Validator: cached.ETag}, nil
 	default:
-		return fetchedDocument{}, fmt.Errorf("%s: unexpected status %d", sourceURL, response.StatusCode)
+		return staleInsteadOf(cached, cachedOK, sourceURL, fmt.Errorf("%s: unexpected status %d", sourceURL, response.StatusCode))
 	}
 
 	validator := response.Header.Get("ETag")
@@ -127,6 +133,16 @@ func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePat
 		return fetchedDocument{}, fmt.Errorf("%s: the document is larger than the %d byte bound", sourceURL, maximumDocumentBytes)
 	}
 	return fetchedDocument{Body: body, URL: sourceURL, Validator: validator}, nil
+}
+
+// staleInsteadOf turns a failure to read the origin into the cached document
+// marked stale, when there is one to use. With no cache the cause is returned
+// unchanged, so the caller still learns why the run could not collect.
+func staleInsteadOf(cached cacheDocument, cachedOK bool, sourceURL string, cause error) (fetchedDocument, error) {
+	if !cachedOK {
+		return fetchedDocument{}, cause
+	}
+	return fetchedDocument{Body: cached.Body, URL: sourceURL, Validator: cached.ETag, Stale: true}, nil
 }
 
 // storeDocument records a freshly read document under the injected path, once the

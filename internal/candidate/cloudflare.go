@@ -43,9 +43,12 @@ const (
 
 // CloudflareSource is the global candidate source. It takes the limit to honour
 // and the local date to seed the sample with, both from the caller, so a run is
-// reproducible and no clock is read here.
+// reproducible and no clock is read here. It returns a CandidateSet rather than a
+// bare list, because a set read from the cache after an origin failure is not the
+// same claim as a set read from the origin, and a report has to be able to tell
+// them apart.
 type CloudflareSource interface {
-	Candidates(ctx context.Context, limit int, localDate time.Time) ([]Candidate, error)
+	Candidates(ctx context.Context, limit int, localDate time.Time) (CandidateSet, error)
 }
 
 // HTTPCloudflareSource reads the Cloudflare IP API over HTTP and keeps the
@@ -96,33 +99,43 @@ func NewCloudflareSource(client *http.Client, baseURL, cachePath string) (*HTTPC
 // target. When the document covers more blocks than the limit, the blocks are
 // spread across the whole range rather than taken from its start, so the cap does
 // not turn the sample into the same few blocks every day.
-func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localDate time.Time) ([]Candidate, error) {
+//
+// When the origin cannot be read at all, the last document this build accepted
+// stands in for it and the returned set is marked stale. A hard failure would
+// leave the run with no official candidate at all, which is a worse answer than
+// measuring the ranges of the day before last: every address in a stale set is
+// still probed for identity before it can be published, and the flag is what
+// tells the report that they came from an old document.
+func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localDate time.Time) (CandidateSet, error) {
 	if limit <= 0 {
-		return nil, fmt.Errorf("the official candidate limit must be greater than zero, got %d", limit)
+		return CandidateSet{}, fmt.Errorf("the official candidate limit must be greater than zero, got %d", limit)
 	}
 	seed, err := newDailySeed(localDate)
 	if err != nil {
-		return nil, err
+		return CandidateSet{}, err
 	}
 	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath, validatorRequired)
 	if err != nil {
-		return nil, err
+		return CandidateSet{}, err
 	}
 	document, err := parseCloudflareDocument(s.baseURL, fetched.Body)
 	if err != nil {
-		return nil, err
+		// A body that arrived and does not parse is a hard error, stale or not:
+		// the cache is not quietly substituted for a document this build does not
+		// understand.
+		return CandidateSet{}, err
 	}
 	blocks, err := document.blocks()
 	if err != nil {
-		return nil, err
+		return CandidateSet{}, err
 	}
 	// The document is only stored once it has been accepted, so the cache never
-	// holds a body this run refused.
+	// holds a body this run refused. A stale document is already stored.
 	if err := storeDocument(s.cachePath, fetched); err != nil {
-		return nil, err
+		return CandidateSet{}, err
 	}
 	if len(blocks) == 0 {
-		return nil, fmt.Errorf("%s: the document covers no /24 block", s.baseURL)
+		return CandidateSet{}, fmt.Errorf("%s: the document covers no /24 block", s.baseURL)
 	}
 	chosen := min(len(blocks), limit)
 	candidates := make([]Candidate, 0, chosen)
@@ -131,12 +144,12 @@ func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localD
 		// exactly k distinct blocks spread over the whole range.
 		address := seed.addressIn(blocks[(int64(index)*int64(len(blocks)))/int64(chosen)])
 		if !validPublicIPv4(address) {
-			return nil, fmt.Errorf("%s: sampled address %s is not public IPv4 space", s.baseURL, address)
+			return CandidateSet{}, fmt.Errorf("%s: sampled address %s is not public IPv4 space", s.baseURL, address)
 		}
 		candidates = append(candidates, Candidate{Provider: ProviderCloudflare, IP: address, Source: SourceCloudflare})
 	}
 	Sort(candidates)
-	return candidates, nil
+	return CandidateSet{Candidates: candidates, Stale: fetched.Stale}, nil
 }
 
 // cloudflareRanges is the shape the IP API answers with. The fields this

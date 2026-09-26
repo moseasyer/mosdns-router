@@ -91,6 +91,7 @@ type fakeOrigin struct {
 	notModified  bool
 	status       int
 	streamBytes  int64
+	hijack       bool
 	seen         []originRequest
 	servedBodies int
 }
@@ -122,6 +123,13 @@ func (o *fakeOrigin) serve(writer http.ResponseWriter, request *http.Request) {
 	switch {
 	case o.status != http.StatusOK:
 		writer.WriteHeader(o.status)
+	case o.hijack:
+		// A real transport failure from a real server: the connection is taken
+		// over and closed without a response, so the client sees an unexpected
+		// EOF rather than a status any code could read.
+		if connection, _, err := writer.(http.Hijacker).Hijack(); err == nil {
+			_ = connection.Close()
+		}
 	case o.notModified:
 		writer.WriteHeader(http.StatusNotModified)
 	case o.streamBytes != 0:
@@ -145,6 +153,22 @@ func (o *fakeOrigin) setStatus(status int) {
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 	o.status = status
+}
+
+// setHijack makes the next requests fail at the connection instead of answering.
+func (o *fakeOrigin) setHijack(hijack bool) {
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	o.hijack = hijack
+}
+
+// setDocument replaces what the origin answers with a fresh body.
+func (o *fakeOrigin) setDocument(document string) {
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	o.document = document
+	o.status = http.StatusOK
+	o.hijack = false
 }
 
 func (o *fakeOrigin) requests() []originRequest {
@@ -214,11 +238,16 @@ func newTestSource(t *testing.T, origin *fakeOrigin, cachePath string) *HTTPClou
 
 func cloudflareCandidates(t *testing.T, source *HTTPCloudflareSource, limit int, date time.Time) []Candidate {
 	t.Helper()
-	candidates, err := source.Candidates(context.Background(), limit, date)
+	return cloudflareSet(t, source, limit, date).Candidates
+}
+
+func cloudflareSet(t *testing.T, source *HTTPCloudflareSource, limit int, date time.Time) CandidateSet {
+	t.Helper()
+	set, err := source.Candidates(context.Background(), limit, date)
 	if err != nil {
 		t.Fatalf("Candidates: %v", err)
 	}
-	return candidates
+	return set
 }
 
 // blockOf returns the /24 a candidate was sampled from, which is the unit the
@@ -279,6 +308,107 @@ func cachedValidator(t *testing.T, cachePath string) string {
 		t.Fatalf("decode cache: %v", err)
 	}
 	return document.ETag
+}
+
+func TestCloudflareCandidatesServeTheCacheWhenTheOriginIsUnavailable(t *testing.T) {
+	// An outage, a 5xx or a renamed field must not shrink the candidate set to
+	// nothing: a run that can still reach the addresses it reached yesterday
+	// measures them, and says so. The cached document is the one this build
+	// accepted, and the set carries the stale flag so the report can record that
+	// it is not today's ranges.
+	cachePath := filepath.Join(t.TempDir(), "cloudflare-ips.json")
+	origin := newFakeOrigin(t, standardDocument(), fixtureETag)
+	date := testDate(2026, time.September, 25)
+	fresh := cloudflareSet(t, newTestSource(t, origin, cachePath), 512, date)
+	if fresh.Stale {
+		t.Fatal("the first run reported a stale set with no origin failure at all")
+	}
+
+	origin.setStatus(http.StatusServiceUnavailable)
+	stale := cloudflareSet(t, newTestSource(t, origin, cachePath), 512, date)
+	if !stale.Stale {
+		t.Error("a set served from the cache after a 503 was not marked stale")
+	}
+	assertCandidates(t, stale.Candidates, fresh.Candidates)
+}
+
+func TestCloudflareCandidatesServeTheCacheWhenTheConnectionFails(t *testing.T) {
+	// A transport failure is the same decision as a 5xx: the origin could not be
+	// read, so the last validated document stands in for it.
+	cachePath := filepath.Join(t.TempDir(), "cloudflare-ips.json")
+	origin := newFakeOrigin(t, standardDocument(), fixtureETag)
+	date := testDate(2026, time.September, 25)
+	fresh := cloudflareSet(t, newTestSource(t, origin, cachePath), 512, date)
+
+	origin.setHijack(true)
+	stale := cloudflareSet(t, newTestSource(t, origin, cachePath), 512, date)
+	if !stale.Stale {
+		t.Error("a set served from the cache after a failed connection was not marked stale")
+	}
+	assertCandidates(t, stale.Candidates, fresh.Candidates)
+}
+
+func TestCloudflareCandidatesFailWithoutACacheWhenTheOriginCannotBeRead(t *testing.T) {
+	// With nothing cached there is nothing to stand in, and an empty candidate set
+	// that looks like a measurement would be worse than a failure. Both kinds of
+	// unreadable origin are covered: a status and a connection.
+	for name, breakOrigin := range map[string]func(*fakeOrigin){
+		"a 503":               func(origin *fakeOrigin) { origin.setStatus(http.StatusServiceUnavailable) },
+		"a 404":               func(origin *fakeOrigin) { origin.setStatus(http.StatusNotFound) },
+		"a closed connection": func(origin *fakeOrigin) { origin.setHijack(true) },
+	} {
+		origin := newFakeOrigin(t, standardDocument(), fixtureETag)
+		breakOrigin(origin)
+		source := newTestSource(t, origin, filepath.Join(t.TempDir(), "cloudflare-ips.json"))
+		if set, err := source.Candidates(context.Background(), 512, testDate(2026, time.September, 25)); err == nil {
+			t.Errorf("Candidates answered with %d candidates and no error after %s", len(set.Candidates), name)
+		}
+	}
+}
+
+func TestCloudflareCandidatesRefuseAFreshDocumentItCannotUse(t *testing.T) {
+	// A body that arrived and cannot be used is not an outage, it is a document
+	// this build does not understand, and it is a hard error: the cache is not
+	// quietly substituted for it, and it is not allowed to overwrite the last
+	// document this build did accept either. Both stages are covered, because a
+	// document can be refused by the envelope or by the ranges inside it.
+	cachePath := filepath.Join(t.TempDir(), "cloudflare-ips.json")
+	origin := newFakeOrigin(t, standardDocument(), fixtureETag)
+	cloudflareCandidates(t, newTestSource(t, origin, cachePath), 512, testDate(2026, time.September, 25))
+	validatorBefore := cachedValidator(t, cachePath)
+
+	for name, document := range map[string]string{
+		"an envelope that reports a failed request": `{"errors":[{"code":1000,"message":"bad request"}],"messages":[],"result":{"ipv4_cidrs":["104.16.0.0/22"],"ipv6_cidrs":[],"etag":"x"},"success":false}`,
+		"a range that is not a prefix":              cloudflareDocument("", fixtureIPv6CIDRs, fixtureETag),
+		"a range no rewrite target may use":         cloudflareDocument("10.0.0.0/8", fixtureIPv6CIDRs, fixtureETag),
+		"a document that is not JSON":               `not json at all`,
+	} {
+		origin.setDocument(document)
+		source := newTestSource(t, origin, cachePath)
+		if set, err := source.Candidates(context.Background(), 512, testDate(2026, time.September, 25)); err == nil {
+			t.Errorf("Candidates answered with %d candidates from %s", len(set.Candidates), name)
+		}
+		if got := cachedValidator(t, cachePath); got != validatorBefore {
+			t.Errorf("the cache now holds the validator %q after %s, want the last document this build accepted (%q)", got, name, validatorBefore)
+		}
+	}
+}
+
+func TestCloudflareCandidatesRefuseACacheThatNoLongerParses(t *testing.T) {
+	// Serve-stale only serves a document this build would still accept. A cache
+	// entry that no longer parses is a hard error, because a run must not measure
+	// ranges out of a document nobody can read.
+	cachePath := filepath.Join(t.TempDir(), "cloudflare-ips.json")
+	origin := newFakeOrigin(t, standardDocument(), fixtureETag)
+	cloudflareCandidates(t, newTestSource(t, origin, cachePath), 512, testDate(2026, time.September, 25))
+
+	// Same source, same schema, a real validator, and a body that decodes but is
+	// not a published range list.
+	writeCacheEntry(t, cachePath, fixtureETag, `{"errors":[],"messages":[],"result":{"ipv4_cidrs":[],"ipv6_cidrs":[],"etag":"x"},"success":false}`, origin.server.URL)
+	origin.setStatus(http.StatusServiceUnavailable)
+	if set, err := newTestSource(t, origin, cachePath).Candidates(context.Background(), 512, testDate(2026, time.September, 25)); err == nil {
+		t.Errorf("Candidates answered with %d candidates from a cache that no longer parses", len(set.Candidates))
+	}
 }
 
 func TestCloudflareCandidatesExpandOnlyTheIPv4Ranges(t *testing.T) {

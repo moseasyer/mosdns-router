@@ -89,6 +89,18 @@ type Candidate struct {
 	Hostname string
 }
 
+// CandidateSet is one collection of candidates and where it came from.
+//
+// Stale is true when the published document behind the collection could not be
+// refreshed and the last one this build accepted was used instead. The addresses
+// in it are still the ones a run would have measured, so the set is returned
+// rather than nothing, but a report that says "12 candidates" without saying so
+// would be presenting yesterday's ranges as today's.
+type CandidateSet struct {
+	Candidates []Candidate
+	Stale      bool
+}
+
 // Validate refuses every candidate a later component could not publish: a
 // provider that is not one of the two groups, a hostname that does not belong
 // to the group, an address that is not a routable public IPv4 address, and a

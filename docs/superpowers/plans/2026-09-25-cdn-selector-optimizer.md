@@ -29,6 +29,14 @@
 - The eleventh download must be rejected when 100 MiB are already consumed.
 - A CloudFront winner validated for one hostname must never be copied to another hostname.
 - Corrupt selector state must not be overwritten by a failed test or pin operation.
+- A run that cannot refresh the official ranges must not silently measure nothing. **Decision (Task 1):** the
+  last range document this build validated stands in for the one it could not read — a transport
+  failure or any status that is neither 200 nor 304 — and the candidate set is returned with a stale
+  marker, which the report must carry. Serve-stale never covers a document that arrived and could
+  not be understood: that is a hard error, and the cached document is neither substituted for it nor
+  overwritten by it. With no cache at all, or a 304 that cannot be satisfied, the run fails rather
+  than measuring an empty set. Serving stale is safe because every candidate in a stale set still has
+  to pass the final identity proof before it can be published.
 
 ---
 
@@ -90,7 +98,9 @@ type CloudFrontProfile struct {
 }
 
 type CloudFrontSource interface { Profiles(context.Context) ([]CloudFrontProfile, error) }
-type CloudflareSource interface { Candidates(context.Context, int, time.Time) ([]Candidate, error) }
+type CloudflareSource interface { Candidates(context.Context, int, time.Time) (CandidateSet, error) }
+// CandidateSet carries the stale marker the serve-stale decision needs, so a report
+// can say the set came from an older document instead of presenting it as current.
 ```
 
 ```go
