@@ -1,10 +1,12 @@
 package optimizer
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -673,6 +675,143 @@ func TestScoreTheExclusionLimitsAreTheOnesTheCallerPassed(t *testing.T) {
 	// group the latency ranking already refused.
 	if ranking := RankBandwidth(group, 2, Limits{MaxLoss: 0.10, MaxP50MS: 20}); len(ranking.Ranked) != 1 {
 		t.Errorf("the bandwidth ranking kept %d candidates, want 1", len(ranking.Ranked))
+	}
+}
+
+// The ceilings are the one number in this package with no policy field behind
+// them, so the package has to say what a caller who has not chosen them should
+// pass. DefaultLimits is that answer, built from named constants so a reviewer
+// can see the two numbers rather than infer them from a literal, and it is the
+// value Task 4 must pass.
+//
+// The zero value still means "no ceiling" and a caller can still ask for it, but
+// a caller who writes Params{} by accident now has a documented value to reach
+// for instead of the one that measures and publishes a candidate with 40% of its
+// handshakes dropped.
+func TestScoreDefaultLimitsAreTheDocumentedCeilings(t *testing.T) {
+	limits := DefaultLimits()
+	if limits != (Limits{MaxLoss: DefaultMaxLossFraction, MaxP50MS: DefaultMaxP50MS}) {
+		t.Errorf("DefaultLimits() = %+v, want MaxLoss %v and MaxP50MS %v", limits, DefaultMaxLossFraction, DefaultMaxP50MS)
+	}
+	// The two numbers are stated in the report and in the plan, and they are the
+	// ones a residential anycast CDN is held to: a tenth of handshakes lost is
+	// already a bad edge, and a median connect over 150ms is past the point where
+	// the user notices.
+	if DefaultMaxLossFraction != 0.10 {
+		t.Errorf("the default loss ceiling is %v, want 0.10", DefaultMaxLossFraction)
+	}
+	if DefaultMaxP50MS != 150 {
+		t.Errorf("the default latency ceiling is %vms, want 150ms", DefaultMaxP50MS)
+	}
+	// Both are positive, so a caller who passes them gets a real filter rather
+	// than a second way of saying "none".
+	if limits.MaxLoss <= 0 || limits.MaxP50MS <= 0 {
+		t.Errorf("DefaultLimits() = %+v, want both ceilings above zero", limits)
+	}
+	// And they are enforced: the documented ceilings refuse a candidate the
+	// zero value would rank first.
+	group := []CandidateResult{
+		measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 5*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.1.1", 10, 12, 22, 2, 0.40, 4*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.2.1", 10, 300, 320, 3, 0.00, 3*mib),
+	}
+	unfiltered := RankLatency(group, 3, Limits{})
+	if len(unfiltered.Ranked) != 3 {
+		t.Errorf("the zero limits ranked %d of 3, want all 3", len(unfiltered.Ranked))
+	}
+	filtered := RankLatency(group, 3, DefaultLimits())
+	equalAddresses(t, "the ranking under the default ceilings", filtered.Ranked, []string{"104.16.0.1"})
+	if got := reasonOf(t, filtered.Excluded, "104.16.1.1"); got != ReasonLossAboveLimit {
+		t.Errorf("the 40%% loss candidate is refused with %q", got)
+	}
+	if got := reasonOf(t, filtered.Excluded, "104.16.2.1"); got != ReasonLatencyAboveLimit {
+		t.Errorf("the 300ms candidate is refused with %q", got)
+	}
+	// The ceilings are inclusive, so a candidate exactly at either one is kept.
+	atCeilings := []CandidateResult{
+		measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 150, 160, 1, 0.10, 5*mib),
+	}
+	if ranking := RankLatency(atCeilings, 1, DefaultLimits()); len(ranking.Ranked) != 1 {
+		t.Errorf("a candidate exactly at both ceilings was excluded with %q", ranking.Excluded[0].Reason)
+	}
+}
+
+// A malformed set of counts is a clear refusal, not a silent empty union. The
+// counts come from three different policy fields, and a caller that wired one of
+// them to the wrong variable gets an empty report today; with Validate the caller
+// can find out before a run spends the user's bandwidth, and Select names the
+// failure on every candidate so a report says what went wrong.
+func TestScoreParamsRefuseCountsThatCannotSelectAnything(t *testing.T) {
+	group := []CandidateResult{
+		measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 5*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.1.1", 10, 12, 22, 2, 0.00, 4*mib),
+	}
+	valid := Params{LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 3, Weights: documentedWeights}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("the documented policy values are refused by Validate: %v", err)
+	}
+
+	for name, params := range map[string]Params{
+		"nothing at all":           {},
+		"no latency shortlist":     {LatencyCandidates: 0, LatencyTop: 3, BandwidthTop: 3},
+		"no latency top":           {LatencyCandidates: 10, LatencyTop: 0, BandwidthTop: 3},
+		"no bandwidth top":         {LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 0},
+		"a negative shortlist":     {LatencyCandidates: -1, LatencyTop: 3, BandwidthTop: 3},
+		"a negative latency top":   {LatencyCandidates: 10, LatencyTop: -3, BandwidthTop: 3},
+		"a negative bandwidth top": {LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: -3},
+	} {
+		err := params.Validate()
+		if err == nil {
+			t.Errorf("%s: Validate accepted %+v", name, params)
+			continue
+		}
+		// The refusal names every count that is wrong, so a caller fixing one
+		// field does not have to re-run to find the next, and it names no count
+		// that is fine, because a message listing correct fields sends the reader
+		// looking for a second mistake that is not there.
+		for field, value := range map[string]int{
+			"latency_candidate_count": params.LatencyCandidates,
+			"latency_top":             params.LatencyTop,
+			"bandwidth_top":           params.BandwidthTop,
+		} {
+			named := strings.Contains(err.Error(), field)
+			if value <= 0 && !named {
+				t.Errorf("%s: the refusal %q does not name the wrong count %s", name, err, field)
+			}
+			if value > 0 && named {
+				t.Errorf("%s: the refusal %q names %s, which is %d and usable", name, err, field, value)
+			}
+		}
+		if !errors.Is(err, ErrUnusableCounts) {
+			t.Errorf("%s: the refusal is %v, want ErrUnusableCounts", name, err)
+		}
+		// And Select refuses every candidate with the same named reason, so a
+		// report says the counts were unusable rather than listing no candidates.
+		selection := Select(group, params)
+		if len(selection.Scored) != 0 {
+			t.Errorf("%s: %d candidates were scored with unusable counts", name, len(selection.Scored))
+		}
+		if len(selection.Excluded) != len(group) {
+			t.Fatalf("%s: %d candidates were accounted for, want all %d", name, len(selection.Excluded), len(group))
+		}
+		for _, result := range selection.Excluded {
+			if result.Reason != ReasonUnusableCounts {
+				t.Errorf("%s: %s is refused with %q, want %q", name, result.Candidate.IP, result.Reason, ReasonUnusableCounts)
+			}
+			if result.Eligible {
+				t.Errorf("%s: %s is eligible with unusable counts", name, result.Candidate.IP)
+			}
+		}
+		if len(selection.Latency.Ranked) != 0 || len(selection.Bandwidth.Ranked) != 0 {
+			t.Errorf("%s: unusable counts produced a shortlist: %v", name, selection.Latency.Ranked)
+		}
+	}
+	// The limits and the weights are not Validate's business: a zero Limits means
+	// no ceiling by definition, and an unnormalizable weighting already scores
+	// zero, which the switch gate refuses.
+	permissive := Params{LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 3, Limits: Limits{}, Weights: Weights{}}
+	if err := permissive.Validate(); err != nil {
+		t.Errorf("Validate refused a zero Limits and zero Weights: %v", err)
 	}
 }
 

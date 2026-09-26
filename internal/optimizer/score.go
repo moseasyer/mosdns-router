@@ -43,8 +43,11 @@ package optimizer
 
 import (
 	"cmp"
+	"errors"
+	"fmt"
 	"math"
 	"slices"
+	"strings"
 
 	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/measure"
@@ -89,6 +92,13 @@ const (
 	// latency shortlist but in neither half of the combined set, so it was
 	// measured and has a score but was not scored against the others.
 	ReasonOutsideCombined = "outside the combined shortlist"
+
+	// ReasonUnusableCounts is the refusal for every candidate in a call whose
+	// shortlist counts could not select anything. Naming the cause is the point:
+	// a report that lists twelve candidates and no scores, with no reason, is a
+	// report that reads as "nothing was good enough" when the truth is that the
+	// caller wired a policy field to the wrong variable.
+	ReasonUnusableCounts = "the shortlist counts cannot select anything"
 
 	// ReasonMixedGroups is the refusal for a slice holding more than one group.
 	// Nothing in it is ranked, and the reason says why: comparing them is the
@@ -224,6 +234,37 @@ type Limits struct {
 	MaxP50MS float64
 }
 
+// The default exclusion ceilings, as named constants rather than as literals
+// inside a function, because they are the two numbers a reviewer has to agree
+// with and a number buried in a return statement is a number nobody reads.
+//
+// They are the values Task 4 must pass as optimizer.Params.Limits. The zero
+// Limits still means "no ceiling" and a caller can still ask for it, but a caller
+// who writes Params{} by accident has a documented value here to reach for
+// instead of the one that measures and publishes a candidate which dropped 40% of
+// its handshakes.
+//
+// Neither number is a config.Policy field, because this plan may not add one.
+// They are the caller's to override and these are the documented defaults.
+const (
+	// DefaultMaxLossFraction refuses a candidate that lost more than one
+	// handshake in ten. A tenth is already an edge that drops queries, and it is
+	// well above the loss a healthy anycast address shows.
+	DefaultMaxLossFraction = 0.10
+
+	// DefaultMaxP50MS refuses a candidate whose median connect took longer than
+	// 150 milliseconds. Past that the delay is one a user feels on every query
+	// rather than on a slow one, which is the whole thing a selector is for.
+	DefaultMaxP50MS = 150.0
+)
+
+// DefaultLimits is the documented exclusion set, and the value Task 4 must pass
+// as optimizer.Params.Limits. Both ceilings are inclusive, so a candidate exactly
+// at either one is kept.
+func DefaultLimits() Limits {
+	return Limits{MaxLoss: DefaultMaxLossFraction, MaxP50MS: DefaultMaxP50MS}
+}
+
 // Params is everything a selection needs from the policy, gathered in one value
 // so a caller cannot pass a shortlist count from one policy and a ceiling from
 // another. The fields name the policy they come from.
@@ -237,10 +278,51 @@ type Params struct {
 	// BandwidthTop is how many of that shortlist join it on speed alone, from
 	// cdn.combined.bandwidth_top.
 	BandwidthTop int
-	// Limits are the loss and latency ceilings.
+	// Limits are the loss and latency ceilings. Pass DefaultLimits() unless the
+	// operator has said otherwise; the zero value is no ceiling at all, which
+	// measures everything and excludes nothing.
 	Limits Limits
 	// Weights are the three shares of the combined score.
 	Weights Weights
+}
+
+// ErrUnusableCounts reports a Params whose three top-N counts cannot select
+// anything. It is a named error so a caller can test for it with errors.Is
+// instead of matching the message, and it is returned before any measurement is
+// worth starting: the counts come from three separate policy fields, and a
+// caller that wired one of them to the wrong variable would otherwise spend the
+// user's bandwidth to learn it.
+var ErrUnusableCounts = errors.New("the shortlist counts cannot select anything")
+
+// Validate reports whether these parameters can select anything at all.
+//
+// It checks the three counts and nothing else, deliberately. The ceilings are not
+// checked because a zero Limits means "no ceiling" by definition and a caller
+// must be able to ask for that; the weights are not checked because a weighting
+// that cannot be normalized already scores zero, and zero is a score
+// SwitchAllowed refuses, so an unusable weighting produces no winner rather than
+// a wrong one.
+//
+// Every count that is wrong is named in the message, not just the first, because
+// a caller fixing one field should not have to run again to find the next.
+func (p Params) Validate() error {
+	var unusable []string
+	for _, count := range []struct {
+		name  string
+		value int
+	}{
+		{"latency_candidate_count", p.LatencyCandidates},
+		{"latency_top", p.LatencyTop},
+		{"bandwidth_top", p.BandwidthTop},
+	} {
+		if count.value <= 0 {
+			unusable = append(unusable, fmt.Sprintf("%s is %d, want more than zero", count.name, count.value))
+		}
+	}
+	if len(unusable) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrUnusableCounts, strings.Join(unusable, "; "))
 }
 
 // Ranking is one ranking of one group: the candidates that took part, best
@@ -353,6 +435,14 @@ func Select(group []CandidateResult, params Params) Selection {
 	if !ok {
 		refusal := refuseAll(group, ReasonMixedGroups)
 		return Selection{Group: refusal.Group, Excluded: refusal.Excluded, Latency: refusal, Bandwidth: refusal}
+	}
+	// The counts are checked before anything is ranked, so a malformed call is a
+	// refusal that says why rather than an empty union that looks like an
+	// absence of good candidates. Validate is exported for a caller that wants to
+	// find this out before a run starts spending the user's bandwidth.
+	if err := params.Validate(); err != nil {
+		refusal := refuseAll(group, ReasonUnusableCounts)
+		return Selection{Group: groupKeyOf(group), Excluded: refusal.Excluded, Latency: refusal, Bandwidth: refusal}
 	}
 	key := groupKeyOf(group)
 	eligible, refused := splitByLimits(group, params.Limits)
