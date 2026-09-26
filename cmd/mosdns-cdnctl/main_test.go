@@ -397,9 +397,10 @@ var fixedMoment = time.Date(2026, 9, 26, 3, 0, 0, 0, time.UTC)
 
 // selectorProfileYAML is the operator's CloudFront profile document: one hostname
 // and no address of its own, so it names a hostname to be proved without adding a
-// candidate. Its hostname is deliberately not the representative domain's, because
-// a global address is proved against every profile a configuration names, and a
-// fixture that used the same name twice would be proving the same thing twice.
+// candidate. Its hostname is deliberately not the representative domain's, though
+// the two kinds of profile are never used for the same subject, so a collision
+// would be harmless: keeping them distinguishable by name is what lets any case
+// assert which kind of profile a proof was made against by reading the name alone.
 const selectorProfileYAML = `schema_version: 1
 profiles:
   - hostname: assets.example.test

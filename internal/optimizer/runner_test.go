@@ -2192,8 +2192,8 @@ func TestPinProvesAGlobalAddressOnlyAgainstTheGlobalProfiles(t *testing.T) {
 func TestPinStoresAManualWinnerAfterProvingItAgainstEveryGlobalProfile(t *testing.T) {
 	// A pinned address is the operator's decision, and it outranks every automatic
 	// result, so it is held to a stricter rule than a measurement: it is proved
-	// against every profile this configuration names before it is stored, and the
-	// store is one generation on from what was there.
+	// against the profiles of the group it would be published for before it is
+	// stored, and the store is one generation on from what was there.
 	fake := newFakeProber(map[string]*addressFixture{
 		"104.16.9.9": served(10, 1, 0, 5*mib),
 	})

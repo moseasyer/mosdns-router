@@ -1624,8 +1624,10 @@ func fallbackAfter(winner string, current state.Selector) string {
 // and a second shape would be a second thing to get wrong. The address is held to
 // the candidate package's own rule first, so a LAN or reserved address is refused
 // before a socket is opened; then the control lock is taken, the selector read
-// under it, the identity proof run under it for every configured profile, and only
-// then the generation incremented and the file written. A refusal at any step
+// under it, the identity proof run under it against the profiles of the group this
+// address would be published for - every global profile for an address with no
+// hostname of its own, and only its own hostname's profile for one that has - and
+// only then the generation incremented and the file written. A refusal at any step
 // leaves the file exactly as it was, which is the whole of what an operator is
 // relying on when they type an address in.
 //

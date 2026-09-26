@@ -806,9 +806,10 @@ func publishedSelector(report optimizer.Report, written state.Selector) *state.S
 }
 
 // runCDNPin stores an address as the manual winner, after a real identity proof
-// against every profile this configuration names. It accepts an address and
-// nothing else: a manual pin is one operator, one address, and a decision this
-// project will not extend to a host, a prefix or a hostname it did not measure.
+// against the profiles of the group that address would be published for. It accepts
+// an address and nothing else: a manual pin is one operator, one address, and a
+// decision this project will not extend to a host, a prefix or a hostname it did
+// not measure.
 func runCDNPin(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
 	options, err := parseCDNOptions("pin", args, 1)
 	if err != nil {
