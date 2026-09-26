@@ -61,6 +61,10 @@ internal/mosdnsconfig/render.go
 internal/mosdnsconfig/render_test.go
 cmd/mosdns-router/main.go
 tests/integration/rewrite_test.go
+tests/integration/routing_test.go
+cmd/mosdns-cdnctl/render_test.go
+configs/mosdns.yaml
+scripts/test-make-entrypoints.sh
 Makefile
 ```
 
@@ -72,6 +76,42 @@ is not one. Two of the four are the files the producer already had — the chang
 accepted, and the change to `cloudflare_test.go` is one assertion in
 `TestCloudflareCacheIsWrittenOnlyUnderTheInjectedPath`, which a second artifact
 under the injected root made wrong in its letter while leaving its property intact.
+
+The last six entries are Task 6's, and three of them are not in Task 6's own file
+list, which is the first thing a later reader needs to know:
+
+- **`tests/integration/routing_test.go`** is modified because the plugin is now
+  rendered into every configuration this package starts. That is the point of the
+  change rather than a side effect: a routing case that ran without the rewriter
+  would be proving the routing of a document nobody ships, and the claim that a
+  China answer is byte-identical "with the plugin installed" cannot be made in a
+  process where the plugin is absent. The harness now writes the five documents the
+  rewriter reads, with a **disabled** selector and an allowlist that is a comment,
+  so a routing case gets a plugin that starts and changes nothing beyond what the
+  case is about.
+- **`cmd/mosdns-cdnctl/render_test.go`** is modified because the committed routing
+  document names the policy path **twice** now: once in the generated header and
+  once as the rewriter's `policy_file`. The test derived its expectation by replacing
+  the first occurrence and refused to run when there was more than one, which is a
+  correct guard against an ambiguous replacement applied to a document that had only
+  one. It now requires exactly two, replaces all of them, and additionally asserts
+  that the published document carries `policy_file: <the policy the render was
+  given>` — a byte comparison against the committed file could not tell a document
+  whose header named one policy from a document whose plugin argument named another.
+  This is the obligation a policy path appearing twice in one generated document
+  creates for anything that derives an expectation from that document.
+- **`configs/mosdns.yaml`** is the renderer's output, regenerated through
+  `MOSDNS_ROUTER_UPDATE=1 go test ./internal/mosdnsconfig` and never hand-edited.
+  Its header gained a paragraph, because the file is read by whoever is diagnosing a
+  wrong answer and a rewriter nothing mentions is a rewriter nobody knows is there.
+- **`scripts/test-make-entrypoints.sh`** now asserts `-count=1` on the line `verify`
+  plans for the end-to-end package, not only on the one `test-integration` plans. The
+  flag is the difference between a gate that ran the wire tests and a gate that
+  replayed a cached result, and it belonged to the gate's contract rather than to one
+  target's comment.
+- **`Makefile`** needed no functional change: `test-integration` already ran the
+  whole package with `-count=1`, and the new cases are in that package. Its comment
+  is what changed, to say what the suite now covers.
 
 ### Interfaces produced by this plan
 
@@ -488,6 +528,95 @@ while another caller refreshes — is the same fix. Cost if wrong: a second quer
 the source in the case where the first one failed, which is a case that is already a
 failure.
 
+### The `Paths` the renderer carries, and what each refusal is for
+
+`internal/mosdnsconfig.Paths` grew four fields, and the distinction between them is
+the whole of the refusals they carry:
+
+| field | production value | checked for | why |
+|---|---|---|---|
+| `Selector` | `/var/lib/mosdns/runtime/cdn-selector.json` | empty, absolute, not under `/etc` | the optimizer and the health check rewrite it while the router runs; it is `optimizer.DefaultSelectorPath`, and a test ties the two together |
+| `ForceECH` | `/etc/mosdns/force-ech-domains.txt` | empty, absolute **only** | nothing rewrites it while the router runs: an operator edits it and expects to find it beside the rest of the configuration |
+| `ECHState` | `/var/lib/mosdns/runtime/ech-state.json` | empty, absolute, not under `/etc` | the rewriter publishes it; under a root-owned directory the write fails and a force-ECH name loses the record of the key it is holding |
+| `CloudflarePrefixes` | `/var/lib/mosdns/lists/cloudflare-prefixes.txt` | empty, absolute, not under `/etc` | the list updater rewrites it; the list updater refuses a prefix list that is not under `/var/lib`, so rendering one anywhere else produces a document whose list will never be published |
+
+`CloudflarePrefixes` is the **published prefix list**, beside
+`candidate.DefaultCloudflareCachePath` and named
+`candidate.DefaultCloudflarePrefixFileName`. It is not the API cache envelope: the
+envelope is a JSON document with a schema, a URL and an etag, and the ranges inside
+it are quoted strings in a nested object. A `cloudflare_cidr_file` naming it makes
+the plugin **refuse to load** — a range list with no prefix in it classifies every
+response as somebody else's, which stops every rewrite in the router while the router
+looks healthy — and `TestTheRenderedConfigRefusesToLoadWithoutAPrefixList` proves that
+on the real loader rather than assuming it, because a renderer pointing the plugin at
+the envelope produces a document no installed router can start and only a test that
+loads it would have said so.
+
+**The plugin's `foreign_upstream` is the same checked value as the forward's
+`upstreams[0].addr`.** Not a second literal, not a second field: one `Paths` entry,
+resolved once by `checkForeignListener`, written into both places. So the two cannot
+disagree, and the plugin's own refusal of a non-`tcp://` scheme is a second opinion on
+a value this renderer has already refused for the forward: port 53, a hostname, a
+path, credentials and a query are all refused before either line is written. The cost
+of the coupling is that a deployment cannot fetch the ECH key somewhere other than
+where it forwards, and that is deliberate — the ECH fetch exists to be the same
+exchange the foreign branch makes, through the transport that cannot drop an answer.
+
+### What the wire tests can and cannot observe about the cache
+
+A strict force-ECH A/AAAA query is answered before `next` runs, so nothing
+downstream is reached at all. From outside the process that is observable in exactly
+two ways, and the case asserts both:
+
+- **The upstream was not asked.** The foreign resolver's per-name and per-type counts
+  do not move, and neither does its grand total — which also covers the ECH fetch,
+  because that goes to the same listener.
+- **The cache's answer was not used.** Both forced names are asked for *before* they
+  are forced, so the cache holds a real, unexpired answer for both of them, and the
+  strict queries are then answered with the plugin's own empty answer instead.
+
+What is **not** observable from outside is whether the cache was *consulted* and
+returned nothing, because the pinned mosdns cache plugin logs nothing per query at the
+level this document renders. No test claims otherwise: the property the order buys is
+stated as "a cached answer is not used", which is what a client can tell, and the
+structural claim ("the rewriter is the first rule of `foreign_path`") is pinned by the
+renderer test instead. The two together are the whole argument, and a rewriter moved
+behind the cache fails both the structural test and
+`TestARewriteAcrossASelectorGenerationLeavesTheCachedObjectAlone` — because the
+`has_resp → accept` rule ends the branch on a cache hit, the plugin would then never
+run for a strict name at all.
+
+### Obligations a later task inherits
+
+1. **`mosdnsconfig.Render` is not free of a populated `Paths`.** Every caller that
+   builds a path set must now supply the four new paths or be refused, and the
+   documents they name must exist: the plugin reads its policy and its range list at
+   construction, so a rendered document naming a path nothing wrote is a document no
+   real mosdns can start. `internal/mosdnsconfig`'s own `temporaryPaths` and
+   `tests/integration`'s harness both write the five documents for this reason; a new
+   caller must do the same or it is testing a document that would not load.
+2. **The policy path now appears twice in the routing document.** Anything that
+   derives an expectation from `configs/mosdns.yaml` by rewriting a path has to
+   account for both occurrences: the generated header and the rewriter's
+   `policy_file`. `cmd/mosdns-cdnctl`'s render test is the one place that did, and
+   its amendment is recorded above.
+3. **The rewriter is in the foreign branch, so a change to the foreign path's rule
+   order is a change to a privacy property.** The three rules that follow the rewriter
+   (`$foreign_cache`, the `has_resp` guard, `$foreign_forward`) are the cache-hit
+   guard and the forward, and the first of them is now the only thing between a
+   rewrite and a cache.
+4. **The Cloudflare prefix list is a second artifact for packaging to provision**, as
+   the ruling that created it already said. It is written by `internal/candidate` on
+   every run of the Cloudflare fetch, beside the cache envelope, and the router
+   refuses to start without it. An installation that provisions only
+   `cloudflare-ips.json` does not start.
+5. **`/etc/mosdns/force-ech-domains.txt` is now named by a generated document**, and
+   `mosdns-cdnctl`'s default for the same file is an unexported constant in a `main`
+   package. Nothing ties the two together at compile time; the only check is
+   `TestTheCommittedConfigNamesThePathsTheOtherComponentsPublish`, which pins the
+   literal this plan's own constraint fixes. If a later plan moves that file, both
+   places have to move with it.
+
 ---
 
 ### Task 1: Parse and validate ECHConfigList bytes
@@ -811,13 +940,17 @@ git commit -m "feat: add CDN and ECH rewrite plugin"
 - Modify: `internal/mosdnsconfig/render.go`
 - Modify: `internal/mosdnsconfig/render_test.go`
 - Create: `tests/integration/rewrite_test.go`
+- Modify: `tests/integration/routing_test.go` (the plugin is rendered into every configuration this suite starts)
+- Modify: `cmd/mosdns-cdnctl/render_test.go` (the committed document now names the policy path twice)
+- Modify: `configs/mosdns.yaml` (regenerated by the renderer, never by hand)
+- Modify: `scripts/test-make-entrypoints.sh` (the `-count=1` assertion extended to `verify`)
 - Modify: `Makefile`
 
 **Interfaces:**
 - Consumes: approved system paths and the plugin Args.
 - Produces: final foreign sequence with rewrite wrapping cache and forward.
 
-- [ ] **Step 1: Update renderer tests first**
+- [x] **Step 1: Update renderer tests first**
 
 Assert foreign path order:
 
@@ -827,27 +960,29 @@ cdn_rewrite -> foreign_cache -> foreign_forward
 
 Assert `cdn_rewrite` is not in the domestic path and receives the policy file, selector, allowlist, ECH metadata, direct foreign upstream, and Cloudflare CIDR file. That direct foreign upstream is `tcp://127.0.0.1:15353`, the same loopback TCP listener the foreign forward uses: ECHConfig bytes are fetched from the same resolver through the same transport, and MOSDNS's stock UDP transport is measured re-sending unanswered queries and dropping answers, so an ECH fetch must not be the one place that uses it. The plugin loads AAAA suppression, ECH failure policy, and stale grace through `config.Load` so one policy file is authoritative.
 
-- [ ] **Step 2: Run renderer tests and verify failure**
+- [x] **Step 2: Run renderer tests and verify failure**
 
 ```bash
 go test ./internal/mosdnsconfig -v
 ```
 
-Expected: FAIL because the plugin is not rendered.
+Expected: FAIL because the plugin is not rendered. Observed: every new assertion
+failed for that reason, and `TestCommittedMosdnsConfigIsExactlyTheRenderedDefault`
+failed afterwards with the plugin rendered and the committed file not yet regenerated.
 
-- [ ] **Step 3: Update the renderer**
+- [x] **Step 3: Update the renderer**
 
 Insert `cdn_rewrite` as the first executable in `foreign_path`. Keep cache downstream so normal upstream responses are cached before the outer recursive plugin mutates a deep copy of the returned response. A cache-hit integration assertion must query again after changing selector generation and prove the second query returns the new IP without corrupting the first cached object.
 
-- [ ] **Step 4: Write integration wire tests**
+- [x] **Step 4: Write integration wire tests**
 
 Start local DNS and HTTPS upstreams. Query A/AAAA/HTTPS for Cloudflare, mixed CDN, and a CloudFront profile. Assert exact owner names, answer counts, selected IP, empty AAAA, ECH parameter, mandatory key, hints, AD bit, and RRSIG removal.
 
-- [ ] **Step 5: Add strict ECH integration cases**
+- [x] **Step 5: Add strict ECH integration cases**
 
 Assert A/AAAA never reach either cache or upstream, valid HTTPS reaches only the foreign upstream, strict config failure returns SERVFAIL, and fallback mode returns an A answer when ECH is unavailable.
 
-- [ ] **Step 6: Run all verification**
+- [x] **Step 6: Run all verification**
 
 ```bash
 go test ./internal/dnsclassify ./internal/dnsrewrite ./internal/echconfig ./internal/statewatch ./plugin/executable/cdn_rewrite -v
@@ -855,26 +990,59 @@ go test ./tests/integration -run 'TestRewrite|TestECH' -v
 go test ./...
 ```
 
-Expected: PASS.
+Expected: PASS. **This step's own commands were corrected rather than run as
+written**: the `-run` filter matched a subset and carried no `-count=1`, so it is
+replaced in the acceptance block above by the whole package, twice.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/mosdnsconfig tests/integration/rewrite_test.go Makefile
 git commit -m "test: prove CDN rewrite and ECH wire behavior"
 ```
 
+The commit stages more than this line names: `tests/integration/routing_test.go`,
+`cmd/mosdns-cdnctl/render_test.go`, `configs/mosdns.yaml` and
+`scripts/test-make-entrypoints.sh` are all part of the same change, for the reasons
+the File Map records.
+
 ---
 
 ## Plan Acceptance
 
-Run:
+Run the whole gate, which is what a merge should be measured by:
 
 ```bash
-go test ./internal/echconfig ./internal/dnsclassify ./internal/dnsrewrite ./internal/statewatch ./plugin/executable/cdn_rewrite -v
-go test -race ./internal/echconfig ./internal/dnsrewrite ./plugin/executable/cdn_rewrite
-go test ./tests/integration -run 'TestRewrite|TestECH' -v
+make verify
 ```
+
+`verify` runs `test` (every unit suite with `-short`, plus the Python bridge and the
+Make entry-point regression), then `test-integration`, then `verify-build-info`, then
+`go vet`. The end-to-end suite is the part that cannot be replayed from a cache: it
+runs with `-count=1`, which `scripts/test-make-entrypoints.sh` asserts for both
+`test-integration` and the line `verify` plans for it.
+
+To run one layer on its own, with the same flags the gate uses:
+
+```bash
+go test -mod=readonly -count=1 -timeout 300s \
+  ./internal/echconfig ./internal/dnsclassify ./internal/dnsrewrite \
+  ./internal/statewatch ./internal/state ./internal/candidate \
+  ./internal/mosdnsconfig ./plugin/executable/cdn_rewrite ./plugin/executable/dhcp_forward
+
+go test -mod=readonly -race -count=1 -timeout 300s \
+  ./internal/echconfig ./internal/dnsclassify ./internal/dnsrewrite \
+  ./internal/statewatch ./internal/candidate ./plugin/executable/cdn_rewrite
+
+go test -mod=readonly -count=1 -timeout 300s ./tests/integration
+```
+
+**There is no `-run` filter here, and that is deliberate.** An earlier draft of this
+block filtered the end-to-end package with `-run 'TestRewrite|TestECH'`, which matched
+a subset of the cases and carried no `-count=1`, so a cached result could satisfy it
+and the gate could be green without the wire cases ever having been asked. A filter is
+only worth writing when it is anchored (`-run '^TestARewritten'`) and carries
+`-count=1` beside it; the honest form is to run the package.
 
 Expected:
 

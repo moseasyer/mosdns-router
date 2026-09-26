@@ -219,16 +219,20 @@ for target in test test-python verify; do
 done
 
 # 7. The acceptance gate runs the end-to-end suite. tests/integration is the only
-#    place the routing promises are checked at all -- a document-level test cannot
-#    see where a query was sent -- and `go test -short ./...` skips it, so a gate
-#    that stopped depending on it would quietly stop proving anything end to end.
+#    place the routing and the response-rewrite promises are checked at all -- a
+#    document-level test cannot see where a query was sent, and cannot see what a
+#    client received -- and `go test -short ./...` skips it, so a gate that stopped
+#    depending on it would quietly stop proving anything end to end. The flag is
+#    part of the assertion, not only of the target's own comment: -count=1 is what
+#    stops a cached result from satisfying the gate with no case run, and a verify
+#    that reached the package without it would be a gate that says nothing.
 status=0
 make --no-print-directory -n verify GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
 if [ "$status" -ne 0 ]; then
 	fail "dry run of verify exited $status"
 	sed 's/^/    /' "$work/dryrun" >&2 || true
-elif ! grep -q 'test -mod=readonly.*tests/integration' "$work/dryrun"; then
-	fail "verify does not run the end-to-end suite in tests/integration"
+elif ! grep -q 'test -mod=readonly -count=1 .*tests/integration' "$work/dryrun"; then
+	fail "verify does not run the end-to-end suite in tests/integration with -count=1, so a cached result could satisfy it with no case run"
 	sed 's/^/    /' "$work/dryrun" >&2 || true
 fi
 # The unit-test entry point must not run it either: it is the -short suite, and

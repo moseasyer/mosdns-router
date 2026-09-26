@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,7 +18,9 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/miekg/dns"
 	"gopkg.in/yaml.v3"
+	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/config"
+	"mosdns-router/internal/optimizer"
 	"mosdns-router/internal/state"
 	"mosdns-router/internal/testdns"
 )
@@ -87,6 +90,18 @@ type renderedDHCPForward struct {
 type renderedCache struct {
 	Size     int    `yaml:"size"`
 	DumpFile string `yaml:"dump_file"`
+}
+
+// renderedCDNRewrite is the response rewriter's own argument set, decoded into
+// this test's type rather than the plugin's, so a renderer that got a key or a
+// value wrong cannot be agreed with by a test that reuses the plugin's structures.
+type renderedCDNRewrite struct {
+	PolicyFile         string `yaml:"policy_file"`
+	SelectorFile       string `yaml:"selector_file"`
+	ForceECHFile       string `yaml:"force_ech_file"`
+	ECHStateFile       string `yaml:"ech_state_file"`
+	ForeignUpstream    string `yaml:"foreign_upstream"`
+	CloudflareCIDRFile string `yaml:"cloudflare_cidr_file"`
 }
 
 type renderedForward struct {
@@ -174,6 +189,7 @@ func TestRenderedRoutingNamesEachPluginExactlyOnceInLoadOrder(t *testing.T) {
 	}{
 		{"cn_domains", "domain_set"},
 		{"dhcp_forward", "dhcp_forward"},
+		{"cdn_rewrite", "cdn_rewrite"},
 		{"foreign_cache", "cache"},
 		{"foreign_forward", "forward"},
 		{"cn_path", "sequence"},
@@ -382,10 +398,11 @@ func TestTheFailurePolicyTheOperatorChoseReachesThePlugin(t *testing.T) {
 }
 
 // TestForeignPathAnswersFromTheCacheBeforeItForwards covers the foreign branch's
-// four steps, and the second one is the load-bearing one: the cache is a
-// recursive executable that always runs the rules after it, so a cache hit is
-// only kept when a has_resp check ends the branch there. Without that check every
-// cache hit would be forwarded as well, and the cache would save nothing.
+// five steps, and the second and third are the load-bearing ones. The cache is a
+// recursive executable that always runs the rules after it, so a cache hit is only
+// kept when a has_resp check ends the branch there; and the rewriter is ahead of
+// the cache, so what it changes is a copy of what the cache hands back rather than
+// the object the cache owns.
 func TestForeignPathAnswersFromTheCacheBeforeItForwards(t *testing.T) {
 	document, err := Render(config.Defaults(), ProductionPaths())
 	if err != nil {
@@ -394,6 +411,7 @@ func TestForeignPathAnswersFromTheCacheBeforeItForwards(t *testing.T) {
 	parsed := decodeRendered(t, document)
 
 	want := []renderedRule{
+		{Exec: "$cdn_rewrite"},
 		{Exec: "$foreign_cache"},
 		{Matches: []string{"has_resp"}, Exec: "accept"},
 		{Exec: "$foreign_forward"},
@@ -412,6 +430,171 @@ func TestForeignPathAnswersFromTheCacheBeforeItForwards(t *testing.T) {
 	}
 	if forward.DumpFile != "" {
 		t.Errorf("foreign_cache dumps to %q, want no dump file", forward.DumpFile)
+	}
+}
+
+// TestTheRewritePluginIsTheFirstExecutableOfTheForeignBranchAndOfNoOther is where
+// the plugin's place in the document is decided, and both halves of it are the
+// same claim. A name the China list matches is answered inside the network the
+// user is not leaving, and this router does not rewrite answers there: an address
+// installed in a domestic answer would be a claim about a network the domestic
+// branch chose, made by a component that proved nothing about it. So the plugin
+// appears in the foreign branch and in no other, exactly once, and the domestic
+// sequence names the DHCP forwarder and nothing else.
+//
+// The break it catches is the plugin landing downstream of the cache, which is
+// the order this file's foreign branch is written to prevent: the rewrite would
+// then be applied to the object the cache owns and stored, pinning one selector
+// generation's address for as long as the entry lived.
+func TestTheRewritePluginIsTheFirstExecutableOfTheForeignBranchAndOfNoOther(t *testing.T) {
+	document, err := Render(config.Defaults(), ProductionPaths())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	parsed := decodeRendered(t, document)
+
+	// entry fails unless the tag names exactly one plugin, so this is also the
+	// assertion that the tag is not used twice.
+	if got := parsed.entry(t, "cdn_rewrite").Type; got != "cdn_rewrite" {
+		t.Errorf("the cdn_rewrite tag has type %q, want the plugin itself", got)
+	}
+
+	// The foreign branch's first rule is the plugin, before the cache it wraps.
+	rules := rulesOf(t, parsed.entry(t, "foreign_path"))
+	if len(rules) == 0 {
+		t.Fatal("the foreign_path sequence has no rules")
+	}
+	if rules[0].Exec != "$cdn_rewrite" {
+		t.Errorf("the first rule of foreign_path is %q, want the rewrite plugin ahead of the cache it wraps", rules[0].Exec)
+	}
+	for index, rule := range rules {
+		if rule.Exec == "$cdn_rewrite" && index != 0 {
+			t.Errorf("foreign_path rule %d runs the rewrite plugin, want it once and first", index+1)
+		}
+	}
+
+	// The domestic branch, which must be untouched by all of this.
+	want := []renderedRule{{Exec: "$dhcp_forward"}, {Exec: "accept"}}
+	if got := rulesOf(t, parsed.entry(t, "cn_path")); !equalRules(got, want) {
+		t.Errorf("the cn_path sequence is\n got %+v\nwant %+v", got, want)
+	}
+	// And the dispatch itself must not run it either: a plugin reached from main
+	// rather than from the foreign branch would see a China name as well.
+	for index, rule := range rulesOf(t, parsed.entry(t, "main")) {
+		if strings.Contains(rule.Exec, "cdn_rewrite") {
+			t.Errorf("main rule %d runs the rewrite plugin (%q), want the rewrite confined to the foreign branch", index+1, rule.Exec)
+		}
+	}
+}
+
+// TestTheRewritePluginIsGivenEveryDocumentItReads covers the six arguments, one
+// at a time, because the plugin refuses to start without any of them: a mistyped
+// path is a router that classifies nothing and looks healthy, and the two files it
+// writes (the ECH metadata document) or reads continuously (the selector, the
+// allowlist, the range list) are each a document some other component of this
+// project owns.
+//
+// The break it catches is a key this document does not write, a value written under
+// the wrong key, or a path pointed at the wrong file -- and the last of those has a
+// documented victim: the Cloudflare API cache envelope is a JSON document with the
+// ranges inside it as quoted strings, so a cloudflare_cidr_file naming it is a
+// plugin that refuses to load rather than one that classifies.
+func TestTheRewritePluginIsGivenEveryDocumentItReads(t *testing.T) {
+	document, err := Render(config.Defaults(), ProductionPaths())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	rewriter := argsOf[renderedCDNRewrite](t, decodeRendered(t, document).entry(t, "cdn_rewrite"))
+
+	for name, testCase := range map[string]struct{ got, want string }{
+		"the policy it is configured by":       {rewriter.PolicyFile, "/etc/mosdns/policy.yaml"},
+		"the published selector":               {rewriter.SelectorFile, "/var/lib/mosdns/runtime/cdn-selector.json"},
+		"the operator's force-ECH allowlist":   {rewriter.ForceECHFile, "/etc/mosdns/force-ech-domains.txt"},
+		"the ECH metadata it publishes":        {rewriter.ECHStateFile, "/var/lib/mosdns/runtime/ech-state.json"},
+		"the direct ECH upstream":              {rewriter.ForeignUpstream, productionForeignListener},
+		"the published Cloudflare prefix list": {rewriter.CloudflareCIDRFile, "/var/lib/mosdns/lists/cloudflare-prefixes.txt"},
+	} {
+		if testCase.got != testCase.want {
+			t.Errorf("cdn_rewrite is given %s as %q, want %q", name, testCase.got, testCase.want)
+		}
+	}
+}
+
+// TestTheCommittedConfigNamesThePathsTheOtherComponentsPublish ties three of the
+// six to the components that write the files, because a literal in this package and
+// a constant in another can drift and nothing would notice: the document would
+// name a file nothing publishes, and the plugin would serve with the last document
+// it read, which is no document at all.
+//
+// The selector and the range list are checked against the constants their writers
+// use. The allowlist has no exported constant -- the command that reads it is a
+// main package -- so it is checked against the path this plan's own constraint
+// fixes, and that is the whole of what the check is: two places spelling the same
+// path is two places to fix it.
+func TestTheCommittedConfigNamesThePathsTheOtherComponentsPublish(t *testing.T) {
+	rewriter := argsOf[renderedCDNRewrite](t,
+		decodeRendered(t, mustRender(t, ProductionPaths())).entry(t, "cdn_rewrite"))
+
+	if want := optimizer.DefaultSelectorPath; rewriter.SelectorFile != want {
+		t.Errorf("cdn_rewrite reads the selector at %q, but the optimizer publishes it at %q", rewriter.SelectorFile, want)
+	}
+	published := filepath.Join(filepath.Dir(candidate.DefaultCloudflareCachePath), candidate.DefaultCloudflarePrefixFileName)
+	if rewriter.CloudflareCIDRFile != published {
+		t.Errorf("cdn_rewrite reads the Cloudflare ranges from %q, but the fetch that publishes them writes %q", rewriter.CloudflareCIDRFile, published)
+	}
+	// And the envelope itself is not that file, which is the mistake this path
+	// exists to prevent: the cache is a JSON document with a schema, a URL and an
+	// etag, and the ranges inside it are strings in a nested object.
+	if rewriter.CloudflareCIDRFile == candidate.DefaultCloudflareCachePath {
+		t.Error("cdn_rewrite is pointed at the Cloudflare API cache envelope rather than the published prefix list beside it")
+	}
+	if want := "/etc/mosdns/force-ech-domains.txt"; rewriter.ForceECHFile != want {
+		t.Errorf("cdn_rewrite reads the force-ECH allowlist at %q, want %q", rewriter.ForceECHFile, want)
+	}
+}
+
+// TestTheECHKeyIsFetchedThroughTheSameListenerTheForeignBranchDials covers the
+// transport the ECH fetch uses, and it is the one value in the plugin's arguments
+// that is not a path. The key comes from the same resolver the foreign branch
+// forwards to, and it has to come through the same tcp:// listener: mosdns's stock
+// UDP upstream re-sends a query that has gone unanswered and can drop an answer that
+// arrived before its exchange waited for it, and an ECH fetch is the one exchange on
+// this path with no client watching it, so a lost query is a force-ECH name that
+// fails closed for as long as the last key lasts.
+//
+// The two are one value, and the control case is the proof of it: move the listener
+// and both the forward's upstream and the plugin's carry the new address. A renderer
+// that gave the plugin its own literal would leave one of the two behind.
+func TestTheECHKeyIsFetchedThroughTheSameListenerTheForeignBranchDials(t *testing.T) {
+	for name, listener := range map[string]string{
+		"the production listener":    "tcp://127.0.0.1:15353",
+		"a listener on another port": "tcp://127.0.0.2:25353",
+	} {
+		t.Run(name, func(t *testing.T) {
+			paths := withForeignListener(ProductionPaths(), listener)
+			document := mustRender(t, paths)
+			parsed := decodeRendered(t, document)
+
+			forward := argsOf[renderedForward](t, parsed.entry(t, "foreign_forward"))
+			if len(forward.Upstreams) != 1 {
+				t.Fatalf("the foreign forward has %d upstreams, want exactly one: %+v", len(forward.Upstreams), forward.Upstreams)
+			}
+			rewriter := argsOf[renderedCDNRewrite](t, parsed.entry(t, "cdn_rewrite"))
+			if rewriter.ForeignUpstream != forward.Upstreams[0].Addr {
+				t.Errorf("cdn_rewrite fetches ECH through %q while the foreign forward enters %q: the two can disagree about where the resolver is",
+					rewriter.ForeignUpstream, forward.Upstreams[0].Addr)
+			}
+			if !strings.HasPrefix(rewriter.ForeignUpstream, "tcp://") {
+				t.Errorf("cdn_rewrite fetches ECH through %q, want a tcp:// URL: the UDP transport re-sends and drops answers", rewriter.ForeignUpstream)
+			}
+			address, err := netip.ParseAddrPort(strings.TrimPrefix(rewriter.ForeignUpstream, "tcp://"))
+			if err != nil {
+				t.Fatalf("the rendered ECH upstream %q is not an address and a port: %v", rewriter.ForeignUpstream, err)
+			}
+			if address.Port() == 53 {
+				t.Error("cdn_rewrite fetches ECH through port 53, which belongs to the system resolver this router exists to keep out of foreign queries")
+			}
+		})
 	}
 }
 
@@ -479,6 +662,21 @@ func TestRenderRefusesAPathSetThatCannotBeServed(t *testing.T) {
 		"no state document path":         {withoutDHCPState(ProductionPaths()), "must not be empty"},
 		"no foreign listener":            {withoutForeignListener(ProductionPaths()), "must not be empty"},
 		"no listen address":              {withoutListen(ProductionPaths()), "must not be empty"},
+		"no selector path":               {withoutSelector(ProductionPaths()), "must not be empty"},
+		"no force-ECH allowlist":         {withoutForceECH(ProductionPaths()), "must not be empty"},
+		"no ECH state path":              {withoutECHState(ProductionPaths()), "must not be empty"},
+		"no Cloudflare prefix list":      {withoutCloudflarePrefixes(ProductionPaths()), "must not be empty"},
+		"a relative selector":            {withSelector(ProductionPaths(), "runtime/cdn-selector.json"), "runtime/cdn-selector.json"},
+		"a relative ECH state document":  {withECHState(ProductionPaths(), "runtime/ech-state.json"), "runtime/ech-state.json"},
+		"a relative prefix list":         {withCloudflarePrefixes(ProductionPaths(), "lists/cloudflare-prefixes.txt"), "lists/cloudflare-prefixes.txt"},
+		"a relative force-ECH allowlist": {withForceECH(ProductionPaths(), "mosdns/force-ech-domains.txt"), "mosdns/force-ech-domains.txt"},
+		"a selector under etc":           {withSelector(ProductionPaths(), "/etc/mosdns/cdn-selector.json"), "/etc/mosdns/cdn-selector.json"},
+		"an ECH state document under etc": {
+			withECHState(ProductionPaths(), "/etc/mosdns/ech-state.json"), "/etc/mosdns/ech-state.json",
+		},
+		"a prefix list under etc": {
+			withCloudflarePrefixes(ProductionPaths(), "/etc/mosdns/cloudflare-prefixes.txt"), "/etc/mosdns/cloudflare-prefixes.txt",
+		},
 		"a blank policy path":            {withPolicy(ProductionPaths(), "   "), "must not be empty"},
 		"a relative China list":          {withCNDomains(ProductionPaths(), "lists/cn-domains.txt"), "lists/cn-domains.txt"},
 		"a China list under etc":         {withCNDomains(ProductionPaths(), "/etc/mosdns/lists/cn-domains.txt"), "/etc/mosdns/lists/cn-domains.txt"},
@@ -498,6 +696,12 @@ func TestRenderRefusesAPathSetThatCannotBeServed(t *testing.T) {
 			withCNDomains(ProductionPaths(), "/var/lib/mosdns/lists/223.5.5.5.txt"),
 			"223.5.5.5",
 		},
+		"a prefix list named after a Chinese resolver": {
+			// The same scan, through the one of the four new paths an operator is
+			// most likely to fill in from a resolver's address.
+			withCloudflarePrefixes(ProductionPaths(), "/var/lib/mosdns/lists/223.5.5.5.txt"),
+			"223.5.5.5",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			document, err := Render(config.Defaults(), testCase.paths)
@@ -508,6 +712,80 @@ func TestRenderRefusesAPathSetThatCannotBeServed(t *testing.T) {
 				t.Errorf("the refusal %q does not name the offending value %q", err, testCase.wantMention)
 			}
 		})
+	}
+}
+
+// TestTheForceECHCallowlistMayLiveUnderEtc is the control for the four refusals
+// above that are about /etc, and the reason they are not a fifth. The allowlist is
+// written by an operator and replaced by packaging, so /etc/mosdns is exactly where
+// it belongs; the other three are rewritten while the router runs, and a rule the
+// router cannot replace under a root-owned configuration directory is a rule that
+// survives an upgrade nobody meant to keep it.
+//
+// The break it catches is the /etc refusal generalised to a file it does not apply
+// to, which would refuse every document that names a path this plan's own global
+// constraint fixes at /etc/mosdns/force-ech-domains.txt.
+func TestTheForceECHCallowlistMayLiveUnderEtc(t *testing.T) {
+	document, err := Render(config.Defaults(), withForceECH(ProductionPaths(), "/etc/mosdns/force-ech-domains.txt"))
+	if err != nil {
+		t.Fatalf("Render refused the operator's own allowlist under /etc: %v", err)
+	}
+	rewriter := argsOf[renderedCDNRewrite](t, decodeRendered(t, document).entry(t, "cdn_rewrite"))
+	if rewriter.ForceECHFile != "/etc/mosdns/force-ech-domains.txt" {
+		t.Errorf("cdn_rewrite reads the allowlist at %q, want the path the caller chose", rewriter.ForceECHFile)
+	}
+}
+
+// TestTheRenderedConfigRefusesToLoadWithoutAPrefixList is the load-time proof of
+// the file the renderer points the plugin at, and it is the reason the renderer
+// carries a field for it at all.
+//
+// What a run of the Cloudflare fetch caches is the API's own JSON: a schema
+// version, the URL it came from, an etag, and the document as a string. A
+// cloudflare_cidr_file naming that file is a plugin whose range list holds no
+// prefix, and this release refuses to start over one -- correctly, because a
+// classification with no argument classifies every response as somebody else's and
+// stops every rewrite in the router while the router looks healthy. So the refusal
+// is asserted here, on the real loader, rather than being assumed: a renderer that
+// pointed the plugin at the envelope would produce a document no installed router
+// could start, and no test that only read bytes would have said so.
+func TestTheRenderedConfigRefusesToLoadWithoutAPrefixList(t *testing.T) {
+	directory := t.TempDir()
+	envelope := filepath.Join(directory, "cloudflare-ips.json")
+	// The shape a run of the fetch leaves behind: a schema, a URL, an etag, and
+	// the document as a string rather than as ranges.
+	published := `{"schema_version":1,"url":"https://example.invalid/ips-v4","etag":"W/\"abc\"",` +
+		`"body":"{\"result\":{\"ipv4_cidrs\":[\"104.16.0.0/13\"],\"etag\":\"x\"}}"}`
+	if err := os.WriteFile(envelope, []byte(published), 0o600); err != nil {
+		t.Fatalf("write the cache envelope: %v", err)
+	}
+	prefixesOnly, _ := temporaryPaths(t, "tcp://127.0.0.1:15353")
+	paths := withCloudflarePrefixes(prefixesOnly, envelope)
+	// A literal listen address, because nothing binds it: this case is about the
+	// loader refusing, and reserving a free port for a process that must not start
+	// would make a case about a refusal depend on the port allocator.
+	paths.Listen = "127.0.0.1:15354"
+
+	document, err := Render(config.Defaults(), paths)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	loaded := decodeMosdnsConfig(t, document)
+	instance, err := coremain.NewMosdns(loaded)
+	if err == nil {
+		instance.CloseWithErr(nil)
+		_ = instance.GetSafeClose().WaitClosed()
+		t.Fatal("a configuration whose cloudflare_cidr_file is the API cache envelope loaded, so the plugin would classify every response as somebody else's")
+	}
+	// The refusal has to name the file, because an operator who is told only that
+	// a plugin refused has no idea which of the six arguments to look at. It does
+	// not name the ARGUMENT: the plugin reports the path it could not read, which
+	// is the value the operator has to change, and the six arguments are one per
+	// path in the document.
+	for _, want := range []string{envelope, "is not a prefix"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
 	}
 }
 
@@ -605,6 +883,10 @@ func TestRenderIsAStableFunctionOfItsInputs(t *testing.T) {
 		"the listen address":   withListen(ProductionPaths(), "127.0.0.1:5353"),
 		"the policy path":      withPolicy(ProductionPaths(), "/etc/mosdns/other-policy.yaml"),
 		"the foreign listener": withForeignListener(ProductionPaths(), "tcp://127.0.0.1:25353"),
+		"the selector path":    withSelector(ProductionPaths(), "/var/lib/mosdns/runtime/other.json"),
+		"the force-ECH list":   withForceECH(ProductionPaths(), "/etc/mosdns/other-domains.txt"),
+		"the ECH state path":   withECHState(ProductionPaths(), "/var/lib/mosdns/runtime/other-ech.json"),
+		"the prefix list path": withCloudflarePrefixes(ProductionPaths(), "/var/lib/mosdns/lists/other-prefixes.txt"),
 	} {
 		other, err := Render(config.Defaults(), elsewhere)
 		if err != nil {
@@ -814,11 +1096,19 @@ func TestASuccessfulDomesticAnswerIsNeverReplacedByTheForeignCache(t *testing.T)
 }
 
 // temporaryPaths builds a path set a test can load: the committed China list in
-// a temporary directory, a valid state document, a foreign listener on the
-// caller's mock, and a listen address whose port nothing else holds. The state
-// document names no resolver, which is the fail-closed state the bridge
-// publishes when it cannot vouch for a set, so a test that runs the real
-// domestic plugin answers without a network.
+// a temporary directory, a valid state document, the four documents the response
+// rewriter reads, a foreign listener on the caller's mock, and a listen address
+// whose port nothing else holds. The state document names no resolver, which is
+// the fail-closed state the bridge publishes when it cannot vouch for a set, so a
+// test that runs the real domestic plugin answers without a network.
+//
+// The rewriter's files are written rather than pointed at, because the plugin
+// refuses to start without a readable range list and reads its policy at
+// construction: a document naming a path nothing wrote is a document no real
+// mosdns could load, and a test that proved the sequences worked around an
+// unstartable document would be proving nothing. The selector is disabled and the
+// allowlist is a comment, so a test that is not about the rewrite gets a plugin
+// that starts and changes nothing.
 func temporaryPaths(t *testing.T, foreignListener string) (Paths, string) {
 	t.Helper()
 	temporary := t.TempDir()
@@ -843,14 +1133,56 @@ func temporaryPaths(t *testing.T, foreignListener string) (Paths, string) {
 		t.Fatalf("write the state document: %v", err)
 	}
 
+	policyFile := filepath.Join(temporary, "policy.yaml")
+	policy, err := config.Marshal(config.Defaults())
+	if err != nil {
+		t.Fatalf("encode the policy: %v", err)
+	}
+	if err := os.WriteFile(policyFile, policy, 0o600); err != nil {
+		t.Fatalf("write the policy: %v", err)
+	}
+
+	selectorFile := filepath.Join(temporary, "cdn-selector.json")
+	disabled := state.NewSelector(0, "disabled", "cloudflare", time.Unix(0, 0).UTC())
+	if err := state.WriteJSONAtomic(selectorFile, disabled); err != nil {
+		t.Fatalf("write the disabled selector: %v", err)
+	}
+
+	allowlist := filepath.Join(temporary, "force-ech-domains.txt")
+	if err := os.WriteFile(allowlist, []byte("# no domain is forced in this document\n"), 0o600); err != nil {
+		t.Fatalf("write the allowlist: %v", err)
+	}
+
+	prefixes := filepath.Join(temporary, "cloudflare-prefixes.txt")
+	if err := os.WriteFile(prefixes, []byte("104.16.0.0/13\n"), 0o600); err != nil {
+		t.Fatalf("write the Cloudflare prefix list: %v", err)
+	}
+
 	listenAddress := net.JoinHostPort("127.0.0.1", freeLoopbackPort(t))
 	return Paths{
-		Policy:          "/etc/mosdns/policy.yaml",
-		CNDomains:       cnList,
-		DHCPState:       stateFile,
-		ForeignListener: foreignListener,
-		Listen:          listenAddress,
+		Policy:             policyFile,
+		Selector:           selectorFile,
+		ForceECH:           allowlist,
+		ECHState:           filepath.Join(temporary, "ech-state.json"),
+		CNDomains:          cnList,
+		CloudflarePrefixes: prefixes,
+		DHCPState:          stateFile,
+		ForeignListener:    foreignListener,
+		Listen:             listenAddress,
 	}, listenAddress
+}
+
+// mustRender renders a document for a path set that is expected to be renderable,
+// and fails the test with the document if it is not. It is the one place a test
+// that is about something other than a refusal stops repeating the same four
+// lines.
+func mustRender(t *testing.T, paths Paths) []byte {
+	t.Helper()
+	document, err := Render(config.Defaults(), paths)
+	if err != nil {
+		t.Fatalf("Render(%+v): %v", paths, err)
+	}
+	return document
 }
 
 // decodeMosdnsConfig decodes a rendered document the way the router's own start
@@ -1042,6 +1374,26 @@ func withPolicy(paths Paths, value string) Paths {
 	return paths
 }
 
+func withSelector(paths Paths, value string) Paths {
+	paths.Selector = value
+	return paths
+}
+
+func withForceECH(paths Paths, value string) Paths {
+	paths.ForceECH = value
+	return paths
+}
+
+func withECHState(paths Paths, value string) Paths {
+	paths.ECHState = value
+	return paths
+}
+
+func withCloudflarePrefixes(paths Paths, value string) Paths {
+	paths.CloudflarePrefixes = value
+	return paths
+}
+
 func withCNDomains(paths Paths, value string) Paths {
 	paths.CNDomains = value
 	return paths
@@ -1069,6 +1421,22 @@ func withDHCPUpstreamPort(paths Paths, value int) Paths {
 
 func withoutPolicy(paths Paths) Paths {
 	return withPolicy(paths, "")
+}
+
+func withoutSelector(paths Paths) Paths {
+	return withSelector(paths, "")
+}
+
+func withoutForceECH(paths Paths) Paths {
+	return withForceECH(paths, "")
+}
+
+func withoutECHState(paths Paths) Paths {
+	return withECHState(paths, "")
+}
+
+func withoutCloudflarePrefixes(paths Paths) Paths {
+	return withCloudflarePrefixes(paths, "")
 }
 
 func withoutCNDomains(paths Paths) Paths {

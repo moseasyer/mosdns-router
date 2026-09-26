@@ -148,14 +148,28 @@ func TestRenderPublishesTheReviewedDocumentPair(t *testing.T) {
 	}
 
 	committedRouting := readCommitted(t, committedMosdnsDocument)
+	// The committed routing document names the policy path twice: once in the
+	// generated header, and once as the document the response rewriter is configured
+	// by. Both have to be the policy this render was given, so every occurrence is
+	// replaced rather than the first -- and the count is asserted instead of assumed,
+	// because a document naming the path once would mean the rewriter was configured
+	// by a different file than the header claims produced it.
 	occurrences := bytes.Count(committedRouting, []byte(productionPolicyPath))
-	if occurrences != 1 {
-		t.Fatalf("%s names %q %d times, so the expected document cannot be derived from it",
+	if occurrences != 2 {
+		t.Fatalf("%s names %q %d times, want 2: the generated header and the rewriter's policy_file",
 			committedMosdnsDocument, productionPolicyPath, occurrences)
 	}
-	want := bytes.Replace(committedRouting, []byte(productionPolicyPath), []byte(instance.policy), 1)
-	if got := instance.contents(t, "mosdns.yaml"); !bytes.Equal(got, want) {
-		t.Errorf("the published routing document is not %s rendered from %s:\n%s", committedMosdnsDocument, instance.policy, got)
+	want := bytes.ReplaceAll(committedRouting, []byte(productionPolicyPath), []byte(instance.policy))
+	published := instance.contents(t, "mosdns.yaml")
+	if !bytes.Equal(published, want) {
+		t.Errorf("the published routing document is not %s rendered from %s:\n%s", committedMosdnsDocument, instance.policy, published)
+	}
+	// And the rewriter is configured by that same policy rather than by the installed
+	// one, which a byte-for-byte comparison above cannot tell: it would pass on a
+	// document whose header said one thing and whose plugin argument said another, as
+	// long as both were the committed bytes.
+	if !bytes.Contains(published, []byte("policy_file: "+instance.policy+"\n")) {
+		t.Errorf("the published routing document does not give the rewriter %s as its policy:\n%s", instance.policy, published)
 	}
 
 	for _, want := range []string{

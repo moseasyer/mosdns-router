@@ -14,6 +14,15 @@
 # resolver over TCP. There is no fallback between them: a foreign query that
 # cannot be answered fails, and is never re-asked inside the network the user is
 # leaving.
+#
+# The foreign branch rewrites what comes back from that resolver, and only what
+# comes back from it: cdn_rewrite runs first, so a rewritten answer is never
+# itself cached, and a cached answer is rewritten on the way out to every client
+# rather than stored rewritten. It replaces an address only for a response every
+# one of whose addresses is inside a published Cloudflare range, and only while
+# the published selection's proof window is open. Nothing in the domestic branch
+# is rewritten: those answers come from the network the user is not leaving, and
+# nothing here has proved anything about them.
 log:
   level: info
 plugins:
@@ -29,6 +38,15 @@ plugins:
       cache_entries: 4096
       upstream_port: 53
       failure_policy: disable-current
+  - tag: cdn_rewrite
+    type: cdn_rewrite
+    args:
+      policy_file: /etc/mosdns/policy.yaml
+      selector_file: /var/lib/mosdns/runtime/cdn-selector.json
+      force_ech_file: /etc/mosdns/force-ech-domains.txt
+      ech_state_file: /var/lib/mosdns/runtime/ech-state.json
+      foreign_upstream: tcp://127.0.0.1:15353
+      cloudflare_cidr_file: /var/lib/mosdns/lists/cloudflare-prefixes.txt
   - tag: foreign_cache
     type: cache
     args:
@@ -46,6 +64,7 @@ plugins:
   - tag: foreign_path
     type: sequence
     args:
+      - exec: $cdn_rewrite
       - exec: $foreign_cache
       - matches:
           - has_resp

@@ -448,8 +448,7 @@ func newHarnessWithList(t *testing.T, fixture stateFixture, list chinaListFixtur
 	if err != nil {
 		t.Fatalf("split the domestic address %q: %v", h.domestic.Address(), err)
 	}
-	document, err := mosdnsconfig.Render(config.Defaults(), mosdnsconfig.Paths{
-		Policy:    filepath.Join(directory, "policy.yaml"),
+	document, err := mosdnsconfig.Render(config.Defaults(), withRewriteFiles(mosdnsconfig.Paths{
 		CNDomains: h.cnList,
 		DHCPState: h.stateFile,
 		// The foreign branch is entered over TCP, so the resolver is a tcp://
@@ -458,10 +457,10 @@ func newHarnessWithList(t *testing.T, fixture stateFixture, list chinaListFixtur
 		ForeignListener: "tcp://" + h.foreign.Address(),
 		Listen:          h.listen,
 		// A published state carries a bare address, so the port it is dialled on
-		// is this document's to state. Without it the plugin would dial 53, and
-		// the domestic branch would answer nothing at all.
+		// is this document's to state. Without it the plugin would dial 53, and the
+		// domestic branch would answer nothing at all.
 		DHCPUpstreamPort: atoi(t, upstreamPort),
-	})
+	}, inactiveRewriteFixture().write(t, directory)))
 	if err != nil {
 		t.Fatalf("render a configuration for the harness: %v", err)
 	}

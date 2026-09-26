@@ -64,10 +64,18 @@ test: check-go test-python
 # carries GO through, so the binary under test is built by the toolchain check-go
 # just accepted rather than by whichever go happens to be on PATH.
 #
+# The suite is the only place the two promises this router makes about answers are
+# checked together: that a name reaches only its own branch, and that a response
+# this router rewrites is rewritten on the way out rather than stored rewritten.
+# Every other test in this repository reads bytes, so a case that starts the real
+# binary and follows its queries is the only thing that can fail when the document
+# is right and the behaviour is not.
+#
 # -count=1 because this suite's work is not something the test cache can see: it
 # binds sockets and runs a child process, and a cached pass would be a gate
 # satisfied without a single case having been asked. The entry-point regression
-# asserts this flag is here, so it cannot be dropped and left as a comment.
+# asserts this flag is here, for this target AND for verify, so it cannot be
+# dropped and left as a comment.
 #
 # The suite skips on a host with no non-loopback IPv4 address, because the
 # production DHCP state decoder refuses a loopback upstream and the alternative

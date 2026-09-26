@@ -33,6 +33,7 @@ import (
 	// own plugin is not in that bundle, so it is linked here as well.
 	_ "github.com/IrineSistiana/mosdns/v5/plugin"
 
+	cdnrewrite "mosdns-router/plugin/executable/cdn_rewrite"
 	dhcpforward "mosdns-router/plugin/executable/dhcp_forward"
 )
 
@@ -42,6 +43,7 @@ import (
 const (
 	tagCNDomains      = "cn_domains"
 	tagDHCPForward    = "dhcp_forward"
+	tagCDNRewrite     = "cdn_rewrite"
 	tagForeignCache   = "foreign_cache"
 	tagForeignForward = "foreign_forward"
 	tagCNPath         = "cn_path"
@@ -123,11 +125,34 @@ var chinesePublicDNSAddresses = []string{
 // environment is a path a different invocation resolves differently.
 type Paths struct {
 	// Policy is the policy file the document is generated from. It is named in
-	// the generated header so an operator can tell which policy produced it.
+	// the generated header so an operator can tell which policy produced it, and
+	// the response rewriter reads it as well: the switches an operator edits --
+	// IPv6 suppression, whether ECH is forced at all, what happens when the key
+	// cannot be fetched -- are read from this one file, so there is no second
+	// place to set them.
 	Policy string
+	// Selector is the published selection: which address is in service, the window
+	// its proof is good for, and the per-hostname CloudFront mappings. The
+	// optimizer and the health check write it, so it is rewritten while the router
+	// runs and is not under /etc.
+	Selector string
+	// ForceECH is the operator's list of the domains to force ECH for. It is
+	// written by hand and replaced by packaging, so it belongs in the
+	// read-only configuration directory: nothing rewrites it while the router
+	// runs, and an operator has to find it.
+	ForceECH string
+	// ECHState is the document the response rewriter publishes about the key it
+	// fetched: the source, the times, the digest and the public name, and never a
+	// byte of the key itself. The router writes it, so it is not under /etc.
+	ECHState string
 	// CNDomains is the pinned China rule list the domestic dispatch matches
 	// against. It is rewritten by the list updater, so it is not under /etc.
 	CNDomains string
+	// CloudflarePrefixes is the PUBLISHED Cloudflare range list, one prefix per
+	// line, that the same cached fetch writes beside the API's own document. It is
+	// the only argument the response classifier has, so it is the one path in this
+	// document whose absence stops the router rather than silencing a feature.
+	CloudflarePrefixes string
 	// DHCPState is the state document the DHCP bridge publishes, with the DNS
 	// servers the client is currently configured with. It is rewritten on every
 	// renewal, so it is not under /etc.
@@ -151,12 +176,16 @@ type Paths struct {
 // under /run.
 func ProductionPaths() Paths {
 	return Paths{
-		Policy:           "/etc/mosdns/policy.yaml",
-		CNDomains:        "/var/lib/mosdns/lists/cn-domains.txt",
-		DHCPState:        "/run/mosdns/dhcp-upstreams.json",
-		ForeignListener:  "tcp://127.0.0.1:15353",
-		Listen:           "127.0.0.1:53",
-		DHCPUpstreamPort: 53,
+		Policy:             "/etc/mosdns/policy.yaml",
+		Selector:           "/var/lib/mosdns/runtime/cdn-selector.json",
+		ForceECH:           "/etc/mosdns/force-ech-domains.txt",
+		ECHState:           "/var/lib/mosdns/runtime/ech-state.json",
+		CNDomains:          "/var/lib/mosdns/lists/cn-domains.txt",
+		CloudflarePrefixes: "/var/lib/mosdns/lists/cloudflare-prefixes.txt",
+		DHCPState:          "/run/mosdns/dhcp-upstreams.json",
+		ForeignListener:    "tcp://127.0.0.1:15353",
+		Listen:             "127.0.0.1:53",
+		DHCPUpstreamPort:   53,
 	}
 }
 
@@ -210,6 +239,19 @@ type (
 	// user's query names to disk.
 	cacheArgs struct {
 		Size int `yaml:"size"`
+	}
+	// cdnRewriteArgs is the response rewriter: the six documents it reads, and
+	// the one address it dials. Every path is required, and the plugin refuses to
+	// start without any of them, so a document that names one of them has to name
+	// a file that exists: this renderer cannot check that, which is why the
+	// renderer tests load what it renders rather than only reading it.
+	cdnRewriteArgs struct {
+		PolicyFile         string `yaml:"policy_file"`
+		SelectorFile       string `yaml:"selector_file"`
+		ForceECHFile       string `yaml:"force_ech_file"`
+		ECHStateFile       string `yaml:"ech_state_file"`
+		ForeignUpstream    string `yaml:"foreign_upstream"`
+		CloudflareCIDRFile string `yaml:"cloudflare_cidr_file"`
 	}
 	// forwardArgs is the foreign forward, into the DNSCrypt resolver.
 	forwardArgs struct {
@@ -282,6 +324,47 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 				},
 			},
 			{
+				// The response rewriter, the first executable of the foreign branch.
+				// It sits AHEAD of the cache rather than behind it, and the two
+				// orders are not interchangeable:
+				//
+				// Ahead, a rewrite is applied to a copy of whatever the cache hands
+				// back, and the object the cache owns still holds the upstream's
+				// answer. A client asking again after the optimizer publishes a
+				// different address gets that address, and the cached entry is
+				// still the upstream's answer to rewrite next time.
+				//
+				// Behind, the cache stores what the rewriter returns, so the
+				// selected address becomes the cached answer for as long as the
+				// entry lives: one generation's selection pinned for the entry's
+				// whole lifetime, and every client after the first sent there
+				// whatever the health check last decided.
+				//
+				// It is a recursive executable, so the cache and the forwarder are
+				// its `next` chain, and mosdns hands it exactly that. The order of
+				// the plugin list follows the order the branch runs in, so the file
+				// an operator reads lists the three executables in that order.
+				Tag:  tagCDNRewrite,
+				Type: cdnrewrite.PluginType,
+				Args: cdnRewriteArgs{
+					PolicyFile:   paths.Policy,
+					SelectorFile: paths.Selector,
+					ForceECHFile: paths.ForceECH,
+					ECHStateFile: paths.ECHState,
+					// The same listener the forward below enters, taken from the
+					// same checked value, so the two cannot disagree about where
+					// the resolver is. The ECH key is fetched over this TCP
+					// listener and not through mosdns's UDP transport, which
+					// re-sends an unanswered query and can drop an answer that
+					// arrived early.
+					ForeignUpstream: paths.ForeignListener,
+					// The PUBLISHED prefix list, not the API's cached document: one
+					// prefix per line, written by the same fetch that writes the
+					// envelope. See candidate.DefaultCloudflarePrefixFileName.
+					CloudflareCIDRFile: paths.CloudflarePrefixes,
+				},
+			},
+			{
 				Tag:  tagForeignCache,
 				Type: "cache",
 				Args: cacheArgs{Size: foreignCacheEntries},
@@ -304,12 +387,16 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 				},
 			},
 			{
-				// The foreign branch. The cache is a recursive executable: it
-				// always runs the rules after it, so the has_resp check is what
-				// keeps a cache hit from being forwarded as well.
+				// The foreign branch. The rewriter runs first and the cache is
+				// downstream of it, so a rewrite lands on a copy of a cache hit
+				// and a rewritten answer is never itself stored. The cache is a
+				// recursive executable: it always runs the rules after it, so the
+				// has_resp check is what keeps a cache hit from being forwarded as
+				// well.
 				Tag:  tagForeignPath,
 				Type: "sequence",
 				Args: []rule{
+					{Exec: "$" + tagCDNRewrite},
 					{Exec: "$" + tagForeignCache},
 					{Matches: []string{"has_resp"}, Exec: "accept"},
 					{Exec: "$" + tagForeignForward},
@@ -394,6 +481,15 @@ func header(policyPath string) string {
 # resolver over TCP. There is no fallback between them: a foreign query that
 # cannot be answered fails, and is never re-asked inside the network the user is
 # leaving.
+#
+# The foreign branch rewrites what comes back from that resolver, and only what
+# comes back from it: cdn_rewrite runs first, so a rewritten answer is never
+# itself cached, and a cached answer is rewritten on the way out to every client
+# rather than stored rewritten. It replaces an address only for a response every
+# one of whose addresses is inside a published Cloudflare range, and only while
+# the published selection's proof window is open. Nothing in the domestic branch
+# is rewritten: those answers come from the network the user is not leaving, and
+# nothing here has proved anything about them.
 `, policyPath)
 }
 
@@ -402,12 +498,16 @@ func header(policyPath string) string {
 // resolvedPaths is a Paths that has passed every check. The document is built
 // from it and from nothing else, so no unchecked value can reach an argument.
 type resolvedPaths struct {
-	Policy           string
-	CNDomains        string
-	DHCPState        string
-	ForeignListener  string
-	Listen           string
-	DHCPUpstreamPort int
+	Policy             string
+	Selector           string
+	ForceECH           string
+	ECHState           string
+	CNDomains          string
+	CloudflarePrefixes string
+	DHCPState          string
+	ForeignListener    string
+	Listen             string
+	DHCPUpstreamPort   int
 }
 
 // resolve checks the paths and returns them in the form the document will carry.
@@ -421,7 +521,11 @@ func resolve(paths Paths) (resolvedPaths, error) {
 		value string
 	}{
 		{"policy path", paths.Policy},
+		{"selector path", paths.Selector},
+		{"force-ECH allowlist path", paths.ForceECH},
+		{"ECH state document path", paths.ECHState},
 		{"China list path", paths.CNDomains},
+		{"Cloudflare prefix list path", paths.CloudflarePrefixes},
 		{"state document path", paths.DHCPState},
 		{"foreign listener", paths.ForeignListener},
 		{"listen address", paths.Listen},
@@ -431,35 +535,59 @@ func resolve(paths Paths) (resolvedPaths, error) {
 		}
 	}
 	resolved.Policy = cleanPath(paths.Policy)
+	resolved.Selector = cleanPath(paths.Selector)
+	resolved.ForceECH = cleanPath(paths.ForceECH)
+	resolved.ECHState = cleanPath(paths.ECHState)
 	resolved.CNDomains = cleanPath(paths.CNDomains)
+	resolved.CloudflarePrefixes = cleanPath(paths.CloudflarePrefixes)
 	resolved.DHCPState = cleanPath(paths.DHCPState)
 	resolved.Listen = strings.TrimSpace(paths.Listen)
 
 	// A path that is resolved against a working directory is a path that means
-	// something different under systemd, under a shell and under a test.
+	// something different under systemd, under a shell and under a test. The
+	// allowlist is in this list because it is the one of the four an operator
+	// edits by hand, and a hand-edited path is the one most likely to be written
+	// relative to wherever the operator happened to be.
 	for _, field := range []struct {
 		name  string
 		value string
 	}{
 		{"policy path", resolved.Policy},
+		{"selector path", resolved.Selector},
+		{"force-ECH allowlist path", resolved.ForceECH},
+		{"ECH state document path", resolved.ECHState},
 		{"China list path", resolved.CNDomains},
+		{"Cloudflare prefix list path", resolved.CloudflarePrefixes},
 		{"state document path", resolved.DHCPState},
 	} {
 		if !strings.HasPrefix(field.value, "/") {
 			return resolvedPaths{}, fmt.Errorf("mosdnsconfig: the %s %q must be absolute", field.name, field.value)
 		}
 	}
-	// The China list and the state document are both rewritten while the router
-	// runs. A file under /etc is replaced by packaging, and /etc/mosdns is
-	// root-owned configuration: a rule list published there would be lost on the
-	// next upgrade, and a state document the service user cannot write would stop
-	// the domestic branch at the first DHCP renewal.
+	// The China list, the state document, the selector, the ECH metadata document
+	// and the range list are all rewritten while the router runs. A file under
+	// /etc is replaced by packaging, and /etc/mosdns is root-owned configuration:
+	// a rule list published there would be lost on the next upgrade, a state
+	// document the service user cannot write would stop the domestic branch at the
+	// first DHCP renewal, and an ECH document under a root-owned directory would
+	// cost a force-ECH name its key for as long as the write kept failing.
+	//
+	// The force-ECH allowlist is the one path of the four that is NOT in this
+	// list, and that is the difference between the two kinds of file: nothing
+	// rewrites it while the router runs, an operator edits it and expects to find
+	// it where the other configuration is, and a file the router cannot replace
+	// under /etc is a file that survives the upgrade nobody meant to keep it. The
+	// renderer therefore refuses it for emptiness and for being relative, and
+	// leaves it where the operator put it.
 	for _, field := range []struct {
 		name  string
 		value string
 	}{
 		{"China list path", resolved.CNDomains},
+		{"Cloudflare prefix list path", resolved.CloudflarePrefixes},
 		{"state document path", resolved.DHCPState},
+		{"selector path", resolved.Selector},
+		{"ECH state document path", resolved.ECHState},
 	} {
 		if under(field.value, readOnlyConfigurationRoot) {
 			return resolvedPaths{}, fmt.Errorf(
