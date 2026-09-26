@@ -196,16 +196,37 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-ReadWritePaths=/var/lib/mosdns/runtime /run/mosdns
+ReadWritePaths=/var/lib/mosdns/runtime
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ```
 
-`ReadWritePaths` is per identity and is not one list repeated: the router writes
-the ECH state, the optimizer and the health check write the selector, the budget,
-the health document and the published range cache, the bridge publishes the DHCP
-state, and the list check and the resolver write nothing at all. The test checks
-each unit against that table, so a unit granting a directory its identity does not
-write fails.
+`ReadWritePaths` is per identity and is not one list repeated, and the table it
+comes from is the code's write set rather than a decision: the router writes the
+ECH state, the optimizer writes the selector, the budget, the control lock and the
+published range cache, the health check writes the health document, the selector it
+may transition and the control lock, the bridge publishes the DHCP state, and the
+list check and the resolver write nothing at all. The test derives each row from
+the writer that produces it -- the write call sites in the two plugins, the options
+`runCDNHealthCheck` hands the checker, the paths the optimizer is configured with
+-- and compares it for equality, so a unit granting a directory its identity does
+not write fails, and a writer that starts using a new directory fails the other
+way.
+
+Two consequences of that table are load-bearing rather than tidy:
+
+- **The router does not make `/run/mosdns` writable.** Its only write is the ECH
+  state; `dhcp_forward` only reads the state the bridge publishes, and the plugin
+  treats its absence as "keep the current generation". An unprefixed
+  `ReadWritePaths=` entry naming a directory that is not there fails the unit's
+  mount-namespace setup, and `/run` is a tmpfs, so on a host where the dispatcher
+  has not fired -- a static address, a link NetworkManager does not manage, no
+  dispatcher installed -- that failure is retried on every `RestartSec` forever and
+  the machine has no DNS. A `ReadWritePaths` entry naming a volatile path must
+  carry the `-` prefix, and there is nothing here to grant anyway.
+- **The health check does not make `/var/lib/mosdns/lists` writable.** Its three
+  options are all in the runtime directory, and the identity already reads the
+  published China list through its DAC permissions as a member of the shared group;
+  a mount grant for a directory it does not write in would add no access it lacks.
 
 DNSCrypt runs as `dnscrypt-proxy`, uses `/etc/mosdns/dnscrypt-proxy.toml`, needs
 no capability -- 15353 is unprivileged, so its bounding set is emptied rather than
@@ -225,6 +246,8 @@ take the machine's only DNS path down with it.
 - The optimizer, health and list-check services are `Type=oneshot` and are not enabled; their timers start them. Each service sets a `TimeoutStartSec` above what its command can legitimately spend, because the 90-second default for a oneshot would kill the nightly run and cut a slow origin off before it could report that it was slow.
 - The exit-code policy is one decision, and the test holds it: `SuccessExitStatus=4` on the optimizer and the health check, because 4 is the CLI's own answer for the shared control lock ("the other one got there first") and a race with an operator's own pin or apply is not a broken unit. Every other non-zero exit fails the unit, including a refusal to publish. A budget-exhausted run needs no exception: a full day still names a winner in every group and keeps every mapping, so the command exits 0 by construction. The list check excuses nothing, because it takes no lock, so 4 is unreachable, and its exit 3 is a run that produced no report at all.
 - Router and DNSCrypt must not use `network-online.target` as a hard start requirement, and no unit may pull in `network.target` with `Wants=` or `Requires=`. `network.target` appears as an ordering edge only.
+- Every unit carries `Documentation=man:…` naming the page it is documented by, and that directive is pinned by the text table. `systemd-analyze verify` shells out to `man(1)` for each one and fails the unit with code 16 when the page is not installed, and there is no option to decline the check, so the verify harness puts a stub `man` on `PATH`. That is deliberate: whether the pages exist is a package-completeness question for Task 6, and it must not decide whether a unit is valid. The pages themselves are Task 6's obligation, listed there.
+- Every unit states its systemd version floor in a comment: 249, the oldest supported release, with `ProtectProc=` and `ProcSubset=` (247) the newest directives used. `systemd-analyze verify` runs against the build host's systemd (259 while this was written), so it cannot catch a 250+ directive that Ubuntu 22.04 would refuse at boot; proving the floor is a container run under the spec's isolation testing.
 
 - [ ] **Step 5: Run static tests**
 
@@ -232,7 +255,16 @@ take the machine's only DNS path down with it.
 python3 -m unittest installer.tests.test_units -v
 ```
 
-Expected: PASS, with `systemd-analyze verify` clean for each of the eight files.
+Expected: PASS, with `systemd-analyze verify` at exit 0 and no diagnostic about
+any of the eight units for each of them. The harness resolves each unit's default
+dependencies against a copy of the host's own `/usr/lib/systemd` with its `*.wants`
+symlinks preserved, and a test asserts the copy kept them: a copy that dereferences
+them silently drops all of them, because following a relative link resolves it
+against the process's working directory rather than the link's own directory, and a
+harness that drops the closure is clean because of what it dropped. Diagnostics
+about the host's own units -- a dracut unit enabled by a symlink out of the copied
+tree -- are the host's, and the gate is "nothing systemd said is about this
+package" rather than "stderr is empty".
 
 - [ ] **Step 6: Commit**
 
@@ -526,15 +558,59 @@ a group-writable setgid directory, so the other identity can read it, rename
 over it, and acquire the lock without any additional privilege. Do not grant
 world access and do not rely on a per-file `chown` from an unprivileged unit.
 
+`/run/mosdns` is the one directory on that list that `postinst` cannot keep: `/run`
+is a tmpfs, so the group, the setgid bit and the default ACL are all gone after a
+reboot. **A `tmpfiles.d` entry creates it with the same properties on every boot,
+and reaps `*.tmp` and `*.bak` from both `/var/lib/mosdns/runtime` and
+`/etc/mosdns`** -- the second producer being `cmd/mosdns-cdnctl/publish.go`. The
+package-content test asserts the entry is installed and names `/run/mosdns`.
+
+The DHCP state file `/run/mosdns/dhcp-upstreams.json` has no producer unit and no
+ordering edge, and no unit directive can say that honestly: the NM dispatcher
+creates it asynchronously, the router treats its absence as "keep the current
+generation" and starts green, and `ConditionPathExists` would make the router
+refuse to start before the first dispatch, which is the worse outage. So the
+obligation is entirely in the packaging: the dispatcher script, the `tmpfiles.d`
+entry, and a package-content test that both are installed.
+
+`Documentation=man:mosdns-router(8)`, `man:mosdns-cdnctl(1)` and
+`man:dnscrypt-proxy(8)` are named by all eight units and the package must ship
+those three manual pages, so a directive does not point at nothing. The unit
+tests do not check this -- their `systemd-analyze verify` harness stubs `man(1)` on
+purpose, so that a package which has not shipped its pages yet is not a package
+whose units cannot be verified -- so the package-content test is where the pages
+are asserted.
+
 - [ ] **Step 4: Build pinned dnscrypt-proxy**
 
 `build-deb.sh` sets `CGO_ENABLED=0` and builds dnscrypt-proxy v2.1.18 from the pinned module/source into the staging root. It must use the same Go 1.25.8 toolchain and record source SHA-256 in `/usr/share/doc/mosdns-router/BUILD-MANIFEST`.
 
-- [ ] **Step 5: Implement atomic package build**
+The three binaries are installed at the exact paths the units' `ExecStart` lines
+name -- `/usr/lib/mosdns-router/mosdns-router`,
+`/usr/lib/mosdns-router/mosdns-cdnctl` and
+`/usr/lib/mosdns-router/dnscrypt-proxy` -- and the package-content test reads
+those `ExecStart` lines and asserts a file at each path, so a build that puts a
+binary anywhere else fails the build rather than the first boot.
+
+- [ ] **Step 5: Put the unit policy in the acceptance gate**
+
+`make test-python` discovers `bridge/tests` only, so the 37 unit-policy tests do
+not run in `make verify` until this is done. Add a `test-installer` target running
+
+```make
+	@$(PYTHON) -m unittest discover -s installer/tests
+```
+
+make `verify` depend on it, and add the assertion to
+`scripts/test-make-entrypoints.sh` that it depends on the target and that the
+target names the installer suite -- the same way that script holds the other
+entry points, so a later edit cannot drop it quietly.
+
+- [ ] **Step 6: Implement atomic package build**
 
 Use `dpkg-deb --root-owner-group --build staging build/mosdns-router_VERSION_ARCH.deb`. Do not install the package on the development host.
 
-- [ ] **Step 6: Run package tests**
+- [ ] **Step 7: Run package tests**
 
 ```bash
 make package
@@ -544,7 +620,7 @@ dpkg-deb --contents build/mosdns-router_0.1.0_amd64.deb
 
 Expected: package metadata and paths match the test; no state files or host service changes exist.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add packaging scripts/build-deb.sh Makefile
