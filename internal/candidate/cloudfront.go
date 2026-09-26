@@ -391,12 +391,17 @@ func NewCloudFrontSource(client *http.Client, baseURL, cachePath string, profile
 // the published ranges it holds as reference data. It is safe to call from more
 // than one goroutine.
 func (s *HTTPCloudFrontSource) Profiles(ctx context.Context) ([]CloudFrontProfile, error) {
-	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath)
+	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath, validatorOptional)
 	if err != nil {
 		return nil, err
 	}
 	prefixes, err := parseReferenceRanges(s.baseURL, fetched.Body)
 	if err != nil {
+		return nil, err
+	}
+	// The document is only stored once it has been accepted, so the cache never
+	// holds a body this run refused.
+	if err := storeDocument(s.cachePath, fetched); err != nil {
 		return nil, err
 	}
 	s.mutex.Lock()

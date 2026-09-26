@@ -40,14 +40,30 @@ type cacheDocument struct {
 	Body          json.RawMessage `json:"body"`
 }
 
-// fetchedDocument is one document a source read, with the validator that
-// describes it. An origin that offers no validator yields an empty one: the
-// document is still stored, so a later run can read it, but there is nothing to
-// revalidate with and nothing is sent.
+// fetchedDocument is one document a source read: the bytes, the URL they came
+// from, the validator that describes them, and whether they came from the cache
+// rather than from the origin.
 type fetchedDocument struct {
 	Body      []byte
+	URL       string
 	Validator string
+	Stale     bool
 }
+
+// validatorPolicy is what a source expects of the origin it reads.
+type validatorPolicy uint8
+
+const (
+	// validatorOptional accepts whatever the origin offers. A document with no
+	// validator is still read, because the source that asks for this has other
+	// work to do with the bytes.
+	validatorOptional validatorPolicy = iota
+	// validatorRequired refuses a response with no ETag before the body is read
+	// or stored: an API that documents a validator and sends none is not the API
+	// this build knows how to revalidate, and a stored copy of such a response
+	// could never be used again.
+	validatorRequired
+)
 
 // fetchDocument returns the body of an official source document, revalidating
 // against the cached copy when there is one.
@@ -55,12 +71,16 @@ type fetchedDocument struct {
 // The cache path and the URL are both parameters: production passes its own, and
 // a test passes a temporary directory, so nothing in this package can write
 // outside the path it was handed. A cache that is missing, unreadable, of another
-// version, or written for another URL is simply not used: it is evidence about
-// the document it was read from and about nothing else, and the run refetches.
+// version, written for another URL, or stored without a validator is simply not
+// used: it is evidence about the document it was read from and about nothing else,
+// and the run refetches.
+//
+// Nothing is written here. A document is stored by storeDocument, once the caller
+// has accepted it, so a body this build refuses never reaches the disk.
 //
 // A 304 with no usable cache is an error rather than an empty body, because a
 // validator that revalidates nothing can only mean the cache was lost.
-func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePath string) (fetchedDocument, error) {
+func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePath string, policy validatorPolicy) (fetchedDocument, error) {
 	cached, cachedOK := readCache(cachePath, sourceURL)
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
@@ -70,6 +90,9 @@ func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePat
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", userAgent)
 	if cachedOK {
+		// readCache only accepts a document that carries a validator, so this is
+		// never a bare conditional request. A request with an empty
+		// If-None-Match is malformed, and a strict origin may answer 400.
 		request.Header.Set("If-None-Match", cached.ETag)
 	}
 
@@ -84,12 +107,15 @@ func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePat
 		if !cachedOK {
 			return fetchedDocument{}, fmt.Errorf("%s: the origin answered 304 and no cached document is available", sourceURL)
 		}
-		return fetchedDocument{Body: cached.Body, Validator: cached.ETag}, nil
+		return fetchedDocument{Body: cached.Body, URL: sourceURL, Validator: cached.ETag}, nil
 	default:
 		return fetchedDocument{}, fmt.Errorf("%s: unexpected status %d", sourceURL, response.StatusCode)
 	}
 
 	validator := response.Header.Get("ETag")
+	if policy == validatorRequired && validator == "" {
+		return fetchedDocument{}, fmt.Errorf("%s: the response carries no ETag to revalidate with", sourceURL)
+	}
 	if response.ContentLength > maximumDocumentBytes {
 		return fetchedDocument{}, fmt.Errorf("%s: the document declares %d bytes, larger than the %d byte bound", sourceURL, response.ContentLength, maximumDocumentBytes)
 	}
@@ -100,18 +126,33 @@ func fetchDocument(ctx context.Context, client *http.Client, sourceURL, cachePat
 	if len(body) > maximumDocumentBytes {
 		return fetchedDocument{}, fmt.Errorf("%s: the document is larger than the %d byte bound", sourceURL, maximumDocumentBytes)
 	}
-	if err := writeCache(cachePath, cacheDocument{SchemaVersion: cacheSchemaVersion, URL: sourceURL, ETag: validator, Body: body}); err != nil {
-		return fetchedDocument{}, err
+	return fetchedDocument{Body: body, URL: sourceURL, Validator: validator}, nil
+}
+
+// storeDocument records a freshly read document under the injected path, once the
+// caller has accepted it. A stale document is already stored, and a document with
+// no validator is not stored at all: readCache would refuse it on the next run, so
+// the file could never be used for anything and would only be there to be
+// distrusted.
+func storeDocument(cachePath string, fetched fetchedDocument) error {
+	if fetched.Stale || fetched.Validator == "" {
+		return nil
 	}
-	return fetchedDocument{Body: body, Validator: validator}, nil
+	return writeCache(cachePath, cacheDocument{
+		SchemaVersion: cacheSchemaVersion,
+		URL:           fetched.URL,
+		ETag:          fetched.Validator,
+		Body:          fetched.Body,
+	})
 }
 
 // readCache returns the cached document for exactly this source URL, and reports
-// false for anything it cannot use, including a document cached with no
-// validator: there would be nothing to revalidate with. A cache this build cannot
-// read is replaced by the next run rather than trusted, and a read failure is not
-// fatal: the run that follows writes to the same path and reports the write error
-// if the path really is unusable.
+// false for anything it cannot use. A document stored without a validator is one
+// of those: there would be nothing to revalidate with, and a conditional request
+// carrying an empty validator is malformed. A cache this build cannot read is
+// replaced by the next run rather than trusted, and a read failure is not fatal:
+// the run that follows writes to the same path and reports the write error if the
+// path really is unusable.
 func readCache(cachePath, sourceURL string) (cacheDocument, bool) {
 	contents, err := os.ReadFile(cachePath)
 	if err != nil {
@@ -128,6 +169,9 @@ func readCache(cachePath, sourceURL string) (cacheDocument, bool) {
 		return cacheDocument{}, false
 	}
 	if document.SchemaVersion != cacheSchemaVersion || document.URL != sourceURL {
+		return cacheDocument{}, false
+	}
+	if document.ETag == "" {
 		return cacheDocument{}, false
 	}
 	if len(document.Body) == 0 || !json.Valid(document.Body) {

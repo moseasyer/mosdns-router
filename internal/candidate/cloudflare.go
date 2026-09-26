@@ -104,15 +104,9 @@ func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localD
 	if err != nil {
 		return nil, err
 	}
-	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath)
+	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath, validatorRequired)
 	if err != nil {
 		return nil, err
-	}
-	// This API documents an ETag on every response, and a body with no validator
-	// could never be revalidated, so one without it is refused rather than cached
-	// behind a stale copy.
-	if fetched.Validator == "" {
-		return nil, fmt.Errorf("%s: the response carries no ETag to revalidate with", s.baseURL)
 	}
 	document, err := parseCloudflareDocument(s.baseURL, fetched.Body)
 	if err != nil {
@@ -120,6 +114,11 @@ func (s *HTTPCloudflareSource) Candidates(ctx context.Context, limit int, localD
 	}
 	blocks, err := document.blocks()
 	if err != nil {
+		return nil, err
+	}
+	// The document is only stored once it has been accepted, so the cache never
+	// holds a body this run refused.
+	if err := storeDocument(s.cachePath, fetched); err != nil {
 		return nil, err
 	}
 	if len(blocks) == 0 {

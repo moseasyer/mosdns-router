@@ -3,6 +3,7 @@ package candidate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,10 +67,14 @@ func testDate(year int, month time.Month, day int) time.Time {
 	return time.Date(year, month, day, 3, 4, 5, 0, time.FixedZone("candidate-test", 8*60*60))
 }
 
-// originRequest is one request the fake origin answered.
+// originRequest is one request the fake origin answered. The conditional
+// validator is recorded as both a value and a presence, because a header sent
+// with an empty value is a different thing from no header at all, and the origin
+// cannot tell them apart from the value alone.
 type originRequest struct {
 	path         string
 	ifNoneMatch  string
+	hasValidator bool
 	acceptHeader string
 }
 
@@ -107,9 +112,11 @@ func newFakeOrigin(t *testing.T, document, etag string) *fakeOrigin {
 func (o *fakeOrigin) serve(writer http.ResponseWriter, request *http.Request) {
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
+	_, hasValidator := request.Header["If-None-Match"]
 	o.seen = append(o.seen, originRequest{
 		path:         request.URL.Path,
 		ifNoneMatch:  request.Header.Get("If-None-Match"),
+		hasValidator: hasValidator,
 		acceptHeader: request.Header.Get("Accept"),
 	})
 	switch {
@@ -237,6 +244,41 @@ var fixtureBlocks = []netip.Prefix{
 	netip.MustParsePrefix("172.64.5.0/24"),
 	netip.MustParsePrefix("172.64.6.0/24"),
 	netip.MustParsePrefix("172.64.7.0/24"),
+}
+
+// writeCacheEntry writes a cache document by hand, so a test can put a state on
+// disk that a well-behaved run would never produce: a foreign URL, a corrupt
+// body, or an empty validator.
+func writeCacheEntry(t *testing.T, cachePath, validator, body, sourceURL string) {
+	t.Helper()
+	entry, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"url":            sourceURL,
+		"etag":           validator,
+		"body":           json.RawMessage(body),
+	})
+	if err != nil {
+		t.Fatalf("encode a cache entry: %v", err)
+	}
+	if err := os.WriteFile(cachePath, entry, 0o600); err != nil {
+		t.Fatalf("write a cache entry: %v", err)
+	}
+}
+
+// cachedValidator returns the validator a cache document holds.
+func cachedValidator(t *testing.T, cachePath string) string {
+	t.Helper()
+	contents, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	var document struct {
+		ETag string `json:"etag"`
+	}
+	if err := json.Unmarshal(contents, &document); err != nil {
+		t.Fatalf("decode cache: %v", err)
+	}
+	return document.ETag
 }
 
 func TestCloudflareCandidatesExpandOnlyTheIPv4Ranges(t *testing.T) {
@@ -522,6 +564,51 @@ func TestCloudflareCandidatesReuseTheCachedBodyOnANotModifiedResponse(t *testing
 	}
 	if origin.bodiesServed() != 1 {
 		t.Errorf("the origin served %d bodies, want only the first", origin.bodiesServed())
+	}
+}
+
+func TestCloudflareCandidatesRefuseACacheWithNoValidator(t *testing.T) {
+	// A cache entry with no validator is not evidence about anything: it cannot be
+	// revalidated, and a conditional request carrying an empty validator is a
+	// malformed request a strict origin may answer with 400. So the entry is not
+	// used, which means no conditional header is sent at all, and the run refetches
+	// and replaces it with a document that carries one.
+	cachePath := filepath.Join(t.TempDir(), "cloudflare-ips.json")
+	origin := newFakeOrigin(t, standardDocument(), fixtureETag)
+	// Every other field is one a well-behaved run would write: the same source, a
+	// document that parses, and a body this build would accept. The empty
+	// validator is the only thing wrong, so the refusal cannot be another rule
+	// answering for it.
+	writeCacheEntry(t, cachePath, "", standardDocument(), origin.server.URL)
+	want := cloudflareCandidates(t, newTestSource(t, origin, cachePath), 512, testDate(2026, time.September, 25))
+
+	requests := origin.requests()
+	if len(requests) != 1 {
+		t.Fatalf("got %d requests, want one", len(requests))
+	}
+	if requests[0].hasValidator {
+		t.Errorf("the request revalidated against a cache with no validator, sending If-None-Match %q", requests[0].ifNoneMatch)
+	}
+	if got := cachedValidator(t, cachePath); got != fixtureETag {
+		t.Errorf("the cache now holds the validator %q, want the one the origin sent %q", got, fixtureETag)
+	}
+	if len(want) != len(fixtureBlocks) {
+		t.Errorf("got %d candidates, want one per block", len(want))
+	}
+}
+
+func TestCloudflareCandidatesDoNotStoreABodyTheyRefuse(t *testing.T) {
+	// A body with no validator is refused, so it must never reach the cache: a
+	// stored copy of a document this run would not use is a file a later run has
+	// to distrust, and there is nothing to revalidate it with anyway.
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "cloudflare-ips.json")
+	origin := newFakeOrigin(t, standardDocument(), "")
+	if _, err := newTestSource(t, origin, cachePath).Candidates(context.Background(), 512, testDate(2026, time.September, 25)); err == nil {
+		t.Fatal("Candidates accepted a body with no validator")
+	}
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the refused body was written to %s (stat error %v)", cachePath, err)
 	}
 }
 

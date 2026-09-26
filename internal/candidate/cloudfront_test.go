@@ -3,6 +3,7 @@ package candidate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"net/netip"
@@ -427,6 +428,26 @@ func TestCloudFrontRangesNeverReachTheGlobalCandidateList(t *testing.T) {
 		if cloudFrontReferencePrefix.Contains(candidate.IP) {
 			t.Errorf("the global candidate list holds %v, which is inside the CloudFront range %v", candidate.IP, cloudFrontReferencePrefix)
 		}
+	}
+}
+
+func TestCloudFrontSourceDoesNotStoreADocumentItCouldNeverRevalidate(t *testing.T) {
+	// This origin documents no ETag. The ranges are still read and kept as
+	// reference data, because this source has other work to do with them, but a
+	// stored copy could never be revalidated and readCache would refuse it, so
+	// nothing is written: a file that looks like a cache and is not one is worse
+	// than no file.
+	cachePath := filepath.Join(t.TempDir(), "aws-ip-ranges.json")
+	origin := newFakeOrigin(t, awsRangesDocument(), "")
+	source := newTestCloudFrontSource(t, origin, cachePath, nil)
+	if _, err := source.Profiles(context.Background()); err != nil {
+		t.Fatalf("Profiles: %v", err)
+	}
+	if !slices.Equal(source.ReferencePrefixes(), []netip.Prefix{cloudFrontReferencePrefix}) {
+		t.Errorf("got the reference ranges %v, want %v", source.ReferencePrefixes(), cloudFrontReferencePrefix)
+	}
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a document with no validator was written to %s (stat error %v)", cachePath, err)
 	}
 }
 
