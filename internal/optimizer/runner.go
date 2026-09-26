@@ -93,6 +93,30 @@ const (
 	connectSamples = 3
 )
 
+// FinalProofTimeout bounds the whole final-proof phase of an apply: every group,
+// every profile, in one deadline.
+//
+// The reason it is a constant and not a multiple of the profile count is that the
+// final proof runs under the control lock, so its duration *is* the time apply,
+// pin and the health check are locked out. It is set just above the prober's own
+// per-probe bound (prober.DefaultProbeTimeout, ten seconds) because a deadline
+// below that would cut short a proof the host was still going to answer, and it is
+// far below the shipped 120 second health interval so a health check cannot be
+// starved by an apply. It does not grow with the number of configured profiles: a
+// list long enough to overrun it is answered as far as it gets and then refused,
+// which is the direction that costs an operator one report rather than a lock
+// nobody can take.
+const FinalProofTimeout = 15 * time.Second
+
+// proofConcurrency is how many of a subject's profile proofs run at once.
+//
+// It is high enough that a realistic profile list - the provider's representative
+// domain and a handful of forced-ECH domains - is a single wave, and low enough
+// that a long list is answered in bounded waves rather than all at once. The
+// deadline above is what bounds the hold either way; this bounds how much of the
+// host a single apply leans on.
+const proofConcurrency = 16
+
 // The three refusals the runner adds, as named constants for the same reason the
 // scorer's are: a report has to say which rule refused a candidate, and a rule
 // that can only be recognised by its wording is a rule nobody can match on.
@@ -238,6 +262,13 @@ var (
 	// call, so a pin cannot store an address a candidate could never be.
 	ErrNotPublishable = errors.New("the address is not one a published rewrite target may name")
 
+	// ErrProofTimeout reports that the final identity proof did not finish inside
+	// FinalProofTimeout, which is a statement about this build's patience and not
+	// about the host: a host that is merely slow is not a host that refused. The
+	// refusal leaves the file as it was, and the report carries the bytes the
+	// cut-short proof did read.
+	ErrProofTimeout = errors.New("the final identity proof did not finish in time")
+
 	// ErrNothingPinned reports an unpin of a selector that is not pinned: either
 	// there is no selector document at all, or the mode is already automatic. Both
 	// are a mistake rather than a change, and saying so is better than bumping the
@@ -346,6 +377,13 @@ type Options struct {
 	// Weights are the three shares of the combined score. The zero value means
 	// DefaultWeights, which is what a run with no policy weighting must use.
 	Weights Weights
+
+	// ProofTimeout bounds the final-proof phase of an apply. The zero value means
+	// FinalProofTimeout, which is the production bound; it is a field so a test can
+	// exercise the deadline without waiting fifteen seconds for it, and the
+	// mechanism it covers - one deadline over the whole phase, profiles proved
+	// concurrently under a limit - is the same either way.
+	ProofTimeout time.Duration
 }
 
 // Runner measures candidates and publishes a winner. It is safe to use from more
@@ -400,6 +438,9 @@ func NewRunner(policy config.Policy, prober Prober, options Options) (*Runner, e
 	}
 	if options.Weights == (Weights{}) {
 		options.Weights = DefaultWeights()
+	}
+	if options.ProofTimeout <= 0 {
+		options.ProofTimeout = FinalProofTimeout
 	}
 	params := Params{
 		LatencyCandidates: policy.CDN.LatencyCandidateCount,
@@ -1109,25 +1150,31 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	}
 
 	// The final proof, for every published group, under the lock, before the write.
-	// A group that keeps its mapping is not proved, because nothing of it is being
-	// published and a proof is the cost of a publish.
+	// One deadline covers the whole phase rather than one per group, so the hold is
+	// bounded by FinalProofTimeout whatever the number of groups is; a per-group
+	// deadline would make it a multiple of the group count again. A group that keeps
+	// its mapping is not proved, because nothing of it is being published and a proof
+	// is the cost of a publish.
 	report.Phases.FinalProof.StartedAt = r.now()
+	proof, cancelProof := context.WithTimeout(ctx, r.options.ProofTimeout)
 	proved := make([]groupDecision, 0, len(decisions))
 	for _, decision := range decisions {
 		if !decision.published {
 			continue
 		}
-		metrics, err := r.proveAddress(ctx, decision.winner, profiles)
+		metrics, err := r.proveAddress(proof, decision.winner, profiles)
+		// The bytes a cut-short proof spent are accounted for whether or not it
+		// answered: they crossed the network, and the report is the only place that
+		// can say so.
+		report.IdentityBytes += metrics.BodyBytes
 		if err != nil {
 			report.Phases.FinalProof.EndedAt = r.now()
+			cancelProof()
 			return report, state.Selector{}, err
 		}
-		// The proof is as uncharged as the run's, and this is the only place a
-		// report can account for it: a report written before an apply says nothing
-		// about the bytes that apply spent.
-		report.IdentityBytes += metrics.BodyBytes
 		proved = append(proved, decision)
 	}
+	cancelProof()
 	report.Phases.FinalProof.EndedAt = r.now()
 	report.FinalProofPassed = true
 	report.ProofedAt = report.Phases.FinalProof.EndedAt
@@ -1329,6 +1376,13 @@ func (p Profiles) all() []candidate.ProbeProfile {
 // own hostname's, so a proof never crosses the boundary between the global group
 // and a per-hostname one.
 //
+// The profiles of one address are proved concurrently, under proofConcurrency, so
+// the time the whole proof takes is one probe's time rather than the sum of the
+// list's. The deadline is the caller's - Apply puts one over the entire final-proof
+// phase, which is what bounds the control lock's hold - and this function adds
+// none of its own, because a second deadline per group would make the hold a
+// multiple of the group count again.
+//
 // The profiles are the ones this router is running. They are never taken from the
 // report, so a report cannot choose what it is about to be proved against, and a
 // report naming a hostname this configuration no longer has a profile for is
@@ -1350,21 +1404,54 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 		return measure.HTTPMetrics{}, fmt.Errorf("%w: %s is proved against none of the %d configured profiles %s",
 			ErrNoProfile, subject.IP, len(profiles.all()), kind)
 	}
+	// Each profile's answer is kept in its own place, and the walk afterwards is in
+	// profile order: the bytes are summed whatever happened, and the refusal named is
+	// the first profile's rather than whichever goroutine lost the race.
+	answers := make([]proofAnswer, len(applicable))
+	if err := forEachIndex(ctx, len(applicable), proofConcurrency, func(ctx context.Context, index int) error {
+		metrics, err := r.prober.HTTPS(ctx, subject, applicable[index])
+		answers[index] = proofAnswer{metrics: metrics, err: err}
+		return nil
+	}); err != nil && ctx.Err() == nil {
+		// The phase's own deadline is done and no profile has said why yet, which is
+		// the case a deadline is for: a host that will not answer in time.
+		return measure.HTTPMetrics{}, fmt.Errorf("%w: the proof of %s did not finish within the deadline", ErrProofTimeout, subject.IP)
+	}
 	summed := measure.HTTPMetrics{}
-	for _, profile := range applicable {
-		metrics, err := r.prober.HTTPS(ctx, subject, profile)
+	for index, answer := range answers {
 		// Summed before the error is looked at, for the same reason the run sums
 		// them: a refused proof still spent the bytes it read to reach its verdict,
 		// and the report is the only place that can say so.
-		summed.BodyBytes += metrics.BodyBytes
-		if err != nil {
-			return summed, fmt.Errorf("%w: %s does not serve %s: %v", ErrIdentityRefused, subject.IP, profile.Hostname, err)
+		summed.BodyBytes += answer.metrics.BodyBytes
+		if answer.err == nil {
+			summed.Status = answer.metrics.Status
+			summed.TLSMS = answer.metrics.TLSMS
+			summed.Colocation = answer.metrics.Colocation
+			continue
 		}
-		summed.Status = metrics.Status
-		summed.TLSMS = metrics.TLSMS
-		summed.Colocation = metrics.Colocation
+		hostname := applicable[index].Hostname
+		switch {
+		case errors.Is(answer.err, context.DeadlineExceeded):
+			// The phase's deadline, which is this build's patience rather than a
+			// verdict about the host: a slow host is not a refusing host.
+			return summed, fmt.Errorf("%w: %s did not answer for %s within %s",
+				ErrProofTimeout, subject.IP, hostname, r.options.ProofTimeout)
+		case ctx.Err() != nil:
+			// The caller's own context is done - the run was cancelled - which is
+			// likewise not a statement about the host.
+			return summed, fmt.Errorf("the proof of %s against %s was cut short: %w", subject.IP, hostname, ctx.Err())
+		default:
+			return summed, fmt.Errorf("%w: %s does not serve %s: %v", ErrIdentityRefused, subject.IP, hostname, answer.err)
+		}
 	}
 	return summed, nil
+}
+
+// proofAnswer is one profile's answer to a proof: what it measured, and what it
+// said if it refused.
+type proofAnswer struct {
+	metrics measure.HTTPMetrics
+	err     error
 }
 
 // currentSelector is the selector as it stands, read under the control lock.
@@ -1438,7 +1525,14 @@ func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles)
 	}
 	defer func() { _ = lock.Close() }()
 
-	if _, err := r.proveAddress(ctx, subject, profiles); err != nil {
+	// The proof is bounded by the same deadline an apply's is, and for the same
+	// reason: it runs under the control lock. Its metrics are discarded, because a
+	// pin has no report to account identity bytes in - the gap Task 2 named - and
+	// the bytes are the operator's data allowance either way, bounded by the
+	// identity body cap on each probe.
+	proof, cancel := context.WithTimeout(ctx, r.options.ProofTimeout)
+	defer cancel()
+	if _, err := r.proveAddress(proof, subject, profiles); err != nil {
 		return state.Selector{}, err
 	}
 	published := current

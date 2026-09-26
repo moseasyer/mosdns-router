@@ -168,6 +168,15 @@ type addressFixture struct {
 	// the run and then stopped serving: the first proof passes and the one the apply
 	// runs afterwards does not.
 	identityCallsBeforeFailure int
+	// proofDelay is how long an identity proof of this address takes, so a case can
+	// make the final proof outlive its deadline or make a set of them only fit
+	// concurrently.
+	proofDelay time.Duration
+	// proofDelayAfterCalls is how many identity proofs this address answers at full
+	// speed before its proofs start taking proofDelay. One is the shape of a host
+	// that served the run and then stopped answering quickly: the run's proof is
+	// quick and the apply's is not.
+	proofDelayAfterCalls int
 }
 
 // probeCall is one call the fake prober received, in the order it arrived.
@@ -197,6 +206,10 @@ type fakeProber struct {
 	// https counts the identity proofs each address has been asked for, so a
 	// fixture can answer the run's proof and refuse the apply's.
 	https map[string]int
+	// inFlight and peak record how many identity proofs the prober is answering at
+	// once, which is how a case sees whether the run proved a set of profiles
+	// concurrently and under what limit.
+	inFlight, peak int
 	// before runs inside every probe, so a test can cancel the run from the
 	// prober's side the way a real deadline would.
 	before func(kind, address string)
@@ -257,7 +270,24 @@ func (f *fakeProber) HTTPS(ctx context.Context, subject candidate.Candidate, pro
 	f.mutex.Lock()
 	f.https[subject.IP.String()]++
 	answered := f.https[subject.IP.String()]
+	f.inFlight++
+	if f.inFlight > f.peak {
+		f.peak = f.inFlight
+	}
 	f.mutex.Unlock()
+	if fixture.proofDelay > 0 && (fixture.proofDelayAfterCalls == 0 || answered > fixture.proofDelayAfterCalls) {
+		// A slow host, and a prober that gives up when the caller's deadline is
+		// done, exactly as the real one does.
+		timer := time.NewTimer(fixture.proofDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			f.settle()
+			return measure.HTTPMetrics{BodyBytes: fixture.identityBodyBytes}, ctx.Err()
+		}
+	}
+	f.settle()
 	if fixture.identityCallsBeforeFailure > 0 && answered > fixture.identityCallsBeforeFailure {
 		return measure.HTTPMetrics{BodyBytes: fixture.identityBodyBytes},
 			fmt.Errorf("%s at %s: the response is a 403, which the profile does not expect", profile.Hostname, subject.IP)
@@ -361,6 +391,20 @@ func (f *fakeProber) transfers() []string {
 	}
 	slices.Sort(addresses)
 	return addresses
+}
+
+// settle records that one identity proof has stopped being answered.
+func (f *fakeProber) settle() {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.inFlight--
+}
+
+// peakProofs is the most identity proofs the prober was answering at once.
+func (f *fakeProber) peakProofs() int {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return f.peak
 }
 
 // profiledCalls returns the identity proofs with the hostname each was made
@@ -3261,4 +3305,98 @@ func mustRunAndApplyTwoGroups(t *testing.T, frontFixtures map[string]*addressFix
 		t.Fatalf("Apply: %v", err)
 	}
 	return applied
+}
+
+func TestApplyRefusesWhenTheFinalProofWouldOutliveItsDeadline(t *testing.T) {
+	// The final proof runs under the control lock, so its hold has to be bounded
+	// whatever the number of configured profiles and however slow the host is. One
+	// deadline covers the whole phase; a host that cannot answer inside it is refused
+	// and the selector is left exactly as it was.
+	fixtures, candidates := threeGlobals()
+	// The winner answers the run's proof at full speed and then stops answering in
+	// time: two seconds of proof against a deadline of a tenth of one.
+	fixtures["104.16.0.1"].proofDelay = 2 * time.Second
+	fixtures["104.16.0.1"].proofDelayAfterCalls = 1
+	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(fixtures), func(tuning *runnerTuning) {
+		tuning.options.ProofTimeout = 100 * time.Millisecond
+	})
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	started := time.Now()
+	_, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
+	elapsed := time.Since(started)
+	if !errors.Is(err, ErrProofTimeout) {
+		t.Fatalf("Apply whose proof outlives the deadline returned %v, want %v", err, ErrProofTimeout)
+	}
+	if elapsed > time.Second {
+		t.Errorf("the apply took %s to refuse, want the deadline to cut it short at about 100ms", elapsed)
+	}
+	if !strings.Contains(err.Error(), "speed.example.test") {
+		t.Errorf("the refusal %q does not name the profile that did not answer", err)
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestApplyProvesEveryProfileOfAGlobalAddressConcurrently(t *testing.T) {
+	// A global address is held to the provider's representative domain and every
+	// forced-ECH domain, and the list is the operator's to grow. Proving them one
+	// after another would hold the control lock for the sum of their times, which is
+	// the unbounded aggregate this is the fix for: five profiles answered in
+	// parallel take one probe timeout, not five.
+	profiles := make([]candidate.ProbeProfile, 0, 5)
+	for index := 0; index < 5; index++ {
+		profiles = append(profiles, testProfile(fmt.Sprintf("ech-%d.example.test", index), 443))
+	}
+	fixtures, candidates := threeGlobals()
+	// Every proof of the winner is slow enough that five of them in sequence would
+	// take five times the deadline below.
+	fixtures["104.16.0.1"].proofDelay = 100 * time.Millisecond
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake, func(tuning *runnerTuning) {
+		tuning.options.ProofTimeout = 2 * time.Second
+	})
+	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(profiles...)); err != nil {
+		t.Fatalf("Apply with five profiles: %v", err)
+	}
+	// All five were proved, and all five at once: the prober never had more than one
+	// and never fewer than five in flight.
+	if got := fake.peakProofs(); got != 5 {
+		t.Errorf("the prober was answering %d proofs at once, want 5: the profiles are proved concurrently", got)
+	}
+	proofs := fake.profiledCalls()
+	if len(proofs) != 3+5 {
+		t.Errorf("the prober was asked for %d identity proofs, want 8: three candidates in the run and five in the apply", len(proofs))
+	}
+}
+
+func TestApplyNeverRunsMoreProfileProofsAtOnceThanTheLimit(t *testing.T) {
+	// The concurrency is bounded as well as parallel. A profile list long enough to
+	// overrun the limit is answered in waves, and the limit is what keeps the hold
+	// predictable rather than proportional to whatever the operator has listed.
+	profiles := make([]candidate.ProbeProfile, 0, proofConcurrency+4)
+	for index := 0; index < proofConcurrency+4; index++ {
+		profiles = append(profiles, testProfile(fmt.Sprintf("ech-%d.example.test", index), 443))
+	}
+	fixtures, candidates := threeGlobals()
+	fixtures["104.16.0.1"].proofDelay = 20 * time.Millisecond
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake, func(tuning *runnerTuning) {
+		tuning.options.ProofTimeout = 5 * time.Second
+	})
+	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
+
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(profiles...)); err != nil {
+		t.Fatalf("Apply with %d profiles: %v", len(profiles), err)
+	}
+	if got := fake.peakProofs(); got != proofConcurrency {
+		t.Errorf("the prober was answering %d proofs at once, want the limit of %d", got, proofConcurrency)
+	}
+	if got := len(fake.profiledCalls()); got != 3+proofConcurrency+4 {
+		t.Errorf("the prober was asked for %d identity proofs, want %d: every profile is still proved", got, 3+proofConcurrency+4)
+	}
 }
