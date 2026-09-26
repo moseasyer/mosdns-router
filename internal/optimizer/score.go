@@ -77,6 +77,14 @@ const (
 	// never given a download measurement.
 	ReasonOutsideLatencyTop = "outside the latency shortlist"
 
+	// ReasonOutsideBandwidthTop is the refusal for a candidate that was measured
+	// and fell outside the bandwidth shortlist. It is a different rule from
+	// ReasonOutsideLatencyTop and gets its own name: a report that says a
+	// candidate was outside the latency shortlist when it was outside the
+	// bandwidth one sends the reader looking for a latency filter that was never
+	// run.
+	ReasonOutsideBandwidthTop = "outside the bandwidth shortlist"
+
 	// ReasonOutsideCombined is the refusal for a candidate that was on the
 	// latency shortlist but in neither half of the combined set, so it was
 	// measured and has a score but was not scored against the others.
@@ -129,7 +137,15 @@ func (k GroupKey) Same(other GroupKey) bool {
 // String renders the key for a report. The global group ends in a slash, so a
 // report line reads "cloudfront/a.example.test" or "cloudflare/" and never an
 // ambiguous "cloudfront" with the hostname lost.
+//
+// The zero key renders as "(no group)" rather than as "/". The zero key means
+// two different things — there was no group at all, or the slice was refused for
+// mixing groups — and neither is a group whose provider failed to load, which is
+// what a bare "/" would look like in a report a reader has to act on.
 func (k GroupKey) String() string {
+	if k.Provider == "" && k.Hostname == "" {
+		return "(no group)"
+	}
 	return string(k.Provider) + "/" + k.Hostname
 }
 
@@ -309,9 +325,13 @@ func RankBandwidth(group []CandidateResult, top int, limits Limits) Ranking {
 	ordered := slices.Clone(eligible)
 	slices.SortStableFunc(ordered, bandwidthOrder)
 
-	kept, dropped := atMost(ordered, top, ReasonOutsideLatencyTop)
+	// The drops are named after this ranking, not after the latency one: a
+	// candidate that reached a bandwidth ranking has already been through a
+	// latency ranking, and saying it did not would be a report about a filter
+	// this call never ran.
+	kept, dropped := atMost(ordered, top, ReasonOutsideBandwidthTop)
 	markRanked(kept)
-	markExcluded(dropped)
+	markDropped(dropped, ReasonOutsideBandwidthTop)
 	return Ranking{Group: groupKeyOf(group), Ranked: kept, Excluded: append(refused, dropped...)}
 }
 
@@ -345,7 +365,7 @@ func Select(group []CandidateResult, params Params) Selection {
 
 	bySpeed := slices.Clone(shortlist)
 	slices.SortStableFunc(bySpeed, bandwidthOrder)
-	bandwidthKept, _ := atMost(bySpeed, params.BandwidthTop, ReasonOutsideLatencyTop)
+	bandwidthKept, _ := atMost(bySpeed, params.BandwidthTop, ReasonOutsideBandwidthTop)
 	markRanked(bandwidthKept)
 
 	// The combined set: the best of the shortlist on latency, and the best of
@@ -360,16 +380,23 @@ func Select(group []CandidateResult, params Params) Selection {
 	// on. A candidate that scores exactly the same as another therefore lands in
 	// the documented order, and the result is the same whatever order the
 	// caller assembled the group in.
+	//
+	// The scores are computed against a *copy* of the combined set, not against
+	// the slice being sorted. The rank arithmetic counts rather than sorts, so
+	// the two are equal today; taking the live slice would make that an
+	// assumption rather than a guarantee, and a future rank that sorts would
+	// then read a half-ordered population and report percentiles of it.
+	population := slices.Clone(union)
 	slices.SortStableFunc(union, chainOrder)
 	slices.SortStableFunc(union, func(first, second CandidateResult) int {
-		return cmp.Compare(RankScore(second, union, params.Weights), RankScore(first, union, params.Weights))
+		return cmp.Compare(RankScore(second, population, params.Weights), RankScore(first, population, params.Weights))
 	})
 	present := make(map[candidate.Candidate]bool, len(union))
 	for _, result := range union {
 		present[result.Candidate] = true
 	}
 	for index := range union {
-		union[index].Score = CombinedScore(union[index], union, params.Weights)
+		union[index].Score = CombinedScore(union[index], population, params.Weights)
 		union[index].Eligible = true
 		union[index].Reason = ""
 	}
@@ -825,8 +852,10 @@ func atMost(ordered []CandidateResult, top int, reason string) (kept, dropped []
 	return kept, dropped
 }
 
-// markRanked and markExcluded set the two fields a report reads, so every value
-// this package returns says plainly whether it took part and why not.
+// markRanked, markDropped and markExcluded set the two fields a report reads, so
+// every value this package returns says plainly whether it took part and why not.
+// markDropped takes the reason rather than assuming one, because two of the caps
+// it applies are different rules and a report must not conflate them.
 func markRanked(results []CandidateResult) {
 	for index := range results {
 		results[index].Eligible = true
@@ -834,13 +863,17 @@ func markRanked(results []CandidateResult) {
 	}
 }
 
-func markExcluded(results []CandidateResult) {
+func markDropped(results []CandidateResult, reason string) {
 	for index := range results {
 		results[index].Eligible = false
 		if results[index].Reason == "" {
-			results[index].Reason = ReasonOutsideLatencyTop
+			results[index].Reason = reason
 		}
 	}
+}
+
+func markExcluded(results []CandidateResult) {
+	markDropped(results, ReasonOutsideLatencyTop)
 }
 
 // refuseAll is the answer to a slice that mixes groups: nothing is ranked, and

@@ -678,6 +678,154 @@ func TestScoreTheExclusionLimitsAreTheOnesTheCallerPassed(t *testing.T) {
 
 // The brief's "top ten latency candidates are selected": twelve measured, all
 // inside the ceilings, ten kept, and the two slowest dropped by the cap.
+// A bandwidth ranking that drops candidates has to say it dropped them from the
+// bandwidth shortlist. Labelling them as outside the *latency* shortlist is a
+// report that names a rule which was not applied, and a reader chasing it looks
+// for a latency filter that was never run.
+func TestScoreTheBandwidthRankingNamesItsOwnShortlist(t *testing.T) {
+	group := []CandidateResult{
+		measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 10*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.1.1", 10, 12, 22, 2, 0.00, 9*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.2.1", 10, 14, 24, 3, 0.00, 8*mib),
+	}
+
+	latency := RankLatency(group, 3, noLimits)
+	if len(latency.Excluded) != 0 {
+		t.Errorf("an uncapped latency ranking over three candidates excluded %v", addressesOf(latency.Excluded))
+	}
+	bandwidth := RankBandwidth(group, 1, noLimits)
+	equalAddresses(t, "the fastest candidate", bandwidth.Ranked, []string{"104.16.0.1"})
+	if len(bandwidth.Excluded) != 2 {
+		t.Fatalf("%d candidates were dropped from a bandwidth top of one, want 2", len(bandwidth.Excluded))
+	}
+	for _, result := range bandwidth.Excluded {
+		if result.Reason != ReasonOutsideBandwidthTop {
+			t.Errorf("%s is dropped from the bandwidth shortlist with %q, want %q", result.Candidate.IP, result.Reason, ReasonOutsideBandwidthTop)
+		}
+	}
+	if got := reasonOf(t, bandwidth.Excluded, "104.16.1.1"); got == ReasonOutsideLatencyTop {
+		t.Error("a bandwidth drop is labelled as a latency drop")
+	}
+	// A candidate refused by a ceiling in a bandwidth ranking is still refused by
+	// the ceiling, not by the shortlist: the two reasons stay distinct.
+	noisy := measured(candidate.ProviderCloudflare, "", "104.16.2.1", 10, 14, 24, 3, 0.50, 8*mib)
+	mixed := RankBandwidth([]CandidateResult{group[0], group[1], noisy}, 3, tightLimits)
+	if got := reasonOf(t, mixed.Excluded, "104.16.2.1"); got != ReasonLossAboveLimit {
+		t.Errorf("the 50%% loss candidate is refused with %q, want the ceiling's own reason", got)
+	}
+	// Through Select the two reasons are still distinct, because the latency cap
+	// and the bandwidth cap are different rules.
+	selection := Select(group, Params{LatencyCandidates: 3, LatencyTop: 1, BandwidthTop: 1, Weights: documentedWeights})
+	equalAddresses(t, "the union", selection.Scored, []string{"104.16.0.1"})
+	equalAddresses(t, "the excluded candidates", selection.Excluded, []string{"104.16.1.1", "104.16.2.1"})
+	if got := reasonOf(t, selection.Excluded, "104.16.1.1"); got != ReasonOutsideCombined {
+		t.Errorf("a candidate outside the union is refused with %q, want %q", got, ReasonOutsideCombined)
+	}
+	capped := Select(group, Params{LatencyCandidates: 2, LatencyTop: 2, BandwidthTop: 2, Weights: documentedWeights})
+	if got := reasonOf(t, capped.Excluded, "104.16.2.1"); got != ReasonOutsideLatencyTop {
+		t.Errorf("a candidate dropped by the latency cap is refused with %q, want %q", got, ReasonOutsideLatencyTop)
+	}
+}
+
+// The zero group key means two different things - an empty group and a refused
+// mixed one - and it must not render as a group that could be a real one. A
+// report line reading "/" is a provider that was never named, and a reader cannot
+// tell it from a group whose provider failed to load.
+func TestScoreTheZeroGroupKeyIsNotRenderedAsAGroup(t *testing.T) {
+	zero := GroupKey{}
+	if got, want := zero.String(), "(no group)"; got != want {
+		t.Errorf("the zero group renders as %q, want %q", got, want)
+	}
+	// The two real kinds of group still render, and the global one is still
+	// distinguishable from the zero one.
+	global := GroupOf(candidate.Candidate{Provider: candidate.ProviderCloudflare, IP: netip.MustParseAddr("104.16.0.1")})
+	perHost := GroupOf(candidate.Candidate{Provider: candidate.ProviderCloudFront, Hostname: "a.example.test", IP: netip.MustParseAddr("13.32.0.1")})
+	if got, want := global.String(), "cloudflare/"; got != want {
+		t.Errorf("the global group renders as %q, want %q", got, want)
+	}
+	if got, want := perHost.String(), "cloudfront/a.example.test"; got != want {
+		t.Errorf("a per-hostname group renders as %q, want %q", got, want)
+	}
+	if global.String() == zero.String() || perHost.String() == zero.String() {
+		t.Error("a real group renders the same as the zero group")
+	}
+	// An empty group and a refused mixed group both report the zero key, and both
+	// say so in the same unambiguous way.
+	empty := Select(nil, Params{LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 3, Weights: documentedWeights})
+	if got, want := empty.Group.String(), "(no group)"; got != want {
+		t.Errorf("an empty selection's group renders as %q, want %q", got, want)
+	}
+	if len(empty.Scored) != 0 {
+		t.Errorf("an empty selection scored %v", addressesOf(empty.Scored))
+	}
+	mixed := Select([]CandidateResult{
+		measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 5*mib),
+		measured(candidate.ProviderCloudFront, "a.example.test", "13.32.0.1", 10, 2, 5, 0.1, 0.00, 20*mib),
+	}, Params{LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 3, Weights: documentedWeights})
+	if got, want := mixed.Group.String(), "(no group)"; got != want {
+		t.Errorf("a refused selection's group renders as %q, want %q", got, want)
+	}
+	// A group of one is a real group and says so.
+	one := Select([]CandidateResult{measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 5*mib)},
+		Params{LatencyCandidates: 10, LatencyTop: 3, BandwidthTop: 3, Weights: documentedWeights})
+	if got, want := one.Group.String(), "cloudflare/"; got != want {
+		t.Errorf("a group of one renders as %q, want %q", got, want)
+	}
+}
+
+// Select must not hand back anything that shares storage with the slice the
+// caller gave it. The ranking inside Select is a stable sort over the very slice
+// whose group the scores are computed against, so a caller that reached in and
+// edited the result would be editing the population its own numbers came from.
+func TestScoreTheSelectionSharesNoStorageWithItsInput(t *testing.T) {
+	group := []CandidateResult{
+		measured(candidate.ProviderCloudflare, "", "104.16.0.1", 10, 10, 20, 1, 0.00, 5*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.1.1", 10, 12, 22, 2, 0.00, 4*mib),
+		measured(candidate.ProviderCloudflare, "", "104.16.2.1", 10, 14, 24, 3, 0.00, 12*mib),
+	}
+	before := addressesOf(group)
+	selection := Select(group, Params{LatencyCandidates: 3, LatencyTop: 3, BandwidthTop: 3, Limits: tightLimits, Weights: documentedWeights})
+
+	// Scribble over every field of every returned candidate. Nothing the caller
+	// passed in may change, and re-running must give the same answer.
+	for index := range selection.Scored {
+		selection.Scored[index].Candidate = candidate.Candidate{}
+		selection.Scored[index].Score = -1
+		selection.Scored[index].Eligible = false
+		selection.Scored[index].Reason = "scribbled"
+	}
+	for index := range selection.Latency.Ranked {
+		selection.Latency.Ranked[index].Candidate = candidate.Candidate{}
+		selection.Latency.Ranked[index].Reason = "scribbled"
+	}
+	for index := range selection.Excluded {
+		selection.Excluded[index].Candidate = candidate.Candidate{}
+		selection.Excluded[index].Reason = "scribbled"
+	}
+	if got := addressesOf(group); !slices.Equal(got, before) {
+		t.Errorf("the caller's slice became %v, want %v", got, before)
+	}
+	// The re-run must produce the hand-derived answer for these three, with
+	// n = 3 and the rank score of rank r equal to (4 - r):
+	//	.0.1  latency 1, bandwidth 2, stability 1: 4500*3+4500*2+1000*3 = 25500
+	//	.2.1  latency 3, bandwidth 1, stability 3: 4500*1+4500*3+1000*1 = 19000
+	//	.1.1  latency 2, bandwidth 3, stability 2: 4500*2+4500*1+1000*2 = 15500
+	again := Select(group, Params{LatencyCandidates: 3, LatencyTop: 3, BandwidthTop: 3, Limits: tightLimits, Weights: documentedWeights})
+	equalAddresses(t, "the selection after the result was scribbled on", again.Scored, []string{
+		"104.16.0.1", "104.16.2.1", "104.16.1.1",
+	})
+	for index, want := range []float64{2.55, 1.90, 1.55} {
+		if again.Scored[index].Score != want {
+			t.Errorf("the re-run's %s scored %v, want %v", again.Scored[index].Candidate.IP, again.Scored[index].Score, want)
+		}
+	}
+	for _, result := range again.Scored {
+		if !result.Eligible || result.Reason != "" {
+			t.Errorf("the re-run's %s is eligible=%v reason=%q", result.Candidate.IP, result.Eligible, result.Reason)
+		}
+	}
+}
+
 func TestScoreSelectsTheTopTenLatencyCandidatesOfTwelve(t *testing.T) {
 	ranking := RankLatency(twelveGlobals(), 10, noLimits)
 
@@ -1299,11 +1447,26 @@ func TestScoreEqualCombinedScoresSortByTheLowerAddress(t *testing.T) {
 
 // The switch gate, at the boundary the brief fixes.
 //
-// The comparison is 100*new >= (100+threshold)*current rather than
-// (new-current)/current*100 >= threshold, so the exact-threshold case is defined
-// by a multiplication and not by how a subtraction and a division round. 3.3
-// over 3.0 is ten percent exactly; the percentage form computes 9.999999999999993
-// for it, which would refuse a switch that has reached the threshold.
+// The comparison in force is
+//
+//	newScore >= currentScore * (100 + improvementPercent) / 100
+//
+// — the requirement is built from the incumbent alone, with one multiplication
+// and one division, and the new score is compared against it with a plain
+// greater-or-equal. The two forms this replaced are both wrong at the boundary,
+// and each is wrong on a different case:
+//
+//   - the percentage form, (new-current)/current*100 >= threshold, computes
+//     9.999999999999993 for 3.3 over 3.0, which is ten percent exactly, so it
+//     refuses a switch that has reached the threshold;
+//   - multiplying both sides, 100*new >= (100+threshold)*current, refuses
+//     4.015 over 3.65, because 100*4.015 and 110*3.65 round independently to
+//     401.49999999999994 and 401.5.
+//
+// So this table pins both of those cases by name, because they are the two
+// regressions a reader of this file would most plausibly make, and because a
+// case named after the defect it catches is worth more than a case that happens
+// to catch it.
 func TestSwitchAllowsAnImprovementOfExactlyTheThreshold(t *testing.T) {
 	for name, table := range map[string]struct {
 		newScore      float64
@@ -1316,7 +1479,6 @@ func TestSwitchAllowsAnImprovementOfExactlyTheThreshold(t *testing.T) {
 		"ten percent of seven":     {7.7, 7.0, 10},
 		"ten percent of four":      {4.4, 4.0, 10},
 		"ten percent of a hundred": {110.0, 100.0, 10},
-		"ten percent of 3.65":      {4.015, 3.65, 10},
 		"ten percent of 3.3":       {3.63, 3.3, 10},
 		"ten percent of 1.9":       {2.09, 1.9, 10},
 		"ten percent of 2.35":      {2.585, 2.35, 10},
@@ -1330,6 +1492,40 @@ func TestSwitchAllowsAnImprovementOfExactlyTheThreshold(t *testing.T) {
 		if !SwitchAllowed(table.newScore, table.currentScore, table.improvementPc) {
 			t.Errorf("%s: %v over %v at %v%% was refused, want accepted", name, table.newScore, table.currentScore, table.improvementPc)
 		}
+	}
+}
+
+// The two boundary cases that tell the shipped form from each rejected one, in
+// their own test so a regression names the form it broke rather than a table row.
+//
+// Both are exactly the required improvement, and both are accepted here. Each of
+// the two rejected forms refuses its own case:
+//
+//   - the percentage form (new-current)/current*100 >= threshold computes
+//     (3.3-3.0)/3.0*100 = 9.999999999999993 for ten percent, and refuses.
+//   - 100*new >= (100+threshold)*current compares 100*4.015 = 401.49999999999994
+//     against 110*3.65 = 401.5, and refuses, because the two products round
+//     independently of each other.
+//
+// The shipped form builds the requirement from the incumbent once, and
+// 3.65*110/100 is the same double as the literal 4.015, so the comparison lands
+// on equality and the inclusive boundary accepts it.
+func TestSwitchTheBoundaryCasesThatRuleOutTheRejectedForms(t *testing.T) {
+	if !SwitchAllowed(3.3, 3.0, 10) {
+		// The percentage form refuses this one, and only this one: 9.999999999999993.
+		t.Error("3.3 over 3.0 is ten percent exactly and was refused")
+	}
+	if !SwitchAllowed(4.015, 3.65, 10) {
+		// Multiplying both sides refuses this one: 401.49999999999994 < 401.5.
+		t.Error("4.015 over 3.65 is ten percent exactly and was refused")
+	}
+	// One part in a hundred below each requirement is still refused, so the two
+	// acceptances above are a boundary and not a widened gate.
+	if SwitchAllowed(3.29, 3.0, 10) {
+		t.Error("an improvement just under ten percent of 3.0 was accepted")
+	}
+	if SwitchAllowed(4.01, 3.65, 10) {
+		t.Error("an improvement just under ten percent of 3.65 was accepted")
 	}
 }
 
