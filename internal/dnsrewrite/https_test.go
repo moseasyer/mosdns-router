@@ -133,6 +133,24 @@ func hintOf(t *testing.T, rr *dns.HTTPS) []string {
 	return out
 }
 
+// carriedOnTheWire is what a client sees: the keys of the record in the order they
+// appear on the wire, which is the order RFC 9460 Section 2.2 requires and the
+// order the library's packer imposes whatever order the record holds them in. An
+// expectation written against the order the record was built in would pin this
+// package's own sequence instead of the format.
+func carriedOnTheWire(t *testing.T, rr *dns.HTTPS) string {
+	t.Helper()
+	return carried(roundTripped(t, &dns.Msg{
+		MsgHdr: dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+		Question: []dns.Question{{
+			Name:   rr.Hdr.Name,
+			Qtype:  dns.TypeHTTPS,
+			Qclass: rr.Hdr.Class,
+		}},
+		Answer: []dns.RR{rr},
+	}).Answer[0].(*dns.HTTPS))
+}
+
 // carried lists the keys a record holds, in the order it holds them, so a failure
 // names what is actually there rather than a count of nothing.
 func carried(rr *dns.HTTPS) string {
@@ -946,83 +964,6 @@ func TestHTTPSDropsAnEndpointWhoseOnlyAddressIsIPv6(t *testing.T) {
 	})
 }
 
-// TestHTTPSMergesCompatibleEndpointsAndDropsWhatTheyDisagreeAbout is the rule for
-// an RRset with more than one service mode, which is what a CDN publishes when it
-// has more than one endpoint. Every endpoint that can be used contributes, and a
-// parameter the endpoints describe differently is dropped rather than resolved:
-// this router cannot tell which of two claims about a port or a protocol set the
-// service really has, and a value it picked would be one it invented. The
-// consequence of dropping a parameter is a record a client can still connect
-// through, which is why a disagreement is not a refusal.
-func TestHTTPSMergesCompatibleEndpointsAndDropsWhatTheyDisagreeAbout(t *testing.T) {
-	first := httpsRecord("cdn.example.", 300, 1, ".",
-		&dns.SVCBAlpn{Alpn: []string{"h2"}},
-		&dns.SVCBPort{Port: 8443},
-		&dns.SVCBDoHPath{Template: "/dns-query{?dns}"},
-	)
-	agreeing := httpsRecord("cdn.example.", 300, 1, "svc.example.net.",
-		&dns.SVCBAlpn{Alpn: []string{"h2"}},
-		&dns.SVCBPort{Port: 8443},
-		&dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")},
-	)
-	disagreeing := httpsRecord("cdn.example.", 300, 1, "edge.example.net.",
-		&dns.SVCBAlpn{Alpn: []string{"h3"}},
-		&dns.SVCBPort{Port: 443},
-		&dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")},
-	)
-
-	t.Run("endpoints that agree keep every parameter", func(t *testing.T) {
-		upstream := response("cdn.example.", dns.TypeHTTPS, first, agreeing)
-		got, err := HTTPS(httpsInput(t, upstream))
-		if err != nil {
-			t.Fatalf("HTTPS: %v", err)
-		}
-		out := onlyHTTPS(t, got)
-		if alpn := alpnOf(t, out); !reflect.DeepEqual(alpn, []string{"h2"}) {
-			t.Errorf("alpn = %v, want [h2]: both endpoints say the same thing", alpn)
-		}
-		port, _ := param(t, out, dns.SVCB_PORT).(*dns.SVCBPort)
-		if port == nil || port.Port != 8443 {
-			t.Errorf("port = %v, want 8443: both endpoints say the same thing", port)
-		}
-		local, ok := param(t, out, localKey).(*dns.SVCBLocal)
-		if !ok {
-			t.Fatalf("the key65400 parameter is %T, want *dns.SVCBLocal", param(t, out, localKey))
-		}
-		if string(local.Data) != "probe" {
-			t.Errorf("key65400 = %q, want %q: a parameter only one endpoint carries is still a parameter it carries", local.Data, "probe")
-		}
-	})
-
-	t.Run("endpoints that disagree lose the parameter and keep the record", func(t *testing.T) {
-		upstream := response("cdn.example.", dns.TypeHTTPS, first, disagreeing)
-		got, err := HTTPS(httpsInput(t, upstream))
-		if err != nil {
-			t.Fatalf("HTTPS refused an answer whose endpoints disagree: %v", err)
-		}
-		out := onlyHTTPS(t, got)
-		if carries(out, dns.SVCB_ALPN) {
-			t.Errorf("alpn survived from endpoints that name different protocol sets: %s", carried(out))
-		}
-		if carries(out, dns.SVCB_PORT) {
-			t.Errorf("port survived from endpoints that name different ports: %s", carried(out))
-		}
-		if !carries(out, dns.SVCB_DOHPATH) {
-			t.Errorf("dohpath was dropped although only one endpoint carries it: %s", carried(out))
-		}
-		if !carries(out, localKey) {
-			t.Errorf("key65400 was dropped although only one endpoint carries it: %s", carried(out))
-		}
-		if ech := echOf(t, out); !reflect.DeepEqual(ech, echFixture(t)) {
-			t.Errorf("ech = %d bytes, want the %d validated bytes, byte for byte", len(ech), len(echFixture(t)))
-		}
-		if hints := hintOf(t, out); !reflect.DeepEqual(hints, []string{selectedIP}) {
-			t.Errorf("ipv4hint = %v, want exactly [%s]", hints, selectedIP)
-		}
-		selfConsistent(t, out)
-	})
-}
-
 // TestHTTPSDropsNoDefaultAlpnWithNoAlpnToDefault is the self-consistency rule
 // RFC 9460 Section 7.1.1 states, applied where it can actually be broken. The
 // default protocol set is what a client falls back to when a record names no alpn,
@@ -1470,5 +1411,258 @@ func TestHTTPSSharesNoBufferWithTheResponseItWasGiven(t *testing.T) {
 	}
 	if kept := param(t, out, dns.SVCB_DOHPATH).(*dns.SVCBDoHPath).Template; kept != "/dns-query{?dns}" {
 		t.Errorf("dohpath = %q after the caller edited its own parameter, want the upstream's template: the answer refers to the caller's parameter", kept)
+	}
+}
+
+// reportRecorder is the caller side of the report channel: it stands in for a plugin
+// that logs or counts what the synthesis left out.
+type reportRecorder struct {
+	calls  int
+	report Report
+}
+
+func (r *reportRecorder) capture(report Report) {
+	r.calls++
+	r.report = report
+}
+
+// reportOf runs a call with the report channel attached and returns what it said.
+// A channel that was never called is a report with nothing in it, which is what a
+// synthesis that kept every parameter it inherited has to say.
+func reportOf(t *testing.T, in HTTPSInput) Report {
+	t.Helper()
+	recorder := &reportRecorder{}
+	in.Report = recorder.capture
+	if _, err := HTTPS(in); err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	return recorder.report
+}
+
+// droppedKeys lists the keys a report named, in the order it named them. A report
+// that named nothing yields nothing rather than an empty list, so a test can say
+// "nothing was dropped" by leaving its expectation unset.
+func droppedKeys(report Report) []dns.SVCBKey {
+	if len(report.Dropped) == 0 {
+		return nil
+	}
+	out := make([]dns.SVCBKey, 0, len(report.Dropped))
+	for _, drop := range report.Dropped {
+		out = append(out, drop.Key)
+	}
+	return out
+}
+
+// droppedReason returns the reason a report gave for one key, or the empty string
+// if it named no such key.
+func droppedReason(report Report, key dns.SVCBKey) string {
+	for _, drop := range report.Dropped {
+		if drop.Key == key {
+			return drop.Reason
+		}
+	}
+	return ""
+}
+
+// TestHTTPSKeepsAParameterOnlyWhenEveryEndpointAgreesOnIt is the merge rule for an
+// RRset with more than one service mode, and it is one rule rather than two: a
+// parameter survives only when every retained endpoint carries it and every one of
+// them carries the same value.
+//
+// The presence half is the half that decides this. RFC 9460 Section 7.2 says a
+// client that finds no port uses the authority endpoint's port, so an endpoint that
+// omits a parameter is not silent, it is claiming the default. Merging an endpoint
+// that names port 8443 with one that names no port and keeping 8443 tells every
+// client to hit a port the second endpoint never offered, and no client can tell
+// that from a service that really does listen on 8443. So absence loses the
+// parameter the same way a disagreement does: the key goes, every client falls back
+// to the default the endpoints implied, and the caller is told which key went and
+// why, because a record missing a parameter the upstream published is a degraded
+// answer and a plugin that cannot see the degradation cannot log it.
+func TestHTTPSKeepsAParameterOnlyWhenEveryEndpointAgreesOnIt(t *testing.T) {
+	agreeing := func() *dns.HTTPS {
+		return httpsRecord("cdn.example.", 300, 1, "svc.example.net.",
+			&dns.SVCBAlpn{Alpn: []string{"h2"}},
+			&dns.SVCBPort{Port: 8443},
+			&dns.SVCBDoHPath{Template: "/dns-query{?dns}"},
+			&dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")},
+		)
+	}
+	differentValue := func() *dns.HTTPS {
+		return httpsRecord("cdn.example.", 300, 1, "edge.example.net.",
+			&dns.SVCBAlpn{Alpn: []string{"h3"}},
+			&dns.SVCBPort{Port: 8443},
+			&dns.SVCBDoHPath{Template: "/dns-query{?dns}"},
+			&dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")},
+		)
+	}
+	// The same endpoint as the one above, with the port left out. Everything else
+	// is identical, so the port is the only thing the two endpoints disagree about.
+	noPort := func() *dns.HTTPS {
+		return httpsRecord("cdn.example.", 300, 1, "edge.example.net.",
+			&dns.SVCBAlpn{Alpn: []string{"h2"}},
+			&dns.SVCBDoHPath{Template: "/dns-query{?dns}"},
+			&dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")},
+		)
+	}
+	// And the same again with the alpn left out, so that the rule is shown to be
+	// about every key rather than about the one that happens to matter most.
+	noAlpn := func() *dns.HTTPS {
+		return httpsRecord("cdn.example.", 300, 1, "edge.example.net.",
+			&dns.SVCBPort{Port: 8443},
+			&dns.SVCBDoHPath{Template: "/dns-query{?dns}"},
+			&dns.SVCBLocal{KeyCode: localKey, Data: []byte("probe")},
+		)
+	}
+	// The endpoint that goes with it: the same record without the port and without
+	// the mandatory list, so the port is the only thing the two disagree about.
+	alpnOnly := func() *dns.HTTPS {
+		return httpsRecord("cdn.example.", 300, 1, "edge.example.net.",
+			&dns.SVCBAlpn{Alpn: []string{"h2"}},
+		)
+	}
+	// The endpoint whose port is gone, and whose mandatory list still names it.
+	portIsMandatory := func() *dns.HTTPS {
+		return httpsRecord("cdn.example.", 300, 1, ".",
+			&dns.SVCBMandatory{Code: []dns.SVCBKey{dns.SVCB_ALPN, dns.SVCB_PORT}},
+			&dns.SVCBAlpn{Alpn: []string{"h2"}},
+			&dns.SVCBPort{Port: 8443},
+		)
+	}
+
+	tests := []struct {
+		name    string
+		records []*dns.HTTPS
+		carried string
+		dropped []dns.SVCBKey
+		// names is a word the reason for each dropped key has to contain, so the
+		// report is checked for saying which fault it was rather than for the
+		// exact sentence, which is a message and not a contract.
+		names string
+		// mandatory, when set, is the exact list the record has to carry, written
+		// in the order the package builds it. It is set only where the case is
+		// about the list rather than about the parameters.
+		mandatory string
+	}{
+		{
+			name:    "endpoints that describe the same service keep everything",
+			records: []*dns.HTTPS{agreeing(), agreeing()},
+			carried: "mandatory alpn port ipv4hint ech dohpath key65400",
+		},
+		{
+			name:    "a value the endpoints describe differently is dropped",
+			records: []*dns.HTTPS{agreeing(), differentValue()},
+			carried: "mandatory port ipv4hint ech dohpath key65400",
+			dropped: []dns.SVCBKey{dns.SVCB_ALPN},
+			names:   "differently",
+		},
+		{
+			name:    "a parameter only one endpoint carries is dropped",
+			records: []*dns.HTTPS{agreeing(), noPort()},
+			carried: "mandatory alpn ipv4hint ech dohpath key65400",
+			dropped: []dns.SVCBKey{dns.SVCB_PORT},
+			names:   "omits",
+		},
+		{
+			name:    "alpn is dropped for the same reason as any other key",
+			records: []*dns.HTTPS{agreeing(), noAlpn()},
+			carried: "mandatory port ipv4hint ech dohpath key65400",
+			dropped: []dns.SVCBKey{dns.SVCB_ALPN},
+			names:   "omits",
+		},
+		{
+			name:      "a mandatory key lost with the parameter leaves the list",
+			records:   []*dns.HTTPS{portIsMandatory(), alpnOnly()},
+			carried:   "mandatory alpn ipv4hint ech",
+			dropped:   []dns.SVCBKey{dns.SVCB_PORT},
+			names:     "omits",
+			mandatory: "ech alpn",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			answers := make([]dns.RR, 0, len(tt.records))
+			for _, record := range tt.records {
+				answers = append(answers, record)
+			}
+			upstream := response("cdn.example.", dns.TypeHTTPS, answers...)
+
+			report := reportOf(t, httpsInput(t, upstream))
+			got, err := HTTPS(httpsInput(t, upstream))
+			if err != nil {
+				t.Fatalf("HTTPS: %v", err)
+			}
+			out := onlyHTTPS(t, got)
+
+			if keys := carriedOnTheWire(t, out); keys != tt.carried {
+				t.Errorf("the record carries %s, want %s", keys, tt.carried)
+			}
+			if dropped := droppedKeys(report); !reflect.DeepEqual(dropped, tt.dropped) {
+				t.Errorf("the report names %v as left out, want %v", dropped, tt.dropped)
+			}
+			if tt.names != "" {
+				for _, key := range tt.dropped {
+					if reason := droppedReason(report, key); !strings.Contains(reason, tt.names) {
+						t.Errorf("the reason for leaving out %s is %q, want a reason that says %q", key, reason, tt.names)
+					}
+				}
+			}
+			// Whatever the endpoints disagreed about, the record this router wrote
+			// is still a record a client can use, and still a record whose
+			// mandatory list names nothing it does not carry.
+			if ech := echOf(t, out); !reflect.DeepEqual(ech, echFixture(t)) {
+				t.Errorf("ech = %d bytes, want the %d validated bytes, byte for byte", len(ech), len(echFixture(t)))
+			}
+			if hints := hintOf(t, out); !reflect.DeepEqual(hints, []string{selectedIP}) {
+				t.Errorf("ipv4hint = %v, want exactly [%s]", hints, selectedIP)
+			}
+			if tt.mandatory != "" {
+				keys := mandatoryOf(t, out)
+				names := make([]string, 0, len(keys))
+				for _, key := range keys {
+					names = append(names, key.String())
+				}
+				if got := strings.Join(names, " "); got != tt.mandatory {
+					t.Errorf("mandatory = %q, want %q: a parameter the record no longer carries must not be named", got, tt.mandatory)
+				}
+			}
+			selfConsistent(t, out)
+		})
+	}
+}
+
+// TestHTTPSReportsNothingWhenEveryEndpointAgrees states the other side of the
+// report: a synthesis that lost nothing says nothing, so a plugin counting degraded
+// answers is not counting every answer. A report channel that fires on every call
+// trains an operator to ignore it.
+func TestHTTPSReportsNothingWhenEveryEndpointAgrees(t *testing.T) {
+	record := httpsRecord("cdn.example.", 300, 1, ".",
+		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+		&dns.SVCBPort{Port: 443},
+	)
+	upstream := response("cdn.example.", dns.TypeHTTPS, record)
+
+	recorder := &reportRecorder{}
+	in := httpsInput(t, upstream)
+	in.Report = recorder.capture
+	if _, err := HTTPS(in); err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	if recorder.calls != 0 {
+		t.Errorf("the report channel was called %d time(s) for a synthesis that lost nothing", recorder.calls)
+	}
+
+	// And the same call with no channel at all must be the same answer: the channel
+	// is a report and not a result.
+	without, err := HTTPS(httpsInput(t, upstream))
+	if err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	with, err := HTTPS(in)
+	if err != nil {
+		t.Fatalf("HTTPS: %v", err)
+	}
+	if a, b := packed(t, without), packed(t, with); string(a) != string(b) {
+		t.Errorf("attaching a report channel changed the answer:\n without %s\n with    %s", a, b)
 	}
 }

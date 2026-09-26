@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -93,6 +95,33 @@ type HTTPSInput struct {
 	// value fails closed, which is the safe direction for a name an operator put
 	// on the force-ECH list.
 	Policy FailurePolicy
+	// Report, when it is set, is called once with the SvcParamKeys this router left
+	// out of the record it synthesized, and why each one was left out. It is a
+	// report and not a result: the record is the answer either way, and a caller
+	// that does not set it loses nothing but the log line. It exists because a
+	// record missing a parameter the upstream published is a degraded answer, and a
+	// plugin that cannot see the degradation cannot log it or count it. The channel
+	// is not called when nothing was left out, so a caller counting the calls is
+	// counting degraded answers and nothing else.
+	Report func(Report)
+}
+
+// Report is what one synthesis left out of the record it wrote.
+type Report struct {
+	// Dropped are the SvcParamKeys the record does not carry, in the order the
+	// synthesis decided them.
+	Dropped []DroppedParameter
+}
+
+// DroppedParameter is one SvcParamKey the synthesized record does not carry, and the
+// reason. There are two reasons, and both are a client falling back to a default
+// rather than being told one endpoint's claim: the endpoints described the value
+// differently, or they did not all describe it at all. The second is the same kind
+// of disagreement, and RFC 9460 Section 7.2 is why: a key that is not present is not
+// silence, it is the instruction to use the value the authority endpoint implies.
+type DroppedParameter struct {
+	Key    dns.SVCBKey
+	Reason string
 }
 
 // HTTPS synthesizes the HTTPS record a client reads to decide how to reach a name,
@@ -123,11 +152,15 @@ type HTTPSInput struct {
 //     client can reach through anything this router publishes, so it contributes
 //     nothing; a name that published service bindings and has no usable one left is
 //     a refusal rather than a guess.
-//   - A parameter the usable endpoints describe differently is dropped rather than
-//     resolved, because this router cannot tell which of two claims is the service's
-//     and a value it picked would be one it invented. A dropped parameter leaves a
-//     record a client can still connect through, which is why a disagreement is not
-//     a refusal.
+//   - A parameter is inherited only when every usable endpoint carries it and every
+//     one of them carries the same value. A disagreement about a value is the
+//     obvious case; a disagreement about whether the key is there at all is the
+//     common one. RFC 9460 Section 7.2 makes an absent key an instruction to use the
+//     default, so an endpoint that omits a parameter has claimed the default, and
+//     one endpoint's value is not the service's value. A dropped parameter leaves a
+//     record a client can still connect through, which is why a drop is not a
+//     refusal, and every drop is reported through Report so a caller can see that
+//     the answer it got is a degraded one.
 //   - A mandatory list names only keys the record carries, each of them once. RFC
 //     9460 Section 8 makes a record that names a key it does not carry, or names one
 //     twice, one a client must reject, and for a force-ECH name that rejection is a
@@ -157,7 +190,7 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	if err := checkSelected(in.Selected); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrNoSelectedAddress, err)
 	}
-	record, err := synthesized(question, published, list, in.Selected)
+	record, dropped, err := synthesized(question, published, list, in.Selected)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +211,9 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	// parameters that are no longer there, and a client that validated it would be
 	// told the ECH key is one it is not.
 	StripModifiedDNSSEC(clone)
+	if in.Report != nil && len(dropped) > 0 {
+		in.Report(Report{Dropped: dropped})
+	}
 	return clone, nil
 }
 
@@ -364,10 +400,10 @@ func countHints(record *dns.HTTPS) (ipv4, ipv6 int) {
 
 // synthesized builds the one record the answer will carry, or refuses because the
 // name published a service binding and none of them can be used here.
-func synthesized(question dns.Question, published []*dns.HTTPS, list *echconfig.List, address netip.Addr) (*dns.HTTPS, error) {
+func synthesized(question dns.Question, published []*dns.HTTPS, list *echconfig.List, address netip.Addr) (*dns.HTTPS, []DroppedParameter, error) {
 	found := classify(published)
 	if found.bindings > 0 && len(found.usable) == 0 {
-		return nil, fmt.Errorf("%w: %q published %d service mode record(s) and none of them is usable: %s",
+		return nil, nil, fmt.Errorf("%w: %q published %d service mode record(s) and none of them is usable: %s",
 			ErrNoCompatibleEndpoint, question.Name, found.bindings, strings.Join(found.refusals, "; "))
 	}
 
@@ -385,8 +421,11 @@ func synthesized(question dns.Question, published []*dns.HTTPS, list *echconfig.
 		Priority: 1,
 		Target:   ".",
 	}}
+	var dropped []DroppedParameter
 	if len(found.usable) > 0 {
-		record.Value = append(record.Value, inheritedParameters(found.usable)...)
+		inherited, left := inheritedParameters(found.usable)
+		dropped = left
+		record.Value = append(record.Value, inherited...)
 		record.Hdr.Ttl = shortestTTL(found.usable)
 	} else {
 		// Nothing to inherit, and a ServiceMode carrying no alpn tells a client
@@ -408,56 +447,105 @@ func synthesized(question dns.Question, published []*dns.HTTPS, list *echconfig.
 		&dns.SVCBIPv4Hint{Hint: []net.IP{net.IP(address.AsSlice())}},
 		&dns.SVCBMandatory{Code: mandatoryList(record.Value, found.usable)},
 	)
-	return record, nil
+	return record, dropped, nil
 }
 
-// inheritedParameters collects what the usable endpoints describe. A parameter the
-// endpoints agree on is kept once; a parameter only one of them carries is kept,
-// because a parameter one endpoint of an RRset offers is a parameter the service
-// offers; and a parameter the endpoints describe differently is dropped, because
-// this router cannot tell which of two claims about a port or a protocol set is the
-// service's, and either value it picked would be one it invented. Dropping it
-// leaves a record a client can still connect through, which is why a disagreement
-// is not a refusal.
-func inheritedParameters(usable []*dns.HTTPS) []dns.SVCBKeyValue {
-	kept := map[dns.SVCBKey]dns.SVCBKeyValue{}
-	disagreed := map[dns.SVCBKey]bool{}
+// inheritedParameters collects what the usable endpoints describe, and reports what
+// it left out. There is one rule: a parameter survives only when every retained
+// endpoint carries it and every one of them carries the same value.
+//
+// The value half is the obvious one. Two endpoints naming different ports or
+// different protocol sets mean the service is described two ways, and this router
+// cannot tell which description is the service's; either value it picked would be
+// one it invented, and a wrong port is a connection that cannot be made.
+//
+// The presence half decides more cases than the value half, and it is the half that
+// is easy to get wrong. RFC 9460 Section 7.2 says a client that finds no port uses
+// the authority endpoint's port number, and every other key has a default of its
+// own. An endpoint that omits a parameter is therefore not silent: it is claiming
+// the default, which is a claim about the service just as much as a value is.
+// Keeping the value from the endpoint that did name a key turns that second
+// endpoint's default into the first endpoint's number, and no client can tell the
+// result from a service that really does listen there. So a key that is not in every
+// retained endpoint is dropped exactly as a key they describe differently is
+// dropped, and every client falls back to the default the endpoints implied.
+//
+// Dropping a parameter is not a refusal. What is left is still a service mode, still
+// carries the key and the selected address, and a client connects to it using the
+// default the endpoints agreed on. But it is a degraded answer, so every drop is
+// reported with the fault that caused it, and a caller that wants to count or log
+// the degradation can.
+func inheritedParameters(usable []*dns.HTTPS) ([]dns.SVCBKeyValue, []DroppedParameter) {
 	order := make([]dns.SVCBKey, 0, len(usable)*2)
+	kept := map[dns.SVCBKey]dns.SVCBKeyValue{}
+	claimed := map[dns.SVCBKey]int{}
+	differed := map[dns.SVCBKey]bool{}
 	for _, record := range usable {
 		for _, pair := range record.Value {
 			key := pair.Key()
-			if ownedByThisRouter(key) || disagreed[key] {
+			if ownedByThisRouter(key) {
 				continue
 			}
-			have, seen := kept[key]
-			if !seen {
-				kept[key] = pair
+			if _, seen := claimed[key]; !seen {
+				claimed[key] = 0
 				order = append(order, key)
+			}
+			claimed[key]++
+			have, present := kept[key]
+			if !present {
+				kept[key] = pair
 				continue
 			}
-			// The library's own presentation form is the comparison, so a value
-			// that packs the same way compares the same way.
-			if have.String() != pair.String() {
+			// The values are compared as the values the library will pack, not as a
+			// rendering of them. A presentation form is lossy for a key whose value
+			// is arbitrary bytes, and two different values must never compare equal
+			// here. A deep comparison of the pair is exact for every key the library
+			// defines, an unknown one included.
+			if !differed[key] && !reflect.DeepEqual(have, pair) {
 				delete(kept, key)
-				disagreed[key] = true
+				differed[key] = true
 			}
 		}
 	}
+
+	carried := make([]dns.SVCBKey, 0, len(order))
+	dropped := make([]DroppedParameter, 0, len(order))
+	for _, key := range order {
+		switch {
+		case differed[key]:
+			dropped = append(dropped, DroppedParameter{
+				Key:    key,
+				Reason: fmt.Sprintf("the %d retained endpoints describe it differently, and this router will not pick one endpoint's claim for the whole service", len(usable)),
+			})
+		case claimed[key] < len(usable):
+			dropped = append(dropped, DroppedParameter{
+				Key: key,
+				Reason: fmt.Sprintf("only %d of the %d retained endpoints carry it, and an endpoint that omits a parameter has claimed the default (RFC 9460 Section 7.2), so no endpoint published a value to keep",
+					claimed[key], len(usable)),
+			})
+		default:
+			carried = append(carried, key)
+		}
+	}
+
 	// RFC 9460 Section 7.1.1: no-default-alpn without alpn is not self-consistent,
 	// and a client may reject the whole RRset over it. The default set is what a
 	// client falls back to when a record names no alpn, so a record carrying
 	// no-default-alpn and no alpn claims the service speaks nothing at all. This is
-	// reachable because a disagreement above removes the alpn.
-	if _, hasAlpn := kept[dns.SVCB_ALPN]; !hasAlpn {
-		delete(kept, dns.SVCB_NO_DEFAULT_ALPN)
+	// reachable because a disagreement above can remove the alpn.
+	if !slices.Contains(carried, dns.SVCB_ALPN) && slices.Contains(carried, dns.SVCB_NO_DEFAULT_ALPN) {
+		carried = slices.DeleteFunc(carried, func(key dns.SVCBKey) bool { return key == dns.SVCB_NO_DEFAULT_ALPN })
+		dropped = append(dropped, DroppedParameter{
+			Key:    dns.SVCB_NO_DEFAULT_ALPN,
+			Reason: "the record carries no alpn for it to modify, and RFC 9460 Section 7.1.1 makes the two together one a client may reject the whole RRset over",
+		})
 	}
-	out := make([]dns.SVCBKeyValue, 0, len(kept))
-	for _, key := range order {
-		if pair, ok := kept[key]; ok {
-			out = append(out, pair)
-		}
+
+	out := make([]dns.SVCBKeyValue, 0, len(carried))
+	for _, key := range carried {
+		out = append(out, kept[key])
 	}
-	return out
+	return out, dropped
 }
 
 // mandatoryList is the list this router writes: ech, because the record carries the
