@@ -50,6 +50,8 @@ internal/dnsrewrite/https_test.go
 internal/statewatch/watcher.go
 internal/statewatch/text.go
 internal/statewatch/watcher_test.go
+internal/candidate/cloudflare.go
+internal/candidate/cloudflare_test.go
 internal/candidate/prefixes.go
 internal/candidate/prefixes_test.go
 plugin/executable/cdn_rewrite/cdn_rewrite.go
@@ -62,10 +64,14 @@ tests/integration/rewrite_test.go
 Makefile
 ```
 
-The two `internal/candidate` files are Task 5's addition to the producer, added for
+The four `internal/candidate` files are Task 5's addition to the producer, added for
 the reason recorded in the amendments below: nothing produced a plain prefix list
 for the plugin's `cloudflare_cidr_file` to name, and the cached Cloudflare envelope
-is not one.
+is not one. Two of the four are the files the producer already had — the change to
+`cloudflare.go` is the call that publishes the list from the document a run has just
+accepted, and the change to `cloudflare_test.go` is one assertion in
+`TestCloudflareCacheIsWrittenOnlyUnderTheInjectedPath`, which a second artifact
+under the injected root made wrong in its letter while leaving its property intact.
 
 ### Interfaces produced by this plan
 
@@ -401,6 +407,45 @@ half-applied suppression) or every domain's does not (a suppression with no
 verdict behind it). Cost if wrong: a bounded amount of memory and one map lookup
 per AAAA query.
 
+**Suppressing an IPv6 answer requires the A answer to have been rewritten FIRST,
+and a concurrent pair of queries can apply only the A half.** This is the outcome
+users will see, so it is stated here rather than left to be discovered. A browser
+asking for A and AAAA at the same time — the ordinary case, the one Happy Eyeballs
+exists for — routinely has the IPv6 query processed first, and the plugin then has
+no verdict to work from: the client is sent to the selected IPv4 and keeps the
+upstream's real IPv6 addresses beside it. The direction of that miss is **no
+suppression**, so the client holds exactly the IPv6 answer it would have had without
+this router; the opposite miss, an IPv6 answer emptied on the strength of an A query
+for a different generation or a closed proof window, is what the generation and
+window checks rule out. The mechanism is forced rather than chosen — an IPv6 answer
+carries no address for the published ranges to classify, so there is nothing the
+plugin could inspect instead of the A answer it is waiting for — and the two halves
+are pinned by one test that runs the pair in both orders.
+
+**A per-hostname CloudFront mapping authorises the QUERY, and the addresses it
+replaces are the ones at the end of the response's CNAME chain.** A distribution
+reached through an alias is the ordinary shape of a per-hostname mapping, and
+requiring the terminal to *be* the queried name would refuse every such setup,
+which is the whole point of a mapping. The proof and the authorisation agree: the
+health check proves a mapping against the queried name's own profile, and the
+queried name is the name the operator configured. The guard that keeps it honest is
+the published ranges, which must NOT say the response is Cloudflare-served — a
+mapping is a distribution's address, and a Cloudflare address is not a
+distribution's. A mapped name whose response is Cloudflare-served, at the end of a
+chain or not, is refused and keeps the upstream's own answer.
+
+**A missing force-ECH allowlist leaves the plugin serving with nothing forced, and
+says so; a missing Cloudflare range list refuses to start.** The asymmetry is
+deliberate, and it is a choice about what is inert. An absent allowlist claims no
+domain the operator did not list, so the router is serving correctly with a safety
+setting unset, and refusing to start would take a resolver offline over a file an
+operator may not have created yet; the absence is reported once through the
+watcher's reload handler, so an operator who believes they are forcing ECH for a
+domain is told the list is not there. An absent or unreadable range list is the
+other shape: it classifies every response as somebody else's, so every rewrite in
+the router silently stops while the router looks healthy, and a router whose whole
+selection feature is off is not serving.
+
 **The ECH key is fetched independently of the address it is installed beside.** The
 plugin asks the ECH source for a key on every force-ECH HTTPS query, including the
 queries where the selector's proof window is closed and the address will be
@@ -412,6 +457,36 @@ lifetime while no address is available — the same query a healthy deployment m
 anyway — and the benefit is that the held key and `ech-state.json` stay current
 across a selector outage. Cost if wrong: none; the key is a public HPKE key and the
 query is on the listener the router already uses for every foreign query.
+
+**`ech-state.json` is published on what changed, and the highest generation wins.**
+Two rules the first cut got wrong, both about the document rather than the key. A
+document written only when the status word changed froze after the first fetch,
+because every successful refresh publishes `fresh`: the file went on describing the
+first key's expiry — in the past — and its digest while the router served a newer
+key, so an operator and `mosdns-cdnctl status` were shown a document about a key no
+longer in service. The comparison is now against the whole of what the document says
+about the key: its generation, which moves with the fetched, expiry and grace times
+and with the digest, and the status, which one key changes on its own as it ages.
+And two callers can be inside the write with different snapshots — the fetcher with
+the key it just stored, a waiter with one it read before waiting — so the older one
+must not end up on disk; the rule is the highest generation wins, which is exact
+rather than a heuristic, because a generation comes from the provider's own counter
+under its lock and only a stored key has one. The strict state writer would refuse
+a rollback in any case, so the loser was safe; a refusal that logs a warning every
+time is not a mechanism. Cost if wrong: one file write per refresh as well as per
+transition, which is one write per key lifetime more than the first cut did.
+
+**A caller that loses the ECH single-flight race gets the key the winner stored.**
+The first cut returned an internal sentinel to a caller that had read an empty key
+before the race, which turned the first concurrent pair of force-ECH HTTPS queries
+after a boot into an intermittent SERVFAIL on a strict name — the key had been
+fetched successfully a moment earlier. Every caller now re-reads the stored value
+after a wait and decides from that; the sentinel surfaces only when there is still
+nothing, and the loop is bounded at two attempts, each of which is a real fetch
+rather than a spin. The same case one lifetime later — a caller past the grace
+while another caller refreshes — is the same fix. Cost if wrong: a second query to
+the source in the case where the first one failed, which is a case that is already a
+failure.
 
 ---
 
