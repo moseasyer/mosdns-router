@@ -1051,10 +1051,10 @@ func writePartialReport(options cdnOptions, report optimizer.Report, stdout, std
 // The exit code is the outcome an operator can act on. Zero is a check that did what
 // it was asked, whether or not it found a problem - a failing winner below the
 // threshold is a fact, not a failure. A refused transition is exitStateUnavailable,
-// because the address in service is failing and this command could not move it. A
-// control lock held by an apply or a pin is exitLockHeld, because the answer is
-// "somebody else is publishing right now", and the timer will ask again in two
-// minutes.
+// because the address in service is failing and this command could not move it, and so
+// is a check that was cut short before it could decide one. A control lock held by an
+// apply or a pin is exitLockHeld, because the answer is "somebody else is publishing
+// right now", and the timer will ask again in two minutes.
 func runCDNHealthCheck(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
 	options, err := parseCDNOptions("health-check", args, 0)
 	if err != nil {

@@ -924,16 +924,12 @@ func TestWriteReplacementJSONAtomicStillRefusesAnUnreadableSelector(t *testing.T
 func TestWriteReplacementJSONAtomicRefusesAnUnreadableTargetForEveryOtherKind(t *testing.T) {
 	corrupt := []byte(`{"schema_version": 1,`)
 	cases := map[string]any{
-		"DHCP":       NewDHCPState(1, "eth0", "uuid", []string{"192.0.2.53"}, testFetchedAt, "dhcp4", true),
-		"ECH":        NewECHState(1, "cloudflare-ech.com", testFetchedAt, testFetchedAt.Add(time.Hour), testFetchedAt.Add(2*time.Hour), testSHA256, "public.example", "fresh"),
-		"budget":     BandwidthBudgetState{SchemaVersion: SchemaVersion, LocalDate: "2026-09-25", LimitBytes: 10, UsedBytes: 2},
-		"selector":   NewSelector(2, "auto", "cloudflare", testFetchedAt),
-		"healthable": HealthState{SchemaVersion: SchemaVersion},
+		"DHCP":     NewDHCPState(1, "eth0", "uuid", []string{"192.0.2.53"}, testFetchedAt, "dhcp4", true),
+		"ECH":      NewECHState(1, "cloudflare-ech.com", testFetchedAt, testFetchedAt.Add(time.Hour), testFetchedAt.Add(2*time.Hour), testSHA256, "public.example", "fresh"),
+		"budget":   BandwidthBudgetState{SchemaVersion: SchemaVersion, LocalDate: "2026-09-25", LimitBytes: 10, UsedBytes: 2},
+		"selector": NewSelector(2, "auto", "cloudflare", testFetchedAt),
 	}
 	for name, value := range cases {
-		if name == "healthable" {
-			continue
-		}
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state.json")
 			if err := os.WriteFile(path, corrupt, 0600); err != nil {
