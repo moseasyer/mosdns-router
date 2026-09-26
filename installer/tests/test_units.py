@@ -589,7 +589,8 @@ class UnitTextTests(unittest.TestCase):
     def test_every_unit_file_parses(self):
         for name in SHIPPED_UNITS:
             with self.subTest(unit=name):
-                sections = parsed(name)
+                text = unit_text(name)
+                sections = parse_unit(text, name)
                 self.assertIn("Unit", sections, f"{name} has no [Unit] section")
                 for section in sections:
                     self.assertIn(
@@ -597,6 +598,13 @@ class UnitTextTests(unittest.TestCase):
                         ("Unit", "Service", "Timer", "Install", "Socket"),
                         f"{name} has a [{section}] section this package never writes",
                     )
+                self.assertTrue(
+                    text.endswith("\n"),
+                    f"{name} does not end in a newline, so its last directive is joined to "
+                    "whatever is appended to it -- which is how a ReadWritePaths line added "
+                    "by an editing tool becomes part of the previous value instead of a "
+                    "directive of its own",
+                )
 
     def test_every_directive_is_the_one_that_was_decided(self):
         for name in SHIPPED_UNITS:
@@ -1263,15 +1271,22 @@ class WriteSetEvidenceTests(unittest.TestCase):
         # of "just add /run to the list" from appearing later.
         self.assertEqual(BRIDGE_WRITES, (RUN_DIR,))
         self.assertEqual(os.path.dirname(DHCP_STATE), RUN_DIR)
-        self.assertFalse(
-            [name for name in SHIPPED_UNITS if "bridge" in name],
+        present = (
+            sorted(path.name for path in UNIT_DIR.iterdir())
+            if UNIT_DIR.is_dir()
+            else []
+        )
+        self.assertEqual(
+            [name for name in present if "bridge" in name or "dhcp" in name],
+            [],
             "the bridge is dispatched by NetworkManager and has no unit; one appearing here "
-            "means the dispatcher was replaced and this table needs a User= row for it",
+            "means the dispatcher was replaced, and this table needs a User= row and a "
+            "ReadWritePaths row for it before the units can say anything about it",
         )
         publisher = (REPO / "bridge" / "mosdns_dhcp_bridge" / "publish.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("replace", publisher, "the publisher replaces the state by rename")
+        self.assertIn("os.replace", publisher, "the publisher replaces the state by rename")
 
     def test_the_router_writes_only_the_ech_state(self):
         # The router's whole write set is one document the cdn_rewrite plugin
