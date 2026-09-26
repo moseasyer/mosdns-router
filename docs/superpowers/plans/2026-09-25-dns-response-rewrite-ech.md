@@ -72,13 +72,29 @@ func (l List) Validate() error
 
 package dnsclassify
 
-type Result struct { Provider candidate.Provider; TerminalName string; AllMatch bool; Mixed bool }
+// Result authorizes a rewrite only when AllMatch is true. On every refusal
+// Provider and TerminalName are empty, so a Result that is forwarded without
+// being read carries nothing the rewriter would accept. Refusal is the reason
+// there is none; RefusalNone is a rewriteable response.
+type Result struct { Provider candidate.Provider; TerminalName string; AllMatch bool; Mixed bool; Refusal Refusal }
+type Refusal string
 func Cloudflare(msg *dns.Msg, prefixes []netip.Prefix) Result
+// Chain is the one bounded CNAME walk, exported so the rewriter uses it rather
+// than writing a second one: it keys the names it has been on by their canonical
+// form, so a self-alias and any cycle terminate at the first repeat.
+func Chain(msg *dns.Msg) ([]string, Refusal)
+func CanonicalName(name string) string
 
 package dnsrewrite
 
-type AddressInput struct { Response *dns.Msg; QType uint16; Provider candidate.Provider; Selected netip.Addr; SuppressAAAA bool }
-func Address(in AddressInput) error
+type AddressInput struct { Response *dns.Msg; QType uint16; Provider candidate.Provider; Selected netip.Addr; SuppressAAAA bool; TerminalName string; Hostname string; Prefixes []netip.Prefix }
+// TerminalName is the owner dnsclassify walked to, required and checked against
+// the response's own chain. Hostname is the exact CloudFront hostname, and
+// applies to candidate.ProviderCloudFront only. Prefixes is the caller's
+// published Cloudflare ranges: the Cloudflare arm re-derives the verdict from
+// them rather than trusting the label, and the CloudFront arm refuses a response
+// they call Cloudflare-served.
+func Address(in AddressInput) (*dns.Msg, error)
 func StripModifiedDNSSEC(msg *dns.Msg)
 
 package statewatch
@@ -108,6 +124,41 @@ type Args struct {
     CloudflareCIDRFile string `yaml:"cloudflare_cidr_file"`
 }
 ```
+
+### Amendments from Task 2
+
+`Address` returns `(*dns.Msg, error)` rather than `error` because the rule that a
+rewrite is applied to a clone and the error-only signature are jointly
+unsatisfiable: a function that neither returns a message nor mutates its argument
+has nowhere to put a rewrite, so returning the message is the only shape that
+leaves the caller's object untouched. `AddressInput` carries the three fields that
+make the call checkable: `TerminalName`, `Hostname` and `Prefixes`. `Result`
+carries `Refusal`. Task 2 shipped all of these; the block above is the shipped
+shape, and it compiles verbatim against it.
+
+Three obligations no other section of this plan states, which the later tasks
+inherit:
+
+- **Task 5 must handle both shapes `Address` returns.** A refusal is
+  `(nil, error)`; a call that had nothing to change is `(in.Response, nil)`, the
+  caller's own message. A caller that discards the error is left holding a `nil`
+  message, which is the loud direction on purpose, and a caller that assumes a
+  non-nil first return is always a message is wrong. Decide on one shape and hold
+  to it: on a refusal, return the original upstream response unchanged, and in
+  strict ECH mode fail closed instead.
+- **Task 5 must gate the AAAA-suppression path itself.** `Address` classifies only
+  the Cloudflare A path, because an AAAA answer carries no A records for the
+  published ranges to be checked against, so a `QType: dns.TypeAAAA` call with
+  `SuppressAAAA` set arrives at the rewriter with no Cloudflare verdict required of
+  it. Task 5 must reach that path only with a verdict it already holds, and never
+  for a name whose classification was refused.
+- **Task 3 must call `StripModifiedDNSSEC` after rewriting the HTTPS RR.** The
+  ruling that any modified RRset drops all DNSSEC records and clears AD applies to
+  the SVCB parameters as much as to an address: an ECH-rewritten HTTPS record
+  that keeps the RRSIG over the old RRset would ship a message with `AD=true` and
+  a signature that contradicts the parameters in front of it, which is the exact
+  state the ruling exists to prevent. The function is exported and takes the
+  message in place, so call it on the copy the plugin already made.
 
 ---
 
