@@ -1440,6 +1440,63 @@ func TestACancelledIdentityPhaseStillReportsTheUnchargedBytesItSpent(t *testing.
 	}
 }
 
+// A report that names only what this run spent cannot answer the question an
+// operator has before they spend it: with the shipped policy a ten-candidate
+// shortlist at 10 MiB each is exactly the 100 MiB day, so at most one switching
+// run is possible per local date - and a report-only run spends the same budget as
+// an applying one. So the report carries the limit and what is left of it.
+//
+// This run transfers three candidates at 2 MiB each, so the day stands at 6 MiB
+// of 100 MiB and 94 MiB is left: 6 * 1048576 = 6291456, and 100 * 1048576 minus
+// that is 98566144.
+func TestARunReportsTheDaysLimitAndWhatIsLeftOfIt(t *testing.T) {
+	fixtures, candidates := threeGlobals()
+	report := mustRunWithIncumbent(t, newTestRunner(t, newFakeProber(fixtures)).Runner, candidates, "104.16.1.1")
+
+	if report.BudgetUsed != 3*runnerDownloadBytes {
+		t.Fatalf("the report says the day stands at %d bytes, want %d: three transfers of 2 MiB", report.BudgetUsed, 3*runnerDownloadBytes)
+	}
+	if report.BudgetLimit != 100*mib {
+		t.Errorf("the report names a limit of %d bytes, want the policy's %d", report.BudgetLimit, 100*mib)
+	}
+	if report.BudgetRemaining != 98566144 {
+		t.Errorf("the report says %d bytes remain, want 98566144: 100 MiB less the 6 MiB this run transferred", report.BudgetRemaining)
+	}
+}
+
+// The limit in the report is the one the run was held to, not the one the policy
+// document names. A day can be tightened by hand in the budget document, and
+// dayRule holds the day to the smaller of the two, so a report that quoted the
+// policy instead would show an operator 90 MiB of room on a 50 MiB day.
+//
+// The document says 10 MiB already spent and allows 50, so this run's three 2 MiB
+// transfers leave 16 MiB spent: 10 + 6 MiB = 16777216, and 50 MiB less that is
+// 35651584.
+func TestTheReportsBudgetLimitIsTheOneTheRunWasHeldTo(t *testing.T) {
+	fixtures, candidates := threeGlobals()
+	built := newTestRunner(t, newFakeProber(fixtures))
+	record := state.BandwidthBudgetState{
+		SchemaVersion: state.SchemaVersion,
+		LocalDate:     runnerNow.Format("2006-01-02"),
+		LimitBytes:    50 * mib,
+		UsedBytes:     10 * mib,
+	}
+	if err := state.WriteJSONAtomic(built.budgetPath, record); err != nil {
+		t.Fatalf("write the budget fixture: %v", err)
+	}
+
+	report := mustRunWithIncumbent(t, built.Runner, candidates, "104.16.1.1")
+	if report.BudgetLimit != 50*mib {
+		t.Errorf("the report names a limit of %d bytes, want the 50 MiB the document tightened it to", report.BudgetLimit)
+	}
+	if report.BudgetUsed != 16*mib {
+		t.Errorf("the report says the day stands at %d bytes, want %d: 10 MiB already spent plus this run's 6 MiB", report.BudgetUsed, 16*mib)
+	}
+	if report.BudgetRemaining != 35651584 {
+		t.Errorf("the report says %d bytes remain, want 35651584: 50 MiB less the 16 MiB spent", report.BudgetRemaining)
+	}
+}
+
 func TestRunnerMeasuresWhileAnotherProcessHoldsTheControlLock(t *testing.T) {
 	// The control lock is held for the read-validate-increment-write of the
 	// selector and for the final proof in front of it, and for nothing else. A

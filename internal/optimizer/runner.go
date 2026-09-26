@@ -578,6 +578,20 @@ type Report struct {
 	// includes spending by other runs today. A report that hid that would read
 	// as though this run had spent the day.
 	BudgetUsed int64 `json:"budget_used_bytes"`
+	// BudgetLimit is the limit the day is held to, as the budget itself resolved
+	// it: the smaller of the policy's cdn.bandwidth.daily_budget and the limit the
+	// document already carries, so an operator who tightened the day by hand sees
+	// the number their own document is enforcing. It comes from the same read as
+	// BudgetUsed, because a total and a limit from two different reads can show
+	// more room than the day has.
+	BudgetLimit int64 `json:"budget_limit_bytes"`
+	// BudgetRemaining is what is left of the day after this run, which is the
+	// number an operator needs before spending it: with the shipped policy a
+	// ten-candidate shortlist at 10 MiB each is exactly the 100 MiB day, so at
+	// most one switching run fits - and a report-only run spends it just as an
+	// applying one does. It is never negative, because an overspent day is
+	// reported as fully spent rather than as room in the other direction.
+	BudgetRemaining int64 `json:"budget_remaining_bytes"`
 	// BudgetExhausted is true when the day could not pay for every transfer this
 	// run wanted to make. The run is not a failure: the latency and identity
 	// phases finish, the transfers that did not fit are skipped, and no winner
@@ -776,8 +790,8 @@ func (r Report) Validate() error {
 	if r.PolicySHA256 != r.ConfigSHA256 {
 		return fmt.Errorf("the report carries policy digest %s and config digest %s, which are two accounts of one configuration and do not agree", r.PolicySHA256, r.ConfigSHA256)
 	}
-	if r.IdentityBytes < 0 || r.BudgetUsed < 0 {
-		return errors.New("identity_body_bytes and budget_used_bytes must not be negative")
+	if r.IdentityBytes < 0 || r.BudgetUsed < 0 || r.BudgetLimit < 0 || r.BudgetRemaining < 0 {
+		return errors.New("identity_body_bytes, budget_used_bytes, budget_limit_bytes and budget_remaining_bytes must not be negative")
 	}
 	if err := validatePhases(r.Phases); err != nil {
 		return err
@@ -1822,17 +1836,28 @@ func (r *Runner) Run(ctx context.Context, input Input) (report Report, err error
 	return run.report, nil
 }
 
-// finalize reads the day's total and the refused settlements into the report.
+// finalize reads the day's total, the limit it is held to and the refused
+// settlements into the report.
 //
 // It is a separate step and not the tail of the scoring phase because a run that
 // stopped early has still spent bytes, and the run's own counters are only complete
 // once every probe it started has been joined - which the phase boundaries are.
+//
+// The day's two numbers come from one read of the one budget this run spent from,
+// through Budget.Standing, and never from the policy: a document an operator has
+// tightened holds the day to the tighter number, and a report that quoted the
+// policy beside it would show room this run did not have. The remaining figure is
+// the same arithmetic a refused reservation is measured with, clamped at zero for
+// the same reason: an overspent day has no room, not negative room.
 func (run *runState) finalize() {
 	if run.spend != nil {
 		run.report.SettleRefusals = run.spend.refused()
 	}
 	if run.budget != nil {
-		run.report.BudgetUsed = run.budget.Used()
+		used, limit := run.budget.Standing()
+		run.report.BudgetUsed = used
+		run.report.BudgetLimit = limit
+		run.report.BudgetRemaining = max(0, limit-used)
 	}
 	run.report.BudgetExhausted = run.exhausted.Load()
 }

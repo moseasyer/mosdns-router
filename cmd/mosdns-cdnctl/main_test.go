@@ -530,6 +530,29 @@ func threeCloudflareCandidates() candidate.CandidateSet {
 	}}
 }
 
+// A run that names only what it spent cannot answer the question an operator has
+// before spending it: the day is 100 MiB, a full shortlist of ten candidates at
+// 10 MiB each is exactly that, and a report-only run spends it just as an
+// applying one does. So the output carries the limit and the room left.
+//
+// Three candidates transfer 1 MiB each here, so the day stands at 3 MiB of
+// 104857600 and 101711872 bytes are left: 104857600 - 3145728 = 101711872.
+func TestTestCommandSaysHowMuchOfTheDayIsLeft(t *testing.T) {
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"test"}, fixture.flags()...), &stdout, &stderr,
+		servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("test exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "budget-limit-bytes: 104857600") {
+		t.Errorf("the report does not name the day's limit:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "budget-remaining-bytes: 101711872") {
+		t.Errorf("the report does not say what is left of the day:\n%s", stdout.String())
+	}
+}
+
 func TestTestCommandReportsWithoutPublishing(t *testing.T) {
 	// The default of `test` is a report and nothing else. A run that changed the
 	// address in service would rewrite every user's DNS answers on the strength of

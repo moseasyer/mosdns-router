@@ -331,8 +331,8 @@ func parseCDNOptions(name string, args []string, positional int) (cdnOptions, er
 	flags.StringVar(&options.representative, "representative-domain", defaultRepresentativeDomain, "the provider domain a global address is proved against")
 	flags.StringVar(&options.rangesURL, "ranges-url", defaultCloudflareRangesURL, "the published Cloudflare range document")
 	flags.StringVar(&options.rangesCache, "ranges-cache", defaultCloudflareRangesCache, "where the published range document is cached")
-	flags.StringVar(&options.report, "report", "", "write the report document to this path")
-	flags.BoolVar(&options.apply, "apply", false, "publish the winner once the final identity proof has passed")
+	flags.StringVar(&options.report, "report", "", "write the report document to this path; a report-only run spends the same daily bandwidth budget as one that applies")
+	flags.BoolVar(&options.apply, "apply", false, "publish the winner once the final identity proof has passed; spends the same daily bandwidth budget as a report-only run")
 	if err := flags.Parse(args); err != nil {
 		return cdnOptions{}, err
 	}
@@ -677,6 +677,16 @@ func (b byteBudget) Consume(reserved, actual int64) { b.inner.Consume(reserved, 
 // measured. A report written earlier is never what gets published, and the report
 // file --report writes is an output for a person rather than an input to this
 // command.
+//
+// **A report-only run spends the day's bandwidth exactly as an applying one does.**
+// The transfers happen in the measurement phases, which both forms run, and
+// publication is a proof and a write at the end. Nothing here is a dry run, and
+// with the shipped policy the difference is not academic: a ten-candidate
+// shortlist at 10 MiB each is exactly the 100 MiB day, so an exploratory `test`
+// can leave the nightly `test --apply` with `budget-exhausted: true` and every
+// group kept. The report therefore carries the day's limit and what remains of it
+// - from the run's own budget document, so an operator who tightened the day sees
+// the number their document enforces - and the output prints both.
 func runCDNTest(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
 	options, err := parseCDNOptions("test", args, 0)
 	if err != nil {
@@ -971,6 +981,12 @@ func writeCDNReport(output io.Writer, report optimizer.Report, published *state.
 	writeReportLine(output, "stale-candidates: %t\n", report.Stale)
 	writeReportLine(output, "identity-body-bytes: %d\n", report.IdentityBytes)
 	writeReportLine(output, "budget-used-bytes: %d\n", report.BudgetUsed)
+	// The limit and the room left, because a run that named only what it spent
+	// would leave an operator finding out the day's budget by having the next run
+	// refused. Both numbers come from the run's own budget document, so an
+	// operator who tightened the day sees the number their own document enforces.
+	writeReportLine(output, "budget-limit-bytes: %d\n", report.BudgetLimit)
+	writeReportLine(output, "budget-remaining-bytes: %d\n", report.BudgetRemaining)
 	writeReportLine(output, "budget-exhausted: %t\n", report.BudgetExhausted)
 	if len(report.SettleRefusals) > 0 {
 		for _, refusal := range report.SettleRefusals {

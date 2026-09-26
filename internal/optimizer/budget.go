@@ -95,6 +95,10 @@ type counter interface {
 	refund(day string, limit, amount int64) (int64, error)
 	// total reports the current total without writing.
 	total(day string, limit int64) (int64, error)
+	// standing reports the current total and the limit it is held to, from one
+	// read, so a caller that shows both cannot show a total and a limit from two
+	// different moments.
+	standing(day string, limit int64) (used, effective int64, err error)
 }
 
 // Budget is a daily byte allowance a download probe reserves from. It is safe
@@ -354,6 +358,31 @@ func (b *Budget) Used() int64 {
 	return used
 }
 
+// Standing reports what the day stands at and what it is allowed: the bytes
+// already charged and the limit they are held to, both from one read of this
+// budget's own document and this budget's own day rule.
+//
+// The limit it returns is the one in force rather than the one the constructor was
+// given, because the document may carry a tighter one - that is dayRule's rule,
+// and it is the same number a refused reservation is measured against. A caller
+// that wants to show an operator how much room is left must use this rather than
+// re-reading the policy: a policy document is not what the day is held to once an
+// operator has tightened it by hand.
+//
+// A document this budget can no longer read is reported from the last total it did
+// establish, as Used does, and the limit from this value's own. A reader that lost
+// the file must not learn there is budget left.
+func (b *Budget) Standing() (used, limit int64) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	read, effective, err := b.counter.standing(b.day(), b.limit)
+	if err != nil {
+		return b.lastKnown, b.limit
+	}
+	b.lastKnown = read
+	return read, effective
+}
+
 // Path is where this budget's document lives, and is empty for a budget that
 // has no document.
 func (b *Budget) Path() string {
@@ -437,6 +466,11 @@ func (m *memoryCounter) total(day string, limit int64) (int64, error) {
 	return used, nil
 }
 
+func (m *memoryCounter) standing(day string, limit int64) (int64, int64, error) {
+	used, effective := dayRule(m.record(limit), limit, day)
+	return used, effective, nil
+}
+
 func (m *memoryCounter) record(limit int64) state.BandwidthBudgetState {
 	return state.BandwidthBudgetState{SchemaVersion: state.SchemaVersion, LocalDate: m.day, LimitBytes: limit, UsedBytes: m.used}
 }
@@ -509,6 +543,18 @@ func (f *fileCounter) total(day string, limit int64) (int64, error) {
 	}
 	used, _ := dayRule(record, limit, day)
 	return used, nil
+}
+
+// standing is total and the day's limit from the one read, which is the whole
+// reason it is a method and not two: a report that showed a total from one read
+// and a limit from another could show more room than the day has.
+func (f *fileCounter) standing(day string, limit int64) (int64, int64, error) {
+	record, err := f.read()
+	if err != nil {
+		return 0, 0, err
+	}
+	used, effective := dayRule(record, limit, day)
+	return used, effective, nil
 }
 
 func (f *fileCounter) read() (state.BandwidthBudgetState, error) {
