@@ -147,10 +147,10 @@ type echProvider struct {
 	have       bool
 	refreshing bool
 	finished   chan struct{}
-	// publishedStatus is the status the last metadata document carried, so a
-	// transition between fresh, stale and invalid is written once rather than by
-	// every query that notices it.
-	publishedStatus string
+	// published is what the metadata document on disk was last written from, so a
+	// document that would be byte-identical is not written again and an older
+	// snapshot cannot replace a newer one.
+	published publishedKey
 	// bytes counts every payload this provider has read. No budget in this
 	// project accounts for it -- the daily budget governs the optimizer's
 	// measurement transfers and belongs to another process -- so it is counted
@@ -220,8 +220,22 @@ func newECHProvider(o echProviderOptions) (*echProvider, error) {
 //   - held and past the grace: the same refresh attempt, and a failure means there
 //     is nothing left to serve, which is ErrECHExpired and a strict name failing
 //     closed.
+//
+// A fifth case falls between them, and it is the reason the loop below runs twice
+// rather than once: a caller that LOST a race with another caller. It must not
+// answer from anything it read before the race -- on a cold start that snapshot is
+// an empty key, and returning it means a strict force-ECH name gets SERVFAIL over a
+// key that was fetched successfully a moment earlier. So a caller that waited
+// re-reads the stored value and decides from that, and the sentinel surfaces only
+// when there is genuinely still nothing.
+//
+// The bound is two attempts, and each is a real fetch rather than a spin: a caller
+// that finds the other caller's fetch failed does its own, which is a second query
+// in a case that is already a failure. That is the price of never answering from a
+// snapshot taken before a wait, and it is paid only when the source is broken.
 func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
-	for {
+	var lastFailure error
+	for attempt := 0; attempt < 2; attempt++ {
 		e.mu.Lock()
 		held, have := e.current, e.have
 		status := ""
@@ -243,11 +257,17 @@ func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
 			e.publish(echStatusFresh, fetched)
 			return fetched.raw, nil
 		}
-		if !errors.Is(err, errECHNotRefetched) {
-			e.logger.Warn("cdn_rewrite: the ECH source could not be read; the last usable key stands until its grace ends",
-				zap.String("upstream", e.addr), zap.Error(err))
+		if errors.Is(err, errECHNotRefetched) {
+			// Another caller did the fetch. This one re-reads the stored value at the
+			// top of the loop instead of deciding from anything it read before the
+			// wait, which is the only way a loser gets the key just published.
+			continue
 		}
+		lastFailure = err
 		if !have {
+			// Nothing was held and nothing could be fetched, so there is nothing to
+			// fall back on and the failure is the answer.
+			e.logFetchFailure(err)
 			return nil, err
 		}
 		e.publish(status, held)
@@ -258,6 +278,26 @@ func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
 		}
 		return held.raw, nil
 	}
+	// Two attempts and no usable key. The failure this caller last saw is the one to
+	// report; a caller that never saw one was only ever told to re-read, and the
+	// value it found there is the one it had already read.
+	if lastFailure == nil {
+		lastFailure = errECHNotRefetched
+	}
+	e.logFetchFailure(lastFailure)
+	return nil, lastFailure
+}
+
+// logFetchFailure reports a refresh that did not happen. It is a separate function
+// because a caller that waited on somebody else's fetch and then found nothing
+// stored has not itself failed to read the source, and saying so would report a
+// source fault that may never have happened.
+func (e *echProvider) logFetchFailure(err error) {
+	if errors.Is(err, errECHNotRefetched) {
+		return
+	}
+	e.logger.Warn("cdn_rewrite: the ECH source could not be read; the last usable key stands until its grace ends",
+		zap.String("upstream", e.addr), zap.Error(err))
 }
 
 // fetchOnce reads every source, with one fetch at a time. A caller that arrives
@@ -496,21 +536,48 @@ func refreshAfter(ttl uint32) time.Duration {
 
 // publish writes the metadata document for a key in a known state.
 //
-// A refusal to write it is reported and swallowed: the document is what an
-// operator reads, and a router that stopped serving force-ECH names because a
-// state file could not be written would trade a client's privacy for a log line
-// nobody asked for. The write happens outside the lock and at most once per
-// transition.
+// What decides whether a write happens is the CONTENT of the document, not the
+// status word. A status-only rule froze the file after the first fetch: every
+// successful refresh publishes "fresh", so nothing after the first document was
+// ever written, and the file went on describing the first key's expiry -- in the
+// past -- and the first key's digest while the router served a newer one. An
+// operator reading it, or `mosdns-cdnctl status`, was shown a document about a key
+// no longer in service. So the comparison is against everything the document says
+// about the key: its generation, which moves with the fetched, expiry and grace
+// times and with the digest, and the status, which one key changes on its own as it
+// ages.
+//
+// The generation settles the one race there is. Two callers can be inside publish
+// with different snapshots -- the fetcher with the key it just stored, and a waiter
+// with an older one it read before waiting -- and the older one must not be what is
+// on disk. The rule is the highest generation wins, and it is exact rather than a
+// heuristic: a generation comes from the provider's own counter under its lock, and
+// only a fetch that stored a key has one, so two snapshots of different generations
+// are two different keys and the newer one is the key in service. The strict state
+// writer would refuse a rollback in any case, so the loser was safe -- but a
+// refusal that logs a warning is not a mechanism.
+//
+// A write that fails is reported and swallowed: the document is what an operator
+// reads, and a router that stopped serving force-ECH names because a state file
+// could not be written would trade a client's privacy for a log line nobody asked
+// for.
 func (e *echProvider) publish(status string, current echConfig) {
 	if current.source == "" {
 		return
 	}
 	e.mu.Lock()
-	if e.publishedStatus == status {
+	switch {
+	case current.generation < e.published.generation:
+		// A newer key is already the document on disk, so this snapshot is some
+		// caller's older reading of a key that has since been replaced.
+		e.mu.Unlock()
+		return
+	case current.generation == e.published.generation && status == e.published.status:
+		// The same key in the same state: the document would be byte-identical.
 		e.mu.Unlock()
 		return
 	}
-	e.publishedStatus = status
+	e.published = publishedKey{generation: current.generation, status: status}
 	e.mu.Unlock()
 
 	document := state.NewECHState(
@@ -527,6 +594,17 @@ func (e *echProvider) publish(status string, current echConfig) {
 		e.logger.Warn("cdn_rewrite: the ECH state document could not be written; the key itself is unaffected",
 			zap.String("path", e.statePath), zap.Error(err))
 	}
+}
+
+// publishedKey is what the document on disk was last written from. The generation
+// is the whole of it: it changes with every fetch, and it carries the times and the
+// digest because those are properties of the key it was assigned to. The status is
+// beside it because one key changes status as it ages -- fresh, then stale, then
+// invalid -- without its generation moving, and each of those is a different
+// document.
+type publishedKey struct {
+	generation uint64
+	status     string
 }
 
 // Close releases the client. It is idempotent, and a Config call that arrives
