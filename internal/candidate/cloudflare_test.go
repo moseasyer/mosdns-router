@@ -742,6 +742,35 @@ func TestCloudflareCandidatesDoNotStoreABodyTheyRefuse(t *testing.T) {
 	}
 }
 
+// The same rule for a refusal that happens after the body has been read and
+// understood, which is the case the no-validator case cannot reach: that one is
+// refused before a byte of the body is read, so it says nothing about whether a
+// body this build parsed and then rejected reaches the disk.
+//
+// This document is a well-formed response - success, a revision marker, a document
+// this build could sample - that names no IPv4 range at all. Every earlier gate
+// accepts it, and only the "names no IPv4 range" refusal stands between it and the
+// cache. A stored copy would be worse than the no-validator one: this body could be
+// revalidated, so a later run would read it and be told the origin's ranges were
+// empty.
+func TestCloudflareCandidatesDoNotStoreABodyTheyRefuseAfterReadingIt(t *testing.T) {
+	empty := `{"success":true,"errors":[],"messages":[],` +
+		`"result":{"etag":"empty-lists","ipv4_cidrs":[],"ipv6_cidrs":[]}}`
+	cachePath := filepath.Join(t.TempDir(), "cloudflare-ips.json")
+	origin := newFakeOrigin(t, empty, "empty-lists")
+
+	_, err := newTestSource(t, origin, cachePath).Candidates(context.Background(), 512, testDate(2026, time.September, 25))
+	if err == nil {
+		t.Fatal("Candidates accepted a document naming no IPv4 range")
+	}
+	if !strings.Contains(err.Error(), "no IPv4 range") {
+		t.Errorf("the refusal %q does not name the empty range list, so this case may be testing another rule", err)
+	}
+	if _, err := os.Stat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a body refused after it was read was written to %s (stat error %v): the cache is written only after the document is accepted", cachePath, err)
+	}
+}
+
 func TestCloudflareCandidatesRefuseANotModifiedResponseWithNoCache(t *testing.T) {
 	// A 304 with nothing cached is a broken validator, not a document.
 	origin := newFakeOrigin(t, standardDocument(), fixtureETag)

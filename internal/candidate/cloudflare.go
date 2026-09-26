@@ -176,9 +176,15 @@ type cloudflareRanges struct {
 // this build does not know about are not refused, because the document is the
 // origin's own and not a document an operator wrote; every field this build does
 // read is held to the verdict above.
+//
+// The body is read from the slice the fetch already bounded, with no second limit
+// around the decoder: fetchDocument refuses a document larger than
+// maximumDocumentBytes before it returns, so a reader here could only ever hand the
+// decoder the same bytes it already has. The bound that matters is the one at read
+// time, and it is the one that stops a hostile origin.
 func parseCloudflareDocument(sourceURL string, body []byte) (cloudflareRanges, error) {
 	document := cloudflareRanges{}
-	decoder := json.NewDecoder(newLimitedReader(body, maximumDocumentBytes*2))
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&document); err != nil {
 		return cloudflareRanges{}, fmt.Errorf("%s: decode document: %w", sourceURL, err)
 	}
@@ -279,11 +285,4 @@ func (s dailySeed) addressIn(block netip.Prefix) netip.Addr {
 	raw := block.Addr().As4()
 	raw[3] = 1 + byte(binary.BigEndian.Uint32(sum[:4])%sampleHostAddresses)
 	return netip.AddrFrom4(raw)
-}
-
-// newLimitedReader returns a reader over at most limit bytes of body. The body
-// comes from a reader that is already bounded, so this is the parse-time guard
-// against a document whose nesting expands past what the read bound implies.
-func newLimitedReader(body []byte, limit int64) io.Reader {
-	return io.LimitReader(bytes.NewReader(body), limit)
 }
