@@ -42,6 +42,14 @@
   overwritten by it. With no cache at all, or a 304 that cannot be satisfied, the run fails rather
   than measuring an empty set. Serving stale is safe because every candidate in a stale set still has
   to pass the final identity proof before it can be published.
+- **The group barrier is enforced on every exported function that takes a group, not only on the three that take a slice.** `RankScore`, `CombinedScore` and `TenthPercentileSpeed` each take a group without going through `Select`, and a check on the *subject* is not a check on the *group*: a subject can be a good member of a slice that also holds another hostname's results, and the percentile arithmetic then compares the two. All five refuse a slice that is not one group. A review of this must check the entry points, not the call graph inside the package.
+- **The exclusion ceilings are `optimizer.DefaultLimits()` and Task 4 must pass them.** `config.Policy` has no loss or latency ceiling field and this plan may not add one, so the ceilings are a parameter with a documented default: `DefaultMaxLossFraction` 0.10 and `DefaultMaxP50MS` 150ms, both inclusive. `optimizer.Limits{}` still means "no ceiling" and a caller can still ask for it, but a caller that writes `Params{}` by accident must reach for `DefaultLimits()` rather than for the zero value, which measures and publishes a candidate that dropped 40% of its handshakes. A review of the runner must confirm the value it passes.
+- **`Params.Validate()` is a gate, not a convenience.** A non-positive `latency_candidate_count`, `latency_top` or `bandwidth_top` cannot select anything, and the three come from three separate policy fields. `Select` refuses every candidate with `ReasonUnusableCounts` rather than returning an empty union that reads as "nothing was good enough", and `Validate` lets the runner find it out before it spends the day's bandwidth.
+- **Two identity gates, and the scorer deliberately holds neither.** The phase order is `collect -> TCP -> HTTPS identity -> latency shortlist -> bandwidth -> score -> final proof`. A candidate reaches the scorer only if it already passed the identity probe for the hostname it is scored for, and the proof runs again on the winner before anything is published. `optimizer.CandidateResult.HTTP` is therefore carried and never read, and that is the design: a third gate over a fact two others hold would be the one a caller mistakes for the gate itself. A review of the runner must confirm both gates run, because a candidate with no proof will be scored, and scored well.
+- `optimizer.TCPMetrics.P95MS` is measured and **not read by the selector**. It is not a deferred item: the p50 and the jitter are what the three weighted ranks use, and p95 has no term. It is carried because the prober measures it and a report may show it; a review should not read its absence as a missing term.
+- **`optimizer.normalizeWeights` places the rounding remainder on the latency share.** Three rounded ten-thousandths need not sum to the scale, and the remainder goes to the first share so the total is always exact. The choice is arbitrary and the arithmetic is not: with `Weights{1,1,1}` the shares are 3334/3333/3333 rather than 3333/3333/3333, and the second and third candidates' scores differ by 2 points. Any placement is acceptable; a change must keep the sum at exactly 10000.
+- **A duplicate candidate in the input survives `Select`'s deduplication.** The union is deduplicated by `candidate.Candidate`, which is the whole candidate including its source, so the same address under two sources stays two entries. `candidate.Combine` dedupes on provider/hostname/address and produces one entry per address, so a run cannot produce such a pair; a caller that does has a bug the selector is not the place to report.
+- **The `internal/measure` leaf package exists because reversing it re-creates an import cycle.** `prober`'s in-package test uses `*optimizer.Budget` in fifteen places, and Go forbids an in-package test file importing a package that imports the one under test. Declaring `TCPMetrics`/`HTTPMetrics`/`DownloadMetrics` in `internal/measure` and naming them in `prober` as type aliases keeps both names working and the cycle gone. Moving them back into `prober`, or adding any further `optimizer -> prober` import, brings the cycle straight back; the alternatives are a test double in `prober_test.go` or a subpackage for the scorer, both of which cost coverage or the plan's acceptance commands.
 
 ---
 
@@ -165,6 +173,35 @@ type Input struct {
     LastGood           state.Selector
 }
 type ScoreWeights struct { Latency float64; Bandwidth float64; Stability float64 }
+// The exclusion ceilings, as parameters with a documented default. config.Policy
+// has no field for either and this plan may not add one, so the caller chooses
+// and DefaultLimits() is the value Task 4 must pass. Both are inclusive; a zero
+// means no ceiling for that dimension.
+type Limits struct { MaxLoss float64; MaxP50MS float64 }
+const DefaultMaxLossFraction = 0.10
+const DefaultMaxP50MS = 150.0
+func DefaultLimits() Limits
+// The three top-N counts and the weights a selection needs, gathered so a caller
+// cannot pass a count from one policy and a ceiling from another. Validate
+// reports a non-positive count, which cannot select anything, and Select refuses
+// every candidate with ReasonUnusableCounts rather than returning an empty union
+// that reads as an absence of good candidates.
+type Params struct {
+    LatencyCandidates int  // cdn.latency_candidate_count
+    LatencyTop        int  // cdn.combined.latency_top
+    BandwidthTop      int  // cdn.combined.bandwidth_top
+    Limits            Limits
+    Weights           ScoreWeights
+}
+func (p Params) Validate() error
+// GroupKey is the one set of candidates that may be compared. Every function
+// below that takes a group refuses a slice holding more than one, including
+// RankScore, CombinedScore and TenthPercentileSpeed, which take a group without
+// going through Select.
+type GroupKey struct { Provider candidate.Provider; Hostname string }
+func GroupOf(candidate.Candidate) GroupKey
+func (k GroupKey) Same(other GroupKey) bool
+func TenthPercentileSpeed(group []CandidateResult) float64
 type Report struct { GeneratedAt time.Time; Candidates []CandidateResult; Winner candidate.Candidate; BudgetUsed int64 }
 type Runner struct { /* private */ }
 func NewRunner(config.Policy, prober.Prober) *Runner
@@ -334,7 +371,8 @@ Construct 12 candidates with controlled p50, p95, jitter, loss, and speed. Asser
 - top ten latency candidates are selected;
 - bandwidth top three and latency top three form the union;
 - weights 0.45/0.45/0.10 produce the documented ordering;
-- equal scores sort by lower loss, higher p10 speed, lower jitter, then IP;
+- equal scores sort by lower loss, then lower jitter, then the lower address.
+  **Ruling (Task 3):** this line replaces the original "lower loss, higher p10 speed, lower jitter, then IP". A p10 speed is not a tie-break term: a p10 is a property of the group, so comparing two candidates' p10 values compares a number with itself, and the one predicate reading — at or above the group's p10 — is satisfied by every candidate while the group holds ten or fewer, which is the common case. A tie-break that cannot change an order is worse than no tie-break. The group's p10 speed is still computed and reported (`optimizer.TenthPercentileSpeed`, the *lower* tail by ascending nearest-rank, the same form as the prober's p50 and p95) for Task 4's report.
 - a CloudFront result is scored only inside its own hostname group.
 
 - [ ] **Step 2: Write failing switch-gate tests**
