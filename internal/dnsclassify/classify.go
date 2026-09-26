@@ -90,15 +90,21 @@ func (r Refusal) Error() string { return string(r) }
 
 // Result is one classification, and it is a verdict plus the reason for it
 // rather than a set of booleans a caller has to interpret in the right order.
+//
+// The two fields that authorize a rewrite -- Provider and TerminalName -- are set
+// only on a result that authorizes one. A refusal returns both empty, so a caller
+// that forwards a Result without reading it forwards nothing: there is no field
+// left in it that the rewriter would accept. A refusal that still named the
+// network and the owner would be indistinguishable from a success except by
+// reading a boolean, and the mistake would be invisible at the call site.
 type Result struct {
-	// Provider is candidate.ProviderCloudflare when at least one terminal address
-	// is inside a published range, and empty when none is. It says whose network
-	// is in the answer. It is not permission to rewrite: AllMatch is that.
+	// Provider is candidate.ProviderCloudflare when every terminal address is
+	// inside a published range, and empty on every refusal.
 	Provider candidate.Provider
 	// TerminalName is the canonical owner of the terminal address records, and is
-	// what a rewrite has to replace. It is empty when the walk found no address
-	// records or refused to walk, because in those cases there is nothing to
-	// replace and a caller that invented a name would rewrite the wrong RRset.
+	// what a rewrite has to replace. It is empty on every refusal, and a result
+	// that authorizes a rewrite never has it empty: such a result always says
+	// which RRset to replace.
 	TerminalName string
 	// AllMatch is true when every terminal address is inside a published range
 	// and there is at least one of them. It is the only field that authorises a
@@ -106,7 +112,8 @@ type Result struct {
 	AllMatch bool
 	// Mixed is true when at least one terminal address is inside a published
 	// range and at least one is not. It names a response that serves more than
-	// one network, which is reported and never rewritten.
+	// one network. It is reported, and it is not a partial success: the refusal
+	// carrying it is a whole refusal.
 	Mixed bool
 	// Refusal is the reason this response is not rewriteable, and RefusalNone
 	// when it is.
@@ -114,8 +121,9 @@ type Result struct {
 }
 
 // Cloudflare classifies one response against the caller's published IPv4 ranges.
-// Every refusal is reported in Result.Refusal with AllMatch false, and a caller
-// that reads only AllMatch cannot be led into a rewrite by one.
+// Every refusal is reported in Result.Refusal with AllMatch false and with
+// Provider and TerminalName empty, so a caller that forwards the fields which
+// authorize a rewrite cannot be led into one by a refusal.
 func Cloudflare(msg *dns.Msg, prefixes []netip.Prefix) Result {
 	owners, refusal := Chain(msg)
 	if refusal != RefusalNone {
@@ -146,17 +154,9 @@ func Cloudflare(msg *dns.Msg, prefixes []netip.Prefix) Result {
 			AllMatch:     true,
 		}
 	case published > 0:
-		return Result{
-			Provider:     candidate.ProviderCloudflare,
-			TerminalName: terminal,
-			Mixed:        true,
-			Refusal:      RefusalMixed,
-		}
+		return Result{Mixed: true, Refusal: RefusalMixed}
 	default:
-		return Result{
-			TerminalName: terminal,
-			Refusal:      RefusalForeignAddress,
-		}
+		return Result{Refusal: RefusalForeignAddress}
 	}
 }
 

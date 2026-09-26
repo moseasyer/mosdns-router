@@ -152,29 +152,21 @@ func TestCloudflare(t *testing.T) {
 			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "104.16.1.1", 300), answerA("cdn.example.", "198.51.100.5", 300)),
 			prefixes: publishedPrefixes(),
 			want: Result{
-				Provider:     "cloudflare",
-				TerminalName: "cdn.example.",
-				Mixed:        true,
-				Refusal:      RefusalMixed,
+				Mixed:   true,
+				Refusal: RefusalMixed,
 			},
 		},
 		{
 			name:     "a foreign address behind a chain of CNAMEs",
 			msg:      response("cdn.example.", dns.TypeA, answerCNAME("cdn.example.", "origin.example.", 300), answerA("origin.example.", "192.0.2.10", 300)),
 			prefixes: publishedPrefixes(),
-			want: Result{
-				TerminalName: "origin.example.",
-				Refusal:      RefusalForeignAddress,
-			},
+			want:     Result{Refusal: RefusalForeignAddress},
 		},
 		{
 			name:     "every address foreign",
 			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "198.51.100.5", 300), answerA("cdn.example.", "203.0.113.9", 300)),
 			prefixes: publishedPrefixes(),
-			want: Result{
-				TerminalName: "cdn.example.",
-				Refusal:      RefusalForeignAddress,
-			},
+			want:     Result{Refusal: RefusalForeignAddress},
 		},
 		{
 			name:     "a chain that ends at a name with no records at all",
@@ -214,28 +206,19 @@ func TestCloudflare(t *testing.T) {
 			name:     "a real published address the given prefixes omit",
 			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "104.16.1.1", 300)),
 			prefixes: documentationPrefix(),
-			want: Result{
-				TerminalName: "cdn.example.",
-				Refusal:      RefusalForeignAddress,
-			},
+			want:     Result{Refusal: RefusalForeignAddress},
 		},
 		{
 			name:     "a prefix set of IPv6 ranges",
 			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "104.16.1.1", 300)),
 			prefixes: []netip.Prefix{netip.MustParsePrefix("2606:4700::/32")},
-			want: Result{
-				TerminalName: "cdn.example.",
-				Refusal:      RefusalForeignAddress,
-			},
+			want:     Result{Refusal: RefusalForeignAddress},
 		},
 		{
 			name:     "a prefix set written as IPv4-mapped IPv6",
 			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "104.16.1.1", 300)),
 			prefixes: []netip.Prefix{netip.MustParsePrefix("::ffff:104.16.0.0/108")},
-			want: Result{
-				TerminalName: "cdn.example.",
-				Refusal:      RefusalForeignAddress,
-			},
+			want:     Result{Refusal: RefusalForeignAddress},
 		},
 		{
 			name:     "no response at all",
@@ -325,6 +308,114 @@ func TestCloudflare(t *testing.T) {
 	}
 }
 
+// TestARefusalNamesNothingThatCouldAuthorizeARewrite is the property that makes a
+// Result safe to hand to the rewriter without reading it first. A refusal that
+// still carries a provider and a terminal name is a result a caller can pass
+// straight through by mistake, and the mistake is invisible at the call site
+// because the value looks exactly like a success. So every refusal returns a
+// Result with those two fields empty, and this case says so for every kind of
+// refusal there is: a caller that forwards a refusal forwards nothing.
+func TestARefusalNamesNothingThatCouldAuthorizeARewrite(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      *dns.Msg
+		prefixes []netip.Prefix
+		want     Refusal
+		mixed    bool
+	}{
+		{
+			name:     "no response at all",
+			msg:      nil,
+			prefixes: publishedPrefixes(),
+			want:     RefusalNoResponse,
+		},
+		{
+			name: "no question to walk from",
+			msg: func() *dns.Msg {
+				msg := new(dns.Msg)
+				msg.Response = true
+				msg.Answer = []dns.RR{answerA("cdn.example.", "104.16.1.1", 300)}
+				return msg
+			}(),
+			prefixes: publishedPrefixes(),
+			want:     RefusalNoQuestion,
+		},
+		{
+			name:     "no published prefixes at all",
+			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "104.16.1.1", 300)),
+			prefixes: nil,
+			want:     RefusalNoPrefixes,
+		},
+		{
+			name: "a name aliased to itself",
+			msg: response("cdn.example.", dns.TypeA,
+				answerCNAME("cdn.example.", "cdn.example.", 300),
+				answerA("cdn.example.", "104.16.1.1", 300),
+			),
+			prefixes: publishedPrefixes(),
+			want:     RefusalCNAMELoop,
+		},
+		{
+			name: "two CNAMEs at the same name",
+			msg: response("cdn.example.", dns.TypeA,
+				answerCNAME("cdn.example.", "one.example.net.", 300),
+				answerCNAME("cdn.example.", "two.example.net.", 300),
+			),
+			prefixes: publishedPrefixes(),
+			want:     RefusalAmbiguousChain,
+		},
+		{
+			name: "a chain name that also carries an address",
+			msg: response("cdn.example.", dns.TypeA,
+				answerCNAME("cdn.example.", "edge.example.net.", 300),
+				answerA("cdn.example.", "198.51.100.5", 300),
+				answerA("edge.example.net.", "104.16.1.1", 300),
+			),
+			prefixes: publishedPrefixes(),
+			want:     RefusalAddressInChain,
+		},
+		{
+			name:     "a chain that ends at a name with no records at all",
+			msg:      response("cdn.example.", dns.TypeA, answerCNAME("cdn.example.", "nowhere.example.", 300)),
+			prefixes: publishedPrefixes(),
+			want:     RefusalNoAddress,
+		},
+		{
+			name:     "a published address and a foreign address",
+			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "104.16.1.1", 300), answerA("cdn.example.", "198.51.100.5", 300)),
+			prefixes: publishedPrefixes(),
+			want:     RefusalMixed,
+			mixed:    true,
+		},
+		{
+			name:     "every address foreign",
+			msg:      response("cdn.example.", dns.TypeA, answerA("cdn.example.", "198.51.100.5", 300)),
+			prefixes: publishedPrefixes(),
+			want:     RefusalForeignAddress,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Cloudflare(tt.msg, tt.prefixes)
+			if got.Refusal != tt.want {
+				t.Fatalf("refusal = %q, want %q", got.Refusal, tt.want)
+			}
+			if got.AllMatch {
+				t.Error("a refusal reported AllMatch")
+			}
+			if got.Mixed != tt.mixed {
+				t.Errorf("Mixed = %v, want %v", got.Mixed, tt.mixed)
+			}
+			if got.Provider != "" {
+				t.Errorf("a refusal named the provider %q, which a caller can hand to the rewriter", got.Provider)
+			}
+			if got.TerminalName != "" {
+				t.Errorf("a refusal named the terminal owner %q, which a caller can hand to the rewriter", got.TerminalName)
+			}
+		})
+	}
+}
+
 // TestCloudflareRefusesANameAliasedToItself is the case a walk with no memory
 // cannot pass: `cdn.example. CNAME cdn.example.` is a single edge back to the
 // name the walk started at, and following it forever is the failure this whole
@@ -380,6 +471,31 @@ func TestCloudflareRefusesAnAliasCycle(t *testing.T) {
 // 64-name one the test names.
 func nameAt(i int) string {
 	return "hop" + strconv.Itoa(i) + ".alias.example."
+}
+
+// TestCloudflareRefusesACycleSpelledInAnyCase is the loop test with the spelling
+// work left in it. A resolver may answer with any case for a name and may or may
+// not write the trailing dot, and a visited set keyed on anything other than the
+// canonical form misses a cycle the moment two links of it are spelled
+// differently. Each link here is a different name in a different case, and half
+// of them have no final dot, so only a set keyed on the canonical name ends this
+// walk.
+func TestCloudflareRefusesACycleSpelledInAnyCase(t *testing.T) {
+	msg := response("One.Example.COM.", dns.TypeA,
+		answerCNAME("one.example.com", "TWO.example.net.", 300),
+		answerCNAME("two.EXAMPLE.net", "three.Example.Org", 300),
+		answerCNAME("Three.example.ORG", "one.example.COM", 300),
+		answerA("elsewhere.example.", "104.16.1.1", 300),
+	)
+
+	got := withinSecond(t, "the case-varied alias cycle", func() Result {
+		return Cloudflare(msg, publishedPrefixes())
+	})
+
+	want := Result{Refusal: RefusalCNAMELoop}
+	if got != want {
+		t.Fatalf("Cloudflare(case-varied cycle) = %+v, want %+v", got, want)
+	}
 }
 
 // TestChainReportsTheOwnersInOrder is the contract dnsrewrite depends on: the
