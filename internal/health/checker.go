@@ -56,13 +56,11 @@ package health
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -445,7 +443,7 @@ func (c *Checker) Check(ctx context.Context) (result Result, err error) {
 	moment := c.now()
 	updated := applyVerdict(document, winner.Verdict, moment, c.options.FailureThreshold, fresh.LastSuccess, failedClosed)
 	result.FailedClosed = failedClosed
-	if err := writeHealthDocument(c.options.HealthPath, updated); err != nil {
+	if err := state.WriteReplacementJSONAtomic(c.options.HealthPath, updated); err != nil {
 		// The previous document is still on disk and no conclusion has been
 		// recorded, so the next check reads the count as it was and adds to it.
 		return result, err
@@ -470,91 +468,6 @@ func (c *Checker) Check(ctx context.Context) (result Result, err error) {
 // a second.
 func (c *Checker) now() time.Time {
 	return c.options.Now().UTC()
-}
-
-// healthDocumentMode is the mode the health document is published with whatever
-// the creating umask was, because it is runtime state a reader must be able to see
-// and a writer must not be able to take away.
-const healthDocumentMode = 0o640
-
-// writeHealthDocument replaces the health document with document, atomically.
-//
-// It is not state.WriteJSONAtomic, and the difference is the whole reason it exists.
-// That writer refuses to replace a document it cannot read, which is the right
-// answer for the selector - never destroy the address a broken router still has -
-// and the wrong answer here. A health document that cannot be read is precisely the
-// case this package is required to recover from: a corrupt one fails closed to the
-// policy's threshold, and a writer that refused to overwrite it would leave every
-// future check failing closed to a history that no real verdict could ever replace.
-// The selector itself is still written through state.WriteJSONAtomic, where that
-// refusal is the property we want.
-//
-// The discipline is the same one state.WriteJSONAtomic applies, and in the same
-// order: validate the document, write a same-directory temporary file, flush it,
-// close it, rename it over the target, then flush the directory so the rename
-// itself survives a power cut. A reader therefore sees either the whole previous
-// file or the whole new one, and a failure at any step leaves the previous
-// document in place.
-func writeHealthDocument(path string, document state.HealthState) (err error) {
-	if strings.TrimSpace(path) == "" {
-		return errors.New("a health document needs a path to be written to")
-	}
-	if err := document.Validate(); err != nil {
-		return fmt.Errorf("%s: validate the health document: %w", path, err)
-	}
-	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o750); err != nil {
-		return fmt.Errorf("%s: create the health document directory: %w", path, err)
-	}
-	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".health.tmp")
-	if err != nil {
-		return fmt.Errorf("%s: create the health temporary file: %w", path, err)
-	}
-	temporaryPath := temporary.Name()
-	closed := false
-	defer func() {
-		if temporaryPath == "" {
-			return
-		}
-		if !closed {
-			_ = temporary.Close()
-		}
-		if removeErr := os.Remove(temporaryPath); removeErr != nil {
-			err = errors.Join(err, fmt.Errorf("%s: remove the health temporary file: %w", path, removeErr))
-		}
-	}()
-	if err := temporary.Chmod(healthDocumentMode); err != nil {
-		return fmt.Errorf("%s: set the health document mode: %w", path, err)
-	}
-	encoder := json.NewEncoder(temporary)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(document); err != nil {
-		return fmt.Errorf("%s: encode the health document: %w", path, err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("%s: sync the health document: %w", path, err)
-	}
-	if err := temporary.Close(); err != nil {
-		closed = true
-		return fmt.Errorf("%s: close the health document: %w", path, err)
-	}
-	closed = true
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("%s: publish the health document: %w", path, err)
-	}
-	temporaryPath = ""
-	handle, err := os.Open(directory)
-	if err != nil {
-		return fmt.Errorf("%s: open the health document directory: %w", path, err)
-	}
-	if err := handle.Sync(); err != nil {
-		_ = handle.Close()
-		return fmt.Errorf("%s: sync the health document directory: %w", path, err)
-	}
-	if err := handle.Close(); err != nil {
-		return fmt.Errorf("%s: close the health document directory: %w", path, err)
-	}
-	return nil
 }
 
 // readSelector reads the published selector. A document that is not there is a

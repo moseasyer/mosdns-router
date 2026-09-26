@@ -1043,9 +1043,15 @@ func TestTheHealthDocumentHoldsOnlyTheDocumentedFields(t *testing.T) {
 	}
 }
 
-// A write that fails leaves the previous document and this check's conclusion
-// alone: there is no half-written counter, and nothing is published behind a
-// document that was never stored.
+// A write that fails leaves the previous document and this check's conclusion alone:
+// there is no half-written counter, and nothing is published behind a document that
+// was never stored.
+//
+// The step-by-step fault injection for this discipline lives in the state package,
+// beside the harness that can fail the rename, the file flush and the directory
+// flush individually, because the health writer is that writer and has no steps of its
+// own to inject into. What is left for this package to hold is the consequence the
+// check itself owns: a write that did not happen is reported as no document written.
 func TestAFailedHealthWriteLeavesThePreviousDocumentAndConclusion(t *testing.T) {
 	w := newWorld(t, publishedSelector(), profilesFor(), 3)
 	previous := state.HealthState{

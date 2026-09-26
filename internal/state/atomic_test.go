@@ -601,7 +601,7 @@ func TestWriteJSONAtomicPropagatesFileSyncFailureAndCleansTemporaryFile(t *testi
 	}
 	newState := old
 	newState.Generation = 6
-	err := writeJSONAtomicWithOps(path, newState, ops)
+	err := writeJSONAtomicWithOps(path, newState, ops, false)
 	if !errors.Is(err, injected) {
 		t.Fatalf("write error = %v, want injected sync error", err)
 	}
@@ -620,7 +620,7 @@ func TestWriteJSONAtomicPropagatesDirectorySyncFailure(t *testing.T) {
 	injected := errors.New("injected directory sync failure")
 	ops := defaultAtomicFileOps()
 	ops.syncDir = func(string) error { return injected }
-	if err := writeJSONAtomicWithOps(path, value, ops); !errors.Is(err, injected) {
+	if err := writeJSONAtomicWithOps(path, value, ops, false); !errors.Is(err, injected) {
 		t.Fatalf("write error = %v, want injected directory sync error", err)
 	}
 	var got Selector
@@ -668,7 +668,7 @@ func TestWriteJSONAtomicRestoresExistingTargetWhenDirectorySyncFails(t *testing.
 		return nil
 	}
 
-	if err := writeJSONAtomicWithOps(path, candidate, ops); !errors.Is(err, injected) {
+	if err := writeJSONAtomicWithOps(path, candidate, ops, false); !errors.Is(err, injected) {
 		t.Fatalf("write error = %v, want injected directory sync error", err)
 	}
 	if !candidateRenamed {
@@ -699,7 +699,7 @@ func TestWriteJSONAtomicPropagatesRenameFailureWithoutOverwriting(t *testing.T) 
 	ops.rename = func(string, string) error { return injected }
 	newState := old
 	newState.Generation = 6
-	if err := writeJSONAtomicWithOps(path, newState, ops); !errors.Is(err, injected) {
+	if err := writeJSONAtomicWithOps(path, newState, ops, false); !errors.Is(err, injected) {
 		t.Fatalf("write error = %v, want injected rename error", err)
 	}
 	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
@@ -722,7 +722,7 @@ func TestWriteJSONAtomicReportsTemporaryFileRemovalFailure(t *testing.T) {
 	ops.syncFile = func(*os.File) error { return injectedSync }
 	ops.remove = func(string) error { return injectedRemove }
 
-	err := writeJSONAtomicWithOps(path, value, ops)
+	err := writeJSONAtomicWithOps(path, value, ops, false)
 	if !errors.Is(err, injectedSync) {
 		t.Fatalf("write error = %v, want it to report the injected sync failure", err)
 	}
@@ -753,7 +753,7 @@ func TestWriteJSONAtomicReportsBackupRemovalFailureAfterAFailedWrite(t *testing.
 		return os.Remove(name)
 	}
 
-	err := writeJSONAtomicWithOps(path, candidate, ops)
+	err := writeJSONAtomicWithOps(path, candidate, ops, false)
 	if !errors.Is(err, injectedRename) {
 		t.Fatalf("write error = %v, want it to report the injected rename failure", err)
 	}
@@ -784,7 +784,7 @@ func TestWriteJSONAtomicReportsBackupRemovalFailureAfterASuccessfulWrite(t *test
 		return os.Remove(name)
 	}
 
-	if err := writeJSONAtomicWithOps(path, candidate, ops); !errors.Is(err, injectedRemove) {
+	if err := writeJSONAtomicWithOps(path, candidate, ops, false); !errors.Is(err, injectedRemove) {
 		t.Fatalf("write error = %v, want it to report the backup removal failure", err)
 	}
 	var got Selector
@@ -854,4 +854,222 @@ func readFileBytes(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+// ---------------------------------------------------------------------------
+// the replace-unreadable policy
+// ---------------------------------------------------------------------------
+
+// corruptHealthDocument is a target the strict writer refuses and the replacement
+// writer is for: the file is there, it is the document this build writes, and this
+// build cannot read it. It is written with WriteFile rather than through the writers
+// so the file exists before either of them is asked to touch it.
+func corruptHealthDocument(t *testing.T, path string) []byte {
+	t.Helper()
+	contents := []byte(`{"schema_version": 1, "healthy": true, "consecutive_failures": 0,`)
+	if err := os.WriteFile(path, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return contents
+}
+
+// The health document is the one kind of state a count this build cannot read must
+// not block: a history nobody can see is not a history that vouches for an address,
+// and the only useful next step is a real verdict written over it. This is the whole
+// of what the replacement writer is for.
+func TestWriteReplacementJSONAtomicReplacesAnUnreadableHealthDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "health.json")
+	corruptHealthDocument(t, path)
+
+	replacement := HealthState{SchemaVersion: SchemaVersion, ConsecutiveFailures: 1, LastFailure: testFetchedAt}
+	if err := WriteReplacementJSONAtomic(path, replacement); err != nil {
+		t.Fatalf("replace an unreadable health document: %v", err)
+	}
+	var got HealthState
+	if err := ReadJSON(path, &got); err != nil {
+		t.Fatalf("read the replacement health document: %v", err)
+	}
+	if got.ConsecutiveFailures != 1 || !got.LastFailure.Equal(testFetchedAt) || got.Healthy {
+		t.Fatalf("replacement health document = %#v", got)
+	}
+	assertOnlyTargetEntry(t, filepath.Dir(path), "health.json")
+}
+
+// The asymmetry is the point, so it is pinned as a behaviour rather than left as a
+// convention: a selector is the address the router is serving from right now, and a
+// request to replace one this build cannot read is refused however it is asked for.
+func TestWriteReplacementJSONAtomicStillRefusesAnUnreadableSelector(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cdn-selector.json")
+	corrupt := []byte(`{"schema_version": 1, "generation": 4, "mode": "auto",`)
+	if err := os.WriteFile(path, corrupt, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := NewSelector(5, "auto", "cloudflare", testFetchedAt)
+	replacement.WinnerIP = "192.0.2.10"
+	err := WriteReplacementJSONAtomic(path, replacement)
+	if err == nil {
+		t.Fatal("expected an unreadable selector to be refused")
+	}
+	if !strings.Contains(err.Error(), "selector") {
+		t.Fatalf("refusal %q does not name the kind of state it refused", err)
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, corrupt) {
+		t.Fatalf("refused replacement changed target: got %q, want %q", after, corrupt)
+	}
+}
+
+// Every other kind the state package owns is refused the same way, because the rule
+// is a property of the document and not of the caller that asks.
+func TestWriteReplacementJSONAtomicRefusesAnUnreadableTargetForEveryOtherKind(t *testing.T) {
+	corrupt := []byte(`{"schema_version": 1,`)
+	cases := map[string]any{
+		"DHCP":       NewDHCPState(1, "eth0", "uuid", []string{"192.0.2.53"}, testFetchedAt, "dhcp4", true),
+		"ECH":        NewECHState(1, "cloudflare-ech.com", testFetchedAt, testFetchedAt.Add(time.Hour), testFetchedAt.Add(2*time.Hour), testSHA256, "public.example", "fresh"),
+		"budget":     BandwidthBudgetState{SchemaVersion: SchemaVersion, LocalDate: "2026-09-25", LimitBytes: 10, UsedBytes: 2},
+		"selector":   NewSelector(2, "auto", "cloudflare", testFetchedAt),
+		"healthable": HealthState{SchemaVersion: SchemaVersion},
+	}
+	for name, value := range cases {
+		if name == "healthable" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			if err := os.WriteFile(path, corrupt, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteReplacementJSONAtomic(path, value); err == nil {
+				t.Fatal("expected the unreadable target to be refused")
+			}
+			if after := readFileBytes(t, path); !bytes.Equal(after, corrupt) {
+				t.Fatalf("refused replacement changed target: got %q, want %q", after, corrupt)
+			}
+			assertOnlyTargetEntry(t, filepath.Dir(path), "state.json")
+		})
+	}
+}
+
+// The replacement writer keeps the whole discipline the strict one has, including
+// the rollback: a write that fails after the rename put the new document live has to
+// put the previous one back, or a power cut at that moment leaves a health document
+// this build cannot read in place of one it wrote.
+func TestWriteReplacementJSONAtomicRestoresThePreviousHealthDocumentWhenDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health.json")
+	before := corruptHealthDocument(t, path)
+
+	replacement := HealthState{SchemaVersion: SchemaVersion, ConsecutiveFailures: 1, LastFailure: testFetchedAt}
+	injected := errors.New("injected replacement directory sync failure")
+	renamed := false
+	syncCalls := 0
+	ops := defaultAtomicFileOps()
+	ops.rename = func(oldPath, newPath string) error {
+		err := os.Rename(oldPath, newPath)
+		if err == nil && newPath == path {
+			renamed = true
+		}
+		return err
+	}
+	ops.syncDir = func(string) error {
+		if !renamed {
+			return errors.New("directory sync ran before the replacement rename")
+		}
+		syncCalls++
+		if syncCalls == 1 {
+			return injected
+		}
+		return nil
+	}
+
+	if err := writeJSONAtomicWithOps(path, replacement, ops, true); !errors.Is(err, injected) {
+		t.Fatalf("write error = %v, want injected directory sync error", err)
+	}
+	if !renamed {
+		t.Fatal("test did not exercise post-rename directory sync")
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("directory-sync failure did not restore the previous document: got %q, want %q", after, before)
+	}
+	assertOnlyTargetEntry(t, dir, "health.json")
+}
+
+// A file that cannot be flushed is a write that did not happen, and it leaves
+// neither a temporary file nor a backup behind.
+func TestWriteReplacementJSONAtomicPropagatesFileSyncFailureLeavingThePreviousDocument(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health.json")
+	before := corruptHealthDocument(t, path)
+
+	replacement := HealthState{SchemaVersion: SchemaVersion, ConsecutiveFailures: 1, LastFailure: testFetchedAt}
+	injected := errors.New("injected replacement file sync failure")
+	ops := defaultAtomicFileOps()
+	ops.syncFile = func(*os.File) error { return injected }
+
+	if err := writeJSONAtomicWithOps(path, replacement, ops, true); !errors.Is(err, injected) {
+		t.Fatalf("write error = %v, want injected file sync error", err)
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("file-sync failure changed the previous document: got %q, want %q", after, before)
+	}
+	assertOnlyTargetEntry(t, dir, "health.json")
+}
+
+// A rename that fails changes nothing at all: the previous document is still the one
+// on disk and there is no partial replacement behind it.
+func TestWriteReplacementJSONAtomicPropagatesRenameFailureLeavingThePreviousDocument(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "health.json")
+	before := corruptHealthDocument(t, path)
+
+	replacement := HealthState{SchemaVersion: SchemaVersion, ConsecutiveFailures: 1, LastFailure: testFetchedAt}
+	injected := errors.New("injected replacement rename failure")
+	ops := defaultAtomicFileOps()
+	ops.rename = func(string, string) error { return injected }
+
+	if err := writeJSONAtomicWithOps(path, replacement, ops, true); !errors.Is(err, injected) {
+		t.Fatalf("write error = %v, want injected rename error", err)
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("rename failure changed the previous document: got %q, want %q", after, before)
+	}
+	assertOnlyTargetEntry(t, dir, "health.json")
+}
+
+// A document this build refuses to write is refused before the target is touched, so
+// the recovery path cannot replace one unreadable document with an invalid one.
+func TestWriteReplacementJSONAtomicRefusesAnInvalidDocumentWithoutTouchingTheTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "health.json")
+	before := corruptHealthDocument(t, path)
+
+	invalid := HealthState{SchemaVersion: SchemaVersion, ConsecutiveFailures: -1}
+	if err := WriteReplacementJSONAtomic(path, invalid); err == nil {
+		t.Fatal("expected an invalid health document to be refused")
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("invalid replacement changed the previous document: got %q, want %q", after, before)
+	}
+}
+
+// The generation rule is unchanged by the replacement policy: a readable target is
+// still held to it, so a replacement writer cannot be used to roll a generation
+// back either.
+func TestWriteReplacementJSONAtomicStillPreventsGenerationRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cdn-selector.json")
+	current := NewSelector(7, "auto", "cloudflare", testFetchedAt)
+	current.WinnerIP = "192.0.2.5"
+	if err := WriteJSONAtomic(path, current); err != nil {
+		t.Fatal(err)
+	}
+	before := readFileBytes(t, path)
+
+	rollback := current
+	rollback.Generation = 6
+	rollback.WinnerIP = "192.0.2.6"
+	if err := WriteReplacementJSONAtomic(path, rollback); err == nil {
+		t.Fatal("expected a generation rollback to be refused by the replacement writer")
+	}
+	if after := readFileBytes(t, path); !bytes.Equal(after, before) {
+		t.Fatalf("refused rollback changed target: got %q, want %q", after, before)
+	}
 }
