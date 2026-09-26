@@ -763,6 +763,12 @@ func runCDNApply(ctx context.Context, args []string, stdout, stderr io.Writer, s
 	}
 	applied, published, err := world.runner.Apply(ctx, report, world.profiles)
 	if err != nil {
+		// The report is printed before the error, on the same grounds as `test
+		// --apply`: it carries the decision the run reached and the outcome the
+		// apply reached, and a reader who only ever sees the error line learns
+		// nothing about which address was about to go into service or that nothing
+		// did.
+		_ = writeCDNReport(stdout, applied, nil)
 		writeCLIError(stderr, "apply: %v", err)
 		return cdnExitCode(err)
 	}

@@ -327,6 +327,15 @@ type stubProber struct {
 	// the rest, which is the shape a real refusal has: a Cloudflare anycast address
 	// serves the provider's domains and cannot present a chain for a CloudFront one.
 	identityRefusedFor map[string]error
+	// finalProofRefused refuses the second and later identity proofs of the named
+	// addresses and answers the first, which is the shape of a host that served the
+	// run and then stopped serving: the run finds a winner and the apply's final
+	// proof does not confirm it. The keys are addresses because that is what the
+	// apply re-proves - the run's winner - and not the whole profile set.
+	finalProofRefused map[string]error
+	// httpsByAddress counts the identity proofs of each address, which is what
+	// finalProofRefused is counted against.
+	httpsByAddress map[string]int
 	// transferred is what each transfer delivers.
 	transferred int64
 }
@@ -335,10 +344,18 @@ func (p *stubProber) TCP(context.Context, netip.Addr, uint16, int) (prober.TCPMe
 	return prober.TCPMetrics{Samples: 10, P50MS: 10, P95MS: 20, JitterMS: 1, Loss: 0}, nil
 }
 
-func (p *stubProber) HTTPS(_ context.Context, _ candidate.Candidate, profile candidate.ProbeProfile) (prober.HTTPMetrics, error) {
+func (p *stubProber) HTTPS(_ context.Context, subject candidate.Candidate, profile candidate.ProbeProfile) (prober.HTTPMetrics, error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	p.httpsCalls++
+	address := subject.IP.String()
+	if p.httpsByAddress == nil {
+		p.httpsByAddress = make(map[string]int)
+	}
+	p.httpsByAddress[address]++
+	if refused, is := p.finalProofRefused[address]; is && p.httpsByAddress[address] > 1 {
+		return prober.HTTPMetrics{BodyBytes: 512}, refused
+	}
 	if refused, is := p.identityRefusedFor[profile.Hostname]; is {
 		return prober.HTTPMetrics{BodyBytes: 512}, refused
 	}
@@ -365,7 +382,7 @@ func (p *stubProber) Download(_ context.Context, _ candidate.Candidate, _ candid
 // newStubProber is a stub that transfers 1 MiB per candidate, so a case that reads
 // the budget document has a number to read.
 func newStubProber() *stubProber {
-	return &stubProber{transferred: 1 << 20}
+	return &stubProber{transferred: 1 << 20, httpsByAddress: make(map[string]int)}
 }
 
 func (p *stubProber) proofs() int {
@@ -1273,5 +1290,118 @@ func TestApplyCommandClaimsNoPublicationWhenEveryGroupKeptItsMapping(t *testing.
 	assertNoPublicationClaimed(t, stdout.String())
 	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
 		t.Errorf("the selector changed on an apply that published nothing:\n%s", got)
+	}
+}
+
+// assertRefusedNotPublished is the shape every refusing command's output has to
+// have: the outcome says the apply was refused, the applied line says nothing was
+// applied, and no line names an address as one this run published.
+//
+// The pair is what matters. `applied: nothing` alone was what round 2 checked for
+// the all-kept path, and a refusal printed `applied: nothing` correctly while
+// saying `outcome: published` next to it - so a script keying on the outcome line
+// instead of the applied line recorded a publication that never happened.
+func assertRefusedNotPublished(t *testing.T, output string) {
+	t.Helper()
+	if !strings.Contains(output, "applied: nothing") {
+		t.Errorf("the output does not say that nothing was applied:\n%s", output)
+	}
+	if got := reportOutcome(output); got != "refused" {
+		t.Errorf("the report's own outcome is %q, want %q: a refusal is not a publication, and a script keying on this line is exactly the reader that was misled:\n%s", got, "refused", output)
+	}
+	// A group that was about to be published is downgraded rather than left claiming
+	// a publication, and it says why - so the record an operator reads names both
+	// the address the run had chosen and the fact that nothing was written.
+	if !strings.Contains(output, optimizer.ReasonApplyRefused) {
+		t.Errorf("the output does not say why the group was not published:\n%s", output)
+	}
+	for _, claimed := range []string{"outcome: published", "applied: 104.16.1.1", "generation: 5", "fallback: "} {
+		if strings.Contains(output, claimed) {
+			t.Errorf("the output claims %q for an apply that refused:\n%s", claimed, output)
+		}
+	}
+}
+
+// reportOutcome is the outcome of the report as a whole, which is the one a script
+// reads. The per-group outcomes are printed indented, so this returns the top-level
+// line and only the top-level line.
+func reportOutcome(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if rest, is := strings.CutPrefix(line, "outcome: "); is {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+func TestApplyCommandReportsARefusalRatherThanAPublication(t *testing.T) {
+	// The control lock is the refusal this router is most likely to meet, because a
+	// health check and an update both take it. The report the apply was handed says
+	// the run would publish; the apply did not, and its output has to say so.
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	// A report a run really wrote, so the apply has a decision to refuse.
+	measuring := newStubProber()
+	var measureOut, measureErr bytes.Buffer
+	if code := runWithContext(t.Context(), append([]string{"test", "--report", fixture.reportPath}, fixture.flags()...),
+		&measureOut, &measureErr, servicesFor(measuring, threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
+		t.Fatalf("test exit = %d, want %d (stderr: %s)", code, exitSuccess, measureErr.String())
+	}
+
+	// Another process holds the control lock for the whole apply.
+	held, err := filelock.Acquire(fixture.lockPath)
+	if err != nil {
+		t.Fatalf("take the control lock: %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"apply", fixture.reportPath, "--report", filepath.Join(fixture.directory, "applied.json")}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(newStubProber(), threeCloudflareCandidates(), fixedMoment)); code == exitSuccess {
+		t.Fatal("apply with the control lock held succeeded, want a refusal")
+	}
+	// The refusal reason goes to stderr where every CLI error does; the report goes
+	// to stdout, and the report is what this case is about.
+	if !strings.Contains(stderr.String(), "control lock") {
+		t.Errorf("stderr does not name the lock as the reason: %s", stderr.String())
+	}
+	assertRefusedNotPublished(t, stdout.String())
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("the selector changed on a refused apply:\n%s", got)
+	}
+}
+
+func TestTestCommandWithApplyReportsARefusalRatherThanAPublication(t *testing.T) {
+	// The same mislabel through `test --apply`, where the report is printed from the
+	// failed apply rather than read from a file - so a single invocation shows both
+	// the decision the run reached and the fact that the apply refused it.
+	//
+	// The host serves the run and then stops, which is the one shape where the run
+	// finds a winner and the final proof does not confirm it.
+	fixture := newCDNFixture(t, 4, "104.16.1.1")
+	before := string(mustReadFile(t, fixture.selectorPath))
+	stub := newStubProber()
+	stub.finalProofRefused = map[string]error{
+		"104.16.0.1": errors.New("the response is a 521, which the profile does not expect"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	args := append([]string{"test", "--apply"}, fixture.flags()...)
+	if code := runWithContext(t.Context(), args, &stdout, &stderr,
+		servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code == exitSuccess {
+		t.Fatal("test --apply with a refused final proof succeeded, want a refusal")
+	}
+	if !strings.Contains(stderr.String(), "identity proof was refused") {
+		t.Errorf("stderr does not name the proof as the reason: %s", stderr.String())
+	}
+	assertRefusedNotPublished(t, stdout.String())
+	// The report is still printed with the group it had decided on, because that is
+	// what an operator needs to see: which address was about to be published.
+	if !strings.Contains(stdout.String(), "104.16.0.1") {
+		t.Errorf("the report does not name the address that was about to be published:\n%s", stdout.String())
+	}
+	if got := string(mustReadFile(t, fixture.selectorPath)); got != before {
+		t.Errorf("the selector changed on a refused apply:\n%s", got)
 	}
 }

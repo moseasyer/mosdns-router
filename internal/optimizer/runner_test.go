@@ -3690,3 +3690,129 @@ func TestApplyNamesAHostRefusalEvenWhenTheProofRanOutOfTimeBesideIt(t *testing.T
 	}
 	mustBeUnchanged(t, selectorPath, before)
 }
+
+// mustSayRefused asserts that a report an apply refused says so at both levels: the
+// report as a whole, and every group inside it.
+//
+// The report-level outcome is what a script reads, and the per-group one is what a
+// reader reads, so a refusal that only fixed the first would still tell a reader
+// the group was published. Both are asserted here, and neither is allowed to be
+// "published" - the pair is the only place in this file where an apply's outcome is
+// checked rather than assumed.
+func mustSayRefused(t *testing.T, report Report) {
+	t.Helper()
+	if report.Outcome == OutcomePublished {
+		t.Errorf("a refused apply returned a report whose outcome is %q: a refusal is not a publication", report.Outcome)
+	}
+	if report.Outcome != OutcomeRefused {
+		t.Errorf("a refused apply returned a report whose outcome is %q, want %q", report.Outcome, OutcomeRefused)
+	}
+	for _, group := range report.Groups {
+		if group.Outcome == OutcomePublished {
+			t.Errorf("a refused apply left %s's outcome as %q: nothing was published for it", group.Group, group.Outcome)
+		}
+		if group.Outcome != "" && group.OutcomeReason == "" {
+			t.Errorf("a refused apply left %s's outcome %q with no reason", group.Group, group.Outcome)
+		}
+	}
+}
+
+// refuseRefusal is how a case prepares one refusal: it arranges the router's own
+// state, and edits the report in place when the gate is one about the report rather
+// than about the router.
+type refuseRefusal func(t *testing.T, runner *testRunner, report *Report)
+
+func TestApplyReportsARefusalRatherThanAPublication(t *testing.T) {
+	// Every gate an apply can be stopped at, and the claim each of them has to stop
+	// making. Apply records what it *decided* before it takes the lock, so a
+	// refusal after that point hands back a report whose group says "published" and
+	// whose own outcome says "published" - printed next to "applied: nothing", which
+	// is the same mislabel round 2 fixed for the all-kept path and left in place for
+	// this one. A script keying on outcome: rather than applied: would record a
+	// publication on every one of them.
+	profiles := globalProfiles(testProfile("speed.example.test", 443))
+	for name, refuse := range map[string]refuseRefusal{
+		// The four gates before the lock, which is where the per-group outcomes are
+		// not yet recorded. They are here because the outcome claim has to be
+		// *absent* on these paths, which is a different thing from being refused, and
+		// a report read back from a previously applied document still carries one.
+		"a report whose phase stamps are out of order": func(_ *testing.T, _ *testRunner, report *Report) {
+			report.Phases.Collect.EndedAt = runnerNow.Add(time.Hour)
+		},
+		"a report measured under another configuration": func(_ *testing.T, _ *testRunner, report *Report) {
+			other := "0000000000000000000000000000000000000000000000000000000000000000"
+			report.PolicySHA256, report.ConfigSHA256 = other, other
+		},
+		"a report older than the maximum age": func(_ *testing.T, _ *testRunner, report *Report) {
+			report.GeneratedAt = runnerNow.Add(-MaxReportAge - time.Second)
+		},
+		"a report that already claims a publication": func(t *testing.T, runner *testRunner, report *Report) {
+			// The document an apply wrote out carries its outcomes, so an operator
+			// applying that file again hands the apply a report that already says
+			// published. The lock below stops it, and the stale claim must not survive
+			// the refusal.
+			report.Outcome = OutcomePublished
+			report.Groups[0].Outcome = OutcomePublished
+			t.Cleanup(holdLockInAnotherProcess(t, runner.lockPath))
+		},
+		// The gates under the lock, which is where the per-group outcomes are
+		// recorded and therefore where the mislabel lived.
+		"a control lock another process holds": func(t *testing.T, runner *testRunner, _ *Report) {
+			t.Cleanup(holdLockInAnotherProcess(t, runner.lockPath))
+		},
+		"a selector pinned by hand": func(t *testing.T, runner *testRunner, _ *Report) {
+			selector := mustSelector(t, 4, "104.16.1.1", "")
+			selector.Mode = "manual"
+			writeSelector(t, runner.selectorPath, selector)
+		},
+		"a selector document it cannot parse": func(t *testing.T, runner *testRunner, _ *Report) {
+			if err := os.WriteFile(runner.selectorPath, []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"a winner that will not serve its own profile": func(_ *testing.T, runner *testRunner, _ *Report) {
+			// The winner answers the run's proof and is refused by the apply's, which
+			// is the shape of a host that stopped serving between the two.
+			runner.prober.(*fakeProber).fixtures["104.16.0.1"].identityCallsBeforeFailure = 1
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixtures, candidates := threeGlobals()
+			runner := newTestRunner(t, newFakeProber(fixtures))
+			writeSelector(t, runner.selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+			report := mustRunWithIncumbent(t, runner.Runner, candidates, "104.16.1.1")
+			// The run decided this report would publish, so the refusal below is the
+			// one that has to undo the claim: a gate that fires before the decision
+			// cannot mislabel anything, which is why the first four rows above are
+			// the weaker half of this case.
+			if winner := mustWinner(t, mustGroup(t, report, "cloudflare/")); !winner.SwitchAllowed {
+				t.Fatal("the fixture's winner is refused its switch, so this case proves nothing")
+			}
+			refuse(t, runner, &report)
+			// The selector as the refusal will find it: two of the rows above write it,
+			// so it cannot be read before them.
+			before := string(mustReadSelectorBytes(t, runner.selectorPath))
+
+			applied, published, err := runner.Apply(t.Context(), report, profiles)
+			if err == nil {
+				t.Fatalf("Apply refused by %s succeeded, want a refusal", name)
+			}
+			mustSayRefused(t, applied)
+			// A refusal returns no selector at all, on the same contract as an
+			// all-kept apply: the returned document means "this is what was written",
+			// and nothing was.
+			if published.WinnerIP != "" || published.Generation != 0 {
+				t.Errorf("a refused apply returned the selector %+v, want no selector", published)
+			}
+			// The decision is still readable. An operator's question on a refusal is
+			// which group was about to be published, and the group entry keeps its
+			// candidates, its winner and the switch verdict the run reached.
+			if winner := mustWinner(t, mustGroup(t, applied, "cloudflare/")); winner.IP != "104.16.0.1" {
+				t.Errorf("the refused report names the winner %q, want the 104.16.0.1 it had decided on", winner.IP)
+			}
+			if got := string(mustReadSelectorBytes(t, runner.selectorPath)); got != before {
+				t.Errorf("a refused apply changed the selector:\nbefore: %s\nafter:  %s", before, got)
+			}
+		})
+	}
+}

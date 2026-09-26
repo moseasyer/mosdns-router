@@ -514,7 +514,22 @@ const (
 	// measured nothing publishable, or the winner was not enough of an improvement
 	// over the address already in service.
 	OutcomeKept Outcome = "kept"
+
+	// OutcomeRefused means the apply stopped at one of its gates and wrote nothing
+	// at all. It is a third answer rather than an empty one because an apply that
+	// recorded what it had decided and was then refused has the most misleading
+	// document to hand back: its group says "published" and a reader who does not
+	// notice the error alongside it believes the address is in service. The
+	// per-group outcomes say what the run decided; this says what the apply did, and
+	// the two are only the same thing when the apply got as far as the write.
+	OutcomeRefused Outcome = "refused"
 )
+
+// ReasonApplyRefused is a group's outcome reason when the apply was stopped at a
+// gate. It is a run reason and not a run's, so it is named here beside the
+// outcomes it explains: nothing was published for this group because the apply did
+// not get as far as publishing anything.
+const ReasonApplyRefused = "the apply refused, so nothing was published"
 
 // Report is what a run produces: the measurement, the decision, and the two
 // digests that let an apply check both. It is a document, so every field is
@@ -816,8 +831,15 @@ func (r Report) validateOutcomes() error {
 		if published != 0 {
 			return errors.New("the report claims it kept everything while a group was published")
 		}
+	case OutcomeRefused:
+		// The apply stopped at a gate, so nothing reached the file. A group that
+		// claims a publication here is the mislabel this outcome exists to prevent,
+		// and a hand-edited document saying both is refused rather than believed.
+		if published != 0 {
+			return errors.New("the report claims the apply refused while a group says it was published")
+		}
 	default:
-		return fmt.Errorf("outcome must be %q or %q, got %q", OutcomePublished, OutcomeKept, r.Outcome)
+		return fmt.Errorf("outcome must be %q, %q or %q, got %q", OutcomePublished, OutcomeKept, OutcomeRefused, r.Outcome)
 	}
 	return nil
 }
@@ -1103,7 +1125,38 @@ func PolicyDigest(document []byte) string {
 // "applied: <ip>" off a night the file was not touched records a publication that
 // never happened. A caller that wants the selector either way reads it from
 // Options.SelectorPath.
-func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (Report, state.Selector, error) {
+//
+// The zero selector on its own does not say which of the two happened, and the
+// error is what tells them apart; the report's Outcome is the second witness, so a
+// caller that has only the report can still tell a refusal from a no-op.
+func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (applied Report, published state.Selector, err error) {
+	// What the apply did is not known until the write, and the report it hands back
+	// says so. A report's own outcome is whatever it carried on the way in - empty
+	// for a run's report, and *published* for one an apply wrote out and an operator
+	// is applying a second time - so an error returning that claim unchanged would
+	// report a publication for an apply that published nothing. The defer takes it
+	// back, on every error path, including the gates before the per-group outcomes
+	// are recorded at all.
+	defer func() {
+		if err == nil {
+			return
+		}
+		applied.Outcome = OutcomeRefused
+		published = state.Selector{}
+		// Per group, the decision the run reached is left standing - it is what the
+		// group entries are for, and what an operator reads to find out which address
+		// was about to go into service - but a group that was about to be published
+		// did not get published, and a reader who missed the error line beside the
+		// outcome would be told otherwise. "kept", with the refusal as its reason, is
+		// the honest record: nothing was written for that group either way.
+		for index := range applied.Groups {
+			if applied.Groups[index].Outcome != OutcomePublished {
+				continue
+			}
+			applied.Groups[index].Outcome = OutcomeKept
+			applied.Groups[index].OutcomeReason = ReasonApplyRefused
+		}
+	}()
 	if err := report.Validate(); err != nil {
 		return report, state.Selector{}, fmt.Errorf("%w: %v", ErrInvalidReport, err)
 	}
@@ -1113,8 +1166,11 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	if age := r.now().Sub(report.GeneratedAt); age > MaxReportAge || age < 0 {
 		return report, state.Selector{}, fmt.Errorf("%w: the report is dated %s, which is %s from now, and the limit is %s", ErrReportTooOld, report.GeneratedAt.Format(time.RFC3339), age, MaxReportAge)
 	}
-	decisions, err := report.decisions(r.policy.CDN.SwitchImprovementPercent)
-	if err != nil {
+	// The named err is assigned rather than shadowed from here on: the deferred
+	// refusal above reads it, and a local of the same name would be a second value
+	// with a job already done.
+	var decisions []groupDecision
+	if decisions, err = report.decisions(r.policy.CDN.SwitchImprovementPercent); err != nil {
 		return report, state.Selector{}, err
 	}
 	// Every group's own outcome is recorded in the report before anything is
@@ -1138,8 +1194,8 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 		report.Outcome = OutcomeKept
 	}
 
-	lock, err := filelock.Acquire(r.options.ControlLockPath)
-	if err != nil {
+	var lock *filelock.Lock
+	if lock, err = filelock.Acquire(r.options.ControlLockPath); err != nil {
 		if errors.Is(err, filelock.ErrLocked) {
 			return report, state.Selector{}, fmt.Errorf("%s: %w", r.options.ControlLockPath, ErrControlLocked)
 		}
@@ -1147,8 +1203,8 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	}
 	defer func() { _ = lock.Close() }()
 
-	current, err := r.currentSelector()
-	if err != nil {
+	var current state.Selector
+	if current, err = r.currentSelector(); err != nil {
 		return report, state.Selector{}, err
 	}
 	// A pinned address is the operator's decision. Publishing an automatic result
@@ -1196,7 +1252,7 @@ func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (R
 	report.FinalProofPassed = true
 	report.ProofedAt = report.Phases.FinalProof.EndedAt
 
-	published := current
+	published = current
 	published.SchemaVersion = state.SchemaVersion
 	published.Generation = current.Generation + 1
 	published.ConfigSHA256 = r.options.ConfigSHA256
