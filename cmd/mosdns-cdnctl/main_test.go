@@ -567,9 +567,11 @@ func TestTestCommandAppliesInTheSameInvocationWhenAsked(t *testing.T) {
 	// never what gets applied.
 	//
 	// Three candidates are proved once each by the run, against the one global
-	// profile. The apply then proves the winner against every profile this
-	// configuration names, which is the representative domain and the CloudFront
-	// rule's hostname: five proofs in total.
+	// identity profile this configuration names. The apply proves the winner again
+	// against that same global profile: four proofs. The CloudFront rule's hostname
+	// is not asked about a global address - a Cloudflare anycast address cannot
+	// serve it, and the CloudFront mapping is per-hostname, so the global winner is
+	// never published there.
 	fixture := newCDNFixture(t, 4, "104.16.1.1")
 	before, err := os.ReadFile(fixture.selectorPath)
 	if err != nil {
@@ -582,8 +584,8 @@ func TestTestCommandAppliesInTheSameInvocationWhenAsked(t *testing.T) {
 	if code := runWithContext(t.Context(), args, &stdout, &stderr, servicesFor(stub, threeCloudflareCandidates(), fixedMoment)); code != exitSuccess {
 		t.Fatalf("test --apply exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr.String())
 	}
-	if got := stub.proofs(); got != 5 {
-		t.Errorf("the prober was asked for %d identity proofs, want 5: three candidates once each, then the winner against both configured profiles", got)
+	if got := stub.proofs(); got != 4 {
+		t.Errorf("the prober was asked for %d identity proofs, want 4: three candidates once each, then the winner against the global profile again", got)
 	}
 	selector := state.Selector{}
 	if err := state.ReadJSON(fixture.selectorPath, &selector); err != nil {

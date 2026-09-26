@@ -140,8 +140,14 @@ type addressFixture struct {
 	// identityBodyBytes is what the identity probe reports, whether or not it
 	// succeeds.
 	identityBodyBytes int64
-	// identityErr refuses the identity proof, as a refused probe does.
+	// identityErr refuses the identity proof for every profile, as an address that
+	// is serving none of them does.
 	identityErr error
+	// identityRefusedFor refuses the identity proof for named profile hostnames and
+	// answers the rest, which is the shape a real refusal has: a Cloudflare anycast
+	// address serves the provider's own domains and cannot present a chain for a
+	// CloudFront hostname.
+	identityRefusedFor map[string]error
 	// identityStatus is the status a successful identity proof reports.
 	identityStatus int
 	// transferLimit is the most this address will transfer. A run that asks the
@@ -169,6 +175,9 @@ type probeCall struct {
 	Address string
 	Port    uint16
 	Samples int
+	// Hostname is the profile hostname an identity probe was made against, which is
+	// the whole of what decides which profiles a proof covers.
+	Hostname string
 	// Reserve is what a transfer asked the budget for, which is the run's own
 	// per-candidate limit, and Reserved is what the budget actually gave it. A
 	// transfer whose Reserved is zero was refused by the day and read nothing, so
@@ -235,7 +244,7 @@ func (f *fakeProber) TCP(ctx context.Context, address netip.Addr, port uint16, s
 }
 
 func (f *fakeProber) HTTPS(ctx context.Context, subject candidate.Candidate, profile candidate.ProbeProfile) (measure.HTTPMetrics, error) {
-	f.record(probeCall{Kind: "https", Address: subject.IP.String(), Port: profile.Port})
+	f.record(probeCall{Kind: "https", Address: subject.IP.String(), Port: profile.Port, Hostname: profile.Hostname})
 	f.note("https", subject.IP.String())
 	fixture, err := f.fixture(subject.IP)
 	if err != nil {
@@ -251,6 +260,11 @@ func (f *fakeProber) HTTPS(ctx context.Context, subject candidate.Candidate, pro
 	if fixture.identityCallsBeforeFailure > 0 && answered > fixture.identityCallsBeforeFailure {
 		return measure.HTTPMetrics{BodyBytes: fixture.identityBodyBytes},
 			fmt.Errorf("%s at %s: the response is a 403, which the profile does not expect", profile.Hostname, subject.IP)
+	}
+	// A refusal for this hostname alone, which is how a Cloudflare address behaves
+	// against a CloudFront hostname: the other profiles are answered normally.
+	if refused, is := fixture.identityRefusedFor[profile.Hostname]; is {
+		return measure.HTTPMetrics{BodyBytes: fixture.identityBodyBytes}, refused
 	}
 	if fixture.identityErr != nil {
 		// A refused probe reports what it read to reach its verdict, which is the
@@ -348,6 +362,20 @@ func (f *fakeProber) transfers() []string {
 	return addresses
 }
 
+// profiledCalls returns the identity proofs with the hostname each was made
+// against, which is what says which profiles a proof covered.
+func (f *fakeProber) profiledCalls() []probeCall {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	proofs := make([]probeCall, 0, len(f.calls))
+	for _, call := range f.calls {
+		if call.Kind == "https" {
+			proofs = append(proofs, call)
+		}
+	}
+	return proofs
+}
+
 // served builds the fixture of a global candidate that measures cleanly: a p50,
 // a jitter, no loss, an identity proof, and a transfer of the recorded size.
 func served(p50MS, jitterMS, loss, transferSpeed float64) *addressFixture {
@@ -360,6 +388,14 @@ func served(p50MS, jitterMS, loss, transferSpeed float64) *addressFixture {
 		transferBytes:     runnerDownloadBytes,
 		transferSpeed:     transferSpeed,
 	}
+}
+
+// globalProfiles is the profile set for a run whose groups are all global, which is
+// every fixture in this file except the ones that name a CloudFront hostname. It
+// exists so the common case reads as one call rather than a struct literal, and so
+// a case that means to mix the two kinds cannot do it by accident.
+func globalProfiles(profiles ...candidate.ProbeProfile) Profiles {
+	return Profiles{Global: profiles}
 }
 
 // globalCandidate is one address of the global Cloudflare group.
@@ -1417,7 +1453,7 @@ func TestApplyWritesTheNextGenerationAndMovesTheOldWinnerToTheFallback(t *testin
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	applied, published, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)})
+	applied, published, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -1499,7 +1535,7 @@ func TestApplyRefusesAReportMeasuredUnderAnotherConfiguration(t *testing.T) {
 	// refuses that as the incoherent document it is.
 	otherDigest := "0000000000000000000000000000000000000000000000000000000000000000"
 	edited.PolicySHA256, edited.ConfigSHA256 = otherDigest, otherDigest
-	if _, _, err := runner.Apply(t.Context(), edited, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrConfigChanged) {
+	if _, _, err := runner.Apply(t.Context(), edited, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrConfigChanged) {
 		t.Fatalf("Apply with a report from another configuration returned %v, want %v", err, ErrConfigChanged)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1518,7 +1554,7 @@ func TestApplyRefusesAReportOlderThanTheMaximumAge(t *testing.T) {
 	// One second past the limit is refused.
 	stale := report
 	stale.GeneratedAt = runnerNow.Add(-MaxReportAge - time.Second)
-	if _, _, err := runner.Apply(t.Context(), stale, profiles); !errors.Is(err, ErrReportTooOld) {
+	if _, _, err := runner.Apply(t.Context(), stale, globalProfiles(profiles...)); !errors.Is(err, ErrReportTooOld) {
 		t.Fatalf("Apply with a report %s old returned %v, want %v", MaxReportAge+time.Second, err, ErrReportTooOld)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1528,7 +1564,7 @@ func TestApplyRefusesAReportOlderThanTheMaximumAge(t *testing.T) {
 	// stopping for rather than a report worth applying.
 	future := report
 	future.GeneratedAt = runnerNow.Add(time.Second)
-	if _, _, err := runner.Apply(t.Context(), future, profiles); !errors.Is(err, ErrReportTooOld) {
+	if _, _, err := runner.Apply(t.Context(), future, globalProfiles(profiles...)); !errors.Is(err, ErrReportTooOld) {
 		t.Fatalf("Apply with a report dated in the future returned %v, want %v", err, ErrReportTooOld)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1544,7 +1580,7 @@ func TestApplyAcceptsAReportExactlyAtTheMaximumAge(t *testing.T) {
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
 	aged := report
 	aged.GeneratedAt = runnerNow.Add(-MaxReportAge)
-	_, published, err := runner.Apply(t.Context(), aged, []candidate.ProbeProfile{testProfile("speed.example.test", 443)})
+	_, published, err := runner.Apply(t.Context(), aged, globalProfiles(testProfile("speed.example.test", 443)))
 	if err != nil {
 		t.Fatalf("Apply with a report exactly %s old: %v", MaxReportAge, err)
 	}
@@ -1568,7 +1604,7 @@ func TestApplyRefusesWhenTheFinalIdentityProofFails(t *testing.T) {
 	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
 
-	if _, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrIdentityRefused) {
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrIdentityRefused) {
 		t.Fatalf("Apply whose final proof was refused returned %v, want %v", err, ErrIdentityRefused)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1587,7 +1623,7 @@ func TestApplyRefusesWhileAnotherProcessHoldsTheControlLock(t *testing.T) {
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
 
 	release := holdLockInAnotherProcess(t, built.lockPath)
-	_, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)})
+	_, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
 	release()
 	if !errors.Is(err, ErrControlLocked) {
 		t.Fatalf("Apply while another process held the control lock returned %v, want %v", err, ErrControlLocked)
@@ -1606,7 +1642,7 @@ func TestApplyRefusesWhileTheSelectorIsPinnedByHand(t *testing.T) {
 	before := writeSelector(t, selectorPath, pinned)
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.2.1")
 
-	if _, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrModeManual) {
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrModeManual) {
 		t.Fatalf("Apply against a pinned selector returned %v, want %v", err, ErrModeManual)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1632,7 +1668,7 @@ func TestApplyRefusesAReportWhoseWinnerIsNotAnImprovement(t *testing.T) {
 	if mustWinner(t, mustGroup(t, report, "cloudflare/")).SwitchAllowed {
 		t.Fatal("the run allowed a switch it should have refused, so this case proves nothing")
 	}
-	if _, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrSwitchNotAllowed) {
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrSwitchNotAllowed) {
 		t.Fatalf("Apply of a report that refused its own switch returned %v, want %v", err, ErrSwitchNotAllowed)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1656,7 +1692,7 @@ func TestApplyRefusesAReportWhoseRecordedSwitchTheConfigurationDoesNotAgreeWith(
 	winner.SwitchAllowed = false
 	winner.SwitchRefusal = "the winner is the address already in service"
 	edited.Groups[0].Winner = &winner
-	if _, _, err := runner.Apply(t.Context(), edited, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrSwitchNotAllowed) {
+	if _, _, err := runner.Apply(t.Context(), edited, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrSwitchNotAllowed) {
 		t.Fatalf("Apply of a report whose recorded switch does not agree with its own numbers returned %v, want %v", err, ErrSwitchNotAllowed)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1673,7 +1709,7 @@ func TestApplyKeepsTheFallbackWhenTheWinnerDoesNotChange(t *testing.T) {
 	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.0.1", "104.16.1.1"))
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.0.1")
 
-	_, published, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)})
+	_, published, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -1701,7 +1737,7 @@ func TestApplyCreatesTheFirstSelectorWhenThereIsNoneYet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	_, published, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)})
+	_, published, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443)))
 	if err != nil {
 		t.Fatalf("Apply with no selector on disk: %v", err)
 	}
@@ -1732,7 +1768,7 @@ func TestApplyRefusesACorruptSelectorRatherThanOverwritingIt(t *testing.T) {
 	}
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
 
-	if _, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); err == nil {
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); err == nil {
 		t.Fatal("Apply over a corrupt selector returned no error, want a refusal")
 	}
 	mustBeUnchanged(t, selectorPath, corrupt)
@@ -1764,7 +1800,7 @@ func TestApplyPublishesACloudFrontWinnerOnlyForItsOwnHostname(t *testing.T) {
 	if mustWinner(t, group).IP != "205.251.192.1" {
 		t.Fatalf("the CloudFront winner is %s, want 205.251.192.1", group.Winner.IP)
 	}
-	_, published, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{profile})
+	_, published, err := runner.Apply(t.Context(), report, Profiles{ByHostname: map[string]candidate.ProbeProfile{profile.Hostname: profile}})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -1805,51 +1841,154 @@ func TestApplyRefusesACloudFrontWinnerWhoseProfileThisConfigurationNoLongerNames
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if _, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("other.example.test", 443)}); !errors.Is(err, ErrNoProfile) {
+	if _, _, err := runner.Apply(t.Context(), report, Profiles{ByHostname: map[string]candidate.ProbeProfile{"other.example.test": testProfile("other.example.test", 443)}}); !errors.Is(err, ErrNoProfile) {
 		t.Fatalf("Apply of a CloudFront winner with no live profile returned %v, want %v", err, ErrNoProfile)
 	}
 	mustBeUnchanged(t, selectorPath, before)
 }
 
-func TestApplyProvesAGlobalWinnerAgainstEveryProfileThisConfigurationNames(t *testing.T) {
-	// The design holds a Cloudflare address to the provider's representative domain
-	// and every forced-ECH domain, so the final proof for a global winner is one
-	// probe per configured profile and a refusal by any of them refuses the apply.
+func TestApplyProvesAGlobalWinnerOnlyAgainstTheGlobalProfiles(t *testing.T) {
+	// A global address is proved against the global identity profiles and nothing
+	// else. The operator's CloudFront hostnames are per-hostname answers: the global
+	// winner is never published for one of them, so requiring a Cloudflare anycast
+	// address to present a chain for a CloudFront hostname tests a relationship that
+	// does not exist - and it fails every time, because it cannot succeed.
+	//
+	// The fixture refuses the CloudFront hostname for the global address exactly as
+	// a real Cloudflare address would, so an apply that proved against it would be
+	// refused with ErrIdentityRefused on any router that has a CloudFront domain
+	// list at all.
 	fixtures, candidates := threeGlobals()
+	// The global winner answers the two global profiles and is refused by the
+	// CloudFront one.
+	fixtures["104.16.0.1"].identityRefusedFor = map[string]error{
+		"assets.example.test": errors.New("the certificate presented is for speed.example.test, not assets.example.test"),
+	}
 	fake := newFakeProber(fixtures)
 	runner, selectorPath := newTestRunnerWithSelector(t, fake)
 	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
-	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
-
-	profiles := []candidate.ProbeProfile{
+	// The configuration this run and this apply share: two global identity profiles
+	// and one CloudFront rule.
+	globals := []candidate.ProbeProfile{
 		testProfile("speed.example.test", 443),
 		testProfile("secure.example.test", 443),
-		testProfile("strict.example.test", 443),
+	}
+	report, err := runner.Run(t.Context(), Input{
+		Cloudflare:         candidates,
+		CloudflareProfiles: globals,
+		LastGood:           readSelector(t, selectorPath),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	profiles := Profiles{
+		Global: globals,
+		ByHostname: map[string]candidate.ProbeProfile{
+			"assets.example.test": testProfile("assets.example.test", 443),
+		},
+	}
+	_, published, err := runner.Apply(t.Context(), report, profiles)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if published.WinnerIP != "104.16.0.1" {
+		t.Errorf("the published winner is %q, want 104.16.0.1", published.WinnerIP)
+	}
+	// Three candidates proved against the two global profiles in the run, and the
+	// winner proved against those same two in the apply. The CloudFront hostname is
+	// never asked about a global address.
+	if got := len(fake.addressesOf("https")); got != 3*2+2 {
+		t.Errorf("the prober was asked for %d identity proofs, want 8: three candidates against two global profiles, then the winner against the same two", got)
+	}
+	for _, call := range fake.profiledCalls() {
+		if call.Hostname == "assets.example.test" {
+			t.Errorf("a global address was proved against the per-hostname profile %q, which no global winner is ever published for", call.Hostname)
+		}
+	}
+}
+
+func TestApplyProvesAPerHostnameWinnerOnlyAgainstItsOwnProfile(t *testing.T) {
+	// The other half of the same rule. A per-hostname address is proved against its
+	// own hostname's profile and no other: a proof for one hostname says nothing
+	// about another, which is the anti-leak rule and the reason the mapping is
+	// per-hostname in the first place.
+	fixtures := map[string]*addressFixture{"205.251.192.1": served(10, 1, 0, 5*mib)}
+	own := testProfile("assets.example.test", 443)
+	other := testProfile("other.example.test", 443)
+	fake := newFakeProber(fixtures)
+	runner, selectorPath := newTestRunnerWithSelector(t, fake)
+	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.0.1", ""))
+	rule := candidate.CloudFrontProfile{Profile: own, Candidates: []netip.Addr{netip.MustParseAddr("205.251.192.1")}}
+	report, err := runner.Run(t.Context(), Input{
+		CloudFront:      []candidate.Candidate{cloudFrontCandidate("205.251.192.1", "assets.example.test")},
+		CloudFrontRules: []candidate.CloudFrontProfile{rule},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	profiles := Profiles{
+		Global:     []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+		ByHostname: map[string]candidate.ProbeProfile{"assets.example.test": own, "other.example.test": other},
 	}
 	if _, _, err := runner.Apply(t.Context(), report, profiles); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	// Three candidates proved in the run, plus the winner proved once per profile.
-	if got := len(fake.addressesOf("https")); got != 3+3 {
-		t.Errorf("the prober was asked for %d identity proofs, want 6: three in the run and the winner against each of three profiles", got)
+	// One candidate proved against its own profile in the run, and once more in the
+	// apply: two proofs, and the global profile is never involved.
+	if got := len(fake.addressesOf("https")); got != 2 {
+		t.Errorf("the prober was asked for %d identity proofs, want 2: the candidate's own hostname twice", got)
+	}
+	for _, call := range fake.profiledCalls() {
+		if call.Hostname != "assets.example.test" {
+			t.Errorf("a per-hostname address was proved against %q, want only its own hostname", call.Hostname)
+		}
 	}
 }
 
-func TestApplyRefusesAGlobalWinnerOneProfileWillNotVouchFor(t *testing.T) {
-	// The strict direction: a global address that serves the provider's domain but
-	// not a forced-ECH domain cannot be published, because a user on that domain
-	// would have every query rewritten to an address that will not serve it.
+func TestApplyRefusesAPerHostnameWinnerWhoseOwnProfileThisConfigurationNoLongerNames(t *testing.T) {
+	// The profiles come from the router's configuration and never from the report,
+	// so a report naming a hostname this configuration has no profile for is refused
+	// rather than proved against something else.
+	runner, selectorPath := newTestRunnerWithSelector(t, newFakeProber(map[string]*addressFixture{
+		"205.251.192.1": served(10, 1, 0, 5*mib),
+	}))
+	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.0.1", ""))
+	profile := testProfile("assets.example.test", 443)
+	rule := candidate.CloudFrontProfile{Profile: profile, Candidates: []netip.Addr{netip.MustParseAddr("205.251.192.1")}}
+	report, err := runner.Run(t.Context(), Input{
+		CloudFront:      []candidate.Candidate{cloudFrontCandidate("205.251.192.1", "assets.example.test")},
+		CloudFrontRules: []candidate.CloudFrontProfile{rule},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The configuration no longer names the hostname at all, and names another one.
+	profiles := Profiles{ByHostname: map[string]candidate.ProbeProfile{"other.example.test": testProfile("other.example.test", 443)}}
+	if _, _, err := runner.Apply(t.Context(), report, profiles); !errors.Is(err, ErrNoProfile) {
+		t.Fatalf("Apply of a per-hostname winner with no profile of its own returned %v, want %v", err, ErrNoProfile)
+	}
+	mustBeUnchanged(t, selectorPath, before)
+}
+
+func TestApplyStillRefusesAGlobalWinnerOneGlobalProfileWillNotVouchFor(t *testing.T) {
+	// The scoping does not weaken the rule it narrows: a global address that serves
+	// the provider's domain but not a forced-ECH domain cannot be published, because
+	// a user on that domain would have every query rewritten to an address that will
+	// not serve it.
 	fixtures, candidates := threeGlobals()
-	// The winner serves the first profile and is refused by the second.
+	// The winner serves the first global profile and is refused by the second.
 	fixtures["104.16.0.1"].identityCallsBeforeFailure = 1
 	fake := newFakeProber(fixtures)
 	runner, selectorPath := newTestRunnerWithSelector(t, fake)
 	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
 	report := mustRunWithIncumbent(t, runner, candidates, "104.16.1.1")
-	profiles := []candidate.ProbeProfile{testProfile("speed.example.test", 443), testProfile("secure.example.test", 443)}
+	profiles := Profiles{Global: []candidate.ProbeProfile{
+		testProfile("speed.example.test", 443),
+		testProfile("secure.example.test", 443),
+	}}
 
 	if _, _, err := runner.Apply(t.Context(), report, profiles); !errors.Is(err, ErrIdentityRefused) {
-		t.Fatalf("Apply with a profile that will not vouch for the winner returned %v, want %v", err, ErrIdentityRefused)
+		t.Fatalf("Apply with a global profile that will not vouch for the winner returned %v, want %v", err, ErrIdentityRefused)
 	}
 	mustBeUnchanged(t, selectorPath, before)
 }
@@ -1870,7 +2009,7 @@ func TestApplyRefusesAReportWithNoWinner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if _, _, err := runner.Apply(t.Context(), report, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrNoWinner) {
+	if _, _, err := runner.Apply(t.Context(), report, globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrNoWinner) {
 		t.Fatalf("Apply of a report with no winner returned %v, want %v", err, ErrNoWinner)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -1944,7 +2083,43 @@ func holdLockInAnotherProcess(t *testing.T, lockPath string) func() {
 // Pinning and unpinning by hand
 // ---------------------------------------------------------------------------
 
-func TestPinStoresAManualWinnerAfterProvingItAgainstEveryProfile(t *testing.T) {
+func TestPinProvesAGlobalAddressOnlyAgainstTheGlobalProfiles(t *testing.T) {
+	// The same scoping a pin gets, and the same reason: a Cloudflare anycast address
+	// cannot present a chain for the operator's CloudFront hostnames, so a pin that
+	// demanded it would be refused on every router that has one. The address is
+	// refused by the CloudFront profile here, exactly as a real one would be.
+	fake := newFakeProber(map[string]*addressFixture{"104.16.9.9": served(10, 1, 0, 5*mib)})
+	fixture, err := fake.fixture(netip.MustParseAddr("104.16.9.9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.identityRefusedFor = map[string]error{
+		"assets.example.test": errors.New("the certificate presented is for speed.example.test, not assets.example.test"),
+	}
+	runner, selectorPath := newTestRunnerWithSelector(t, fake)
+	writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
+	profiles := Profiles{
+		Global: []candidate.ProbeProfile{testProfile("speed.example.test", 443)},
+		ByHostname: map[string]candidate.ProbeProfile{
+			"assets.example.test": testProfile("assets.example.test", 443),
+		},
+	}
+
+	pinned, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), profiles)
+	if err != nil {
+		t.Fatalf("Pin of an address the CloudFront profile refuses: %v", err)
+	}
+	if pinned.WinnerIP != "104.16.9.9" {
+		t.Errorf("the pinned winner is %q, want 104.16.9.9", pinned.WinnerIP)
+	}
+	// One proof: the global profile. The CloudFront hostname is never asked about a
+	// global address.
+	if got := len(fake.profiledCalls()); got != 1 {
+		t.Errorf("the prober was asked for %d identity proofs, want 1: the global profile only", got)
+	}
+}
+
+func TestPinStoresAManualWinnerAfterProvingItAgainstEveryGlobalProfile(t *testing.T) {
 	// A pinned address is the operator's decision, and it outranks every automatic
 	// result, so it is held to a stricter rule than a measurement: it is proved
 	// against every profile this configuration names before it is stored, and the
@@ -1960,7 +2135,7 @@ func TestPinStoresAManualWinnerAfterProvingItAgainstEveryProfile(t *testing.T) {
 		testProfile("strict.example.test", 443),
 	}
 
-	pinned, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), profiles)
+	pinned, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), globalProfiles(profiles...))
 	if err != nil {
 		t.Fatalf("Pin: %v", err)
 	}
@@ -2015,7 +2190,7 @@ func TestPinRefusesAnAddressARewriteTargetMayNotName(t *testing.T) {
 			runner, selectorPath := newTestRunnerWithSelector(t, fake)
 			before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
 
-			if _, err := runner.Pin(t.Context(), netip.MustParseAddr(address), []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); !errors.Is(err, ErrNotPublishable) {
+			if _, err := runner.Pin(t.Context(), netip.MustParseAddr(address), globalProfiles(testProfile("speed.example.test", 443))); !errors.Is(err, ErrNotPublishable) {
 				t.Fatalf("Pin of %s returned %v, want %v", address, err, ErrNotPublishable)
 			}
 			if got := len(fake.addressesOf("https")); got != 0 {
@@ -2042,7 +2217,7 @@ func TestPinRefusesWhenAProfileWillNotVouchForTheAddress(t *testing.T) {
 	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
 
 	profiles := []candidate.ProbeProfile{testProfile("speed.example.test", 443), testProfile("strict.example.test", 443)}
-	if _, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), profiles); !errors.Is(err, ErrIdentityRefused) {
+	if _, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), globalProfiles(profiles...)); !errors.Is(err, ErrIdentityRefused) {
 		t.Fatalf("Pin of an address one profile refuses returned %v, want %v", err, ErrIdentityRefused)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -2056,7 +2231,7 @@ func TestPinRefusesWithoutAProfileToProveItAgainst(t *testing.T) {
 	runner, selectorPath := newTestRunnerWithSelector(t, fake)
 	before := writeSelector(t, selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
 
-	if _, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), nil); !errors.Is(err, ErrNoProfile) {
+	if _, err := runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), Profiles{}); !errors.Is(err, ErrNoProfile) {
 		t.Fatalf("Pin with no profile returned %v, want %v", err, ErrNoProfile)
 	}
 	mustBeUnchanged(t, selectorPath, before)
@@ -2071,7 +2246,7 @@ func TestPinRefusesWhileAnotherProcessHoldsTheControlLock(t *testing.T) {
 	before := writeSelector(t, built.selectorPath, mustSelector(t, 4, "104.16.1.1", ""))
 
 	release := holdLockInAnotherProcess(t, built.lockPath)
-	_, err := built.Runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), []candidate.ProbeProfile{testProfile("speed.example.test", 443)})
+	_, err := built.Runner.Pin(t.Context(), netip.MustParseAddr("104.16.9.9"), globalProfiles(testProfile("speed.example.test", 443)))
 	release()
 	if !errors.Is(err, ErrControlLocked) {
 		t.Fatalf("Pin while another process held the control lock returned %v, want %v", err, ErrControlLocked)
@@ -2309,7 +2484,7 @@ func TestWriteReportAndReadReportCarryTheWholeDocument(t *testing.T) {
 	assertPhaseStamps(t, read.Phases)
 	// A report this build wrote must be one it can apply, or the two halves have
 	// drifted apart.
-	if _, _, err := runner.Apply(t.Context(), read, []candidate.ProbeProfile{testProfile("speed.example.test", 443)}); err != nil {
+	if _, _, err := runner.Apply(t.Context(), read, globalProfiles(testProfile("speed.example.test", 443))); err != nil {
 		t.Errorf("the report read back from its own file is not one the runner will apply: %v", err)
 	}
 }

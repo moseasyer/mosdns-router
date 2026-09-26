@@ -385,13 +385,17 @@ type cdnWorld struct {
 	policy config.Policy
 	digest string
 	runner *optimizer.Runner
-	// cloudflareProfiles are the hostnames a global address is proved against, and
-	// cloudFrontRules the per-hostname profiles.
-	cloudflareProfiles []candidate.ProbeProfile
-	cloudFrontRules    []candidate.CloudFrontProfile
-	// profiles is every profile this configuration names, which is what a final
-	// proof and a pin are held to.
-	profiles []candidate.ProbeProfile
+	// profiles keeps the two kinds of identity profile apart, because a proof is
+	// held to one or the other and never to both: the global profiles are the
+	// provider's representative domain and the forced-ECH domains, and each
+	// CloudFront rule is the only profile its own hostname may be proved against.
+	// A Cloudflare anycast address cannot present a chain for a CloudFront
+	// hostname, and the CloudFront mapping is per-hostname, so a global address is
+	// never published for one - which is the whole of why they are not mixed here.
+	profiles optimizer.Profiles
+	// cloudFrontRules are the operator's CloudFront profiles, which are also the
+	// run's input: a rule names the addresses to measure for its own hostname.
+	cloudFrontRules []candidate.CloudFrontProfile
 }
 
 // buildCDNWorld reads the policy, the profiles and the identity domains, and
@@ -421,11 +425,15 @@ func buildCDNWorld(options cdnOptions, services services) (cdnWorld, error) {
 	if err != nil {
 		return world, err
 	}
-	domains = append([]string{options.representative}, domains...)
-	if world.cloudflareProfiles, err = identityProfiles(domains); err != nil {
+	// The provider's representative domain leads the list, so a refusal names it
+	// first, and identityProfiles collapses it with a name the list also carries:
+	// two spellings of one hostname are one profile, and proving the same thing
+	// twice would double the final gate's hold of the control lock.
+	profiles, err := identityProfiles(append([]string{options.representative}, domains...))
+	if err != nil {
 		return world, err
 	}
-	world.profiles = append(slicesClone(world.cloudflareProfiles), ruleProfiles(world.cloudFrontRules)...)
+	world.profiles = optimizer.Profiles{Global: profiles, ByHostname: profilesByHostname(world.cloudFrontRules)}
 	if world.runner, err = optimizer.NewRunner(world.policy, services.newProber(), optimizer.Options{
 		BudgetPath:      options.budget,
 		SelectorPath:    options.selector,
@@ -495,12 +503,22 @@ func readDomainList(path string) ([]string, error) {
 // holds each to what a prober could check before a socket is opened. A hostname
 // that cannot be a profile is a refusal here rather than a proof that would fail
 // later against the network.
+//
+// Two names that differ only in case are one profile, because DNS names are case
+// insensitive and the profile is keyed by the name: two would be the same proof run
+// twice, and the final gate runs under the control lock.
 func identityProfiles(domains []string) ([]candidate.ProbeProfile, error) {
 	profiles := make([]candidate.ProbeProfile, 0, len(domains))
+	seen := make(map[string]bool, len(domains))
 	for _, domain := range domains {
+		name := strings.ToLower(domain)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
 		profile := candidate.ProbeProfile{
-			Hostname:       domain,
-			URL:            "https://" + domain + identityPath,
+			Hostname:       name,
+			URL:            "https://" + name + identityPath,
 			Method:         http.MethodGet,
 			Port:           identityPort,
 			ExpectedStatus: []int{http.StatusOK},
@@ -513,12 +531,18 @@ func identityProfiles(domains []string) ([]candidate.ProbeProfile, error) {
 	return profiles, nil
 }
 
-func ruleProfiles(rules []candidate.CloudFrontProfile) []candidate.ProbeProfile {
-	profiles := make([]candidate.ProbeProfile, 0, len(rules))
-	for _, rule := range rules {
-		profiles = append(profiles, rule.Profile)
+// profilesByHostname is the operator's CloudFront rules as the per-hostname half of
+// the profile set. A hostname two rules share is already refused by the profile
+// parser, so one rule is one hostname here.
+func profilesByHostname(rules []candidate.CloudFrontProfile) map[string]candidate.ProbeProfile {
+	if len(rules) == 0 {
+		return nil
 	}
-	return profiles
+	byHostname := make(map[string]candidate.ProbeProfile, len(rules))
+	for _, rule := range rules {
+		byHostname[strings.ToLower(rule.Profile.Hostname)] = rule.Profile
+	}
+	return byHostname
 }
 
 // networkProber is the composition of the prober package's prober with the
@@ -599,7 +623,7 @@ func runCDNTest(ctx context.Context, args []string, stdout, stderr io.Writer, se
 	}
 	input := optimizer.Input{
 		Cloudflare:         collected.Candidates,
-		CloudflareProfiles: world.cloudflareProfiles,
+		CloudflareProfiles: world.profiles.Global,
 		CloudFrontRules:    world.cloudFrontRules,
 		Stale:              collected.Stale,
 	}

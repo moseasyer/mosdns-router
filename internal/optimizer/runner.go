@@ -946,7 +946,7 @@ func PolicyDigest(document []byte) string {
 // rather than for the minutes a measurement run takes. That is also why a run
 // itself never takes this lock: it would block apply, pin and the health timer
 // behind a download.
-func (r *Runner) Apply(ctx context.Context, report Report, profiles []candidate.ProbeProfile) (Report, state.Selector, error) {
+func (r *Runner) Apply(ctx context.Context, report Report, profiles Profiles) (Report, state.Selector, error) {
 	if err := report.Validate(); err != nil {
 		return report, state.Selector{}, fmt.Errorf("%w: %v", ErrInvalidReport, err)
 	}
@@ -1110,22 +1110,71 @@ func switchDecision(winner ReportWinner, improvementPercent float64, budgetExhau
 	}
 }
 
+// Profiles is the set of identity profiles a proof is held to, kept apart by what
+// each one is for, because the two kinds answer to different hostnames and a
+// proof of one is not evidence about the other.
+//
+// The separation is the anti-leak rule at the point where a proof is run. A global
+// address is proved against the global profiles - the provider's representative
+// domain and every forced-ECH domain, which is what §11.6 of the design holds a
+// manual Cloudflare address to. A per-hostname address is proved against its own
+// hostname's profile and no other.
+//
+// A global address is never proved against a per-hostname profile, and that is
+// deliberate in both directions. It cannot succeed: a Cloudflare anycast address
+// cannot present a chain for a CloudFront hostname, so an apply on any router with
+// a CloudFront domain list would be refused every time. And it is not needed: the
+// CloudFront mapping is per-hostname, so the global winner is never published for
+// one of those hostnames, and asking a Cloudflare address to impersonate a
+// CloudFront one tests a relationship that does not exist.
+type Profiles struct {
+	// Global are the profiles a hostname-less address is proved against.
+	Global []candidate.ProbeProfile
+	// ByHostname is one profile per CloudFront hostname, which is the only profile
+	// an address of that hostname may be proved against. DNS names are matched
+	// case-insensitively, as they are everywhere else here.
+	ByHostname map[string]candidate.ProbeProfile
+}
+
+// forSubject is the profiles one address has to satisfy, and an empty result means
+// this configuration names none for it - which is a refusal, not a pass.
+func (p Profiles) forSubject(subject candidate.Candidate) []candidate.ProbeProfile {
+	if subject.Hostname == "" {
+		return p.Global
+	}
+	for hostname, profile := range p.ByHostname {
+		if strings.EqualFold(hostname, subject.Hostname) {
+			return []candidate.ProbeProfile{profile}
+		}
+	}
+	return nil
+}
+
+// all is every configured profile, which a refusal message quotes so an operator
+// can see whether the set is empty or merely does not cover this address.
+func (p Profiles) all() []candidate.ProbeProfile {
+	every := make([]candidate.ProbeProfile, 0, len(p.Global)+len(p.ByHostname))
+	every = append(every, p.Global...)
+	for _, profile := range p.ByHostname {
+		every = append(every, profile)
+	}
+	return every
+}
+
 // proveAddress is the final identity proof: it proves that an address is serving
-// everything this configuration will ask it to serve, and it is the same rule a
+// the hostnames this configuration will publish it for, and it is the same rule a
 // manual pin is held to.
 //
-// A global address is proved against every configured profile, because a
-// Cloudflare address that serves the provider's domain and not a forced-ECH domain
-// would leave every query on that domain rewritten to an address that will not
-// serve it. A per-hostname address is proved against its own profile and no other,
-// which is the anti-leak rule: a proof for one hostname says nothing about
-// another.
+// Which hostnames those are is Profiles' decision and not this function's: a
+// global address is held to the global profiles and a per-hostname address to its
+// own hostname's, so a proof never crosses the boundary between the global group
+// and a per-hostname one.
 //
 // The profiles are the ones this router is running. They are never taken from the
 // report, so a report cannot choose what it is about to be proved against, and a
 // report naming a hostname this configuration no longer has a profile for is
 // refused rather than proved against something else.
-func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, profiles []candidate.ProbeProfile) (measure.HTTPMetrics, error) {
+func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, profiles Profiles) (measure.HTTPMetrics, error) {
 	// Both callers hold the subject to the candidate rules before they get here -
 	// Pin validates the address it was given, and Validate has checked every
 	// candidate in the report - so this is the backstop that turns a subject built
@@ -1133,18 +1182,14 @@ func (r *Runner) proveAddress(ctx context.Context, subject candidate.Candidate, 
 	if err := subject.Validate(); err != nil {
 		return measure.HTTPMetrics{}, fmt.Errorf("%w: %v", ErrNotPublishable, err)
 	}
-	applicable := make([]candidate.ProbeProfile, 0, len(profiles))
-	for _, profile := range profiles {
-		if subject.Hostname != "" {
-			if strings.EqualFold(profile.Hostname, subject.Hostname) {
-				applicable = append(applicable, profile)
-			}
-			continue
-		}
-		applicable = append(applicable, profile)
-	}
+	applicable := profiles.forSubject(subject)
 	if len(applicable) == 0 {
-		return measure.HTTPMetrics{}, fmt.Errorf("%w: %s is proved against %d configured profiles", ErrNoProfile, subject.IP, len(profiles))
+		kind := "for a global address"
+		if subject.Hostname != "" {
+			kind = fmt.Sprintf("for %s", subject.Hostname)
+		}
+		return measure.HTTPMetrics{}, fmt.Errorf("%w: %s is proved against none of the %d configured profiles %s",
+			ErrNoProfile, subject.IP, len(profiles.all()), kind)
 	}
 	summed := measure.HTTPMetrics{}
 	for _, profile := range applicable {
@@ -1217,7 +1262,7 @@ func fallbackAfter(winner string, current state.Selector) string {
 // the proof immediately, or the file records an address that was proved at some
 // other time. It is bounded by the prober's probe timeout, and a pin is a manual
 // action, so seconds under the lock is the right trade.
-func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles []candidate.ProbeProfile) (state.Selector, error) {
+func (r *Runner) Pin(ctx context.Context, address netip.Addr, profiles Profiles) (state.Selector, error) {
 	subject := candidate.Candidate{
 		Provider: candidate.ProviderCloudflare,
 		IP:       address,
