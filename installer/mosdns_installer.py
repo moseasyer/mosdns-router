@@ -1,7 +1,11 @@
-"""Check that this machine can have this router installed on it, and change nothing.
+"""Check that this machine can have this router installed on it, and then do it.
 
-This module is the only part of the installer that runs before the package owns
-anything, so it has exactly two jobs and the whole design follows from them:
+The module has two halves and the line between them is the one that matters on a
+router. Everything above :func:`install` reads and reports; everything in
+:func:`install` changes a machine's DNS, in one fixed order, with a record of what
+it found and a rollback for every step it takes. ``preflight`` is the half that
+runs before the package owns anything, so it has exactly two jobs and the whole of
+its design follows from them:
 
 * **It reads, and it says.** Every check either establishes a fact or names a
   refusal, and a refusal carries the values it refused on. A preflight that
@@ -25,31 +29,53 @@ string a shell would have interpreted. There is no second code path -- no
 test suite holds that, because the FakeRunner refusing a string only covers the
 paths a test happens to reach.
 
-Nothing here is a network, a service or a file write. ``--check-only`` reads
-``/etc/os-release``, asks four read-only questions of systemd and NetworkManager,
-reads the state directories' metadata, and reports. If it cannot answer a
-question it says so; it never answers "fine" from a failed read, because the
-installer's next step binds a privileged port and a second answer that does not
-exist is how two resolvers end up fighting over port 53.
+Nothing in that half is a network, a service or a file write. ``--check-only``
+reads ``/etc/os-release``, asks four read-only questions of systemd and
+NetworkManager, reads the state directories' metadata, and reports. If it cannot
+answer a question it says so; it never answers "fine" from a failed read, because
+the installer's next step binds a privileged port and a second answer that does
+not exist is how two resolvers end up fighting over port 53.
+
+:func:`install` is the other half, and its design is one sentence: **the
+NetworkManager is touched last, after the machine's own resolver has answered a
+real query.** Everything before that point is undone by stopping two units;
+everything after it is undone from a record written before any of it, and a
+failure anywhere leaves either a machine that is as it was found or a loud report
+that says which of this package's changes are still applied. Read the numbered
+order at the head of the transaction section before changing anything in it.
 """
 
 from __future__ import annotations
 
+import datetime
+import ipaddress
+import json
 import os
 import re
+import socket
 import stat
 import sys
+import time
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Sequence
+from typing import Callable, List, NamedTuple, Optional, Sequence
 
 __all__ = [
+    "BACKUP_PATH",
+    "BACKUP_SCHEMA_VERSION",
     "CommandRunner",
     "Completed",
     "Connection",
     "Holder",
+    "InstallRefused",
+    "InstallResult",
+    "MANAGED_BY",
     "Owner",
     "Preflight",
     "RealCommandRunner",
+    "SCRUBBED_ENVIRONMENT_NAMES",
+    "Transaction",
+    "build_dns_query",
+    "capture_command",
     "check_architecture",
     "check_connection",
     "check_control_lock",
@@ -60,7 +86,14 @@ __all__ = [
     "check_release",
     "check_resolv_conf",
     "check_state_directories",
+    "install",
     "preflight",
+    "prepare_backup",
+    "probe_dns",
+    "response_is_an_answer",
+    "validate_backup",
+    "wait_for_dns",
+    "write_backup",
     "main",
 ]
 
@@ -1441,42 +1474,1169 @@ def preflight(root: Path, run: CommandRunner) -> Preflight:
     return report
 
 
-# The exit statuses the command boundary uses. They are the CLI's own: 0 is a
-# machine this can install onto, 1 is one it cannot, and 2 is a usage error.
+# ---------------------------------------------------------------------------
+# The install transaction
+# ---------------------------------------------------------------------------
+#
+# The preflight above reads and reports. Everything below changes, and the order
+# it changes things in is the whole of its safety argument:
+#
+#   1. preflight -- a refusal here means nothing has been touched at all;
+#   2. capture the lease this machine is following RIGHT NOW, through the
+#      bridge's own capture, with four environment names scrubbed;
+#   3. read every value the transaction will change, and write AND read back the
+#      root-only backup that records them;
+#   4. enable the two units, start each, and prove each answers before the next;
+#   5. health-check 127.0.0.1:53 with a real query;
+#   6. only then point NetworkManager at the loopback, reactivate the one
+#      connection, and check that resolved forwards to it;
+#   7. write the ownership marker, last, so an install that failed anywhere above
+#      leaves nothing claiming the machine's DNS.
+#
+# Step 6 is last on purpose. Everything before it is reversible by stopping two
+# units; the three properties in step 6 are the ones that can leave a machine
+# with no resolver at all, and they are only written once a local query has come
+# back. The whole transaction hangs on that, and the test suite holds the two
+# steps apart by asserting the whole argument-and-probe sequence as one literal.
+
+# The package this installer belongs to. The version is not a constant here: an
+# operator reading a backup has to know which release wrote it, and a literal in
+# this file would be the version the source was last edited at rather than the
+# one that ran.
+PACKAGE_NAME = "mosdns-router"
+
+# Where this installer's own record lives, and what is in it. Both files are
+# root-only and so is the directory: the backup names the machine's resolvers and
+# the connection they belong to, and the marker is the claim an uninstall reads
+# to decide whether the DNS on this machine is ours to change back.
+INSTALLER_DIRECTORY = "/var/lib/mosdns/installer"
+BACKUP_PATH = INSTALLER_DIRECTORY + "/network-manager-backup.json"
+BACKUP_MODE = 0o600
+BACKUP_MODE_OCTAL = "0600"
+INSTALLER_DIRECTORY_MODE = 0o700
+MARKER_MODE = 0o600
+
+# The schema version of the backup. It is written into the document and checked
+# on the way back in, so a future release that cannot read this shape says so
+# instead of restoring a guess.
+BACKUP_SCHEMA_VERSION = 1
+
+# The document the backup digests. It is the POLICY rather than the rendered
+# routing config because that is what this project already means by a
+# configuration digest: `internal/optimizer`'s PolicyDigest is the SHA-256 of the
+# policy's own bytes, and a second meaning for the same field name in the same
+# repository is a trap for whoever reads both.
+POLICY_CONFIG = "/etc/mosdns/policy.yaml"
+
+# Where the DHCP bridge publishes, and how a first-install capture is asked for.
+# These are the same three values bridge/mosdns_dhcp_bridge documents and the
+# same ones the package's dispatcher script uses, so a capture and the first
+# `up` event after it record one state rather than two generations.
+DHCP_STATE_FILE = "/run/mosdns/dhcp-upstreams.json"
+DHCP_LOCK_FILE = "/run/mosdns/dhcp-bridge.lock"
+DHCP_BRIDGE = ("python3", "-m", "mosdns_dhcp_bridge.cli")
+DHCP_CAPTURE = "--capture-current"
+
+# The four environment names the capture must not inherit, and no others.
+#
+# `CommandRunner.run` takes no `env=`, so the environment the capture would
+# inherit is changed by the COMMAND rather than by the caller: `env -u NAME` for
+# each of the four, inside the argument array. That is a real answer to a real
+# constraint rather than a workaround -- it needs no `os.environ` surgery, it is
+# visible in the array a test records, and `env -u` on a name that is not set is
+# not an error, so the scrub does not depend on what the installer's own
+# environment happened to carry.
+#
+# Each of the four changes what the capture records, which is why none of them
+# can be left to chance:
+#
+#   * the action makes `--capture-current` a usage error, and exits 2 before a
+#     single command runs;
+#   * the two DHCP variables are ranked below NetworkManager's raw fields but
+#     above the effective device DNS, so a stale value is recorded as the
+#     `dispatcher-env` source -- a source no real event can reproduce, and so a
+#     generation advance and a cache flush at the moment there must be none;
+#   * the connection UUID outranks the authoritative `nmcli -g GENERAL.CON-UUID`
+#     lookup, so a stale value makes the capture name the WRONG connection and
+#     skip the query, and the first real event then names the true one.
+#
+# `DEVICE_IP_IFACE`, `INTERFACE` and `DEVICE` are deliberately left alone: a
+# capture never reads them, because the caller names the interface on the
+# command line instead.
+SCRUBBED_ENVIRONMENT_NAMES = (
+    "NM_DISPATCHER_ACTION",
+    "DHCP4_DOMAIN_NAME_SERVERS",
+    "DHCP6_DOMAIN_NAME_SERVERS",
+    "CONNECTION_UUID",
+)
+
+# The address the machine's own resolver listens on. It is loopback, and nothing
+# here may name a resolver that is not this machine: after the three properties
+# below, the machine's only path to DNS is a process on the other end of a
+# loopback socket.
+LOCAL_DNS = "127.0.0.1"
+
+# The two properties that tell NetworkManager to stop following the lease, and
+# the one that points it at the loopback instead. Named as constants because they
+# appear in three places -- the read, the set and the restore -- and a typo in one
+# of the three would be a property this package sets and cannot undo.
+IPV4_IGNORE_AUTO_DNS = "ipv4.ignore-auto-dns"
+IPV6_IGNORE_AUTO_DNS = "ipv6.ignore-auto-dns"
+IPV4_DNS = "ipv4.dns"
+IPV6_DNS = "ipv6.dns"
+
+# The three mutations, in the order they are made, and the only three.
+#
+# The order is not incidental. Both ignore-auto-dns properties are set before any
+# address is, so the window in which the lease's resolvers are being ignored is a
+# window in which the loopback address has already been given. The reverse order
+# would leave a moment where the connection follows nothing at all and before it
+# is asked to use an address the machine cannot yet resolve through.
+NM_MUTATIONS = (
+    (IPV4_IGNORE_AUTO_DNS, "yes"),
+    (IPV6_IGNORE_AUTO_DNS, "yes"),
+    (IPV4_DNS, LOCAL_DNS),
+)
+
+# The four properties the backup records: the three above and the IPv6 address
+# list, which this install never changes and an operator restoring by hand does.
+# Recording a property nothing restores costs two reads; failing to record one
+# somebody may have to restore costs a machine with no DNS.
+IGNORED_AUTOMATICALLY = (IPV4_IGNORE_AUTO_DNS, IPV6_IGNORE_AUTO_DNS)
+ADDRESS_LISTS = (IPV4_DNS, IPV6_DNS)
+RECORDED_PROPERTIES = IGNORED_AUTOMATICALLY + ADDRESS_LISTS
+
+# The two units this transaction owns, in the order it enables them. The router
+# is enabled as well as started: a machine whose NetworkManager points DNS at the
+# loopback and whose router is not enabled comes back from a reboot with no
+# resolver at all, which is a worse outcome than one extra idempotent call.
+OWNED_UNITS = (RESOLVER_UNIT, ROUTER_UNIT)
+
+# The answers that mean "this unit was not running" and "this unit is not
+# enabled". Anything else -- including an answer this program could not read --
+# is treated as "it was", because stopping or disabling something that was
+# already running is the harm the rollback rule exists to prevent, and leaving one
+# running is a smaller and reversible one.
+NOT_ACTIVE = ("inactive", "failed")
+NOT_ENABLED = ("disabled", "not-found")
+
+# The name the probes ask for. `.invalid` is reserved by RFC 6761, so a resolver
+# that is answering has to say something -- NXDOMAIN or SERVFAIL, both of which
+# are a response from a listening socket -- without the probe depending on any
+# public name being reachable, and without the install leaking a lookup.
+INSTALL_PROBE_NAME = "install-probe.invalid"
+PROBE_TIMEOUT_SECONDS = 2.0
+# How long a unit gets to start answering. It fails the install rather than
+# hanging, because a resolver that is not up is exactly the state this
+# transaction must not point a machine at.
+WAIT_DEADLINE_SECONDS = 60.0
+WAIT_POLL_SECONDS = 0.25
+
+# The DNS message the prober builds and reads, spelled out rather than borrowed
+# from a library: this is the one place the transaction opens a socket, it is the
+# only network code in the installer, and the Python standard library has no DNS
+# client. 12 header bytes, one question, an A record, class IN.
+DNS_HEADER_LENGTH = 12
+DNS_RECURSION_DESIRED = 0x0100
+DNS_RESPONSE_BIT = 0x8000
+DNS_QUESTION_COUNT = 1
+DNS_TYPE_A = 1
+DNS_CLASS_IN = 1
+DNS_LABEL_LIMIT = 63
+DNS_NAME_LIMIT = 255
+
+
+class InstallRefused(Exception):
+    """A step of the transaction could not be completed, and the machine says why.
+
+    It is raised for every failure the transaction has, and the transaction
+    catches nothing itself: one exception type means there is exactly one path
+    from "a step failed" to "roll back", and a second one would be a step that
+    could fail without a rollback.
+    """
+
+
+class InstallResult(NamedTuple):
+    """What the transaction did, and what it could not put back.
+
+    ``error`` and ``rollback_error`` are separate because they are separate facts
+    about a machine: the first says the install did not finish, and the second
+    says whether the machine is now as it was found. A script -- or an operator --
+    has to be able to tell those apart without reading prose, so ``main`` gives
+    them different exit statuses.
+    """
+
+    ok: bool
+    backup: Optional[str]
+    report: Optional[Preflight]
+    notes: List[str]
+    error: Optional[str]
+    rollback_error: Optional[str]
+
+
+class AppliedStep(NamedTuple):
+    """One mutating action this transaction took, and the action that undoes it.
+
+    The undo is a callable rather than a command array because a step is not always
+    a command: putting back a marker that was not there before is an unlink, and a
+    step whose undo were a command the transaction never recorded would be a value
+    it invented.
+    """
+
+    description: str
+    undo: Callable[[], None]
+
+
+class Transaction:
+    """The applied mutations, and the restoration of them in reverse order.
+
+    A stack rather than a list of completed things, because the order is the
+    point: the last change made is the first one taken back, and a restoration in
+    any other order would try to reapply a value the step above it is in the
+    middle of removing.
+
+    A failure in one undo does not stop the others. Every failure is collected and
+    the transaction reports all of them, because stopping at the first would leave
+    more of this package's changes applied than restoring past it would, and the
+    operator's only information would be about whichever one happened to fail
+    first.
+    """
+
+    def __init__(self) -> None:
+        self._steps: List[AppliedStep] = []
+        self.backup: Optional[str] = None
+
+    def apply(self, description: str, undo) -> None:
+        """Record a mutation that has already happened, and how to take it back."""
+        self._steps.append(AppliedStep(description, undo))
+
+    def rollback(self) -> List[str]:
+        """Undo every applied step, newest first, and report what would not undo."""
+        failures = []
+        for step in reversed(self._steps):
+            try:
+                step.undo()
+            except Exception as error:  # noqa: BLE001 - see this method's docstring
+                failures.append(f"{step.description} could not be undone: {error}")
+        self._steps = []
+        return failures
+
+
+def build_dns_query(name: str, identifier: int) -> bytes:
+    """The bytes of one A/IN question for ``name``.
+
+    Built by hand because the standard library has no DNS client and this program
+    may not add a dependency: it runs from a Debian package as root on a router,
+    and a resolver probe is not worth a library.
+
+    The name is refused rather than mangled. A label over 63 octets, an empty
+    label, or a name over 255 octets is not a question any resolver will answer,
+    and a probe that built one would be waiting for a timeout instead of getting a
+    refusal.
+    """
+    if not name:
+        raise ValueError("a DNS question needs a name")
+    labels = []
+    for label in name.rstrip(".").split("."):
+        encoded = label.encode("ascii", "strict")
+        if not encoded:
+            raise ValueError(f"{name!r} has an empty label")
+        if len(encoded) > DNS_LABEL_LIMIT:
+            raise ValueError(f"{name!r} has a label over {DNS_LABEL_LIMIT} octets")
+        labels.append(bytes([len(encoded)]) + encoded)
+    question = b"".join(labels) + b"\x00"
+    if len(question) > DNS_NAME_LIMIT:
+        raise ValueError(f"{name!r} is over {DNS_NAME_LIMIT} octets encoded")
+    header = (
+        identifier.to_bytes(2, "big")
+        + DNS_RECURSION_DESIRED.to_bytes(2, "big")
+        + DNS_QUESTION_COUNT.to_bytes(2, "big")
+        + b"\x00\x00\x00\x00\x00\x00"
+    )
+    return header + question + DNS_TYPE_A.to_bytes(2, "big") + DNS_CLASS_IN.to_bytes(2, "big")
+
+
+def response_is_an_answer(datagram: bytes, identifier: int) -> bool:
+    """Whether ``datagram`` is a DNS response to the question ``identifier`` asked.
+
+    Three facts, and no more: it is long enough to hold a header, its transaction
+    id is the one this program chose, and its QR bit says it is a response rather
+    than a query. The response code is deliberately NOT checked -- NXDOMAIN and
+    SERVFAIL are both answers from a socket that is listening and speaking DNS,
+    which is the fact being waited for, and a resolver that refuses a reserved
+    name is a working resolver.
+
+    A datagram from something that is not a resolver at all -- a proxy answering
+    on the same port, say -- has the QR bit clear, so it does not pass.
+    """
+    if len(datagram) < DNS_HEADER_LENGTH:
+        return False
+    if int.from_bytes(datagram[:2], "big") != identifier:
+        return False
+    return bool(int.from_bytes(datagram[2:4], "big") & DNS_RESPONSE_BIT)
+
+
+def probe_dns(
+    address: str,
+    port: int,
+    timeout: float = PROBE_TIMEOUT_SECONDS,
+    name: str = INSTALL_PROBE_NAME,
+) -> bool:
+    """Ask ``address:port`` one question and report whether anything answered.
+
+    This is the one place in the installer that opens a socket, and it opens a UDP
+    socket to a loopback address and sends a few dozen bytes. It binds nothing:
+    the machine's resolver ports belong to the resolver, and a probe that took one
+    of them to find out whether it was free would be the thing it was measuring.
+
+    Every failure is a `False` rather than an exception. "Nothing answered" is the
+    answer this function exists to give, and a caller that had to tell a refused
+    socket from a silent one could only do it by reading the error, which is a
+    worse contract than the fact.
+    """
+    identifier = 0x4D4F
+    query = build_dns_query(name, identifier)
+    try:
+        connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        connection.settimeout(timeout)
+        connection.sendto(query, (address, port))
+        datagram, _ = connection.recvfrom(4096)
+    except OSError:
+        return False
+    finally:
+        connection.close()
+    return response_is_an_answer(datagram, identifier)
+
+
+def wait_for_dns(address: str, port: int, probe, deadline_seconds: float, poll_seconds: float) -> bool:
+    """Poll ``probe`` until it answers or the deadline passes.
+
+    A query, not a sleep: preflight's port check established that a free port is a
+    fact about one moment and not a reservation, and this is the other half of
+    that. Waiting a fixed interval and asking once would pass a machine whose
+    router took four seconds to bind; polling a real question is the only way to
+    know a resolver is up rather than merely scheduled.
+
+    The deadline is what keeps a broken machine from hanging the install, and it is
+    reported as a failure rather than a warning: the next step would point the
+    machine at an address nothing is answering on.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        if probe(address, port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_seconds)
+
+
+def _utcnow() -> datetime.datetime:
+    """The time the backup is stamped with."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _stamp(moment: datetime.datetime) -> str:
+    return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_text(path: Path, what: str) -> str:
+    """Read a file the transaction cannot go on without, or refuse."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise InstallRefused(f"{what} ({path}) could not be read: {error}") from error
+
+
+def _text(runner: CommandRunner, args: Sequence[str]) -> Optional[str]:
+    """What a query printed, or `None` when the query could not be run at all.
+
+    The text and not the status, because that is the shape of the answers that
+    matter here: `systemctl is-active` answers 3 for a stopped unit and
+    `is-enabled` answers 1 for a disabled one, both with the answer on standard
+    output. A reader that looked at the status instead would conclude that every
+    unit on a healthy machine is stopped.
+
+    `None` means only that the call itself failed -- a missing binary, a runner
+    that raised -- and an empty string is a real answer that happened to be empty.
+    The two are kept apart because a property with no value set is one of the
+    values this transaction has to record and put back, and a reader that called
+    silence "no answer" would refuse every connection that has no manual DNS.
+    """
+    try:
+        completed = runner.run(list(args), check=False)
+    except Exception:  # noqa: BLE001 - the boundary is arbitrary injected code
+        return None
+    return (completed.stdout or "").strip()
+
+
+def _answer(runner: CommandRunner, args: Sequence[str]) -> Optional[str]:
+    """:func:`_text`, with a blank answer folded into "this program cannot say".
+
+    Used only for the two unit-state queries, where silence and a missing unit
+    are the same fact and `None` is what makes the caller fall back to the safe
+    reading instead of treating silence as a state.
+    """
+    return _text(runner, args) or None
+
+
+def _checked(runner: CommandRunner, args: Sequence[str], what: str) -> None:
+    """Run a command that has to succeed, and name the step if it did not.
+
+    The broad `except` is forced and not lazy: the module's one process boundary is
+    the only place allowed to name `subprocess`, because naming it here would be a
+    second reference the preflight's boundary scan would have to allow -- and this
+    program runs as root, so a scan weakened to accommodate it is a scan that no
+    longer holds. Every failure of the injected boundary means the same thing to
+    this step anyway: the command did not do what it was asked to do.
+    """
+    try:
+        runner.run(list(args), check=True)
+    except Exception as error:  # noqa: BLE001 - see above
+        raise InstallRefused(f"{what} failed: {error}") from error
+
+
+def capture_command(interface: str) -> List[str]:
+    """The capture, as an argument array, with the four names scrubbed in it.
+
+    `env -u` four times and then the bridge's own documented module invocation. It
+    is an array and never a string, so an interface name cannot be reinterpreted,
+    and the scrub is part of the command rather than a property of the process that
+    runs it -- which is what makes it visible to a test and independent of what the
+    installer's own environment happened to carry.
+    """
+    command = ["env"]
+    for name in SCRUBBED_ENVIRONMENT_NAMES:
+        command += ["-u", name]
+    command += list(DHCP_BRIDGE)
+    command += [
+        DHCP_CAPTURE,
+        interface,
+        "--state-file",
+        DHCP_STATE_FILE,
+        "--lock-file",
+        DHCP_LOCK_FILE,
+    ]
+    return command
+
+
+def _capture_dhcp(runner: CommandRunner, device: str) -> None:
+    """Publish the lease in use right now, before anything is pointed anywhere.
+
+    The capture is the bridge's own publication path with an interface this
+    installer named, so the first real `up` event after this install records one
+    state rather than a second generation for resolvers that never moved.
+
+    Each of the bridge's own statuses is named rather than lumped together,
+    because they are three different facts about the machine:
+
+      * 4 is a defined outcome and not an accident. The collector read the lease
+        and the connection it belonged to could not be read, so the capture
+        published nothing and discarded the addresses it had read. The state file
+        keeps the generation it had, which is the fail-closed answer: a state
+        carrying resolvers and no connection is one the publisher refuses, and the
+        machine really did have a lease.
+      * 2 is a refusal of the command line, which after a scrubbed environment
+        means this installer and the bridge disagree about how a capture is
+        invoked -- a bug, not a machine.
+      * anything else failed for a reason the bridge has already logged.
+    """
+    command = capture_command(device)
+    try:
+        completed = runner.run(command, check=False)
+    except Exception as error:  # noqa: BLE001 - see _checked
+        raise InstallRefused(
+            f"the DHCP capture could not be run at all ({error}); this install records the lease "
+            "the machine is following before it changes anything, and a capture that did not run "
+            "says nothing about that lease"
+        ) from error
+    if completed.returncode == 0:
+        return
+    if completed.returncode == 4:
+        raise InstallRefused(
+            f"the DHCP capture read the lease on {device} and could not name the connection it "
+            "belongs to, so it published nothing and discarded the resolvers it had read; the "
+            "state file keeps the generation it had. This is a failure and not a success, because "
+            "the machine does have a lease and this install cannot say which connection it belongs "
+            "to"
+        )
+    if completed.returncode == 2:
+        raise InstallRefused(
+            "the DHCP capture refused its command line, which with a scrubbed environment means "
+            "this installer and mosdns_dhcp_bridge disagree about how a capture is invoked; "
+            "nothing has been changed"
+        )
+    raise InstallRefused(
+        f"the DHCP capture failed with status {completed.returncode}; nothing has been changed"
+    )
+
+
+def _package_version(runner: CommandRunner) -> str:
+    """The version of the package that is doing the installing.
+
+    Read from dpkg rather than from a literal in this file, because the point of
+    recording it is that an operator reading a backup months later can tell which
+    release wrote it. A version this installer cannot read is a refusal rather than
+    a blank field, because a backup with no version cannot be matched against the
+    release being removed.
+    """
+    args = ("dpkg-query", "--show", "--showformat=${Version}", PACKAGE_NAME)
+    answer = _answer(runner, args)
+    if answer is None:
+        raise InstallRefused(
+            f"the installed version of {PACKAGE_NAME} could not be read (`dpkg-query --show "
+            f"--showformat=${{Version}} {PACKAGE_NAME}`); the backup records which release wrote "
+            "it, so an unknown version is a backup nobody can match against the release they are "
+            "trying to remove"
+        )
+    return answer
+
+
+def _original_property(runner: CommandRunner, uuid: str, prop: str) -> str:
+    """One property of one connection, as NetworkManager reports it now.
+
+    `-g` with a single field, and a single field because of what an empty value
+    does to the answer: asked for four properties at once, nmcli prints four lines
+    and an unset last one has no line of its own to count, so which line is which
+    becomes a guess. Asked one at a time there is exactly one answer and no way to
+    misattribute it.
+
+    The answer is validated against what the property can be. An ignore-auto-dns
+    this module cannot read as `yes` or `no` is refused rather than stored, because
+    a restore writes back a value it recorded and a value it could not parse is
+    one it would write back as nonsense.
+    """
+    answer = _text(runner, ("nmcli", "-g", prop, "connection", "show", uuid))
+    if answer is None:
+        raise InstallRefused(
+            f"{prop} of connection {uuid} could not be read (`nmcli -g {prop} connection show "
+            f"{uuid}` failed); this install changes that property, and a property it cannot read "
+            "is one it could not put back"
+        )
+    if prop in IGNORED_AUTOMATICALLY and answer not in ("yes", "no"):
+        raise InstallRefused(
+            f"{prop} of connection {uuid} is {answer!r}, which is neither 'yes' nor 'no'; this "
+            "install refuses to change a property whose current value it cannot record, because a "
+            "restore can only put back what was written down"
+        )
+    return answer
+
+
+def _address_list(uuid: str, prop: str, answer: str) -> List[str]:
+    """The addresses in one of the DNS list properties, or a refusal.
+
+    Split on every separator NetworkManager has been seen to use for an array,
+    because this module cannot measure which one a given release prints and guessing
+    wrong is not a cosmetic error: an un-split list restores as ONE malformed
+    address, and a machine whose DNS is a single malformed address has no DNS at
+    all.
+
+    Each address is then checked with `ipaddress`, and anything that is not one
+    refuses the install. That is the fail-closed direction and the only safe one: a
+    value the module cannot parse is a value its restore could not reproduce, and a
+    backup that cannot be restored is worse than an install that declined to start.
+    """
+    tokens = [token for token in re.split(r"[,;\s]+", answer.strip()) if token]
+    for token in tokens:
+        try:
+            ipaddress.ip_address(token)
+        except ValueError as error:
+            raise InstallRefused(
+                f"{prop} of connection {uuid} is {answer!r}, and {token!r} in it is not an IP "
+                f"address ({error}); this install refuses to change a connection whose manual DNS "
+                "it cannot parse, because a restore can only put back what was written down"
+            ) from error
+    return tokens
+
+
+def _config_digest(root: Path) -> str:
+    """The SHA-256 of the configuration document, as this project already means it.
+
+    The policy's own bytes, matching the digest `mosdns-cdnctl` stamps into the
+    selector and the ECH state. An uninstall compares it to decide whether the
+    operator has edited the configuration since the install, so a document that
+    cannot be read is an install that cannot be accounted for later -- which is why
+    this refuses rather than recording nothing.
+    """
+    import hashlib
+
+    path = root / POLICY_CONFIG.lstrip("/")
+    try:
+        contents = path.read_bytes()
+    except OSError as error:
+        raise InstallRefused(
+            f"{path} could not be read ({error}); the backup records the digest of the "
+            "configuration this install ran under, so an uninstall can tell an operator's edits "
+            "from ours, and a configuration it cannot digest is a change it cannot account for"
+        ) from error
+    return hashlib.sha256(contents).hexdigest()
+
+
+def _dhcp_state(root: Path) -> dict:
+    """The lease the capture just published, or a refusal.
+
+    The backup records the lease this machine was following, because the whole
+    reason the capture runs first is that a resolver pointed at the loopback makes
+    the original resolvers un-followable: after the switch, nothing on the machine
+    can read them back out of NetworkManager. A state file that cannot be read now
+    is a lease this install will not be able to describe afterwards.
+    """
+    path = root / DHCP_STATE_FILE.lstrip("/")
+    text = _read_text(path, "the published DHCP state")
+    try:
+        document = json.loads(text)
+    except ValueError as error:
+        raise InstallRefused(
+            f"{path} is not the state document the bridge publishes ({error}); the backup records "
+            "the lease this machine is following, and a document it cannot read is a lease it "
+            "cannot describe"
+        ) from error
+    if not isinstance(document, dict):
+        raise InstallRefused(f"{path} is not a JSON object; nothing has been changed")
+    return document
+
+
+def prepare_backup(root: Path, runner: CommandRunner, connection: Connection, now) -> dict:
+    """Read every value the transaction will change, and return the backup document.
+
+    Nothing is written here. The document is built from reads only, so a step that
+    cannot read is a refusal before any mutation, and the document that comes out
+    of this function is the only source of an original value anywhere in the
+    transaction -- which is what makes "restore only what was recorded" a property
+    of the code rather than a promise in a review.
+    """
+    version = _package_version(runner)
+    original: dict = {}
+    for prop in RECORDED_PROPERTIES:
+        answer = _original_property(runner, connection.uuid, prop)
+        if prop in ADDRESS_LISTS:
+            original[prop] = {"raw": answer, "value": _address_list(connection.uuid, prop, answer)}
+        else:
+            original[prop] = {"raw": answer, "value": answer}
+    dhcp = _dhcp_state(root)
+    return {
+        "schema_version": BACKUP_SCHEMA_VERSION,
+        "managed_by": MANAGED_BY_VALUE,
+        "package": PACKAGE_NAME,
+        "package_version": version,
+        "created_at": _stamp(now()),
+        "config_path": POLICY_CONFIG,
+        "config_sha256": _config_digest(root),
+        "connection": {
+            "uuid": connection.uuid,
+            "name": connection.name,
+            "type": connection.kind,
+            "device": connection.device,
+        },
+        "original": original,
+        "dhcp": {
+            "state_file": DHCP_STATE_FILE,
+            "interface": dhcp.get("interface", connection.device),
+            "connection_uuid": dhcp.get("connection_uuid", connection.uuid),
+            "upstreams": list(dhcp.get("upstreams") or []),
+            "source": dhcp.get("source", ""),
+            "generation": dhcp.get("generation", 0),
+            "observed_at": dhcp.get("observed_at", ""),
+        },
+    }
+
+
+def write_backup(root: Path, document: dict) -> Path:
+    """Write the backup at mode 0600 under the installer directory, and return its path.
+
+    The directory is created at 0700 when it is not there and is NOT
+    re-permissioned when it is, for the reason preflight never repairs anything: a
+    directory the package already made belongs to the package, and the install
+    writes into it rather than deciding what it should be.
+
+    The mode is set after the write rather than through the open, because the
+    standard library's own file-opening call is the one `os` attribute this
+    module's allowlist refuses -- and the window that would close is inside a
+    directory this function has just made root-only, so nothing else can reach the
+    file while it is briefly at the umask's mode.
+    """
+    directory = root / INSTALLER_DIRECTORY.lstrip("/")
+    if _path_state(directory) == "absent":
+        try:
+            directory.mkdir(parents=True, mode=INSTALLER_DIRECTORY_MODE)
+            directory.chmod(INSTALLER_DIRECTORY_MODE)
+        except OSError as error:
+            raise InstallRefused(
+                f"{INSTALLER_DIRECTORY} could not be created ({error}); it is where the record of "
+                "this machine's original DNS settings lives, so an install that cannot write it "
+                "must not change anything"
+            ) from error
+    path = root / BACKUP_PATH.lstrip("/")
+    try:
+        path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        path.chmod(BACKUP_MODE)
+    except OSError as error:
+        raise InstallRefused(
+            f"{path} could not be written ({error}); this install changes NetworkManager's DNS and "
+            "the record of what it was has to be readable before it does"
+        ) from error
+    return path
+
+
+def validate_backup(root: Path, document: dict) -> None:
+    """Read the backup back and check it against what was meant to be written.
+
+    "Wrote a file" is not the same claim as "there is a file that can be read back
+    and says the right thing", and the difference is the whole of what a rollback
+    and a manual recovery depend on. So the file is asked about with `lstat` (a
+    path that exists and cannot be read is a failure, not an absence), its mode is
+    read from the inode rather than trusted, and the decoded document is compared to
+    the one in hand -- so the message can name the field that disagrees rather than
+    only saying that they differ.
+
+    The schema version and the marker are checked on their own after the
+    comparison, because they are the two fields a future release has to refuse
+    rather than guess at, and a message that only said "the documents differ" would
+    not tell an operator which of the two it was.
+    """
+    path = root / BACKUP_PATH.lstrip("/")
+    state = _path_state(path)
+    if state != "a regular file":
+        raise InstallRefused(
+            f"{BACKUP_PATH} is {state} after being written, so the record of this machine's "
+            "original DNS settings cannot be read back; nothing has been changed, and a backup "
+            "that cannot be read is not a backup"
+        )
+    try:
+        mode = stat.S_IMODE(path.lstat().st_mode)
+    except OSError as error:
+        raise InstallRefused(
+            f"{BACKUP_PATH} could not be stat'd after being written: {error}"
+        ) from error
+    if mode != BACKUP_MODE:
+        raise InstallRefused(
+            f"{BACKUP_PATH} is at mode {mode:04o} rather than {BACKUP_MODE_OCTAL}; it names this "
+            "machine's resolvers and its connection, so it is readable by root and by nobody else, "
+            "and an install that cannot make it so must not change anything"
+        )
+    text = _read_text(path, "the backup")
+    try:
+        written = json.loads(text)
+    except ValueError as error:
+        raise InstallRefused(
+            f"{BACKUP_PATH} is not a JSON document after being written ({error}); nothing has been "
+            "changed"
+        ) from error
+    if written != document:
+        differences = sorted(
+            key for key in set(written) | set(document) if written.get(key) != document.get(key)
+        )
+        raise InstallRefused(
+            f"{BACKUP_PATH} does not read back as the document that was written; "
+            f"{', '.join(differences) if differences else 'the documents differ'} disagree(s). "
+            "Nothing has been changed: a rollback and a manual recovery both work from this file, "
+            "and one whose contents are not the ones that were recorded is worse than none"
+        )
+    if written.get("schema_version") != BACKUP_SCHEMA_VERSION:
+        raise InstallRefused(
+            f"{BACKUP_PATH} names schema version {written.get('schema_version')!r} rather than "
+            f"{BACKUP_SCHEMA_VERSION}; nothing has been changed"
+        )
+    if written.get("managed_by") != MANAGED_BY_VALUE:
+        raise InstallRefused(
+            f"{BACKUP_PATH} names {written.get('managed_by')!r} rather than {MANAGED_BY_VALUE!r}, "
+            "so it is not a record of this project's changes; nothing has been changed"
+        )
+
+
+def _unit_states(runner: CommandRunner) -> dict:
+    """Whether each owned unit was running and enabled before this transaction.
+
+    Read once, before anything is enabled, and read conservatively: only a definite
+    `inactive`/`failed` and a definite `disabled`/`not-found` mean the transaction
+    may undo the corresponding change afterwards. Anything else -- including a
+    query that could not be answered -- is read as "it was already that way",
+    because a rollback that stops or disables a unit somebody else was running is
+    the harm this rule exists to prevent, and leaving one running is a smaller,
+    reversible, reportable one.
+    """
+    states = {}
+    for unit in OWNED_UNITS:
+        active = _answer(runner, ("systemctl", "is-active", unit))
+        enabled = _answer(runner, ("systemctl", "is-enabled", unit))
+        states[unit] = {
+            "active": active is None or active not in NOT_ACTIVE,
+            "enabled": enabled is None or enabled not in NOT_ENABLED,
+        }
+    return states
+
+
+def _enable(runner: CommandRunner, transaction: Transaction, unit: str, states: dict) -> None:
+    """Enable a unit, and record how to take that back if this was not its state."""
+    _checked(runner, ("systemctl", "enable", unit), f"enabling {unit}")
+    if states[unit]["enabled"]:
+        return
+    transaction.apply(
+        f"enabling {unit}",
+        lambda unit=unit: _checked(runner, ("systemctl", "disable", unit), f"disabling {unit}"),
+    )
+
+
+def _start(runner: CommandRunner, transaction: Transaction, unit: str, states: dict) -> None:
+    """Start a unit, and record how to take that back if it was not running."""
+    _checked(runner, ("systemctl", "start", unit), f"starting {unit}")
+    if states[unit]["active"]:
+        return
+    transaction.apply(
+        f"starting {unit}",
+        lambda unit=unit: _checked(runner, ("systemctl", "stop", unit), f"stopping {unit}"),
+    )
+
+
+def _restore_value(prop: str, recorded: dict) -> str:
+    """The single argument that puts one property back the way it was.
+
+    An address list is joined with commas, which is the separator nmcli's own
+    property parser accepts, and an ignore-auto-dns is the `yes` or `no` that was
+    recorded. Nothing else is ever written: a value this function did not get from
+    the backup is a value nothing read, and the whole point of recording before
+    mutating is that no restore has to guess.
+    """
+    value = recorded[prop]["value"]
+    return ",".join(value) if isinstance(value, list) else value
+
+
+def _apply_nm(
+    runner: CommandRunner, transaction: Transaction, connection: Connection, document: dict
+) -> None:
+    """Make the three property changes, each with its own recorded undo.
+
+    The UUID is a separate argument throughout, and never the connection's name:
+    `GENERAL.CONNECTION` holds a profile's name, a name is not a UUID, and a modify
+    aimed at a name is a modify aimed at the wrong thing with no error.
+
+    Each undo is pushed immediately after its own mutation succeeded, so a failure
+    halfway through the three leaves exactly the ones that happened on the stack
+    and nothing else.
+    """
+    recorded = document["original"]
+    for prop, value in NM_MUTATIONS:
+        _checked(
+            runner,
+            ("nmcli", "connection", "modify", connection.uuid, prop, value),
+            f"setting {prop} to {value} on {connection.uuid}",
+        )
+        put_back = _restore_value(prop, recorded)
+        transaction.apply(
+            f"setting {prop} to {value} on {connection.uuid}",
+            lambda prop=prop, put_back=put_back: _checked(
+                runner,
+                ("nmcli", "connection", "modify", connection.uuid, prop, put_back),
+                f"putting {prop} back to {put_back!r} on {connection.uuid}",
+            ),
+        )
+
+
+def _reconnect(runner: CommandRunner, transaction: Transaction, connection: Connection) -> None:
+    """Reactivate the one connection, and record that the undo is to reactivate it.
+
+    Reactivating this connection is the design; reloading or restarting
+    NetworkManager would take every other connection on the machine with it,
+    including a VPN and a second uplink, so nothing here does that.
+
+    The undo is the same command, and that is not a placeholder. The properties
+    above are written to the connection's *profile*, and a profile change reaches
+    the live device only when the connection is brought up again -- so a rollback
+    that restored the properties and stopped here would leave a machine whose
+    NetworkManager was still handing resolved the loopback address, with the
+    recorded values sitting unused on disk. Reactivating is what makes the restore
+    take effect, and it is idempotent, so a rollback reaches the same state whether
+    the reconnection succeeded or failed.
+    """
+    _checked(
+        runner,
+        ("nmcli", "connection", "up", connection.uuid),
+        f"reactivating {connection.uuid}",
+    )
+    transaction.apply(
+        f"reactivating {connection.uuid}",
+        lambda: _checked(
+            runner,
+            ("nmcli", "connection", "up", connection.uuid),
+            f"reactivating {connection.uuid} again to apply what was put back",
+        ),
+    )
+
+
+def _verify(runner: CommandRunner, ask, connection: Connection) -> None:
+    """Check that the machine is really using the loopback, and that it answers.
+
+    Three questions, and each of them can fail the install. `resolvectl` has to
+    name the loopback for this device, which is the observable consequence of the
+    three properties and of nothing else; the router has to answer a real query
+    again, in case it died between the health check and the reconnection; and
+    resolved's own stub has to answer, because a stub that has stopped speaking is
+    a machine with no resolver at all however correct the properties are.
+
+    This is the step that catches a NetworkManager which accepted the change and
+    did not apply it -- the failure mode a successful `nmcli` and a correct backup
+    both miss.
+    """
+    forwarding = _text(runner, ("resolvectl", "dns", connection.device))
+    if forwarding is None:
+        raise InstallRefused(
+            f"resolvectl could not be asked what {connection.device} is using for DNS; the "
+            "properties were set to use the loopback and nothing has confirmed that resolved took "
+            "them, so the transaction is being undone rather than claimed as installed"
+        )
+    if LOCAL_DNS not in forwarding.split():
+        raise InstallRefused(
+            f"resolvectl reports {connection.device} using {forwarding!r} rather than the loopback "
+            f"address {LOCAL_DNS}, so NetworkManager accepted the properties and did not apply "
+            "them; the transaction is being undone rather than leaving a machine that resolves "
+            "nothing"
+        )
+    if not ask(LOCAL_DNS, DNS_PORT):
+        raise InstallRefused(
+            f"the router answered no query at {LOCAL_DNS}:{DNS_PORT} after the reconnection, "
+            "though it answered before NetworkManager was pointed at it; the transaction is being "
+            "undone rather than leaving the machine's DNS pointing at a resolver that is not there"
+        )
+    if not ask(RESOLVED_STUB_ADDRESS, DNS_PORT):
+        raise InstallRefused(
+            f"systemd-resolved's stub at {RESOLVED_STUB_ADDRESS}:{DNS_PORT} answered no query "
+            "after the reconnection, so /etc/resolv.conf points at something that is not "
+            "answering; the transaction is being undone"
+        )
+
+
+def _undo_marker(path: Path, previous: Optional[str]) -> None:
+    """Put the ownership marker back the way it was, byte for byte.
+
+    A marker that was not there is removed, and one that was is written back
+    exactly, because on a re-install the marker that was there belongs to a router
+    that is still installed and still running.
+    """
+    if previous is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+    else:
+        path.write_text(previous, encoding="utf-8")
+        path.chmod(MARKER_MODE)
+
+
+def _commit_marker(root: Path, transaction: Transaction) -> None:
+    """Write the ownership marker, last, and record what has to happen if it cannot stay.
+
+    The marker is the claim an uninstall reads to decide whether the DNS on this
+    machine is this package's to change back, so it is written after the health check
+    and after the verification, and an install that failed anywhere above leaves
+    none. A machine with this package's DNS on it and no marker is a machine an
+    uninstall will refuse to restore automatically, which is the correct answer and
+    the reason the write is the last step rather than an early one.
+
+    The marker that was already there is read first and put back byte for byte if
+    anything later fails, so a failed re-install cannot make a later uninstall refuse
+    to restore a machine it should have restored.
+    """
+    path = root / MANAGED_BY.lstrip("/")
+    previous: Optional[str] = None
+    if _path_state(path) == "a regular file":
+        previous = _read_text(path, "the existing ownership marker")
+    try:
+        path.write_text(MANAGED_BY_VALUE + "\n", encoding="utf-8")
+        path.chmod(MARKER_MODE)
+    except OSError as error:
+        raise InstallRefused(
+            f"{MANAGED_BY} could not be written ({error}); the marker is what tells an uninstall "
+            "that the DNS on this machine is this package's, so an install that cannot record that "
+            "is being undone rather than claimed as installed"
+        ) from error
+    transaction.apply(f"writing {MANAGED_BY}", lambda: _undo_marker(path, previous))
+
+
+def _run_transaction(
+    root: Path,
+    runner: CommandRunner,
+    connection: Connection,
+    ask,
+    transaction: Transaction,
+    now,
+    deadline_seconds: float,
+    poll_seconds: float,
+    notes: List[str],
+) -> None:
+    """Every step, in the only order this program runs them in.
+
+    The numbered order at the head of this section is the design; this function is
+    that order written out, and the barrier comment below is the one line of it
+    that a future edit must not move.
+    """
+    _capture_dhcp(runner, connection.device)
+    document = prepare_backup(root, runner, connection, now)
+    path = write_backup(root, document)
+    validate_backup(root, document)
+    transaction.backup = str(path)
+
+    states = _unit_states(runner)
+    for unit in OWNED_UNITS:
+        _enable(runner, transaction, unit, states)
+
+    for unit, port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT)):
+        _start(runner, transaction, unit, states)
+        if not wait_for_dns(LOCAL_DNS, port, ask, deadline_seconds, poll_seconds):
+            raise InstallRefused(
+                f"{unit} was started but nothing answered a DNS query at {LOCAL_DNS}:{port} within "
+                f"{deadline_seconds:g}s, so the machine has no local resolver to point "
+                "NetworkManager at; nothing has been pointed at anything and the transaction is "
+                "being undone"
+            )
+
+    # The barrier. Everything above is reversible by stopping two units; the three
+    # properties below are the ones that can leave a machine with no resolver at all,
+    # and they are not touched until a real query has come back from the machine's own
+    # resolver.
+    if not ask(LOCAL_DNS, DNS_PORT):
+        raise InstallRefused(
+            f"the router answered no query at {LOCAL_DNS}:{DNS_PORT} and this install will not "
+            "point a working machine at a resolver it has not seen answer; nothing has been changed "
+            "on the machine's connection"
+        )
+
+    _apply_nm(runner, transaction, connection, document)
+    _reconnect(runner, transaction, connection)
+    _verify(runner, ask, connection)
+    _commit_marker(root, transaction)
+    notes.append(
+        f"{connection.name} ({connection.device}, {connection.uuid}) now uses the loopback address "
+        f"{LOCAL_DNS}; the original settings are recorded in {BACKUP_PATH}"
+    )
+
+
+def install(
+    root: Path,
+    run: CommandRunner,
+    clock=None,
+    probe=None,
+    deadline_seconds: float = WAIT_DEADLINE_SECONDS,
+    poll_seconds: float = WAIT_POLL_SECONDS,
+) -> InstallResult:
+    """Take this machine's DNS over, transactionally, and report what happened.
+
+    ``root`` is the filesystem to read and write, which is the real ``/`` in
+    production and a temporary directory in a test; ``run`` is the only way this
+    module reaches a command, exactly as in :func:`preflight`; ``clock`` is the time
+    the backup is stamped with.
+
+    ``probe`` and the two intervals are the second seam, and they exist because a
+    socket is the one thing an injected runner cannot stand in for. The default is
+    the real prober, and the transaction's tests pass a scripted one -- so a test
+    never opens a socket to the machine's own resolver ports, and a test that wanted
+    the real thing would have to ask for it by name.
+
+    Nothing here raises. The result carries the failure and the rollback failure as
+    two separate fields, because "the install did not finish" and "the machine is not
+    as it was found" are two different facts, and an operator deciding whether to
+    reach for the backup needs both.
+    """
+    root = Path(root)
+    now = clock or _utcnow
+    ask = probe or (lambda address, port: probe_dns(address, port))
+    notes: List[str] = []
+
+    report = preflight(root, run)
+    if not report.ok:
+        return InstallResult(
+            ok=False,
+            backup=None,
+            report=report,
+            notes=list(report.notes()),
+            error="preflight refused this machine, so nothing was captured, backed up or changed: "
+            + "; ".join(report.problems()),
+            rollback_error=None,
+        )
+    notes.extend(report.notes())
+    connection = report.connection
+    if connection is None:  # pragma: no cover - a passing preflight always sets it
+        return InstallResult(
+            ok=False,
+            backup=None,
+            report=report,
+            notes=notes,
+            error="preflight accepted this machine without naming a connection, so there is "
+            "nothing to back up and nothing to change",
+            rollback_error=None,
+        )
+
+    transaction = Transaction()
+    try:
+        _run_transaction(
+            root, run, connection, ask, transaction, now, deadline_seconds, poll_seconds, notes
+        )
+    except InstallRefused as error:
+        failures = transaction.rollback()
+        return InstallResult(
+            ok=False,
+            backup=transaction.backup,
+            report=report,
+            notes=notes,
+            error=str(error),
+            rollback_error="; ".join(failures) if failures else None,
+        )
+    except Exception as error:  # noqa: BLE001 - see below
+        # A step that fails in a way this program did not predict -- a bug here, a
+        # runner that raises something exotic, a filesystem that answers in an
+        # unforeseen way -- is rolled back exactly like a predicted one. That is
+        # the whole reason this catch is broad: the alternative is a traceback out
+        # of a transaction that has already pointed a machine's DNS at a
+        # loopback address, which is the single worst outcome available here, and
+        # the exit status of an uncaught exception is the same 1 a refusal uses,
+        # so a script would read a half-applied install as a clean refusal.
+        failures = transaction.rollback()
+        return InstallResult(
+            ok=False,
+            backup=transaction.backup,
+            report=report,
+            notes=notes,
+            error=f"the install failed in a way this program does not recognise, which is a bug "
+            f"in it: {type(error).__name__}: {error}",
+            rollback_error="; ".join(failures) if failures else None,
+        )
+    return InstallResult(
+        ok=True,
+        backup=transaction.backup,
+        report=report,
+        notes=notes,
+        error=None,
+        rollback_error=None,
+    )
+
+
+# The exit statuses the command boundary uses. They are the CLI's own: 0 is a machine
+# this can install onto, 1 is one it cannot, and 2 is a usage error.
+#
+# 3 and 4 are the two halves of a failed install, and they are separate statuses
+# because an operator's next action differs. After 3 the machine is as it was found
+# and the install can simply be repeated. After 4 it is not: something this package
+# changed is still in place, no marker claims it, and the backup is the only record
+# of what the connection was set to -- so that is a manual recovery, and a script
+# that cannot tell the two apart will report "the install failed" about a machine
+# that has lost its resolver.
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
+EXIT_INSTALL_FAILED = 3
+EXIT_ROLLBACK_FAILED = 4
 
 
 def _usage() -> str:
-    return "usage: mosdns_installer.py preflight [--check-only]"
+    return (
+        "usage: mosdns_installer.py preflight [--check-only]\n"
+        "       mosdns_installer.py install\n"
+    )
 
 
-def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = Path("/")) -> int:
-    """Run ``preflight`` and report what it found.
-
-    ``--check-only`` is the only mode and it is not a flag in disguise: it names
-    what the command does, which is check and nothing else. A later mode that
-    provisions would be a different verb rather than a flag on this one, because
-    the distinction between reporting a problem and fixing it is the distinction
-    this program exists to keep.
-
-    ``run`` and ``root`` are the same two seams :func:`preflight` has, and they are
-    named in the other order here: :func:`preflight` takes ``(root, run)`` and this
-    takes ``(argv, run, root)``, so ``root`` is passed along positionally by name
-    rather than by position. A command whose root could not be pointed elsewhere
-    could only be tested against the machine it ran on, and a test here that read
-    the host's NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the
-    host wearing a test's name.
-    """
-    arguments = list(argv)
-    if not arguments or arguments[0] != "preflight":
-        sys.stderr.write(f"{_usage()}\n")
-        return EXIT_USAGE
-    if arguments[1:] not in ([], ["--check-only"]):
-        sys.stderr.write(f"{_usage()}\n")
-        return EXIT_USAGE
-    report = preflight(root, run or RealCommandRunner())
+def _run_preflight(root: Path, run: CommandRunner) -> int:
+    report = preflight(root, run)
     for note in report.notes():
         sys.stdout.write(f"note: {note}\n")
     for problem in report.problems():
@@ -1493,5 +2653,76 @@ def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = 
     return EXIT_OK
 
 
-if __name__ == "__main__":  # pragma: no cover - the process boundary
-    raise SystemExit(main(sys.argv[1:]))
+def _connection_hint(result: InstallResult) -> str:
+    """Which connection the install was working on, for a message about a failure."""
+    if result.report is None or result.report.connection is None:
+        return "the connection"
+    return result.report.connection.uuid
+
+
+def _run_install(root: Path, run: CommandRunner) -> int:
+    result = install(root, run)
+    for note in result.notes:
+        sys.stdout.write(f"note: {note}\n")
+    if result.ok:
+        sys.stdout.write(
+            f"install: {DNS_PORT} and {RESOLVER_PORT} are served on loopback and NetworkManager has "
+            f"been pointed at {LOCAL_DNS}; the ownership marker at {MANAGED_BY} has been written, so "
+            "an uninstall will restore exactly what was changed\n"
+        )
+        return EXIT_OK
+    if result.report is not None and not result.report.ok:
+        for problem in result.report.problems():
+            sys.stderr.write(f"preflight: {problem}\n")
+        sys.stderr.write(f"install: {result.error}\n")
+        return EXIT_REFUSED
+    sys.stderr.write(f"install: {result.error}\n")
+    if result.rollback_error:
+        sys.stderr.write(
+            "install: the rollback did not finish, so these changes are still applied on this "
+            f"machine: {result.rollback_error}\n"
+        )
+        sys.stderr.write(
+            f"install: {result.backup or BACKUP_PATH} records what connection "
+            f"{_connection_hint(result)} was set to before this run, and {MANAGED_BY} was NOT "
+            "written, so an uninstall will refuse to restore automatically and this machine needs "
+            "the manual recovery report\n"
+        )
+        return EXIT_ROLLBACK_FAILED
+    sys.stderr.write(
+        f"install: every change this run made has been rolled back, and {result.backup or BACKUP_PATH} "
+        "records what the connection was set to; nothing is different about this machine now\n"
+    )
+    return EXIT_INSTALL_FAILED
+
+
+def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = Path("/")) -> int:
+    """Run ``preflight`` to report, or ``install`` to take the machine's DNS over.
+
+    Two verbs rather than one verb and a flag, because the difference between
+    reporting a problem and changing the machine is the difference this program
+    exists to keep, and a flag is the kind of thing a script passes because it read
+    it somewhere else. ``preflight`` changes nothing by construction; ``install``
+    changes a machine's DNS and puts it back if anything goes wrong.
+
+    ``--check-only`` is accepted for ``preflight`` and is not a flag in disguise: it
+    names the only mode that verb has.
+
+    ``run`` and ``root`` are the same two seams :func:`preflight` and :func:`install`
+    have, and they are named in the other order here: :func:`preflight` takes
+    ``(root, run)`` and this takes ``(argv, run, root)``, so ``root`` is passed along
+    positionally by name rather than by position. A command whose root could not be
+    pointed elsewhere could only be tested against the machine it ran on, and a test
+    here that read the host's NetworkManager, ports and ``/etc/resolv.conf`` would be
+    a test of the host wearing a test's name.
+    """
+    arguments = list(argv)
+    if arguments[:1] == ["preflight"]:
+        if arguments[1:] not in ([], ["--check-only"]):
+            sys.stderr.write(f"{_usage()}\n")
+            return EXIT_USAGE
+        return _run_preflight(root, run or RealCommandRunner())
+    if arguments == ["install"]:
+        return _run_install(root, run or RealCommandRunner())
+    sys.stderr.write(f"{_usage()}\n")
+    return EXIT_USAGE
