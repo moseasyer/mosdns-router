@@ -1606,6 +1606,30 @@ IGNORED_AUTOMATICALLY = (IPV4_IGNORE_AUTO_DNS, IPV6_IGNORE_AUTO_DNS)
 ADDRESS_LISTS = (IPV4_DNS, IPV6_DNS)
 RECORDED_PROPERTIES = IGNORED_AUTOMATICALLY + ADDRESS_LISTS
 
+# The command that publishes the Cloudflare prefix list, on the installed binary
+# and with every path at its default, which is what makes it the production one.
+#
+# It is here and not merely noted because the router cannot start without it. The
+# response rewriter builds its prefix watcher before anything else and returns the
+# error, so a plugin with no published ranges never constructs -- which means
+# `systemctl start mosdns-router` binds nothing on port 53, the wait for the
+# resolver port burns its whole deadline, and the install rolls itself back. A
+# router that cannot start is not a state an install may leave a machine waiting
+# in, and the producer of the list is not a later task: `update-lists
+# --refresh-ranges` exists, it measures nothing, it spends no bandwidth budget,
+# and its own flag description calls it the mode an installation runs before the
+# router starts. The other two modes are the wrong carriers: `--check` documents
+# that it writes nothing and cannot publish a missing prefix list, and
+# `--pin-remote` re-pins the China list.
+#
+# It is run unconditionally, and it is run with no origin named, because a
+# publisher that decided for itself whether to run would be a second thing that can
+# be wrong: it would have to re-derive the cache envelope's validity, and an origin
+# that is unreachable is exactly the case where the cached envelope is the answer.
+# Left to the publisher, the same array republishes from the cache with no network
+# at all.
+PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--refresh-ranges")
+
 # The two units this transaction owns, in the order it enables them. The router
 # is enabled as well as started: a machine whose NetworkManager points DNS at the
 # loopback and whose router is not enabled comes back from a reboot with no
@@ -1619,12 +1643,38 @@ OWNED_UNITS = (RESOLVER_UNIT, ROUTER_UNIT)
 # running is a smaller and reversible one.
 NOT_ACTIVE = ("inactive", "failed")
 NOT_ENABLED = ("disabled", "not-found")
+# The two keys of a unit's recorded state, named for the same reason the two
+# tuples above are: they are looked up in a mapping this module builds, and a
+# misspelled key there is a question that never gets asked.
+UNIT_ACTIVE = "active"
+UNIT_ENABLED = "enabled"
 
-# The name the probes ask for. `.invalid` is reserved by RFC 6761, so a resolver
-# that is answering has to say something -- NXDOMAIN or SERVFAIL, both of which
-# are a response from a listening socket -- without the probe depending on any
-# public name being reachable, and without the install leaking a lookup.
-INSTALL_PROBE_NAME = "install-probe.invalid"
+# The name the probes ask for, and the measurement that chose it.
+#
+# It has to be under a TLD RFC 6761 reserves, so no public name is needed and no
+# lookup can leak. It must NOT be `.invalid`: measured against real
+# systemd-resolved 24.04 with an unreachable upstream configured, a question for a
+# name under `.invalid` is answered IMMEDIATELY with a bare NXDOMAIN carrying no
+# records at all -- 28 bytes, which is a header and the question and nothing else
+# -- while a question for a name under `.test` is forwarded and comes back as
+# silence. So a dead chain synthesises a definitive denial for `.invalid`, and any
+# check that accepts a denial passes a machine that cannot resolve anything. That
+# is not a theoretical worry about a predicate: it is the predicate the first
+# version of this check had.
+#
+# `.test` is forwarded, so a dead chain is silent, which the wait already reads as
+# a failure. It is also reserved, so a chain that works answers NXDOMAIN (nothing
+# delegates `.test`) and the barrier accepts it -- which is the other half, because
+# a check that rejected every healthy machine would be a check that makes the
+# install impossible. No component of this project short-circuits a reserved TLD,
+# so mosdns-router and dnscrypt-proxy forward it like any other name.
+#
+# UNVERIFIED, and it is the one thing this choice rests on: whether a systemd
+# resolved on 22.04 or 26.04 forwards `.test` the way 24.04 does. A resolved that
+# synthesised `.test` too would pass a dead chain again. Closing that needs a
+# per-release measurement, and the failure is a check that accepts a machine that
+# cannot resolve -- so the residual is recorded rather than designed away.
+INSTALL_PROBE_NAME = "install-probe.test"
 PROBE_TIMEOUT_SECONDS = 2.0
 # How long a unit gets to start answering. It fails the install rather than
 # hanging, because a resolver that is not up is exactly the state this
@@ -1639,11 +1689,18 @@ WAIT_POLL_SECONDS = 0.25
 DNS_HEADER_LENGTH = 12
 DNS_RECURSION_DESIRED = 0x0100
 DNS_RESPONSE_BIT = 0x8000
+DNS_RESPONSE_CODE_MASK = 0x000F
 DNS_QUESTION_COUNT = 1
 DNS_TYPE_A = 1
 DNS_CLASS_IN = 1
 DNS_LABEL_LIMIT = 63
 DNS_NAME_LIMIT = 255
+# The only two response codes that mean a resolver reached somebody and was told
+# the answer. A SERVFAIL or a REFUSED means it did not, and silence means the same
+# thing more slowly.
+DNS_RCODE_NO_ERROR = 0
+DNS_RCODE_NAME_ERROR = 3
+RESOLVING_RCODES = (DNS_RCODE_NO_ERROR, DNS_RCODE_NAME_ERROR)
 
 
 class InstallRefused(Exception):
@@ -1657,13 +1714,26 @@ class InstallRefused(Exception):
 
 
 class InstallResult(NamedTuple):
-    """What the transaction did, and what it could not put back.
+    """What the transaction did, what it could not put back, and what a person owes.
 
     ``error`` and ``rollback_error`` are separate because they are separate facts
     about a machine: the first says the install did not finish, and the second
     says whether the machine is now as it was found. A script -- or an operator --
     has to be able to tell those apart without reading prose, so ``main`` gives
     them different exit statuses.
+
+    ``recovery`` is the third fact, and it is the one only a person can act on. A
+    rollback that failed at the reactivation leaves the profile carrying its
+    recorded values and the device not reactivated, so the machine's DNS may not
+    be in use; a rollback that failed at a property restore leaves the connection
+    handing resolved the loopback address. Those are different states of the
+    machine with different single actions, and collapsing them into "the rollback
+    did not finish" is how an operator ends up rebooting a machine that needed one
+    `nmcli connection up`.
+
+    ``left_running`` names the units this run started and then declined to stop,
+    because their prior state could not be read. It is what keeps the exit-3
+    message from claiming a machine is unchanged when it is not.
     """
 
     ok: bool
@@ -1672,6 +1742,8 @@ class InstallResult(NamedTuple):
     notes: List[str]
     error: Optional[str]
     rollback_error: Optional[str]
+    recovery: Optional[str]
+    left_running: List[str]
 
 
 class AppliedStep(NamedTuple):
@@ -1687,13 +1759,42 @@ class AppliedStep(NamedTuple):
     undo: Callable[[], None]
 
 
-class Transaction:
-    """The applied mutations, and the restoration of them in reverse order.
+class RollbackFailure(NamedTuple):
+    """One undo that did not run, and which kind of step it belonged to.
 
-    A stack rather than a list of completed things, because the order is the
-    point: the last change made is the first one taken back, and a restoration in
-    any other order would try to reapply a value the step above it is in the
-    middle of removing.
+    The group is carried rather than left in prose because the three kinds leave
+    the machine in three different states, and the operator's next action differs
+    for each. ``main`` keys its message off it.
+    """
+
+    group: str
+    description: str
+    error: str
+
+
+class Transaction:
+    """The applied mutations, and the restoration of them in the order that works.
+
+    Three groups, each undone newest-first, taken back in this order:
+
+      1. the connection's profile,
+      2. the reactivation,
+      3. the units.
+
+    Groups 1 and 3 are the reverse of the order they were applied in, and group 2
+    is the whole reason there are three groups rather than one stack. A profile
+    change reaches the live device only when the connection is brought up again,
+    so a rollback that reactivated FIRST would hand the device the values it is in
+    the middle of removing -- both `ignore-auto-dns` set and the loopback address
+    -- and would then write the recorded values to the profile, where nothing reads
+    them again. The machine would come out of a failed install with no resolver in
+    use and a correct profile on disk, and the profile being correct is exactly
+    what makes that state hard to notice. So the reactivation is a group of its
+    own, between the profile and the units: restore the values, let the device pick
+    them up, and only then take the resolver away.
+
+    A plain reverse-order stack cannot express that, and a stack that tries ends up
+    with this order by accident and looks right until a failure proves otherwise.
 
     A failure in one undo does not stop the others. Every failure is collected and
     the transaction reports all of them, because stopping at the first would leave
@@ -1702,23 +1803,49 @@ class Transaction:
     first.
     """
 
+    # The three groups, named because the recovery message keys off them.
+    PROFILE = "the connection profile"
+    REACTIVATING = "the reactivation"
+    UNITS = "the units"
+
     def __init__(self) -> None:
-        self._steps: List[AppliedStep] = []
+        self._groups: dict = {self.PROFILE: [], self.REACTIVATING: [], self.UNITS: []}
         self.backup: Optional[str] = None
+        # Units this run started and then declined to stop, because their prior
+        # state could not be read. Reported so the exit-3 message can except them.
+        self.uncertain_units: List[str] = []
 
-    def apply(self, description: str, undo) -> None:
-        """Record a mutation that has already happened, and how to take it back."""
-        self._steps.append(AppliedStep(description, undo))
+    def apply_profile(self, description: str, undo) -> None:
+        """Record a change to the connection's own properties."""
+        self._groups[self.PROFILE].append(AppliedStep(description, undo))
 
-    def rollback(self) -> List[str]:
-        """Undo every applied step, newest first, and report what would not undo."""
+    def apply_reactivating(self, description: str, undo) -> None:
+        """Record the reactivation, whose undo runs after every profile restore."""
+        self._groups[self.REACTIVATING].append(AppliedStep(description, undo))
+
+    def apply_unit(self, description: str, undo) -> None:
+        """Record a change to a unit, undone after the profile and the reactivation."""
+        self._groups[self.UNITS].append(AppliedStep(description, undo))
+
+    def note_uncertain_unit(self, unit: str) -> None:
+        """Record that ``unit``'s prior state could not be read.
+
+        The unit is therefore left as the rollback found it, whatever the rollback
+        did to it, and the caller has to be able to say so rather than claim the
+        machine is unchanged.
+        """
+        self.uncertain_units.append(unit)
+
+    def rollback(self) -> List[RollbackFailure]:
+        """Undo every applied step, group by group, and report what would not undo."""
         failures = []
-        for step in reversed(self._steps):
-            try:
-                step.undo()
-            except Exception as error:  # noqa: BLE001 - see this method's docstring
-                failures.append(f"{step.description} could not be undone: {error}")
-        self._steps = []
+        for group in (self.PROFILE, self.REACTIVATING, self.UNITS):
+            for step in reversed(self._groups[group]):
+                try:
+                    step.undo()
+                except Exception as error:  # noqa: BLE001 - see this method's docstring
+                    failures.append(RollbackFailure(group, step.description, str(error)))
+            self._groups[group] = []
         return failures
 
 
@@ -1756,15 +1883,35 @@ def build_dns_query(name: str, identifier: int) -> bytes:
     return header + question + DNS_TYPE_A.to_bytes(2, "big") + DNS_CLASS_IN.to_bytes(2, "big")
 
 
+class Answer(NamedTuple):
+    """What one DNS question found, as the two questions the transaction asks.
+
+    ``answered`` is "is something listening on that port and speaking DNS", and
+    ``resolves`` is "did that something reach a resolver and get an answer". One
+    question produces both, because a second question would double the wait's
+    deadline and ask a second question of a machine that is already in trouble.
+
+    They are separate because they come apart in exactly the case this check
+    exists for. A resolver whose upstream is unreachable answers SERVFAIL: it has
+    answered, and it has not resolved. Reading that as "up" is how a transaction
+    points a machine at a chain that cannot resolve anything.
+    """
+
+    answered: bool
+    resolves: bool
+
+
 def response_is_an_answer(datagram: bytes, identifier: int) -> bool:
     """Whether ``datagram`` is a DNS response to the question ``identifier`` asked.
 
     Three facts, and no more: it is long enough to hold a header, its transaction
     id is the one this program chose, and its QR bit says it is a response rather
-    than a query. The response code is deliberately NOT checked -- NXDOMAIN and
-    SERVFAIL are both answers from a socket that is listening and speaking DNS,
-    which is the fact being waited for, and a resolver that refuses a reserved
-    name is a working resolver.
+    than a query. The response code is deliberately not looked at, because this is
+    the question the two WAITS ask -- is a socket listening and speaking DNS -- and
+    any answer at all proves that, including the SERVFAIL a resolver sends while
+    its own upstream is still coming up. The question the BARRIER asks is
+    :func:`response_resolves`, and it gets a different answer from the same
+    datagram.
 
     A datagram from something that is not a resolver at all -- a proxy answering
     on the same port, say -- has the QR bit clear, so it does not pass.
@@ -1776,39 +1923,67 @@ def response_is_an_answer(datagram: bytes, identifier: int) -> bool:
     return bool(int.from_bytes(datagram[2:4], "big") & DNS_RESPONSE_BIT)
 
 
+def response_resolves(datagram: bytes, identifier: int) -> bool:
+    """Whether ``datagram`` is an answer a resolver that reached somebody gives.
+
+    :func:`response_is_an_answer` plus the response code, and the code is the whole
+    of the difference. NOERROR and NXDOMAIN both mean the resolver got an answer:
+    one is an answer with a name in it, the other is an answer that the name does
+    not exist, and for a name under a TLD nothing delegates the second is what a
+    working chain says. SERVFAIL and REFUSED mean the resolver did not get one --
+    the former is what this project's own tests hand a rewriter when an upstream
+    is unreachable, and the latter is a resolver declining rather than failing.
+
+    A bare NXDOMAIN with no records is still accepted, and that is deliberate: a
+    synthesised denial and a real one are the same twelve bytes of header and
+    nothing else, and telling them apart would mean requiring records a healthy
+    resolver may strip. The measurement that makes this safe is not on the rcode
+    but on the NAME -- see :data:`INSTALL_PROBE_NAME`, where the reason a dead
+    chain cannot synthesise a denial is that this build asks a TLD resolved
+    forwards rather than one it answers itself.
+    """
+    if not response_is_an_answer(datagram, identifier):
+        return False
+    flags = int.from_bytes(datagram[2:4], "big")
+    return (flags & DNS_RESPONSE_CODE_MASK) in RESOLVING_RCODES
+
+
 def probe_dns(
     address: str,
     port: int,
     timeout: float = PROBE_TIMEOUT_SECONDS,
     name: str = INSTALL_PROBE_NAME,
-) -> bool:
-    """Ask ``address:port`` one question and report whether anything answered.
+) -> Answer:
+    """Ask ``address:port`` one question and report both answers it gave.
 
     This is the one place in the installer that opens a socket, and it opens a UDP
     socket to a loopback address and sends a few dozen bytes. It binds nothing:
     the machine's resolver ports belong to the resolver, and a probe that took one
     of them to find out whether it was free would be the thing it was measuring.
 
-    Every failure is a `False` rather than an exception. "Nothing answered" is the
-    answer this function exists to give, and a caller that had to tell a refused
-    socket from a silent one could only do it by reading the error, which is a
-    worse contract than the fact.
+    Every failure is an all-`False` :class:`Answer` rather than an exception.
+    "Nothing answered" is an answer this function exists to give, and a caller that
+    had to tell a refused socket from a silent one could only do it by reading the
+    error, which is a worse contract than the fact.
     """
     identifier = 0x4D4F
     query = build_dns_query(name, identifier)
     try:
         connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     except OSError:
-        return False
+        return Answer(answered=False, resolves=False)
     try:
         connection.settimeout(timeout)
         connection.sendto(query, (address, port))
         datagram, _ = connection.recvfrom(4096)
     except OSError:
-        return False
+        return Answer(answered=False, resolves=False)
     finally:
         connection.close()
-    return response_is_an_answer(datagram, identifier)
+    return Answer(
+        answered=response_is_an_answer(datagram, identifier),
+        resolves=response_resolves(datagram, identifier),
+    )
 
 
 def wait_for_dns(address: str, port: int, probe, deadline_seconds: float, poll_seconds: float) -> bool:
@@ -1820,13 +1995,19 @@ def wait_for_dns(address: str, port: int, probe, deadline_seconds: float, poll_s
     router took four seconds to bind; polling a real question is the only way to
     know a resolver is up rather than merely scheduled.
 
+    The question asked here is the LISTENING one -- any answer at all -- and not
+    the resolving one, because a resolver that is up and whose upstream is still
+    coming up answers SERVFAIL and a wait that rejected that would fail a machine
+    that is about to work. Whether the chain resolves is the barrier's question,
+    and it is asked after both units are up.
+
     The deadline is what keeps a broken machine from hanging the install, and it is
     reported as a failure rather than a warning: the next step would point the
     machine at an address nothing is answering on.
     """
     deadline = time.monotonic() + deadline_seconds
     while True:
-        if probe(address, port):
+        if probe(address, port).answered:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -2095,7 +2276,52 @@ def _dhcp_state(root: Path) -> dict:
         ) from error
     if not isinstance(document, dict):
         raise InstallRefused(f"{path} is not a JSON object; nothing has been changed")
+    _check_dhcp_document(path, document)
     return document
+
+
+def _check_dhcp_document(path: Path, document: dict) -> None:
+    """Refuse a state whose resolvers or generation are not what the publisher writes.
+
+    This is the one place the transaction reads a document written by ANOTHER
+    program, and every other such document in this repository is refused rather
+    than parsed loosely. Without the check a state whose `upstreams` is the string
+    "192.0.2.53" is copied into the backup by `list()` as nine characters, and the
+    backup then names a resolvers list of one character at a time -- which is worse
+    than no backup, because it is one an operator cannot tell is wrong.
+
+    The generation has to be a whole number for the same reason in miniature: it is
+    the other half of what identifies this state, and a string in it means the file
+    is not the document the bridge's publisher writes.
+    """
+    if "upstreams" not in document:
+        raise InstallRefused(
+            f"{path} names no `upstreams`, which every state the bridge's publisher writes carries; "
+            "nothing has been changed"
+        )
+    upstreams = document["upstreams"]
+    if not isinstance(upstreams, list):
+        raise InstallRefused(
+            f"{path} has `upstreams` as a {type(upstreams).__name__}, not a list of addresses; "
+            f"{upstreams!r} would be copied into the backup one element at a time, and a backup "
+            "naming a resolvers list of characters is one an operator cannot tell is wrong. Nothing "
+            "has been changed"
+        )
+    for upstream in upstreams:
+        try:
+            ipaddress.ip_address(str(upstream))
+        except ValueError as error:
+            raise InstallRefused(
+                f"{path} lists {upstream!r} among its resolvers, which is not an IP address "
+                f"({error}); the backup records the resolvers this machine is following, and it "
+                "cannot record one it cannot recognise. Nothing has been changed"
+            ) from error
+    generation = document.get("generation")
+    if generation is not None and (type(generation) is not int or generation < 0):
+        raise InstallRefused(
+            f"{path} has a generation of {generation!r}, which is not a whole number of "
+            "generations; nothing has been changed"
+        )
 
 
 def prepare_backup(root: Path, runner: CommandRunner, connection: Connection, now) -> dict:
@@ -2256,35 +2482,68 @@ def _unit_states(runner: CommandRunner) -> dict:
     because a rollback that stops or disables a unit somebody else was running is
     the harm this rule exists to prevent, and leaving one running is a smaller,
     reversible, reportable one.
+
+    Returns the states and the units whose active state could not be read at all.
+    The second is not a detail: such a unit is one this run may start and then
+    decline to stop, and a caller that then claims the machine is unchanged has to
+    except it by name rather than assert the opposite.
     """
     states = {}
+    unreadable = []
     for unit in OWNED_UNITS:
-        active = _answer(runner, ("systemctl", "is-active", unit))
-        enabled = _answer(runner, ("systemctl", "is-enabled", unit))
+        # A blank answer is unreadable as well as a missing one, and for the same
+        # reason: `is-active` on a unit that does not exist prints nothing at all,
+        # so "" and "the call failed" are one fact -- this program cannot say --
+        # and both have to become "was already running".
+        active = _text(runner, ("systemctl", "is-active", unit))
+        enabled = _text(runner, ("systemctl", "is-enabled", unit))
+        if not active:
+            unreadable.append(unit)
         states[unit] = {
-            "active": active is None or active not in NOT_ACTIVE,
-            "enabled": enabled is None or enabled not in NOT_ENABLED,
+            UNIT_ACTIVE: active is None or active not in NOT_ACTIVE,
+            UNIT_ENABLED: enabled is None or enabled not in NOT_ENABLED,
         }
-    return states
+    return states, unreadable
 
 
 def _enable(runner: CommandRunner, transaction: Transaction, unit: str, states: dict) -> None:
     """Enable a unit, and record how to take that back if this was not its state."""
     _checked(runner, ("systemctl", "enable", unit), f"enabling {unit}")
-    if states[unit]["enabled"]:
+    if states[unit][UNIT_ENABLED]:
         return
-    transaction.apply(
+    transaction.apply_unit(
         f"enabling {unit}",
         lambda unit=unit: _checked(runner, ("systemctl", "disable", unit), f"disabling {unit}"),
     )
 
 
-def _start(runner: CommandRunner, transaction: Transaction, unit: str, states: dict) -> None:
-    """Start a unit, and record how to take that back if it was not running."""
+def _start(
+    runner: CommandRunner,
+    transaction: Transaction,
+    unit: str,
+    states: dict,
+    unreadable: Sequence[str],
+) -> None:
+    """Start a unit, and record how to take that back if it was not running.
+
+    A unit whose prior state could not be read is NOT given a stop, and the
+    transaction is told, because the stop is the one undo that would act on a unit
+    this install may not own. Leaving it running is recorded rather than hidden, so
+    the report can name the unit it left as it found it instead of claiming the
+    machine is unchanged.
+    """
     _checked(runner, ("systemctl", "start", unit), f"starting {unit}")
-    if states[unit]["active"]:
+    # The unreadable case is asked FIRST, because an unreadable state reads as
+    # "was already running" and the early return below would swallow it: the
+    # transaction would push no stop, correctly, and record nothing, so the
+    # report would claim a machine is unchanged while a unit this run started is
+    # still running.
+    if unit in unreadable:
+        transaction.note_uncertain_unit(unit)
         return
-    transaction.apply(
+    if states[unit][UNIT_ACTIVE]:
+        return
+    transaction.apply_unit(
         f"starting {unit}",
         lambda unit=unit: _checked(runner, ("systemctl", "stop", unit), f"stopping {unit}"),
     )
@@ -2324,7 +2583,7 @@ def _apply_nm(
             f"setting {prop} to {value} on {connection.uuid}",
         )
         put_back = _restore_value(prop, recorded)
-        transaction.apply(
+        transaction.apply_profile(
             f"setting {prop} to {value} on {connection.uuid}",
             lambda prop=prop, put_back=put_back: _checked(
                 runner,
@@ -2355,7 +2614,7 @@ def _reconnect(runner: CommandRunner, transaction: Transaction, connection: Conn
         ("nmcli", "connection", "up", connection.uuid),
         f"reactivating {connection.uuid}",
     )
-    transaction.apply(
+    transaction.apply_reactivating(
         f"reactivating {connection.uuid}",
         lambda: _checked(
             runner,
@@ -2393,17 +2652,18 @@ def _verify(runner: CommandRunner, ask, connection: Connection) -> None:
             "them; the transaction is being undone rather than leaving a machine that resolves "
             "nothing"
         )
-    if not ask(LOCAL_DNS, DNS_PORT):
+    if not ask(LOCAL_DNS, DNS_PORT).resolves:
         raise InstallRefused(
-            f"the router answered no query at {LOCAL_DNS}:{DNS_PORT} after the reconnection, "
-            "though it answered before NetworkManager was pointed at it; the transaction is being "
-            "undone rather than leaving the machine's DNS pointing at a resolver that is not there"
+            f"the router did not resolve {INSTALL_PROBE_NAME} at {LOCAL_DNS}:{DNS_PORT} after the "
+            "reconnection, though it resolved before NetworkManager was pointed at it; the "
+            "transaction is being undone rather than leaving the machine's DNS pointing at a chain "
+            "that cannot resolve"
         )
-    if not ask(RESOLVED_STUB_ADDRESS, DNS_PORT):
+    if not ask(RESOLVED_STUB_ADDRESS, DNS_PORT).resolves:
         raise InstallRefused(
-            f"systemd-resolved's stub at {RESOLVED_STUB_ADDRESS}:{DNS_PORT} answered no query "
-            "after the reconnection, so /etc/resolv.conf points at something that is not "
-            "answering; the transaction is being undone"
+            f"systemd-resolved's stub at {RESOLVED_STUB_ADDRESS}:{DNS_PORT} did not resolve "
+            f"{INSTALL_PROBE_NAME} after the reconnection, so /etc/resolv.conf points at a chain "
+            "that cannot resolve; the transaction is being undone"
         )
 
 
@@ -2451,7 +2711,7 @@ def _commit_marker(root: Path, transaction: Transaction) -> None:
             "that the DNS on this machine is this package's, so an install that cannot record that "
             "is being undone rather than claimed as installed"
         ) from error
-    transaction.apply(f"writing {MANAGED_BY}", lambda: _undo_marker(path, previous))
+    transaction.apply_unit(f"writing {MANAGED_BY}", lambda: _undo_marker(path, previous))
 
 
 def _run_transaction(
@@ -2477,12 +2737,28 @@ def _run_transaction(
     validate_backup(root, document)
     transaction.backup = str(path)
 
-    states = _unit_states(runner)
+    states, unreadable = _unit_states(runner)
     for unit in OWNED_UNITS:
         _enable(runner, transaction, unit, states)
 
+    # Between the enables and the first start, which is where the ledger put it and
+    # where it has to be: the router is the unit that refuses to start without the
+    # list, so publishing it after the router has been started would be too late to
+    # matter. A non-zero status is a refusal and never a warning, because there is
+    # no later moment at which anything else will publish it: the nightly timer is
+    # hours away, and the install is the only moment at which nothing has.
+    #
+    # No undo is registered. Republishing an already-published list is idempotent,
+    # and a rollback that un-published it would leave a router that will not start,
+    # which is a worse state than the list it was published from.
+    _checked(
+        runner,
+        PUBLISH_PREFIXES,
+        "publishing the Cloudflare prefix list, which the router refuses to start without",
+    )
+
     for unit, port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT)):
-        _start(runner, transaction, unit, states)
+        _start(runner, transaction, unit, states, unreadable)
         if not wait_for_dns(LOCAL_DNS, port, ask, deadline_seconds, poll_seconds):
             raise InstallRefused(
                 f"{unit} was started but nothing answered a DNS query at {LOCAL_DNS}:{port} within "
@@ -2494,12 +2770,16 @@ def _run_transaction(
     # The barrier. Everything above is reversible by stopping two units; the three
     # properties below are the ones that can leave a machine with no resolver at all,
     # and they are not touched until a real query has come back from the machine's own
-    # resolver.
-    if not ask(LOCAL_DNS, DNS_PORT):
+    # resolver AND that query came back resolved rather than as a SERVFAIL from a
+    # chain whose upstream is unreachable. The second half is what the waits cannot
+    # do: a SERVFAIL is an answer, and reading it as proof the machine can resolve
+    # is how this check would hand a machine to a chain that cannot.
+    if not ask(LOCAL_DNS, DNS_PORT).resolves:
         raise InstallRefused(
-            f"the router answered no query at {LOCAL_DNS}:{DNS_PORT} and this install will not "
-            "point a working machine at a resolver it has not seen answer; nothing has been changed "
-            "on the machine's connection"
+            f"the router answered at {LOCAL_DNS}:{DNS_PORT} but did not resolve "
+            f"{INSTALL_PROBE_NAME} -- a SERVFAIL, a REFUSED or silence all mean the chain cannot "
+            "reach a resolver, and this install will not point a working machine at a chain it has "
+            "seen fail; nothing has been changed on the machine's connection"
         )
 
     _apply_nm(runner, transaction, connection, document)
@@ -2553,6 +2833,8 @@ def install(
             error="preflight refused this machine, so nothing was captured, backed up or changed: "
             + "; ".join(report.problems()),
             rollback_error=None,
+            recovery=None,
+            left_running=[],
         )
     notes.extend(report.notes())
     connection = report.connection
@@ -2565,6 +2847,8 @@ def install(
             error="preflight accepted this machine without naming a connection, so there is "
             "nothing to back up and nothing to change",
             rollback_error=None,
+            recovery=None,
+            left_running=[],
         )
 
     transaction = Transaction()
@@ -2574,14 +2858,7 @@ def install(
         )
     except InstallRefused as error:
         failures = transaction.rollback()
-        return InstallResult(
-            ok=False,
-            backup=transaction.backup,
-            report=report,
-            notes=notes,
-            error=str(error),
-            rollback_error="; ".join(failures) if failures else None,
-        )
+        return _failed(transaction, report, notes, str(error), failures)
     except Exception as error:  # noqa: BLE001 - see below
         # A step that fails in a way this program did not predict -- a bug here, a
         # runner that raises something exotic, a filesystem that answers in an
@@ -2592,14 +2869,13 @@ def install(
         # the exit status of an uncaught exception is the same 1 a refusal uses,
         # so a script would read a half-applied install as a clean refusal.
         failures = transaction.rollback()
-        return InstallResult(
-            ok=False,
-            backup=transaction.backup,
-            report=report,
-            notes=notes,
-            error=f"the install failed in a way this program does not recognise, which is a bug "
-            f"in it: {type(error).__name__}: {error}",
-            rollback_error="; ".join(failures) if failures else None,
+        return _failed(
+            transaction,
+            report,
+            notes,
+            f"the install failed in a way this program does not recognise, which is a bug in it: "
+            f"{type(error).__name__}: {error}",
+            failures,
         )
     return InstallResult(
         ok=True,
@@ -2608,7 +2884,65 @@ def install(
         notes=notes,
         error=None,
         rollback_error=None,
+        recovery=None,
+        left_running=[],
     )
+
+
+def _failed(transaction: Transaction, report: Preflight, notes: List[str], error: str, failures) -> InstallResult:
+    """The result of an install that did not finish, with what a person still owes.
+
+    ``recovery`` is built from WHICH group of undo failed, because the three leave
+    the machine in three different states:
+
+      * the reactivation -- every value on disk is back to what it was, and the
+        device simply never picked them up, so the machine's DNS may not be in use
+        and one ``nmcli connection up`` finishes it;
+      * the profile -- the connection is still handing resolved the loopback
+        address, and the recorded values have to be written back by hand before the
+        reactivation means anything;
+      * the units -- a unit this run started is still running, and one
+        ``systemctl stop`` finishes it.
+    """
+    groups = {failure.group for failure in failures}
+    steps = []
+    uuid = connection_of(report)
+    if Transaction.PROFILE in groups:
+        steps.append(
+            f"{Transaction.PROFILE} was not put back, so the connection may still be handing "
+            f"resolved the loopback address {LOCAL_DNS}; {BACKUP_PATH} lists the values it had"
+        )
+    if Transaction.REACTIVATING in groups:
+        steps.append(
+            f"the recorded values are back on the profile of {uuid} but the connection was never "
+            f"reactivated, so the machine's DNS may not be in use; `nmcli connection up {uuid}`, or "
+            "a reboot, is what finishes it"
+        )
+    if Transaction.UNITS in groups:
+        steps.append(
+            f"a unit this run started is still running, and `systemctl stop <unit>` stops it"
+        )
+    return InstallResult(
+        ok=False,
+        backup=transaction.backup,
+        report=report,
+        notes=notes,
+        error=error,
+        rollback_error="; ".join(
+            f"{failure.description} could not be undone: {failure.error}" for failure in failures
+        )
+        if failures
+        else None,
+        recovery=" ".join(steps) if steps else None,
+        left_running=list(transaction.uncertain_units),
+    )
+
+
+def connection_of(report: Optional[Preflight]) -> str:
+    """The connection the install was working on, for a message about its state."""
+    if report is None or report.connection is None:
+        return "the connection"
+    return report.connection.uuid
 
 
 # The exit statuses the command boundary uses. They are the CLI's own: 0 is a machine
@@ -2653,13 +2987,6 @@ def _run_preflight(root: Path, run: CommandRunner) -> int:
     return EXIT_OK
 
 
-def _connection_hint(result: InstallResult) -> str:
-    """Which connection the install was working on, for a message about a failure."""
-    if result.report is None or result.report.connection is None:
-        return "the connection"
-    return result.report.connection.uuid
-
-
 def _run_install(root: Path, run: CommandRunner) -> int:
     result = install(root, run)
     for note in result.notes:
@@ -2682,16 +3009,34 @@ def _run_install(root: Path, run: CommandRunner) -> int:
             "install: the rollback did not finish, so these changes are still applied on this "
             f"machine: {result.rollback_error}\n"
         )
+        if result.recovery:
+            sys.stderr.write(f"install: what is left is this: {result.recovery}\n")
         sys.stderr.write(
             f"install: {result.backup or BACKUP_PATH} records what connection "
-            f"{_connection_hint(result)} was set to before this run, and {MANAGED_BY} was NOT "
+            f"{connection_of(result.report)} was set to before this run, and {MANAGED_BY} was NOT "
             "written, so an uninstall will refuse to restore automatically and this machine needs "
             "the manual recovery report\n"
         )
         return EXIT_ROLLBACK_FAILED
+    # "Nothing is different" is a claim, and there is one case where this module
+    # makes it deliberately false: a unit whose prior state could not be read is
+    # started and then left running, because stopping somebody else's unit is the
+    # harm the rollback rule exists to prevent. So the claim is qualified by name
+    # rather than made unconditionally, which would be the kind of sentence an
+    # operator stops reading after the first time it was wrong.
+    exception = ""
+    if result.left_running:
+        exception = (
+            " except "
+            + " and ".join(result.left_running)
+            + ", which this run started and then left as it found them, because it could not "
+            "read whether they were already running and will not stop a unit it did not know to "
+            "own"
+        )
     sys.stderr.write(
-        f"install: every change this run made has been rolled back, and {result.backup or BACKUP_PATH} "
-        "records what the connection was set to; nothing is different about this machine now\n"
+        f"install: every change this run made has been rolled back, and "
+        f"{result.backup or BACKUP_PATH} records what the connection was set to; nothing else is "
+        f"different about this machine{exception}\n"
     )
     return EXIT_INSTALL_FAILED
 

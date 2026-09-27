@@ -168,6 +168,50 @@ PROJECT_UNITS = (
     "mosdns-cdn-health.timer",
     "mosdns-list-check.timer",
 )
+# The command that publishes the Cloudflare prefix list, which the response
+# rewriter refuses to CONSTRUCT without (plugin/executable/cdn_rewrite calls
+# newPrefixList first and returns the error). It is `mosdns-cdnctl update-lists
+# --refresh-ranges` on the installed binary, with every path at its default, and
+# it measures nothing and spends no bandwidth budget -- its own help text calls it
+# "the mode an installation runs before the router starts".
+CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
+PUBLISH_PREFIXES = (CDNCTL, "update-lists", "--refresh-ranges")
+
+# The names a scripted probe can report, which is what a real resolver's answer
+# looks like to the prober. "healthy" is what a working chain returns for a
+# reserved name; the other three are the three ways a chain that cannot resolve
+# answers instead -- an immediate synthesised denial, an explicit failure, and
+# silence. Measured against real systemd-resolved; see the report.
+SERVFAIL = "servfail"
+REFUSED = "refused"
+SILENT = "silent"
+HEALTHY = "healthy"
+
+# The prober's answer, as the two questions the transaction asks of it. The
+# answering is spelled out here rather than read from the module -- a fixture that
+# asked the module what its own answer is would agree with it whatever it did --
+# but the type is the module's, because the prober's return type IS the interface
+# a scripted probe has to stand in for.
+def answer(answered, resolves):
+    return installer.Answer(answered=answered, resolves=resolves)
+
+
+ANSWER_SHAPES = {
+    HEALTHY: answer(True, True),
+    SERVFAIL: answer(True, False),
+    REFUSED: answer(True, False),
+    SILENT: answer(False, False),
+}
+# RFC 6761 reserves these for testing and documentation, so a resolver is
+# expected to answer a name under one of them without any public delegation. The
+# set is restated here because the probe name's being under it is a property
+# this suite holds, not one it reads.
+RESERVED_TLDS = ("test", "example", "invalid", "localhost", "local")
+# The name the transaction probes with, restated from the measurement that chose
+# it: `.invalid` is answered by systemd-resolved without being forwarded, so it
+# cannot tell a working chain from a dead one.
+INSTALL_PROBE_NAME = "install-probe.test"
+
 NMCLI_CONNECTIONS = ("nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active")
 NMCLI_DEVICE_UUID = ("nmcli", "-g", "GENERAL.CON-UUID", "device", "show", DEVICE)
 SS_LISTENERS = ("ss", "-H", "-lntup")
@@ -242,6 +286,29 @@ def capture_command(interface=DEVICE):
     )
 
 
+def responder(answer):
+    """A one-packet UDP server on 127.0.0.1:0, answering ``answer``.
+
+    Port 0, so the suite can never collide with a resolver and can never be
+    mistaken for one; the address is loopback, so nothing leaves the machine.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    server.settimeout(0.5)
+
+    def serve():
+        try:
+            query, peer = server.recvfrom(4096)
+            if answer is not None:
+                server.sendto(answer(query), peer)
+        except (socket.timeout, OSError):
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return server, server.getsockname()[1], thread
+
+
 class FakeRunner:
     """A CommandRunner that records argument arrays and answers prepared ones.
 
@@ -259,13 +326,21 @@ class FakeRunner:
 
     ``child_environment`` is read at call time, which is what lets a test see the
     environment the scrubbed command would actually hand its child.
+
+    ``fail_after`` is how a command is failed only on its SECOND run. The
+    transaction's reactivation and the rollback's reactivation are the same
+    argument array, so a case that needs the first to succeed and the second to
+    fail cannot say so by naming a command; it says how many times the command may
+    succeed first, which is a fact about the machine rather than about the array.
     """
 
-    def __init__(self, outputs=None, returncodes=None, stderr="", fail=(), child_environment=None, record=None):
+    def __init__(self, outputs=None, returncodes=None, stderr="", fail=(), fail_after=None, child_environment=None, record=None):
         self.outputs = {tuple(key): value for key, value in (outputs or {}).items()}
         self.returncodes = {tuple(key): value for key, value in (returncodes or {}).items()}
         self.stderr = stderr
         self.fail = {tuple(command) for command in fail}
+        self.fail_after = {tuple(key): value for key, value in (fail_after or {}).items()}
+        self.succeeded = {}
         self.child_environment = child_environment
         self.record = record
         self.calls = []
@@ -284,6 +359,10 @@ class FakeRunner:
             self.child_environment(command)
         if command in self.fail:
             raise subprocess.CalledProcessError(1, list(command), "", "injected failure")
+        allowed = self.fail_after.get(command)
+        if allowed is not None and self.succeeded.get(command, 0) >= allowed:
+            raise subprocess.CalledProcessError(1, list(command), "", "injected failure")
+        self.succeeded[command] = self.succeeded.get(command, 0) + 1
         code = self.returncodes.get(command, 0)
         if code != 0 and check:
             raise subprocess.CalledProcessError(code, list(command), "", self.stderr)
@@ -397,9 +476,16 @@ class TransactionFixture(unittest.TestCase):
     # command that undoes each. Written out here so a test can compute the tail a
     # failure must be followed by, rather than only checking that "a stop
     # happened" -- which a rollback that also re-ran a mutation would satisfy.
+    # The mutating steps in the order they are applied, and the command that undoes
+    # each. The three property changes come first, then the reactivation, then the
+    # units: that is the order a rollback has to take them back in, and it is NOT
+    # the reverse of this list. The reactivation has to happen after the profile
+    # carries its recorded values again and before the units are stopped, so this
+    # is a table with two orders in it and both of them are the contract.
     STEPS = (
         ("systemctl", "enable", RESOLVER_UNIT),
         ("systemctl", "enable", ROUTER_UNIT),
+        PUBLISH_PREFIXES,
         ("systemctl", "start", RESOLVER_UNIT),
         ("systemctl", "start", ROUTER_UNIT),
         MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"),
@@ -417,6 +503,24 @@ class TransactionFixture(unittest.TestCase):
         MODIFY + (UUID, "ipv4.dns", LOCAL_DNS): MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM),
         CONNECTION_UP + (UUID,): CONNECTION_UP + (UUID,),
     }
+    # Which group each step's undo belongs to, which is what decides when it runs.
+    PROFILE_STEPS = (
+        MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"),
+        MODIFY + (UUID, "ipv6.ignore-auto-dns", "yes"),
+        MODIFY + (UUID, "ipv4.dns", LOCAL_DNS),
+    )
+    REACTIVATING_STEP = CONNECTION_UP + (UUID,)
+    # In APPLICATION order, like STEPS, because expected_rollback reverses each
+    # group: newest first within a group. So the unit group's rollback is
+    # stop-router, stop-resolver, disable-router, disable-resolver -- the stops
+    # before the disables, and the two units in the reverse of how they were
+    # started.
+    UNIT_STEPS = (
+        ("systemctl", "enable", RESOLVER_UNIT),
+        ("systemctl", "enable", ROUTER_UNIT),
+        ("systemctl", "start", RESOLVER_UNIT),
+        ("systemctl", "start", ROUTER_UNIT),
+    )
 
     @property
     def commands(self):
@@ -455,11 +559,12 @@ class TransactionFixture(unittest.TestCase):
     def expected_rollback(self, failing):
         """The commands a failure at ``failing`` must be followed by, in order.
 
-        Every step the transaction completed before the failing one, undone in the
-        reverse of the order it was applied -- and nothing else at all. Asserting
+        The three groups, each undone newest first, in the order the design
+        requires: the profile, then the reactivation, then the units. Asserting
         the whole tail rather than "an undo for each completed step ran" is what
-        catches a rollback that also repeats a mutation it never reached, which a
-        membership check waves through.
+        catches a rollback that repeats a mutation it never reached, and writing
+        the reactivation into its own group is what catches a rollback that
+        reactivates the device while the profile is still wrong.
         """
         reached = self.commands.index(failing)
         done = [
@@ -467,9 +572,13 @@ class TransactionFixture(unittest.TestCase):
             for command in self.STEPS
             if command in self.commands and self.commands.index(command) < reached
         ]
-        return [self.undo_of(command) for command in reversed(done)]
+        tail = []
+        for group in (self.PROFILE_STEPS, (self.REACTIVATING_STEP,), self.UNIT_STEPS):
+            completed = [command for command in group if command in done]
+            tail += [self.undo_of(command) for command in reversed(completed)]
+        return tail
 
-    def good_runner(self, outputs=None, returncodes=None, fail=(), child_environment=None):
+    def good_runner(self, outputs=None, returncodes=None, fail=(), fail_after=None, child_environment=None):
         """A runner answering exactly what an installable machine answers."""
         answers = {
             ("dpkg", "--print-architecture"): "amd64\n",
@@ -519,6 +628,7 @@ class TransactionFixture(unittest.TestCase):
             outputs=answers,
             returncodes=codes,
             fail=fail or self.failing,
+            fail_after=fail_after,
             child_environment=child_environment or self.record_child,
             record=lambda command: self.events.append(("run", command)),
         )
@@ -535,14 +645,23 @@ class TransactionFixture(unittest.TestCase):
     def probe_for(self, answers=None):
         """A DNS probe that answers from a script and records what it was asked.
 
-        ``answers`` maps ``(address, port)`` to a bool or a callable, so a case
-        can make the resolver answer on the first poll, on the third, or never.
+        ``answers`` maps ``(address, port)`` to one of the four answer shapes a
+        resolver can have -- ``HEALTHY`` (a working chain's denial for a reserved
+        name), ``SERVFAIL``, ``REFUSED`` or ``SILENT`` -- or to a callable, so a
+        case can make a resolver answer on the first poll, on the third, or never.
+
+        The shapes are the whole of the two questions the transaction asks, and
+        they are separate on purpose: "is something listening and speaking DNS" and
+        "does this chain resolve" have different answers on a machine whose
+        upstream is unreachable, and a single predicate cannot serve both.
         """
 
         def probe(address, port):
             self.events.append(("probe", address, port))
-            answer = (answers or {}).get((address, port), True)
-            return answer() if callable(answer) else answer
+            answer = (answers or {}).get((address, port), HEALTHY)
+            if callable(answer):
+                answer = answer()
+            return ANSWER_SHAPES[answer]
 
         return probe
 
@@ -608,6 +727,7 @@ class TransactionFixture(unittest.TestCase):
             ("systemctl", "is-enabled", ROUTER_UNIT),
             ("systemctl", "enable", RESOLVER_UNIT),
             ("systemctl", "enable", ROUTER_UNIT),
+            PUBLISH_PREFIXES,
             ("systemctl", "start", RESOLVER_UNIT),
             ("systemctl", "start", ROUTER_UNIT),
         ]
@@ -1180,6 +1300,43 @@ class BackupTests(TransactionFixture):
         self.assertFalse(self.rooted(BACKUP_PATH).exists())
         self.assertNothingChanged("the transaction changed the machine with no configuration digest")
 
+    def test_a_dhcp_state_that_is_not_a_state_document_is_refused(self):
+        # Everywhere else this module refuses a document it cannot parse, and this
+        # one was the exception: a JSON object of any shape was accepted and copied
+        # with defaults, so a state whose `upstreams` is the STRING "192.0.2.53"
+        # produced a backup listing every character of it as a resolver. A backup
+        # that names a resolvers list of one character at a time is worse than no
+        # backup, because it is one an operator cannot tell is wrong.
+        for name, document, because in (
+            ("upstreams as a string", {"upstreams": "192.0.2.53"}, "a resolvers list of characters"),
+            ("upstreams as a mapping", {"upstreams": {"0": "192.0.2.53"}}, "a resolvers list of keys"),
+            ("upstreams with a non-address", {"upstreams": ["resolver.example"]}, "a hostname where an address belongs"),
+            ("generation as a string", {"generation": "1"}, "a generation that is not a number"),
+            ("generation as a float", {"generation": 1.5}, "a generation that is not a whole number"),
+            ("upstreams missing", {}, "no resolvers field at all when the publisher writes one"),
+        ):
+            with self.subTest(because=because):
+                self.setUp()
+                path = self.rooted(DHCP_STATE_FILE)
+                complete = json.loads(path.read_text(encoding="utf-8"))
+                complete.update(document)
+                if "upstreams" not in document and "upstreams" in complete:
+                    del complete["upstreams"]
+                path.write_text(json.dumps(complete), encoding="utf-8")
+                result = self.run_install()
+                self.assertFalse(result.ok, f"a state with {because} was accepted")
+                self.assertIn(DHCP_STATE_FILE, result.error or "")
+                self.assertNothingChanged(f"the transaction read {because} into a backup")
+
+    def test_an_empty_resolver_list_is_still_a_state_document(self):
+        # The publisher writes `upstreams: []` for a lease that named no resolver
+        # and that is a legitimate state, not a missing field.
+        self.dhcp_state(upstreams=())
+        self.install_succeeds()
+        document = json.loads(self.rooted(BACKUP_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(document["dhcp"]["upstreams"], [])
+        self.assertEqual(document["dhcp"]["source"], "dhcp4")
+
     def test_a_package_version_it_cannot_read_aborts_before_anything_is_mutated(self):
         result = self.run_install(
             outputs={PACKAGE_VERSION_COMMAND: ""}, returncodes={PACKAGE_VERSION_COMMAND: 1}
@@ -1197,6 +1354,242 @@ class BackupTests(TransactionFixture):
         self.assertFalse(result.ok)
         self.assertIn(DHCP_STATE_FILE, result.error or "")
         self.assertNothingChanged("the transaction changed the machine with no lease recorded")
+
+
+class PrefixListTests(TransactionFixture):
+    """The router cannot start without a published prefix list, so it is published.
+
+    The response rewriter calls ``newPrefixList`` before anything else and
+    returns the error, so a plugin with no published Cloudflare ranges never
+    constructs -- which means ``systemctl start mosdns-router`` binds nothing on
+    port 53, the wait for the resolver port burns its whole deadline, and the
+    install rolls itself back. A router that cannot start is not a state an
+    install may leave a machine waiting in, and the producer of the list
+    (``mosdns-cdnctl update-lists --refresh-ranges``, which measures nothing and
+    spends no bandwidth budget) already exists and documents itself as the
+    install-time mode.
+    """
+
+    def test_the_prefix_list_is_published_between_the_enables_and_the_first_start(self):
+        self.install_succeeds()
+        self.assertIn(PUBLISH_PREFIXES, self.commands)
+        enables = [
+            index
+            for index, command in enumerate(self.commands)
+            if command[:2] == ("systemctl", "enable")
+        ]
+        starts = [index for index, command in enumerate(self.commands) if command[:2] == ("systemctl", "start")]
+        published = self.commands.index(PUBLISH_PREFIXES)
+        self.assertEqual(len(enables), 2, "both units are enabled before the list is published")
+        self.assertEqual(len(starts), 2)
+        self.assertLess(max(enables), published, "the list was published before a unit was enabled")
+        self.assertLess(published, min(starts), "a unit was started before the list was published")
+
+    def test_the_publisher_is_the_mode_that_publishes_and_takes_no_measurement(self):
+        # `--check` writes nothing and cannot publish; `--pin-remote` re-pins the
+        # China list, which an install must not do. `--refresh-ranges` is the only
+        # one of the three that publishes the prefix list, and its own flag
+        # description calls it the mode an installation runs before the router
+        # starts. The array is pinned whole, so a mode that measures, or one that
+        # touches the China list, cannot be substituted for it quietly.
+        self.install_succeeds()
+        published = self.commands[self.commands.index(PUBLISH_PREFIXES)]
+        self.assertEqual(published[0], CDNCTL)
+        self.assertEqual(published[1:], ("update-lists", "--refresh-ranges"))
+        for wrong in ("test", "pin-remote", "measure", "apply"):
+            self.assertNotIn(wrong, published[2:], f"{wrong!r} is a mode that may not be substituted here")
+
+    def test_a_prefix_list_that_cannot_be_published_refuses_the_install(self):
+        # Never a warning, and never "the optimizer's timer will get there". The
+        # install is the only moment at which nothing else has published the list,
+        # and the router cannot start without it, so continuing would mean waiting
+        # out a 60-second deadline and rolling back having learned nothing.
+        result = self.run_install(fail=[PUBLISH_PREFIXES])
+        self.assertFalse(result.ok, "a prefix list that could not be published was not a refusal")
+        self.assertIn("prefix", (result.error or "").lower())
+        self.assertIsNone(result.rollback_error, "the rollback of that refusal did not complete")
+        self.assertFalse(self.rooted(MANAGED_BY).exists(), "the marker was written after a refused publish")
+        # Nothing NetworkManager-facing ever ran, and neither unit was started.
+        for command in self.commands:
+            self.assertNotIn(command[:2], (MODIFY[:2], CONNECTION_UP[:2]), f"{command!r} ran")
+            self.assertNotEqual(command[:2], ("systemctl", "start"), f"{command!r} ran")
+        # Both units were enabled and are put back; neither was started, so there
+        # is nothing to stop and a stop would be the transaction acting on a unit
+        # it never reached.
+        self.assertEqual(
+            self.commands[self.commands.index(PUBLISH_PREFIXES) + 1 :],
+            [
+                ("systemctl", "disable", ROUTER_UNIT),
+                ("systemctl", "disable", RESOLVER_UNIT),
+            ],
+        )
+
+    def test_the_list_is_published_the_same_way_with_and_without_a_cached_envelope(self):
+        # A machine with a valid cached envelope must still be sent through the
+        # publisher, because a publisher that decides for itself whether to run
+        # is a publisher whose decision is a second thing that can be wrong: it
+        # would have to re-derive the cache's validity, and an origin that is
+        # unreachable is exactly when the cached envelope is the answer. So the
+        # command is the same array either way, and it names no origin at all.
+        self.install_succeeds()
+        published = self.commands[self.commands.index(PUBLISH_PREFIXES)]
+        self.setUp()
+        self.write(
+            "/var/lib/mosdns/lists/cloudflare-ips.json",
+            json.dumps({"schema_version": 1, "url": "https://example.invalid/ranges", "prefixes": []}),
+            mode=0o644,
+        )
+        self.install_succeeds()
+        self.assertEqual(
+            self.commands[self.commands.index(PUBLISH_PREFIXES)],
+            published,
+            "the command differs when a cached envelope is present, so the decision to publish is "
+            "the installer's rather than the publisher's",
+        )
+        for word in ("--ranges-url", "--ranges-cache", "http://", "https://"):
+            self.assertNotIn(word, " ".join(published), f"{word!r} in the command would make the publish reach the network on its own terms")
+
+    def test_no_undo_is_registered_for_the_publication(self):
+        # Republishing an already-published list is idempotent, and a rollback
+        # that un-published it would leave a router that will not start -- which is
+        # worse than the list it was published from. So the step has no undo, and
+        # the tail after a failure at the FIRST start is the units only.
+        self.run_install(fail=[CONNECTION_UP + (UUID,)])
+        tail = self.commands[self.commands.index(CONNECTION_UP + (UUID,)) + 1 :]
+        self.assertIn(PUBLISH_PREFIXES, self.commands, "the publisher has to have run for this to mean anything")
+        self.assertNotIn(PUBLISH_PREFIXES, tail, "a rollback tried to un-publish the prefix list")
+        # And the units ARE put back, so the absence is the publisher's and not a
+        # rollback that stopped working.
+        self.assertIn(("systemctl", "stop", ROUTER_UNIT), tail)
+        self.assertIn(("systemctl", "stop", RESOLVER_UNIT), tail)
+        self.assertIn(("systemctl", "disable", ROUTER_UNIT), tail)
+        self.assertIn(("systemctl", "disable", RESOLVER_UNIT), tail)
+
+
+class ResolvingChainTests(TransactionFixture):
+    """Two questions, and one predicate cannot answer both.
+
+    "Is something listening and speaking DNS" and "does this chain resolve" have
+    different answers on a machine whose upstream is unreachable, and the second
+    one is the question the barrier exists to ask. Measured against real
+    systemd-resolved 24.04 with an unreachable upstream configured: a request for
+    a name under ``.invalid`` is answered immediately with a bare NXDOMAIN that
+    carries no records at all, while a request for a name under ``.test`` is
+    forwarded and comes back as silence. A barrier that accepts any answer would
+    have passed that machine; a barrier that accepts NOERROR and NXDOMAIN but
+    probes ``.invalid`` still would.
+    """
+
+    def test_a_servfail_answers_the_wait_but_not_the_barrier(self):
+        result = self.run_install(probe=self.probe_for({(LOCAL_DNS, DNS_PORT): SERVFAIL}))
+        self.assertFalse(result.ok, "a resolver answering SERVFAIL passed the health check")
+        self.assertIn("SERVFAIL", (result.error or ""), "the refusal has to name what the resolver said")
+        for command in self.commands:
+            self.assertNotIn(
+                command[:2], (MODIFY[:2], CONNECTION_UP[:2]), f"{command!r} ran after a SERVFAIL chain"
+            )
+        self.assertFalse(self.rooted(MANAGED_BY).exists())
+
+    def test_a_refused_answers_the_wait_but_not_the_barrier(self):
+        result = self.run_install(probe=self.probe_for({(LOCAL_DNS, DNS_PORT): REFUSED}))
+        self.assertFalse(result.ok, "a resolver answering REFUSED passed the health check")
+        for command in self.commands:
+            self.assertNotIn(command[:2], (MODIFY[:2], CONNECTION_UP[:2]), f"{command!r} ran")
+
+    def test_a_denial_from_a_working_chain_passes_both(self):
+        # A reserved name has no delegation, so a chain that works answers
+        # NXDOMAIN. That is a resolver that resolved: it reached somebody who told
+        # it the name does not exist. The barrier must accept it, or the install
+        # would be impossible on every healthy machine.
+        self.install_succeeds(probe=self.probe_for({(LOCAL_DNS, DNS_PORT): HEALTHY}))
+
+    def test_a_silent_resolver_still_fails_the_waits(self):
+        # The waits are the rcode-agnostic half and must stay that way: a socket
+        # that is listening and speaking DNS is proved by any answer at all, and
+        # a resolver that is up but has not finished binding its own children is
+        # not a failure of the install.
+        for port in (RESOLVER_PORT, DNS_PORT):
+            with self.subTest(port=port):
+                self.setUp()
+                result = self.run_install(probe=self.probe_for({(LOCAL_DNS, port): SILENT}))
+                self.assertFalse(result.ok, f"nothing answered on {port} and the install proceeded")
+                self.assertIn(str(port), result.error or "")
+
+    def test_a_servfail_after_the_reconnection_fails_the_verification(self):
+        # The same question again at the end: resolved forwards to the router, and
+        # if the router has started answering SERVFAIL the machine is pointed at a
+        # chain that cannot resolve. The verification is the last chance to notice.
+        def answering_servfail_late(address, port):
+            self.events.append(("probe", address, port))
+            local = [event for event in self.events if event[:3] == ("probe", LOCAL_DNS, DNS_PORT)]
+            return answer(True, len(local) < 3)
+
+        result = self.run_install(probe=answering_servfail_late)
+        self.assertFalse(result.ok, "a chain that started SERVFAILING passed the verification")
+        self.assertIn(MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM), self.commands)
+        self.assertFalse(self.rooted(MANAGED_BY).exists())
+
+    def test_the_probe_name_is_one_a_resolver_forwards(self):
+        # The measured reason the name is not `.invalid`: systemd-resolved
+        # synthesises an immediate bare NXDOMAIN for it instead of forwarding, so
+        # a dead chain looks like a definitive denial. Every label must be under a
+        # TLD RFC 6761 reserves -- so no public name is needed and no lookup can
+        # leak -- and that TLD must not be the measured offender.
+        labels = INSTALL_PROBE_NAME.split(".")
+        self.assertNotIn("invalid", labels, "resolved answers .invalid without forwarding it; see the class docstring")
+        self.assertIn(labels[-1], RESERVED_TLDS, "the probe name must be under a reserved TLD, so no public lookup is needed")
+        for label in labels[:-1]:
+            self.assertTrue(label, "the probe name has an empty label")
+            self.assertLessEqual(len(label), 63)
+
+    def test_response_resolves_is_the_question_the_barrier_asks(self):
+        query = installer.build_dns_query(INSTALL_PROBE_NAME, 0x0042)
+        question = query[12:]
+
+        def reply(flags):
+            return query[:2] + flags.to_bytes(2, "big") + b"\x00\x01\x00\x00\x00\x00\x00\x00" + question
+
+        for flags, listening, resolving, why in (
+            (0x8180, True, True, "NOERROR"),
+            (0x8183, True, True, "NXDOMAIN"),
+            (0x8182, True, False, "SERVFAIL"),
+            (0x8185, True, False, "REFUSED"),
+            (0x8181, True, False, "FORMERR"),
+            (0x8184, True, False, "NOTIMP"),
+        ):
+            with self.subTest(why=why):
+                self.assertTrue(installer.response_is_an_answer(reply(flags), 0x0042), f"{why} is not an answer")
+                self.assertEqual(
+                    installer.response_resolves(reply(flags), 0x0042),
+                    resolving,
+                    f"{why} was read as {'resolving' if resolving else 'not resolving'}",
+                )
+        self.assertFalse(installer.response_is_an_answer(query, 0x0042), "a query is not an answer")
+        self.assertFalse(installer.response_resolves(query, 0x0042), "a query resolves nothing")
+        self.assertFalse(installer.response_resolves(reply(0x8183), 0x0043), "another question's denial")
+        self.assertFalse(installer.response_resolves(b"", 0x0042), "nothing at all")
+
+    def test_the_two_answers_come_from_one_query(self):
+        # One question, two facts, because a second query would double the
+        # deadline and ask a second question of a machine that is already in
+        # trouble. A resolver that answers SERVFAIL has answered; it has not
+        # resolved. Both come from the one datagram.
+        server, port, thread = responder(lambda query: query[:2] + b"\x81\x82" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + query[12:])
+        try:
+            answer = installer.probe_dns("127.0.0.1", port, timeout=2.0)
+            self.assertTrue(answer.answered, "a SERVFAIL is an answer")
+            self.assertFalse(answer.resolves, "a SERVFAIL does not resolve")
+        finally:
+            server.close()
+            thread.join(timeout=5)
+        server, port, thread = responder(lambda query: query[:2] + b"\x81\x83" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + query[12:])
+        try:
+            answer = installer.probe_dns("127.0.0.1", port, timeout=2.0)
+            self.assertTrue(answer.answered)
+            self.assertTrue(answer.resolves, "an NXDOMAIN from a working chain resolves")
+        finally:
+            server.close()
+            thread.join(timeout=5)
 
 
 class MarkerTests(TransactionFixture):
@@ -1319,6 +1712,7 @@ class FailureInjectionTests(TransactionFixture):
         return [
             ("systemctl", "enable", RESOLVER_UNIT),
             ("systemctl", "enable", ROUTER_UNIT),
+            PUBLISH_PREFIXES,
             ("systemctl", "start", RESOLVER_UNIT),
             ("systemctl", "start", ROUTER_UNIT),
             MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"),
@@ -1456,43 +1850,78 @@ class FailureInjectionTests(TransactionFixture):
                     UUID,
                 )
 
-    def test_the_rollback_runs_in_reverse_order(self):
-        self.run_install(fail=[CONNECTION_UP + (UUID,)])
-        order = [
-            command
-            for command in self.commands
-            if command in {
-                CONNECTION_UP + (UUID,),
-                MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM),
-                MODIFY + (UUID, "ipv6.ignore-auto-dns", "no"),
-                MODIFY + (UUID, "ipv4.ignore-auto-dns", "no"),
-                ("systemctl", "stop", ROUTER_UNIT),
-                ("systemctl", "stop", RESOLVER_UNIT),
-                ("systemctl", "disable", ROUTER_UNIT),
-                ("systemctl", "disable", RESOLVER_UNIT),
-            }
-        ]
+    def test_the_rollback_restores_the_profile_and_only_then_reactivates(self):
+        # The order that matters, spelled out. A rollback that reactivated the
+        # device FIRST would hand it the profile as it stands mid-restore -- both
+        # ignore-auto-dns set and the loopback address -- and would then write the
+        # recorded values to the profile, where the live device never reads them
+        # again. The machine would come out of a failed install with no resolver in
+        # use and a correct profile, which is the state this rollback exists to
+        # prevent, and the profile being correct is exactly what makes it hard to
+        # notice.
+        self.run_install(fail=[("resolvectl", "dns", DEVICE)])
+        reached = self.commands.index(("resolvectl", "dns", DEVICE))
+        tail = self.commands[reached + 1 :]
         self.assertEqual(
-            order,
+            tail,
             [
-                CONNECTION_UP + (UUID,),
                 MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM),
                 MODIFY + (UUID, "ipv6.ignore-auto-dns", "no"),
                 MODIFY + (UUID, "ipv4.ignore-auto-dns", "no"),
+                CONNECTION_UP + (UUID,),
                 ("systemctl", "stop", ROUTER_UNIT),
                 ("systemctl", "stop", RESOLVER_UNIT),
                 ("systemctl", "disable", ROUTER_UNIT),
                 ("systemctl", "disable", RESOLVER_UNIT),
             ],
-            "the rollback did not run in the reverse of the order it was applied in",
+            "the rollback put the machine in the order the design requires: profile, then "
+            "reactivation, then units",
         )
+
+    def test_the_reactivation_is_after_every_property_restore_at_every_injection_point(self):
+        # The property above is not a property of one failure. It has to hold
+        # wherever the rollback gets far enough to have a reactivation to order.
+        for failing in (MODIFY + (UUID, "ipv4.dns", LOCAL_DNS), CONNECTION_UP + (UUID,), ("resolvectl", "dns", DEVICE)):
+            with self.subTest(failing=failing):
+                self.setUp()
+                self.run_install(fail=[failing])
+                tail = self.commands[self.commands.index(failing) + 1 :]
+                restores = [command for command in tail if command[:3] == MODIFY]
+                reactivating = [index for index, command in enumerate(tail) if command == CONNECTION_UP + (UUID,)]
+                done = [command for command in self.STEPS if command in self.commands and self.commands.index(command) < self.commands.index(failing)]
+                if not restores:
+                    continue
+                if self.REACTIVATING_STEP not in done:
+                    # The reconnection was never reached, so there is nothing to
+                    # order; the property restores still have to be in order among
+                    # themselves.
+                    self.assertEqual(
+                        restores,
+                        [
+                            self.undo_of(step)
+                            for step in reversed(self.PROFILE_STEPS)
+                            if self.undo_of(step) in tail
+                        ],
+                    )
+                    continue
+                self.assertEqual(len(reactivating), 1, f"a failure at {failing!r} did not reactivation at all")
+                self.assertGreater(
+                    reactivating[0],
+                    len(restores) - 1,
+                    f"a failure at {failing!r} reactivated the device before the profile carried its "
+                    "recorded values again, so the device was handed the values being taken away",
+                )
+                stops = [index for index, command in enumerate(tail) if command[:2] == ("systemctl", "stop")]
+                if stops:
+                    self.assertGreater(reactivating[0], len(restores) - 1)
+                    self.assertLess(reactivating[0], min(stops), "a unit was stopped before the reactivation")
 
     def test_a_wait_that_never_answers_fails_the_install_rather_than_hanging(self):
         for port, unit in ((RESOLVER_PORT, RESOLVER_UNIT), (DNS_PORT, ROUTER_UNIT)):
             with self.subTest(port=port):
                 self.setUp()
                 result = self.run_install(
-                    probe=self.probe_for({("127.0.0.1", port): False}), deadline=0.0
+                    probe=self.probe_for({("127.0.0.1", port): SILENT}), deadline=0.0
                 )
                 self.assertFalse(result.ok, f"a resolver that never answered on {port} passed")
                 self.assertIn(str(port), result.error or "")
@@ -1510,7 +1939,8 @@ class FailureInjectionTests(TransactionFixture):
         def probe(address, port):
             self.events.append(("probe", address, port))
             queries.append((address, port))
-            return (address, port) != (LOCAL_DNS, DNS_PORT) or len(queries) == 1
+            listening = (address, port) != (LOCAL_DNS, DNS_PORT) or len(queries) == 1
+            return answer(listening, listening)
 
         result = self.run_install(probe=probe, deadline=0.0)
         self.assertFalse(result.ok, "a health check that never answered passed the install")
@@ -1526,7 +1956,8 @@ class FailureInjectionTests(TransactionFixture):
     def test_a_stub_that_stops_answering_fails_the_install_and_rolls_back(self):
         def probe(address, port):
             self.events.append(("probe", address, port))
-            return (address, port) != (RESOLVED_STUB, DNS_PORT)
+            listening = (address, port) != (RESOLVED_STUB, DNS_PORT)
+            return answer(listening, listening)
 
         result = self.run_install(probe=probe, deadline=0.0)
         self.assertFalse(result.ok)
@@ -1651,27 +2082,6 @@ class ProbeTests(unittest.TestCase):
     cannot be mistaken for one.
     """
 
-    @staticmethod
-    def responder(answer, ready=None, stop=None):
-        """A one-packet UDP server on 127.0.0.1:0, answering ``answer``."""
-        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        server.bind(("127.0.0.1", 0))
-        server.settimeout(0.5)
-
-        def serve():
-            try:
-                query, peer = server.recvfrom(4096)
-                if answer is not None:
-                    server.sendto(answer(query), peer)
-            except (socket.timeout, OSError):
-                pass
-
-        thread = threading.Thread(target=serve, daemon=True)
-        if ready is not None:
-            ready.set()
-        thread.start()
-        return server, server.getsockname()[1], thread
-
     def test_it_builds_a_well_formed_query(self):
         query = installer.build_dns_query("example.test", 0x1234)
         self.assertEqual(query[:2], b"\x12\x34", "the transaction id is not the one it chose")
@@ -1711,29 +2121,30 @@ class ProbeTests(unittest.TestCase):
         def answer(query):
             return query[:2] + b"\x81\x80" + b"\x00\x01\x00\x00\x00\x00\x00\x00" + query[12:]
 
-        server, port, thread = self.responder(answer)
+        server, port, thread = responder(answer)
         try:
-            self.assertTrue(
-                installer.probe_dns("127.0.0.1", port, timeout=2.0), "a DNS answer on the socket was not seen"
-            )
+            seen = installer.probe_dns("127.0.0.1", port, timeout=2.0)
+            self.assertTrue(seen.answered, "a DNS answer on the socket was not seen")
+            self.assertTrue(seen.resolves, "a NOERROR response does not resolve")
         finally:
             server.close()
             thread.join(timeout=5)
+        silent = installer.probe_dns("127.0.0.1", port, timeout=0.2)
         self.assertFalse(
-            installer.probe_dns("127.0.0.1", port, timeout=0.2),
+            silent.answered,
             "a closed port answered, so the prober would wait for a resolver that is not there",
         )
+        self.assertFalse(silent.resolves)
 
     def test_it_refuses_a_socket_that_answers_with_something_else(self):
         def answer(query):
             return b"HTTP/1.1 400 Bad Request\r\n\r\n"
 
-        server, port, thread = self.responder(answer)
+        server, port, thread = responder(answer)
         try:
-            self.assertFalse(
-                installer.probe_dns("127.0.0.1", port, timeout=2.0),
-                "something that is not DNS was accepted as a working resolver",
-            )
+            seen = installer.probe_dns("127.0.0.1", port, timeout=2.0)
+            self.assertFalse(seen.answered, "something that is not DNS was accepted as an answer")
+            self.assertFalse(seen.resolves, "and therefore not as a working resolver either")
         finally:
             server.close()
             thread.join(timeout=5)
@@ -1743,7 +2154,7 @@ class ProbeTests(unittest.TestCase):
 
         def late(address, port):
             attempts.append((address, port))
-            return len(attempts) >= 3
+            return answer(len(attempts) >= 3, len(attempts) >= 3)
 
         self.assertTrue(
             installer.wait_for_dns(LOCAL_DNS, DNS_PORT, late, 10.0, 0.0),
@@ -1753,7 +2164,13 @@ class ProbeTests(unittest.TestCase):
 
         attempts.clear()
         self.assertFalse(
-            installer.wait_for_dns(LOCAL_DNS, DNS_PORT, lambda a, p: attempts.append((a, p)) or False, 0.0, 0.0),
+            installer.wait_for_dns(
+                LOCAL_DNS,
+                DNS_PORT,
+                lambda a, p: (attempts.append((a, p)), answer(False, False))[1],
+                0.0,
+                0.0,
+            ),
             "a wait with no deadline left succeeded",
         )
         self.assertEqual(len(attempts), 1, "the wait did not try even once")
@@ -1824,6 +2241,71 @@ class CliTransactionTests(TransactionFixture):
         self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
         self.assertIn("still applied", err.lower(), "an operator has to be told the machine is half-changed")
         self.assertIn("ipv4.dns", err)
+
+    def test_the_exit_four_message_says_the_uplink_may_be_down(self):
+        # After the corrected rollback order, a failure of the REACTIVATION alone
+        # leaves the profile carrying its recorded values and the device not
+        # reactivated -- so the machine's DNS may not be in use even though every
+        # value on disk is right. That is the one fact the operator needs and the
+        # message has to carry it, with the one action that finishes the job.
+        status, out, err = self.install_cli(
+            self.good_runner(
+                fail=[("resolvectl", "dns", DEVICE)],
+                fail_after={CONNECTION_UP + (UUID,): 1},
+            )
+        )
+        self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
+        self.assertIn("still applied", err.lower())
+        self.assertIn("reactivated", err.lower(), "the message has to name the reactivation as what is missing")
+        self.assertIn("nmcli connection up", err, "the message has to name the one command that finishes it")
+        self.assertIn(UUID, err, "the message has to name the connection it applies to")
+        self.assertIn("profile", err.lower(), "the message has to say the recorded values ARE back")
+
+    def test_the_exit_four_message_says_when_the_profile_itself_is_still_wrong(self):
+        # A different failed undo is a different state of the machine, and the
+        # message must not tell the operator the profile is fine when it is not:
+        # the connection would still be handing resolved the loopback address.
+        status, out, err = self.install_cli(
+            self.good_runner(fail=[CONNECTION_UP + (UUID,), MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM)])
+        )
+        self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
+        self.assertIn("ipv4.dns", err)
+        self.assertIn("still applied", err.lower())
+        self.assertIn("127.0.0.1", err, "the operator has to be told the machine may still point at the loopback")
+
+    def test_the_exit_four_message_says_when_a_unit_is_still_running(self):
+        status, out, err = self.install_cli(
+            self.good_runner(fail=[CONNECTION_UP + (UUID,), ("systemctl", "stop", ROUTER_UNIT)])
+        )
+        self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
+        self.assertIn(ROUTER_UNIT, err, "the operator has to be told which unit is still running")
+        self.assertIn("systemctl stop", err, "and the one command that stops it")
+
+    def test_the_exit_three_message_excepts_a_unit_it_could_not_ask_about(self):
+        # "Nothing is different about this machine" is a claim, and there is one
+        # case where this module makes it deliberately false: a unit whose prior
+        # state could not be read is started and then left running, because
+        # stopping somebody else's unit is the harm the rule exists to prevent. The
+        # message has to name that exception rather than assert the opposite.
+        self.setUp()
+        self.answers[("systemctl", "is-active", RESOLVER_UNIT)] = ""
+        self.returncodes[("systemctl", "is-active", RESOLVER_UNIT)] = 1
+        status, out, err = self.install_cli(self.good_runner(fail=[("systemctl", "start", ROUTER_UNIT)]))
+        self.assertEqual(status, installer.EXIT_INSTALL_FAILED, err)
+        self.assertIn("rolled back", err.lower())
+        self.assertIn(RESOLVER_UNIT, err, "the message has to name the unit it left as it found it")
+        self.assertIn("could not", err.lower(), "and say that it could not ask about it")
+        self.assertNotIn(
+            "nothing is different",
+            err.lower(),
+            "the message claims the machine is unchanged while a unit it started is still running",
+        )
+
+    def test_the_exit_three_message_makes_no_exception_when_every_state_was_read(self):
+        status, out, err = self.install_cli(self.good_runner(fail=[("systemctl", "start", ROUTER_UNIT)]))
+        self.assertEqual(status, installer.EXIT_INSTALL_FAILED, err)
+        self.assertIn("nothing else is different", err.lower())
+        self.assertNotIn("except", err.lower(), "no exception is due when every unit state was read")
 
     def test_a_usage_error_runs_nothing_at_all(self):
         for arguments in ((), ("install", "--force"), ("preflight", "install"), ("uninstall",)):
