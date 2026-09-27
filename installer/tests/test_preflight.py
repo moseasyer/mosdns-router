@@ -150,7 +150,36 @@ GETFACL = "getfacl"
 # rest, so a fixture answering a word would be answering a string the module could
 # only compare against by luck. `%f` is the same fact as a number.
 STAT_FIELDS = ("stat", "-c", "%a %U %G %f")
-SS_LISTENERS = ("ss", "-H", "-lntu")
+# `ss` with -p, so the process column is present and a holder can be attributed
+# to a unit. Without -p there is no way to tell resolved's own stub from a
+# foreign resolver on port 53, so the check asks for it.
+SS_LISTENERS = ("ss", "-H", "-lntup")
+# The unit whose main pid a port holder is compared against. `systemctl show -p
+# MainPID --value` answers 0 for a unit that is not running and for one that does
+# not exist, both with status 0, so "0" is the answer that matches nothing.
+MAIN_PID = ("systemctl", "show", "-p", "MainPID", "--value")
+RESOLVED_UNIT = "systemd-resolved.service"
+ROUTER_UNIT = "mosdns-router.service"
+RESOLVER_UNIT = "dnscrypt-proxy.service"
+
+# `ss` output as it actually arrives, captured from the system-level test machine
+# (`tests/system/Dockerfile`, Ubuntu 24.04, a real systemd-resolved holding its
+# stub) rather than written by hand. This block is the reason the column layout
+# is pinned: the local address is the fifth field, after Netid, State, Recv-Q and
+# Send-Q, and a hand-written line that forgets the Netid column puts it fourth --
+# a fixture that agrees with a parser reading the wrong column is worse than no
+# fixture, because it makes the wrong parser look right. The padding is `ss`'s
+# own column alignment, which the parser must not depend on.
+RESOLVED_STUB_LISTENERS = """\
+udp UNCONN 0      0         127.0.0.54:53        0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=16))
+udp UNCONN 0      0         127.0.0.53%lo:53     0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=14))
+tcp LISTEN 0      4096      127.0.0.54:53        0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=17))
+tcp LISTEN 0      4096      127.0.0.53%lo:53     0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=15))
+"""
+# The pids those lines name, and the two this package's own units would use.
+RESOLVED_PID = "40"
+ROUTER_PID = "41"
+RESOLVER_PID = "42"
 
 # The subcommands that change something. A --check-only run reaching any of them
 # would have mutated the machine it was asked to inspect, and a test that only
@@ -376,8 +405,31 @@ class PreflightFixture(unittest.TestCase):
             for relative in STATE_DIRECTORIES
         }
 
-    def listener(self, port, address="127.0.0.1", process="mosdns-router"):
-        return f'LISTEN 0 4096 {address}:{port} 0.0.0.:* users:(("{process}",pid=1234,fd=7))\n'
+    @staticmethod
+    def ss_line(protocol, state, local, queue, process=None, pid=None, fd=7):
+        """One `ss -H -lntup` line, in the column order `ss` really prints.
+
+        Netid, State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port, and
+        the process column only when one is known. Single-spaced on purpose: the
+        captured block above keeps `ss`'s own padding, and a parser that needed
+        the padding to find a column would be a parser that breaks on a terminal
+        width change.
+        """
+        columns = [protocol, state, "0", str(queue), local, "0.0.0.0:*"]
+        if process is not None:
+            columns.append(f'users:(("{process}",pid={pid},fd={fd}))')
+        return " ".join(columns) + "\n"
+
+    def listener(self, port, address="127.0.0.1", process="dnsmask", pid="1234", protocol="tcp"):
+        """A listening socket on ``port`` held by a process that is not ours.
+
+        The default is a foreign resolver on purpose: the port check's whole job
+        is to refuse a port something else holds, so a fixture that defaulted to
+        this package's own process would let a broken check pass.
+        """
+        if protocol == "tcp":
+            return self.ss_line("tcp", "LISTEN", f"{address}:{port}", 4096, process, pid)
+        return self.ss_line("udp", "UNCONN", f"{address}:{port}", 0, process, pid)
 
     def good_runner(self, answers=None, returncodes=None, stderr=""):
         """A runner answering exactly what a passing preflight asks for.
@@ -410,6 +462,12 @@ class PreflightFixture(unittest.TestCase):
         )
         for unit in PROJECT_SERVICES + PROJECT_TIMERS:
             outputs[("systemctl", "is-active", unit)] = "inactive\n"
+        # resolved is running, because the fixture's resolv.conf names its stub
+        # and the dependency check requires it; this package's own two services
+        # are not running, so 0 -- which matches no process at all.
+        for unit in PROJECT_SERVICES:
+            outputs[MAIN_PID + (unit,)] = "0\n"
+        outputs[MAIN_PID + (RESOLVED_UNIT,)] = f"{RESOLVED_PID}\n"
         outputs.update(answers or {})
         return FakeRunner(outputs=outputs, returncodes=returncodes, stderr=stderr, acl_reader=self._real_acl)
 
@@ -705,12 +763,97 @@ class NetworkManagerConnectionTests(PreflightFixture):
 
 
 class PortTests(PreflightFixture):
-    """Ports 53 and 15353: the two the router and the resolver will bind."""
+    """Ports 53 and 15353: the two the router and the resolver will bind.
 
-    def test_accepts_a_machine_with_both_ports_free(self):
-        self.assertPasses()
+    A stock Ubuntu already holds port 53. systemd-resolved's stub listener answers
+    on 127.0.0.53 there, and the install keeps resolved in the chain -- it forwards
+    to the router on 127.0.0.1 -- so the stub is not a transient state to clear
+    first, it is the machine working. A check that refuses it refuses every real
+    machine, and one that exempts the port without asking who holds it lets a
+    second resolver answer beside the first. So the exemption is matched on the
+    owning process, resolved by pid to the unit that owns it, and it is the
+    *address* too: a foreign process that has taken 127.0.0.53 is refused even
+    though the address is the stub's own.
+    """
 
-    def test_reports_an_occupied_port_with_the_port_number(self):
+    def test_accepts_the_stub_listener_a_stock_machine_already_has(self):
+        # The captured `ss` answer from a real machine, byte for byte. A fixture
+        # written by hand is how the last version of this check came to read the
+        # send-queue column as the local address: a hand-written line that omits
+        # Netid agrees with a parser that is off by one field, and both are wrong
+        # in the same direction, so the suite could not see it.
+        #
+        # The second assertion is the one that gives the first its teeth: a parser
+        # that finds no ports at all also reports no problem, so "nothing was
+        # refused" is only evidence if the module demonstrably read the lines and
+        # asked who owns the processes on them.
+        runner = self.good_runner({SS_LISTENERS: RESOLVED_STUB_LISTENERS})
+        self.assertPasses(runner)
+        self.assertIn(
+            MAIN_PID + (RESOLVED_UNIT,),
+            runner.calls,
+            "the stub is exempt because resolved is the process holding it, which is a question "
+            "the check has to have asked; a pass that came from reading nothing is not a pass",
+        )
+
+    def test_reports_a_foreign_process_on_the_dns_port(self):
+        problems = " ".join(self.answered({SS_LISTENERS: self.listener(53)}).problems())
+        self.assertIn("53", problems, "an occupied DNS port has to be named")
+        self.assertIn(
+            "dnsmask", problems, "the refusal has to name the process holding the port: 'port 53 "
+            "is taken' sends an operator hunting, and the answer is one `ss` away",
+        )
+
+    def test_reports_a_foreign_process_on_an_address_that_looks_like_the_stub(self):
+        # 127.0.0.53 is the stub's own address, so an exemption keyed on the
+        # address would pass this. It is keyed on the owning process, so it does
+        # not: a second resolver on the stub's address is two answers for one
+        # query, and it is the exact case a port check exists to catch.
+        for protocol in ("tcp", "udp"):
+            with self.subTest(protocol=protocol):
+                self.setUp()
+                problems = " ".join(
+                    self.answered(
+                        {SS_LISTENERS: self.listener(53, address="127.0.0.53", protocol=protocol)}
+                    ).problems()
+                )
+                self.assertIn(
+                    "dnsmask", problems, f"a foreign {protocol} listener on 127.0.0.53 was accepted"
+                )
+
+    def test_accepts_this_packages_own_router_on_53_when_the_marker_claims_it(self):
+        # The upgrade case. The router holds 53 by design once this package is
+        # installed, and the marker is what says so -- which is the same marker
+        # check_foreign_services uses, so a second installation is not excused by
+        # the port check on the strength of the port check alone.
+        answers = {
+            SS_LISTENERS: self.listener(53, process="mosdns-router", pid=ROUTER_PID),
+            MAIN_PID + (ROUTER_UNIT,): f"{ROUTER_PID}\n",
+        }
+        self.assertPasses(self.good_runner(answers))
+
+    def test_reports_this_packages_own_router_on_53_without_the_marker(self):
+        # The same listener, with nothing claiming it. A mosdns-router process
+        # this install did not start is a foreign installation by the marker's
+        # own rule, and it must not be excused here on the strength of its name.
+        self.unmark()
+        answers = {
+            SS_LISTENERS: self.listener(53, process="mosdns-router", pid=ROUTER_PID),
+            MAIN_PID + (ROUTER_UNIT,): f"{ROUTER_PID}\n",
+        }
+        problems = " ".join(self.preflight(self.good_runner(answers)).problems())
+        self.assertIn(
+            "mosdns-router", problems, "an unclaimed router on 53 has to be refused and named"
+        )
+
+    def test_accepts_this_packages_own_resolver_on_15353_when_the_marker_claims_it(self):
+        answers = {
+            SS_LISTENERS: self.listener(15353, process="dnscrypt-proxy", pid=RESOLVER_PID),
+            MAIN_PID + (RESOLVER_UNIT,): f"{RESOLVER_PID}\n",
+        }
+        self.assertPasses(self.good_runner(answers))
+
+    def test_reports_a_foreign_holder_of_the_resolver_port(self):
         for port in (53, 15353):
             with self.subTest(port=port):
                 self.setUp()
@@ -720,6 +863,61 @@ class PortTests(PreflightFixture):
                 self.assertIn(
                     str(port), problems, f"an occupied port {port} has to be named in the refusal"
                 )
+
+    def test_reports_a_foreign_process_sharing_the_stub_socket(self):
+        # `ss` names every process sharing a socket, and two processes can share
+        # one with SO_REUSEPORT. A socket resolved holds alongside a foreign
+        # process is not resolved's alone: the foreign one gets a share of the
+        # queries, which is the two-answers problem this check exists for, and an
+        # exemption that looked at the first owner would wave it through.
+        shared = self.ss_line(
+            "tcp", "LISTEN", "127.0.0.53%lo:53", 4096, "systemd-resolve", RESOLVED_PID, fd=15
+        ) + self.ss_line(
+            "tcp", "LISTEN", "127.0.0.53%lo:53", 4096, "snatch", "777", fd=9
+        )
+        problems = " ".join(self.answered({SS_LISTENERS: shared}).problems())
+        self.assertIn("snatch", problems, "a foreign process on a socket resolved also holds was accepted")
+
+    def test_reports_resolved_holding_the_dns_port_off_loopback(self):
+        # The exemption is the stub on a loopback address, not resolved's process
+        # on any address. A resolved process listening on a routable address is
+        # not the stub this install replaces, and treating it as one would skip
+        # the very check the address exists to make.
+        problems = " ".join(
+            self.answered(
+                {
+                    SS_LISTENERS: self.ss_line(
+                        "tcp", "LISTEN", "192.0.2.53:53", 4096, "systemd-resolve", RESOLVED_PID
+                    )
+                }
+            ).problems()
+        )
+        self.assertIn(
+            "192.0.2.53", problems, "resolved on a non-loopback address is not the stub this install keeps"
+        )
+
+    def test_reports_a_holder_it_cannot_identify(self):
+        # `ss` prints no process column for a socket it may not read, which is
+        # what an unprivileged run sees for every other user's process. A holder
+        # that cannot be named cannot be cleared either, and preflight's rule is
+        # that a question it could not ask is a refusal -- reporting "free" here
+        # would be the one answer the install cannot act on.
+        problems = " ".join(
+            self.answered(
+                {SS_LISTENERS: self.ss_line("tcp", "LISTEN", "127.0.0.1:53", 4096)}
+            ).problems()
+        )
+        self.assertIn("53", problems, "a port 53 nobody can be named on has to be refused")
+
+    def test_reads_the_local_address_and_not_the_send_queue(self):
+        # A listening socket on an unrelated port whose send-queue length is 53.
+        # A parser reading the queue column sees port 53 occupied and refuses a
+        # machine with both of the ports free; a parser reading the local address
+        # passes. The line is in the real column order, so this cannot pass by
+        # accident, and the queue value is the one number a careless parse would
+        # pick up.
+        line = self.ss_line("tcp", "LISTEN", "127.0.0.1:8080", 53, "sshd", "900")
+        self.assertPasses(self.good_runner({SS_LISTENERS: line}))
 
     def test_says_that_a_port_check_is_a_moment_and_not_a_reservation(self):
         # Between this check and the bind, anything may take the port, and the

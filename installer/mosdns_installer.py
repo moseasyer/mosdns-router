@@ -126,6 +126,12 @@ PROJECT_UNITS = (
     "mosdns-cdn-health.timer",
     "mosdns-list-check.timer",
 )
+# The unit whose stub listener already holds port 53 on a stock Ubuntu, and the
+# one the install keeps: resolved stays in front and forwards to the router, so
+# its socket is not a conflict to be cleared first. It is named here because the
+# port check has to be able to exempt it, and an exemption that cannot name the
+# process holding the port is an exemption of the port.
+RESOLVED_UNIT = "systemd-resolved.service"
 
 # Firefox reads HTTPS RRs, and with them ECH, from 129. Below that a domain on
 # the forced list is unreachable in it, which is a loss of protection in one
@@ -582,50 +588,210 @@ def check_connection(run: CommandRunner, report: Preflight) -> None:
     report.connection = Connection(name=primary.name, uuid=found, kind=primary.kind, device=primary.device)
 
 
-def _listening_ports(listeners: str) -> set:
-    """The ports named by ``ss -H -lntu`` output, from its local-address column."""
-    ports = set()
+class Owner(NamedTuple):
+    """One process holding a socket, as `ss` reports it."""
+
+    name: str
+    pid: Optional[int]
+
+
+class Holder(NamedTuple):
+    """One listening socket, and whoever `ss` says is holding it."""
+
+    protocol: str
+    address: str
+    port: int
+    owners: List[Owner]
+
+
+def _holders(listeners: str) -> List[Holder]:
+    """The listening sockets in `ss -H -lntup` output, one Holder per line.
+
+    The local address is found by looking for the first field that ends in a
+    numeric port rather than by counting columns, because the count is not stable:
+    `ss` prints Netid, State, Recv-Q, Send-Q, Local, Peer and -- only with -p --
+    the process, and a version that adds or drops a column moves every index after
+    it. Counting is also how the last version of this check ended up reading the
+    send-queue length as an address: `ss` pads its columns to the terminal width,
+    so a hand-written fixture can agree with an off-by-one parser and both look
+    right.
+
+    A scope suffix is stripped (`127.0.0.53%lo:53`) because which interface a
+    loopback socket is bound to is not what this check decides. `ss` names every
+    process sharing a socket, so all of them are kept: a socket that resolved holds
+    alongside a foreign process is not resolved's alone. A line with no process
+    column at all keeps no owners, which is what `ss` prints for a socket this user
+    may not read -- a holder nobody can name is a holder nobody can clear.
+    """
+    holders = []
     for line in listeners.splitlines():
         fields = line.split()
-        if len(fields) < 4:
+        address = None
+        port_number = 0
+        for field in fields:
+            head, separator, port = field.rpartition(":")
+            if separator and port.isdigit() and head:
+                address, port_number = head, int(port)
+                break
+        if address is None:
             continue
-        local = fields[3]
-        _, separator, port = local.rpartition(":")
-        if separator and port.isdigit():
-            ports.add(int(port))
-    return ports
+        owners = []
+        for field in fields:
+            if not field.startswith("users:(("):
+                continue
+            owners = [
+                Owner(name, int(number))
+                for name, number in re.findall(r'\("([^"]+)",pid=(\d+)', field)
+            ]
+            break
+        holders.append(
+            Holder(
+                protocol=fields[0] if fields else "",
+                address=address.split("%", 1)[0],
+                port=port_number,
+                owners=owners,
+            )
+        )
+    return holders
 
 
-def check_ports(run: CommandRunner, report: Preflight) -> None:
-    """Refuse an occupied 53 or 15353, and say that the answer is one moment.
+def _is_loopback(address: str) -> bool:
+    """Whether an address is one of the loopback range, in either family.
+
+    Two spellings of the same question: `127.0.0.1` and `[::1]`. Anything that is
+    not loopback is not resolved's stub, whatever the owning process is.
+    """
+    bare = address.strip("[]")
+    if bare.startswith("::1") or bare == "::1":
+        return True
+    if bare.startswith("::ffff:127."):
+        return True
+    parts = bare.split(".")
+    return len(parts) == 4 and parts[0] == "127" and all(part.isdigit() for part in parts)
+
+
+def _main_pid_of(run: CommandRunner, unit: str) -> Optional[int]:
+    """The main process id of a unit, or ``None`` when it has none.
+
+    `systemctl show -p MainPID --value` answers 0 for a unit that is not running
+    and for one that does not exist, both with status 0, so 0 is the answer that
+    matches no process at all and a unit that could not be asked about is treated
+    the same way: a holder this check cannot attribute to a unit is a holder it
+    does not exempt.
+    """
+    completed = _ok(run, ("systemctl", "show", "-p", "MainPID", "--value", unit))
+    if completed is None:
+        return None
+    value = completed.stdout.strip()
+    if not value.isdigit() or int(value) == 0:
+        return None
+    return int(value)
+
+
+def _is_exempt(holder: Holder, resolved_pid: Optional[int], own_pids: dict) -> bool:
+    """Whether a holder is one this install expects to find already there.
+
+    Two exemptions and nothing else. systemd-resolved's stub, because the design
+    keeps resolved in front of the router and its socket on port 53 is the machine
+    working; and a unit of this package's own, because the port check must not be
+    the thing that fails an upgrade.
+
+    Both are matched on the owning process and not on the port, and the resolved
+    one is matched on the address as well: a foreign process that has taken
+    127.0.0.53 is two answers for one query, and the port being the right number
+    is not a reason to let it stand. A socket with no identifiable owner is not
+    exempt, and neither is one whose only match is a different address from the
+    stub's. The second exemption is gated on the ownership marker, which is the
+    same claim check_foreign_services makes -- a mosdns-router process this install
+    did not start is a foreign installation whatever it is called.
+    """
+    if not holder.owners:
+        return False
+    for owner in holder.owners:
+        if owner.pid is None:
+            continue
+        if resolved_pid is not None and owner.pid == resolved_pid and _is_loopback(holder.address):
+            return True
+        if owner.pid in own_pids:
+            return True
+    return False
+
+
+def _describe_owners(holder: Holder) -> str:
+    """The processes holding a socket, in a form an operator can act on."""
+    if not holder.owners:
+        return "a process this user is not allowed to name"
+    return " and ".join(
+        f"{owner.name} (pid {owner.pid})" if owner.pid is not None else owner.name
+        for owner in holder.owners
+    )
+
+
+def check_ports(root: Path, run: CommandRunner, report: Preflight) -> None:
+    """Refuse a DNS or resolver port held by anything this install does not own.
 
     The refusal is not a reservation and the note says so. Between this check and
     the bind, anything may take either port, and the installer's own service will
     hold 53 afterwards by design -- so an operator reading "free" is reading a
     fact about the moment it was looked at, not a claim the install holds it.
+
+    A stock Ubuntu already holds port 53: resolved's stub listener, which this
+    install keeps and which is exempted by owning process rather than by port.
+    Every other holder of either port is refused, and the refusal names the
+    process, because "port 53 is taken" sends an operator hunting when the answer
+    is one `ss` away.
     """
-    completed = _ok(run, ("ss", "-H", "-lntu"))
+    completed = _ok(run, ("ss", "-H", "-lntup"))
     if completed is None:
         report.refuse(
-            "the machine's listening sockets could not be read (`ss -H -lntu` failed); an "
+            "the machine's listening sockets could not be read (`ss -H -lntup` failed); an "
             "unreadable answer is not an empty one, and binding a port whose state is "
             "unknown is how two resolvers end up fighting over it"
         )
         return
-    ports = _listening_ports(completed.stdout)
-    for port, holder in ((DNS_PORT, "the router"), (RESOLVER_PORT, "the resolver")):
-        if port in ports:
-            report.refuse(
-                f"port {port} is already bound, and it is the port {holder} needs; something "
-                "else on this machine is already answering there, and this package will not "
-                "take DNS over from a service it did not install"
-            )
-            report.mark_occupied(port)
+    interesting = {DNS_PORT, RESOLVER_PORT}
+    claimed = [holder for holder in _holders(completed.stdout) if holder.port in interesting]
+    resolved_pid = _main_pid_of(run, RESOLVED_UNIT)
+    own_pids = {}
+    if _installation_is_ours(root):
+        for unit in (ROUTER_UNIT, RESOLVER_UNIT):
+            pid = _main_pid_of(run, unit)
+            if pid is not None:
+                own_pids[pid] = unit
+    occupied = set()
+    for holder in claimed:
+        if _is_exempt(holder, resolved_pid, own_pids):
+            continue
+        holder_of = "the router" if holder.port == DNS_PORT else "the resolver"
+        report.refuse(
+            f"{holder.protocol} port {holder.port} is already held on {holder.address} by "
+            f"{_describe_owners(holder)}, and it is the port {holder_of} needs; this package "
+            "keeps only resolved's own stub listener and its own units on these ports, and it "
+            "will not take DNS over from a service it did not install"
+        )
+        occupied.add(holder.port)
+    for port in sorted(occupied):
+        report.mark_occupied(port)
     report.note(
         f"the port check is a reading of this moment, not a reservation: {DNS_PORT} and "
-        f"{RESOLVER_PORT} were free when it ran, anything may take either before the bind, "
+        f"{RESOLVER_PORT} were checked when it ran, anything may take either before the bind, "
         "and this package's own router holds 53 afterwards"
     )
+
+
+def _installation_is_ours(root: Path) -> bool:
+    """Whether the ownership marker names this package.
+
+    One function for two checks that must agree. The foreign-service check and
+    the port check both decide "is this process one of ours", and if they read the
+    marker differently -- one on the unit's state and one on the file's
+    contents -- then a machine can pass one and fail the other, and the operator
+    is left with a refusal that no fact on the machine supports.
+    """
+    try:
+        return (root / MANAGED_BY.lstrip("/")).read_text(encoding="utf-8").strip() == MANAGED_BY_VALUE
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def check_foreign_services(run: CommandRunner, root: Path, report: Preflight) -> None:
@@ -638,12 +804,7 @@ def check_foreign_services(run: CommandRunner, root: Path, report: Preflight) ->
     take DNS over from. A timer counts the same way: a second optimizer would
     measure and publish against a selector this install is about to replace.
     """
-    owned = False
-    marker = root / MANAGED_BY.lstrip("/")
-    try:
-        owned = marker.read_text(encoding="utf-8").strip() == MANAGED_BY_VALUE
-    except (OSError, UnicodeDecodeError):
-        owned = False
+    owned = _installation_is_ours(root)
     for unit in PROJECT_UNITS:
         state = _ok(run, ("systemctl", "is-active", unit))
         if state is None or state.stdout.strip() != "active":
@@ -1064,7 +1225,7 @@ def preflight(root: Path, run: CommandRunner) -> Preflight:
     check_dependencies(run, report)
     check_resolv_conf(root, report)
     check_connection(run, report)
-    check_ports(run, report)
+    check_ports(root, run, report)
     check_foreign_services(run, root, report)
     check_ech(run, root, report)
     check_state_directories(root, run, report)
