@@ -3117,6 +3117,78 @@ class RollbackFailureTests(TransactionFixture):
                 self.assertEqual(command[5], recorded[command[4]])
 
 
+class LocalVerdictBlindSpotTests(TransactionFixture):
+    """`verify-local` must not report a verdict the router fabricated for it.
+
+    The install REFUSES to run when the operator's force-ECH list makes the router
+    answer `install-probe.example` itself: with such an entry the router short
+    circuits A queries for that name, never forwards, and answers NOERROR. Every
+    check the install makes would then be satisfied by the thing it is checking.
+
+    An operator who adds the name AFTER the install gets no such refusal, because
+    there is no install left to refuse -- and the two-minute health check then
+    reports a working local resolver for ever, whatever the router is doing. That
+    is the blind spot this verb inherited from the barrier and did not carry the
+    guard for, and the two predicates that close it already exist here:
+    `_forced_ech_domains` and `_ech_may_answer_locally`.
+    """
+
+    def run_verify(self, shape=HEALTHY, **kwargs):
+        out, err = io.StringIO(), io.StringIO()
+        import contextlib
+
+        self.events = []
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = installer.main(
+                ["verify-local"],
+                self.good_runner(),
+                root=self.root,
+                probe=self.probe_for({(LOCAL_DNS, DNS_PORT): shape}),
+            )
+        return status, out.getvalue(), err.getvalue()
+
+    def blind(self, *domains):
+        self.write(FORCE_ECH, "\n".join(domains) + "\n")
+
+    def test_a_probe_name_the_router_answers_locally_gets_no_verdict_at_all(self):
+        self.blind("install-probe.example.")
+        status, out, err = self.run_verify()
+        self.assertNotEqual(status, installer.EXIT_OK, f"a fabricated answer was called healthy: {out!r}")
+        self.assertEqual(status, installer.EXIT_REFUSED, err)
+        self.assertEqual(
+            [event for event in self.events if event[0] == "probe"],
+            [],
+            "the verb probed after it had already decided the answer proves nothing",
+        )
+        self.assertIn("NOT A SIGN THE ROUTER IS DOWN", err)
+        self.assertIn(FORCE_ECH, err)
+
+    def test_a_list_that_does_not_name_the_probe_leaves_the_verdict_alone(self):
+        # The negative control, and it is what makes the case above a statement
+        # about the probe name rather than about the file existing: a list with
+        # other entries in it is the common case and must not cost the check
+        # anything.
+        self.blind("example.com.", "example.org.")
+        status, out, err = self.run_verify()
+        self.assertEqual(status, installer.EXIT_OK, err)
+        self.assertIn("resolved", out)
+
+    def test_the_same_entry_is_not_a_blind_spot_when_the_policy_turns_ech_off(self):
+        # `_ech_may_answer_locally` is the second half and it is not decoration:
+        # `forcesECH` returns false when ECH is explicitly disabled, whatever the
+        # list says, so the router forwards the name and the answer means
+        # something. A guard that ignored the policy would refuse a machine whose
+        # check is perfectly able to see the router.
+        self.blind("install-probe.example.")
+        self.write(
+            POLICY_CONFIG,
+            "schema_version: 1\ncdn:\n  provider: cloudflare\nech:\n  enabled: false\n",
+        )
+        status, out, err = self.run_verify()
+        self.assertEqual(status, installer.EXIT_OK, err)
+        self.assertIn("resolved", out)
+
+
 class ProbeTests(unittest.TestCase):
     """The prober, against a UDP socket on a loopback ephemeral port.
 

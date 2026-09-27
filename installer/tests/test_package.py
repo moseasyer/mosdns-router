@@ -2521,6 +2521,73 @@ class MaintainerScriptTests(_Staged):
         self.assertIn("status=$?", arm)
         self.assertIn('case "$status" in', arm)
 
+    def test_prerms_exit_five_arm_claims_only_what_the_script_can_know(self):
+        """The exit-5 arm used to assert "The machine's DNS is not this package's to change".
+
+        That is a fact about the machine, and this script cannot establish it: the
+        installer refuses on marker-absent, schema-unknown, UUID-missing or
+        value-changed, and the first of those is a machine with a RECORD and no
+        marker -- which the module itself documents as the more dangerous of the
+        two states, because the record is the thing that would say what the
+        connection was set to and it is the missing half. So the arm claims what
+        the script can actually see: this run changed nothing, and the report above
+        is what names the situation.
+        """
+        text = PRERM.read_text()
+        body = numeric_case_arms(text)["5"]
+        self.assertIn("changed NOTHING", body, "the arm no longer says the one thing it does know")
+        self.assertIn("report above", body, "the arm no longer points at the deliverable")
+        for unknowable in (
+            "The machine's DNS is not this package's",
+            "the machine's DNS is not this package's to change",
+        ):
+            with self.subTest(claim=unknowable):
+                self.assertNotIn(unknowable, body)
+        # And the weakening says WHY, so a later reader does not "fix" it back.
+        self.assertIn("cannot ask", text)
+
+    def test_postinst_does_not_promise_the_daemons_are_still_running_behind_a_failed_rollback(self):
+        """postinst's failure arm said "whatever was enabled and running is still
+        enabled and running" on an upgrade, and that became false when the
+        transaction learned to RESTART a unit that was already running: a restart
+        that fails leaves it down, and on an upgrade the connection is already
+        127.0.0.1 by then, so the machine has no resolver at all.
+
+        So the arm branches on the installer's STATUS rather than on `$2`, and the
+        status it cannot account for gets a sentence that promises nothing. A script
+        that kept the old sentence on a status-4 run would be telling an operator
+        their resolver is fine on the one machine where it may not exist.
+        """
+        text = POSTINST.read_text()
+        self.assertIn("install_status=$?", text, "postinst no longer captures the installer's status")
+        body = text.split('-eq 4', 1)[1].split("elif", 1)[0]
+        self.assertIn("no resolver", body.lower())
+        self.assertIn("emergency-rollback", body)
+        self.assertIn("do not assume", body.lower())
+        self.assertNotIn(
+            "whatever was enabled and running is still",
+            text,
+            "postinst still claims every enabled and running unit survived a failed install, and "
+            "a unit this package restarted may not have",
+        )
+        # The upgrade sentence is still there and still distinguishes the two
+        # installs, because that distinction is real; only the promise is gone.
+        self.assertIn("configured before", text)
+        self.assertIn("the transaction is the authority on that", text)
+        # And the rolled-back arm does not claim that nothing at all changed, because
+        # the transaction publishes a DHCP lease generation before it refuses.
+        rolled_back = text.split("-eq 3", 1)[1].split("else", 1)[0]
+        self.assertNotIn("so nothing has been changed", text)
+        self.assertIn("DHCP lease generation", rolled_back)
+
+    def test_postinst_captures_the_installers_status_the_way_prerm_does(self):
+        # `if ! cmd` cannot capture a status: `$?` after a `!` is the status of the
+        # `!`, which is always zero, so every arm would be the default one.
+        text = POSTINST.read_text()
+        self.assertNotIn('if ! "$INSTALLER" install', text)
+        self.assertIn('if "$INSTALLER" install', text)
+        self.assertIn("install_status=$?", text)
+
     def test_postrm_purges_only_when_purge_was_asked_for(self):
         """The data goes on `dpkg --purge` and not on `dpkg --remove`, and the
         ordering the installer's own `--purge` guarantees is already established
@@ -3830,12 +3897,12 @@ def _swap_the_timer_enable_before_the_transaction(text):
             break
     guard = next(
         index for index, line in enumerate(lines)
-        if not line.lstrip().startswith("#") and line.strip().startswith('if ! "$INSTALLER" install')
+        if not line.lstrip().startswith("#") and line.strip().startswith('if "$INSTALLER" install')
     )
     assert enable > guard, "postinst already enables the timers before the transaction"
     rest = lines[:enable] + lines[cursor:]
     insertion = next(
-        index for index, line in enumerate(rest) if line.strip().startswith('if ! "$INSTALLER" install')
+        index for index, line in enumerate(rest) if line.strip().startswith('if "$INSTALLER" install')
     )
     return rest[:insertion] + moved + rest[insertion:]
 

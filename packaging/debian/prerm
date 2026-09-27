@@ -34,11 +34,17 @@
 # the installer's two refusals are two different machines and an operator told
 # they are the same one does the wrong thing:
 #
-#   5  nothing was changed, because this program could not prove the DNS on this
-#      machine is its own to change. There is no half-restored connection to
-#      finish, and the report above is the whole deliverable.
+#   5  nothing was changed, because this program could not prove the values on the
+#      connection are ones it set. There is no half-restored connection to finish,
+#      and the report above is the whole deliverable.
 #   6  a restore was attempted and did not finish, so some of this package's
 #      values may still be on the connection and the units are still running.
+#
+# Neither arm claims anything about WHOSE the DNS on this machine is. The
+# uninstaller can, because it can read the marker and the record; this script
+# cannot, and a claim it could not check is exactly the kind that is false on the
+# one case that matters -- a marker with no record behind it, which the installer
+# itself documents as the more dangerous of the two states.
 #
 # The status is captured from an `if`/`else` rather than from `if !`, because `$?`
 # after `!` is the status of the `!` -- which is always zero -- so a script that
@@ -75,13 +81,17 @@ remove|deconfigure)
 		status=$?
 		case "$status" in
 		5)
-			echo "prerm: the uninstaller exited 5: it would not change a connection it" >&2
+			echo "prerm: the uninstaller exited 5: it would not write to a connection it" >&2
 			echo "prerm: cannot prove this package set, so it changed NOTHING and printed" >&2
-			echo "prerm: the recovery report above. The machine's DNS is not this package's" >&2
-			echo "prerm: to change and there is no half-finished restore to complete. dpkg is" >&2
-			echo "prerm: ABORTING this removal: the package is still installed and not one file" >&2
-			echo "prerm: has been removed. Follow the report above, then remove the package" >&2
-			echo "prerm: with:" >&2
+			echo "prerm: the recovery report above. That is the only claim made here, and" >&2
+			echo "prerm: it is deliberately the only one: whether the DNS on this machine" >&2
+			echo "prerm: is this package's to change is a question this script cannot ask," >&2
+			echo "prerm: and the case the uninstaller itself calls the more dangerous one" >&2
+			echo "prerm: is a marker with NO record behind it, where the record is the" >&2
+			echo "prerm: thing that would say what the connection was set to. The report" >&2
+			echo "prerm: above is what names it. dpkg is ABORTING this removal: the package" >&2
+			echo "prerm: is still installed and not one file has been removed. Follow the" >&2
+			echo "prerm: report above, then remove the package with:" >&2
 			echo "prerm:   sudo dpkg --remove mosdns-router" >&2
 			;;
 		6)

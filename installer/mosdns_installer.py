@@ -5038,7 +5038,7 @@ def _usage() -> str:
     )
 
 
-def _run_verify_local(probe) -> int:
+def _run_verify_local(root: Path, probe) -> int:
     """Ask the machine's own resolver one question, and fail if it cannot answer it.
 
     This is the SECOND command of `mosdns-cdn-health.service`, and it exists
@@ -5053,17 +5053,57 @@ def _run_verify_local(probe) -> int:
     it here -- or, worse, in the health command's own Go -- is how two programs end
     up disagreeing about whether a machine has DNS.
 
-    It takes no root, reads no file, changes nothing, and takes a `run` it does
-    not need: the only thing it does is open a UDP socket to a loopback address
-    and wait two seconds. So the health unit runs it as its own unprivileged
-    identity inside the same sandbox as the health check.
+    It changes nothing, and takes a `run` it does not need: the only thing it
+    DOES is open a UDP socket to a loopback address and wait two seconds, plus the
+    two file reads below.
 
-    What a failed unit means is a DECISION this package does not make. Putting
-    `emergency-rollback` on a timer would mutate a machine's DNS unattended, and
-    an operator who has watched their DNS die is better served by a signal and a
-    person: the health unit failing is the signal, `sudo mosdns-cdnctl
+    WHAT IT READS, and why the reads are the point rather than an exception. The
+    install REFUSES to run its own checks when the router would answer
+    `install-probe.example` itself from the operator's force-ECH list -- see
+    `_refuse_a_locally_answered_probe`, which is the same two predicates this verb
+    now uses. An operator who adds that name to `/etc/mosdns/force-ech-domains.txt`
+    AFTER the install gets no such refusal, because there is no install to refuse:
+    they get a health check that reports a working local resolver for ever,
+    whatever the router is doing, because the answer it is reading was fabricated
+    in-process by the thing it is supposed to be checking. That is the blind spot
+    the install's guard was written for, inherited by the verb without the guard.
+
+    So the verb refuses the verdict rather than reporting it. It FAILS rather than
+    warning, and that is the fail-closed direction for a health check: a machine
+    whose resolver cannot be proved is not a machine to call healthy, and the
+    alternative -- a passing check that proves nothing -- is the exact failure this
+    verb exists to remove. The message is explicit that this is NOT evidence the
+    router is down, because the health unit failing is the signal for
+    `emergency-rollback` and an operator who read this as "the resolver is dead"
+    would roll back a working machine over a line in a text file.
+
+    What a failed unit otherwise means is a DECISION this package does not make.
+    Putting `emergency-rollback` on a timer would mutate a machine's DNS
+    unattended, and an operator who has watched their DNS die is better served by a
+    signal and a person: the health unit failing is the signal, `sudo mosdns-cdnctl
     emergency-rollback` is the action.
     """
+    blind = next(
+        (
+            name
+            for name in _forced_ech_domains(root)
+            if _forces_ech((name,), INSTALL_PROBE_NAME)
+        ),
+        None,
+    )
+    if blind is not None and _ech_may_answer_locally(root):
+        sys.stderr.write(
+            f"verify-local: {FORCE_ECH_DOMAINS} lists {blind!r} and the policy asks for strict "
+            f"ECH, so the router answers A queries for {INSTALL_PROBE_NAME} itself without asking "
+            f"anything upstream. A resolved answer from {LOCAL_DNS}:{DNS_PORT} for that name is "
+            "therefore evidence of nothing, so this verb cannot report a verdict at all rather "
+            "than report a healthy one. THIS IS NOT A SIGN THE ROUTER IS DOWN: nothing was "
+            f"probed and nothing was changed. An install refuses this machine for the same "
+            f"reason, so the entry is out of step with what this package will install. Either "
+            f"remove {blind!r} from {FORCE_ECH_DOMAINS} so this check can see the router, or "
+            "accept that nothing on this machine can prove the local resolver is answering.\n"
+        )
+        return EXIT_REFUSED
     ask = probe or (lambda address, port: probe_dns(address, port))
     answer = ask(LOCAL_DNS, DNS_PORT)
     if answer.resolves:
@@ -5245,8 +5285,10 @@ def main(
     NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the host
     wearing a test's name. ``probe`` is here for the same reason and one more: a
     DNS query is a real request to a real resolver, and the last three verbs ask
-    one. ``verify-local`` needs no root and no runner, and a test that could not
-    inject the probe into it would be a test that queried a real resolver.
+    one. ``verify-local`` needs no runner -- it issues no command at all -- but it
+    does read the policy and the operator's force-ECH list through ``root``, so
+    that a test can point it at a fake root and a test that could not inject the
+    probe into it would still be a test that queried a real resolver.
     """
     arguments = list(argv)
     if arguments[:1] == ["preflight"]:
@@ -5267,7 +5309,7 @@ def main(
     if arguments == ["emergency-rollback"]:
         return _run_emergency_rollback(root, run or RealCommandRunner(), probe)
     if arguments == ["verify-local"]:
-        return _run_verify_local(probe)
+        return _run_verify_local(root, probe)
     sys.stderr.write(f"{_usage()}\n")
     return EXIT_USAGE
 
