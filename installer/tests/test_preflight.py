@@ -168,20 +168,43 @@ RESOLVER_UNIT = "dnscrypt-proxy.service"
 
 # `ss` output as it actually arrives, captured from the system-level test machine
 # (`tests/system/Dockerfile`, Ubuntu 24.04, a real systemd-resolved holding its
-# stub) rather than written by hand. This block is the reason the column layout
-# is pinned: the local address is the fifth field, after Netid, State, Recv-Q and
-# Send-Q, and a hand-written line that forgets the Netid column puts it fourth --
-# a fixture that agrees with a parser reading the wrong column is worse than no
-# fixture, because it makes the wrong parser look right. The padding is `ss`'s
-# own column alignment, which the parser must not depend on.
+# stub) rather than written by hand. This block is the reason the parser finds the
+# local address by shape: the column count is not a property of the tool, it is a
+# property of the flags.
+#
+# `ss -H -lntup` prints Netid, State, Recv-Q, Send-Q, Local, Peer, Process -- seven
+# fields, the local address fifth. `ss -H -lntp` omits the Netid column entirely
+# because only one protocol family was asked for, and the local address is fourth.
+# The version of this check that read a fixed index read the fourth, which is right
+# for the second invocation and wrong for the first -- and the fixture it was tested
+# against was hand-written in the *second* shape, so the parser and its fixture
+# agreed with each other and both disagreed with the command. That is the whole
+# mechanism of the bug, and it is why both real shapes are pinned here.
 RESOLVED_STUB_LISTENERS = """\
-udp UNCONN 0      0         127.0.0.54:53        0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=16))
-udp UNCONN 0      0         127.0.0.53%lo:53     0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=14))
-tcp LISTEN 0      4096      127.0.0.54:53        0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=17))
-tcp LISTEN 0      4096      127.0.0.53%lo:53     0.0.0.0:*          users:(("systemd-resolve",pid=40,fd=15))
+udp UNCONN 0      0         127.0.0.54:53        0.0.0.0:*          users:(("systemd-resolve",pid=39,fd=16))
+udp UNCONN 0      0         127.0.0.53%lo:53     0.0.0.0:*          users:(("systemd-resolve",pid=39,fd=14))
+tcp LISTEN 0      4096      127.0.0.54:53        0.0.0.0:*          users:(("systemd-resolve",pid=39,fd=17))
+tcp LISTEN 0      4096      127.0.0.53%lo:53     0.0.0.0:*          users:(("systemd-resolve",pid=39,fd=15))
+"""
+# The same machine with `-u` dropped, captured the same way. Four fields fewer is
+# not hypothetical: `ss` drops the Netid column when one protocol family is asked
+# for, so the same socket is the fifth field in one invocation and the fourth in
+# the other.
+RESOLVED_STUB_LISTENERS_TCP_ONLY = """\
+LISTEN 0      4096   127.0.0.53%lo:53   0.0.0.0:* users:(("systemd-resolve",pid=39,fd=15))
+LISTEN 0      4096   127.0.0.54:53      0.0.0.0:* users:(("systemd-resolve",pid=39,fd=17))
+"""
+# A listening socket on an unrelated port whose Send-Q is 53, captured the same
+# way. This is the line a fixed-index parser reads a port out of, and it is why
+# the suite pins the queue-length case rather than only the happy one.
+UNRELATED_PORT_WITH_QUEUE_53 = """\
+tcp LISTEN 0      53     127.0.0.1:8080  0.0.0.0:* users:(("python3",pid=310,fd=3))
+"""
+UNRELATED_PORT_WITH_QUEUE_53_TCP_ONLY = """\
+LISTEN 0      53         127.0.0.1:8080  0.0.0.0:* users:(("python3",pid=310,fd=3))
 """
 # The pids those lines name, and the two this package's own units would use.
-RESOLVED_PID = "40"
+RESOLVED_PID = "39"
 ROUTER_PID = "41"
 RESOLVER_PID = "42"
 
@@ -426,21 +449,27 @@ class PreflightFixture(unittest.TestCase):
         }
 
     @staticmethod
-    def ss_line(protocol, state, local, queue, process=None, pid=None, fd=7):
-        """One `ss -H -lntup` line, in the column order `ss` really prints.
+    def ss_line(protocol, state, local, queue, process=None, pid=None, fd=7, netid=True):
+        """One `ss -H -lntu` line, in the column order `ss` really prints.
 
         Netid, State, Recv-Q, Send-Q, Local Address:Port, Peer Address:Port, and
         the process column only when one is known. Single-spaced on purpose: the
-        captured block above keeps `ss`'s own padding, and a parser that needed
-        the padding to find a column would be a parser that breaks on a terminal
-        width change.
+        captured blocks above keep `ss`'s own padding, and a parser that needed the
+        padding to find a column would be a parser that breaks on a terminal width
+        change.
+
+        ``netid=False`` drops the Netid column, which is what `ss` prints when only
+        one protocol family is asked for -- so a line built here can be in the shape
+        a different set of flags would produce, and a parser that reads a fixed
+        index passes one of the two shapes and fails the other.
         """
-        columns = [protocol, state, "0", str(queue), local, "0.0.0.0:*"]
+        columns = [protocol] if netid else []
+        columns += [state, "0", str(queue), local, "0.0.0.0:*"]
         if process is not None:
             columns.append(f'users:(("{process}",pid={pid},fd={fd}))')
         return " ".join(columns) + "\n"
 
-    def listener(self, port, address="127.0.0.1", process="dnsmask", pid="1234", protocol="tcp"):
+    def listener(self, port, address="127.0.0.1", process="dnsmask", pid="1234", protocol="tcp", netid=True):
         """A listening socket on ``port`` held by a process that is not ours.
 
         The default is a foreign resolver on purpose: the port check's whole job
@@ -448,8 +477,8 @@ class PreflightFixture(unittest.TestCase):
         this package's own process would let a broken check pass.
         """
         if protocol == "tcp":
-            return self.ss_line("tcp", "LISTEN", f"{address}:{port}", 4096, process, pid)
-        return self.ss_line("udp", "UNCONN", f"{address}:{port}", 0, process, pid)
+            return self.ss_line("tcp", "LISTEN", f"{address}:{port}", 4096, process, pid, netid=netid)
+        return self.ss_line("udp", "UNCONN", f"{address}:{port}", 0, process, pid, netid=netid)
 
     def good_runner(self, answers=None, returncodes=None, stderr=""):
         """A runner answering exactly what a passing preflight asks for.
@@ -511,10 +540,12 @@ class PreflightFixture(unittest.TestCase):
         """The preflight with some commands answered differently."""
         return self.preflight(self.good_runner(answers))
 
-    def assertPasses(self, runner=None):
+    def assertPasses(self, runner=None, message=""):
         report = self.preflight(runner)
         self.assertEqual(
-            report.problems(), [], "a machine this install can proceed on reported a problem"
+            report.problems(),
+            [],
+            message or "a machine this install can proceed on reported a problem",
         )
         return report
 
@@ -929,15 +960,78 @@ class PortTests(PreflightFixture):
         )
         self.assertIn("53", problems, "a port 53 nobody can be named on has to be refused")
 
-    def test_reads_the_local_address_and_not_the_send_queue(self):
-        # A listening socket on an unrelated port whose send-queue length is 53.
-        # A parser reading the queue column sees port 53 occupied and refuses a
-        # machine with both of the ports free; a parser reading the local address
-        # passes. The line is in the real column order, so this cannot pass by
-        # accident, and the queue value is the one number a careless parse would
-        # pick up.
-        line = self.ss_line("tcp", "LISTEN", "127.0.0.1:8080", 53, "sshd", "900")
-        self.assertPasses(self.good_runner({SS_LISTENERS: line}))
+    def test_reads_the_same_socket_in_both_of_ss_column_layouts(self):
+        # The captured answer twice, in the two shapes `ss` really prints, and a
+        # foreign listener in each. The column count is a property of the flags and
+        # not of the tool: `-lntup` prints Netid and puts the local address fifth,
+        # `-lntp` omits Netid and puts it fourth. A parser reading a fixed index is
+        # right for one of those and wrong for the other, and which one it was
+        # tested against is the only thing that decides whether the suite sees it --
+        # which is how the version before this one shipped a parser that read the
+        # Send-Q length as a port, and a fixture, hand-written, that agreed with it.
+        for netid in (True, False):
+            shape = "with -u" if netid else "without -u"
+            stub = RESOLVED_STUB_LISTENERS if netid else RESOLVED_STUB_LISTENERS_TCP_ONLY
+            queue = UNRELATED_PORT_WITH_QUEUE_53 if netid else UNRELATED_PORT_WITH_QUEUE_53_TCP_ONLY
+            with self.subTest(shape=shape):
+                self.setUp()
+                self.assertPasses(
+                    self.good_runner({SS_LISTENERS: stub}),
+                    f"resolved's stub in the shape `ss` prints {shape} was refused",
+                )
+            with self.subTest(shape=shape, case="queue"):
+                self.setUp()
+                self.assertPasses(
+                    self.good_runner({SS_LISTENERS: queue}),
+                    "a Send-Q of 53 on port 8080 is not a conflict on 53, and a parser that cannot "
+                    "see the difference refuses a machine with both ports free",
+                )
+            with self.subTest(shape=shape, case="foreign"):
+                self.setUp()
+                problems = " ".join(
+                    self.answered({SS_LISTENERS: self.listener(53, netid=netid)}).problems()
+                )
+                self.assertIn(
+                    "53", problems, f"a foreign listener on 53 was accepted in the {shape} shape"
+                )
+
+    def test_the_captured_lines_are_the_shapes_they_claim_to_be(self):
+        # The two constants above are the evidence for the claim in their comment,
+        # so the claim is asserted rather than left to a reader's counting: seven
+        # fields with a Netid when both families are asked for, six without one when
+        # they are not, and a local address in the fifth position in both cases once
+        # the Netid is accounted for.
+        for name, listeners, with_netid in (
+            ("with -u", RESOLVED_STUB_LISTENERS, True),
+            ("without -u", RESOLVED_STUB_LISTENERS_TCP_ONLY, False),
+        ):
+            with self.subTest(shape=name):
+                self.setUp()
+                line = next(one for one in listeners.splitlines() if "127.0.0.53" in one)
+                fields = line.split()
+                self.assertEqual(
+                    len(fields), 7 if with_netid else 6, f"{name}: the captured line's field count"
+                )
+                if with_netid:
+                    self.assertIn(fields[0], ("tcp", "udp"), f"{name}: the Netid column")
+                else:
+                    self.assertEqual(
+                        fields[0], "LISTEN", f"{name}: without -u the first column is the state"
+                    )
+                self.assertEqual(
+                    fields[4 if with_netid else 3],
+                    "127.0.0.53%lo:53",
+                    f"{name}: the local address is not where this comment says it is",
+                )
+                self.assertTrue(
+                    fields[3 if with_netid else 2].isdigit(),
+                    f"{name}: the column before the address is the queue, and it is a number",
+                )
+        queue = UNRELATED_PORT_WITH_QUEUE_53_TCP_ONLY.split()
+        self.assertEqual(
+            queue[2], "53", "the captured Send-Q line does not carry 53 in the queue column"
+        )
+        self.assertEqual(queue[3], "127.0.0.1:8080", "and the socket is not on port 53")
 
     def test_says_that_a_port_check_is_a_moment_and_not_a_reservation(self):
         # Between this check and the bind, anything may take the port, and the
