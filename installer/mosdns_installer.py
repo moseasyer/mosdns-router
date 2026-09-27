@@ -1768,6 +1768,12 @@ RECORDED_PROPERTIES = IGNORED_AUTOMATICALLY + ADDRESS_LISTS
 # at all.
 PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--refresh-ranges")
 
+# The launcher an operator runs to put a machine's DNS back by hand. Named as a
+# constant because three places print it -- the health verb's failure message and
+# the rollback's recovery line -- and a hand-rolled path in two of three would be
+# wrong on a build where the prefix is not the one above.
+CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
+
 # The operator's force-ECH list -- read by :func:`_forced_ech_domains` above, which
 # is shared with the preflight on purpose -- and the one entry in it that would
 # make this install's own health check meaningless.
@@ -1942,6 +1948,16 @@ class AppliedStep(NamedTuple):
     a command: putting back a marker that was not there before is an unlink, and a
     step whose undo were a command the transaction never recorded would be a value
     it invented.
+
+    ``was_running`` is the fact the recovery message cannot be reconstructed
+    without. A step whose unit was NOT running before this run and whose undo did
+    not run leaves a unit this program STARTED still running, and the operator's
+    action is `systemctl stop <unit>`. A step whose unit WAS running before this
+    run and whose undo did not run leaves a unit this program RESTARTED down, and
+    the operator's action is not a stop at all -- the machine may have no resolver,
+    and `emergency-rollback` is what puts the recorded settings back. One sentence
+    cannot be true of both, and the wrong one sends an operator to stop a resolver
+    on a machine that has nothing left listening.
     """
 
     description: str
@@ -1951,6 +1967,7 @@ class AppliedStep(NamedTuple):
     # to print a command an operator can run and `systemctl stop <unit>` with an
     # unsubstituted placeholder is not one.
     unit: Optional[str] = None
+    was_running: bool = False
 
 
 class RollbackFailure(NamedTuple):
@@ -1958,13 +1975,15 @@ class RollbackFailure(NamedTuple):
 
     The group is carried rather than left in prose because the three kinds leave
     the machine in three different states, and the operator's next action differs
-    for each. ``main`` keys its message off it.
+    for each. ``main`` keys its message off it. ``was_running`` says which way the
+    unit group went wrong, and :class:`AppliedStep` is where that is explained.
     """
 
     group: str
     description: str
     error: str
     unit: Optional[str] = None
+    was_running: bool = False
 
 
 class Transaction:
@@ -2018,9 +2037,16 @@ class Transaction:
         """Record the reactivation, whose undo runs after every profile restore."""
         self._groups[self.REACTIVATING].append(AppliedStep(description, undo))
 
-    def apply_unit(self, description: str, undo, unit: Optional[str] = None) -> None:
-        """Record a change to a unit, undone after the profile and the reactivation."""
-        self._groups[self.UNITS].append(AppliedStep(description, undo, unit))
+    def apply_unit(
+        self, description: str, undo, unit: Optional[str] = None, was_running: bool = False
+    ) -> None:
+        """Record a change to a unit, undone after the profile and the reactivation.
+
+        ``was_running`` says the unit was already running before this run, so the
+        undo is a restart rather than a stop and the recovery message has to talk
+        about a machine that may have no resolver. See :class:`AppliedStep`.
+        """
+        self._groups[self.UNITS].append(AppliedStep(description, undo, unit, was_running))
 
     def note_uncertain_unit(self, unit: str) -> None:
         """Record that ``unit``'s prior state could not be read.
@@ -2040,7 +2066,7 @@ class Transaction:
                     step.undo()
                 except Exception as error:  # noqa: BLE001 - see this method's docstring
                     failures.append(
-                        RollbackFailure(group, step.description, str(error), step.unit)
+                        RollbackFailure(group, step.description, str(error), step.unit, step.was_running)
                     )
             self._groups[group] = []
         return failures
@@ -2998,16 +3024,17 @@ def _start(
     **Not running before** -- `start`, and a stop is registered, because this run
     is what made it run.
 
-    **Running before** -- `try-restart`, and NO stop, because it was already
-    running and a rollback must leave it that way. `try-restart` rather than
-    `start` because `start` on an active unit is a no-op: this is the ordinary
-    path of an UPGRADE, where dpkg has just unpacked a new binary and a new
-    generated `/etc/mosdns/mosdns.yaml` over a machine that is already running
-    the old ones. Starting nothing would leave every check that follows -- the two
-    waits, the barrier, the device's verification, the exit-0 message about ports
-    53 and 15353 -- describing the processes that were there before the upgrade,
-    and the caller would be told it verified this release. The wait the caller
-    does next is what makes the restart observable rather than merely issued.
+    **Running before** -- `try-restart`, and a RESTART is registered as the undo,
+    because it was already running and the only way to put a unit back the way it
+    was found is to have it running again. `try-restart` rather than `start`
+    because `start` on an active unit is a no-op: this is the ordinary path of an
+    UPGRADE, where dpkg has just unpacked a new binary and a new generated
+    `/etc/mosdns/mosdns.yaml` over a machine that is already running the old
+    ones. Starting nothing would leave every check that follows -- the two waits,
+    the barrier, the device's verification, the exit-0 message about ports 53 and
+    15353 -- describing the processes that were there before the upgrade, and the
+    caller would be told it verified this release. The wait the caller does next
+    is what makes the restart observable rather than merely issued.
 
     **State unreadable** -- `start` only, never `try-restart`, and no stop, and
     the transaction is told. `try-restart` STOPS the unit first, and the only
@@ -3016,26 +3043,64 @@ def _start(
     state rule exists to prevent. Leaving one running is recorded rather than
     hidden, so the report can name the unit it left as it found it instead of
     claiming the machine is unchanged.
+
+    WHY THE RESTART'S UNDO GOES ON THE STACK FIRST, which is the whole of the
+    middle case and the reason it is not symmetric with the first.
+
+    `try-restart` STOPS the unit on its way to restarting it, so a `try-restart`
+    that fails may well have left a unit that WAS running down -- and on an upgrade
+    the connection is already `127.0.0.1` by the time this runs, so that is a
+    machine with no resolver at all. An undo registered after the attempt is not
+    on the stack when the rollback runs, so exit 3 says "every change this run
+    made has been rolled back, and nothing else is different about this machine"
+    about a machine whose resolver this run took down. The same argument, and the
+    same shape, as `_reconnect`'s; the two are now the only two places in the
+    transaction where the undo is registered first.
+
+    The price is recorded rather than hidden: a `try-restart` that fails twice --
+    the attempt and the rollback's own -- is a rollback FAILURE (exit 4), because
+    on that machine the unit really is down and no undo in this program can put
+    it back. :func:`_failed` says so in those words and names `emergency-rollback`
+    as the action, and the decision is recorded in the fix report.
+
+    Nothing about the FIRST case is asymmetric in the same way, and it is worth
+    being explicit about why, because the two look identical in the command list.
+    `start` on a unit that was not running cannot have stopped anything: if it
+    fails, the unit is where it was, so there is nothing to undo and the stop
+    registered afterwards is the undo of a success rather than of an attempt.
     """
     uncertain = unit in unreadable
     if states[unit][UNIT_ACTIVE] and not uncertain:
+        # Registered BEFORE the attempt, for the reason in the docstring. The
+        # undo is the same command because putting a running unit back the way it
+        # was IS restarting it, and it is idempotent in the way that matters: a
+        # rollback reaches the same state whether the restart succeeded or failed.
+        transaction.apply_unit(
+            f"restarting {unit}, which was already running",
+            lambda unit=unit: _checked(
+                runner,
+                ("systemctl", "try-restart", unit),
+                f"restarting {unit} again, because it was already running before this run and a "
+                "restart that failed may have left it down",
+            ),
+            unit,
+            was_running=True,
+        )
         _checked(
             runner,
             ("systemctl", "try-restart", unit),
             f"restarting {unit}, which was already running, so the version this package just "
             f"installed is the one that serves {LOCAL_DNS}",
         )
-    else:
-        _checked(runner, ("systemctl", "start", unit), f"starting {unit}")
-    # The unreadable case is asked SECOND, because an unreadable state reads as
-    # "was already running" and the early return below would swallow it: the
-    # transaction would push no stop, correctly, and record nothing, so the
-    # report would claim a machine is unchanged while a unit this run started is
-    # still running.
+        return
+    _checked(runner, ("systemctl", "start", unit), f"starting {unit}")
+    # The unreadable case is asked here, after the `start` and before the stop is
+    # registered, because an unreadable state reads as "was already running" and
+    # the early return above would swallow it: the transaction would push no stop,
+    # correctly, and record nothing, so the report would claim a machine is
+    # unchanged while a unit this run started is still running.
     if uncertain:
         transaction.note_uncertain_unit(unit)
-        return
-    if states[unit][UNIT_ACTIVE]:
         return
     transaction.apply_unit(
         f"starting {unit}",
@@ -3427,6 +3492,17 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
         reactivation means anything;
       * the units -- a unit this run started is still running, and one
         ``systemctl stop`` finishes it.
+
+    And the one arm that is not a housekeeping matter. A unit that was ALREADY
+    running when this run began is restarted, not started, and its undo is another
+    restart; a restart that fails twice leaves it DOWN, on a machine whose
+    connection this run may already have pointed at the loopback. That is not "a
+    unit is still running" and telling an operator to ``systemctl stop`` a resolver
+    that is already stopped would be the wrong instruction twice over. So it gets
+    its own sentence: the machine may have NO RESOLVER, and the action is
+    ``emergency-rollback`` -- the one condition in this program where pointing at
+    it matters most, because there is no unit left to start and no profile value
+    left to write.
     """
     groups = {failure.group for failure in failures}
     steps = []
@@ -3442,9 +3518,33 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
             f"reactivated, so the machine's DNS may not be in use; `nmcli connection up {uuid}`, or "
             "a reboot, is what finishes it"
         )
-    stuck = sorted(
-        {failure.unit for failure in failures if failure.group == Transaction.UNITS and failure.unit}
-    )
+    unit_failures = [failure for failure in failures if failure.group == Transaction.UNITS]
+    # The two halves of the unit group, and they are opposites. `stop` is the undo
+    # of a start, so a start whose stop did not run leaves a unit this program
+    # STARTED running. A restart's undo is a restart, so a restart whose undo did
+    # not run leaves a unit that was ALREADY running down. The second is the
+    # dangerous one and it is a different sentence with a different action.
+    stuck = sorted({failure.unit for failure in unit_failures if failure.unit and not failure.was_running})
+    down = sorted({failure.unit for failure in unit_failures if failure.unit and failure.was_running})
+    if down:
+        # Written with the number's grammar spelled out rather than with a
+        # placeholder, because this is a message an operator reads once, on a
+        # machine with no resolver, and "they/them" in a sentence about one unit
+        # is the sort of thing that makes a reader doubt the rest of it.
+        subject = down[0] if len(down) == 1 else " and ".join(down)
+        verb = "was" if len(down) == 1 else "were"
+        pronoun = "it" if len(down) == 1 else "them"
+        plural = len(down) > 1
+        steps.append(
+            f"THIS MACHINE MAY HAVE NO RESOLVER. {subject} {verb} running before this run began, "
+            f"and the rollback could not put {pronoun} back up: this run RESTARTED {pronoun} rather "
+            f"than starting {pronoun}, because the unit{'s' if plural else ''} "
+            f"{'were' if plural else 'was'} already serving, and a restart that fails STOPS the "
+            f"unit first -- so there may now be nothing at all listening on {LOCAL_DNS}. `systemctl "
+            f"restart {subject}` is the first thing to try, and `sudo {CDNCTL} emergency-rollback` "
+            f"puts the recorded DNS settings back from {BACKUP_PATH} whether or not the unit comes "
+            "up"
+        )
     if len(stuck) == 1:
         steps.append(
             f"this run started {stuck[0]}, which is still running, and `systemctl stop "

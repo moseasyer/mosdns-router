@@ -49,6 +49,7 @@ import threading
 import tokenize
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "installer"))
@@ -133,6 +134,22 @@ UUID = "11111111-1111-1111-1111-111111111111"
 CONNECTION_NAME = "Wired connection 1"
 DEVICE = "ens33"
 OTHER_UUID = "99999999-9999-9999-9999-999999999999"
+
+
+class Injection(NamedTuple):
+    """One row of the failure-injection table: a command, and the machine it is on.
+
+    A bare command is not enough, because two of the transaction's commands are
+    reachable on only one of its two machines. `systemctl try-restart` is issued
+    when a unit was ALREADY running, so a first install never issues it -- a row
+    naming it with nothing else would assert nothing, because the command it names
+    would never appear in the run it injects into. The flag is the machine, and the
+    machine is a fact about the program rather than a convenience for the test.
+    """
+
+    failing: tuple
+    already_running: bool = False
+
 
 # The three mutations, and only these three. A test below reads them out of the
 # recorded command list, so a fourth property fails without anybody editing this
@@ -235,6 +252,13 @@ GETFACL = "getfacl"
 DNS_UUID_PREFIX = ("nmcli", "-g")
 MODIFY = ("nmcli", "connection", "modify")
 CONNECTION_UP = ("nmcli", "connection", "up")
+# The UPGRADE's verb, and it is a different command from `start` rather than a
+# different spelling of it: on an already-active unit `start` is a no-op, which is
+# what an upgrade must not rely on. So the two are separate keys in `UNDO_OF` and
+# separate rows in the failure-injection table, and a table row that named `start`
+# for a machine that is already running would name a command the transaction never
+# issues there.
+TRY_RESTART = ("systemctl", "try-restart")
 
 # What the four recorded properties hold on a machine THIS package has already
 # taken over. It is the state a second install reads, and the reason the value of
@@ -548,12 +572,19 @@ class TransactionFixture(unittest.TestCase):
     # the reverse of this list. The reactivation has to happen after the profile
     # carries its recorded values again and before the units are stopped, so this
     # is a table with two orders in it and both of them are the contract.
+    #
+    # The two `try-restart` rows are the UPGRADE's alternatives to the two `start`
+    # rows and never appear in the same run as them; see UNIT_STEPS. They are here
+    # because `expected_rollback` reads this table for the commands a run actually
+    # issued, and a run that issued a restart would otherwise have no undo to name.
     STEPS = (
         ("systemctl", "enable", RESOLVER_UNIT),
         ("systemctl", "enable", ROUTER_UNIT),
         PUBLISH_PREFIXES,
         ("systemctl", "start", RESOLVER_UNIT),
+        TRY_RESTART + (RESOLVER_UNIT,),
         ("systemctl", "start", ROUTER_UNIT),
+        TRY_RESTART + (ROUTER_UNIT,),
         MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"),
         MODIFY + (UUID, "ipv6.ignore-auto-dns", "yes"),
         MODIFY + (UUID, "ipv4.dns", LOCAL_DNS),
@@ -564,6 +595,13 @@ class TransactionFixture(unittest.TestCase):
         ("systemctl", "enable", ROUTER_UNIT): ("systemctl", "disable", ROUTER_UNIT),
         ("systemctl", "start", RESOLVER_UNIT): ("systemctl", "stop", RESOLVER_UNIT),
         ("systemctl", "start", ROUTER_UNIT): ("systemctl", "stop", ROUTER_UNIT),
+        # The undo of a restart is another restart, and that is the whole of the
+        # property: the unit WAS running, `try-restart` stops it first, and the
+        # only way to put a unit back the way it was found is to have it running
+        # again. A `stop` here would be an undo that takes away a resolver the
+        # machine had before this run began.
+        TRY_RESTART + (RESOLVER_UNIT,): TRY_RESTART + (RESOLVER_UNIT,),
+        TRY_RESTART + (ROUTER_UNIT,): TRY_RESTART + (ROUTER_UNIT,),
         MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"): MODIFY + (UUID, "ipv4.ignore-auto-dns", "no"),
         MODIFY + (UUID, "ipv6.ignore-auto-dns", "yes"): MODIFY + (UUID, "ipv6.ignore-auto-dns", "no"),
         MODIFY + (UUID, "ipv4.dns", LOCAL_DNS): MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM),
@@ -576,21 +614,50 @@ class TransactionFixture(unittest.TestCase):
         MODIFY + (UUID, "ipv4.dns", LOCAL_DNS),
     )
     REACTIVATING_STEP = CONNECTION_UP + (UUID,)
-    # The one step whose undo is registered BEFORE the attempt rather than after
-    # it, and the only place `expected_rollback` therefore has to treat a FAILING
+    # The steps whose undo is registered BEFORE the attempt rather than after it,
+    # and the only places `expected_rollback` therefore has to treat a FAILING
     # command as one whose undo is already on the stack. Every other step
     # registers its undo because it succeeded.
-    UNDO_REGISTERED_FIRST = (CONNECTION_UP + (UUID,),)
+    #
+    # Two kinds, and the reason is the same for both: the attempt can leave the
+    # machine in the state the undo is about even when the attempt itself fails.
+    # `nmcli connection up` takes a connection DOWN on its way up, and
+    # `systemctl try-restart` STOPS a unit on its way to restarting it -- so a
+    # failed `try-restart` on a unit that was running is a unit that is DOWN, and
+    # on an upgrade the connection is already 127.0.0.1 at that point in the
+    # order, so the machine has no resolver at all.
+    UNDO_REGISTERED_FIRST = (
+        CONNECTION_UP + (UUID,),
+        TRY_RESTART + (RESOLVER_UNIT,),
+        TRY_RESTART + (ROUTER_UNIT,),
+    )
     # In APPLICATION order, like STEPS, because expected_rollback reverses each
     # group: newest first within a group. So the unit group's rollback is
     # stop-router, stop-resolver, disable-router, disable-resolver -- the stops
     # before the disables, and the two units in the reverse of how they were
     # started.
+    #
+    # `start` and `try-restart` are both listed for each unit, and only ever ONE of
+    # the pair appears in a run: they are alternatives chosen by the unit's prior
+    # state, not two steps. The order is still the application order for either
+    # machine, because each pair's two entries are adjacent and only one is
+    # present, so filtering by what actually ran leaves the right sequence.
     UNIT_STEPS = (
         ("systemctl", "enable", RESOLVER_UNIT),
         ("systemctl", "enable", ROUTER_UNIT),
         ("systemctl", "start", RESOLVER_UNIT),
+        TRY_RESTART + (RESOLVER_UNIT,),
         ("systemctl", "start", ROUTER_UNIT),
+        TRY_RESTART + (ROUTER_UNIT,),
+    )
+    # The steps an UPGRADE's machine issues but whose undo the transaction does
+    # NOT register, because the state they would undo is the state it found. The
+    # command still runs -- `systemctl enable` on an enabled unit is harmless and
+    # cheap -- so a rollback tail computed without this would name a `disable` the
+    # rollback must not issue.
+    ALREADY_SATISFIED = (
+        ("systemctl", "enable", RESOLVER_UNIT),
+        ("systemctl", "enable", ROUTER_UNIT),
     )
 
     @property
@@ -627,7 +694,7 @@ class TransactionFixture(unittest.TestCase):
         """The command that undoes one of the transaction's own steps."""
         return self.UNDO_OF[command]
 
-    def expected_rollback(self, failing):
+    def expected_rollback(self, failing, already_running=False):
         """The commands a failure at ``failing`` must be followed by, in order.
 
         The three groups, each undone newest first, in the order the design
@@ -636,6 +703,15 @@ class TransactionFixture(unittest.TestCase):
         catches a rollback that repeats a mutation it never reached, and writing
         the reactivation into its own group is what catches a rollback that
         reactivates the device while the profile is still wrong.
+
+        ``already_running`` is the machine, and it is a parameter rather than
+        something read off `self` because the expected tail genuinely depends on
+        the prior state and guessing it would be guessing the code's own rule. On
+        a unit that was ALREADY enabled, `systemctl enable` is still issued and
+        still registers NO `disable` undo, so naming the disable for it would be
+        naming a command the rollback must not run. On a unit that was already
+        running, the undo of the start is never reached at all and the row's
+        command is the restart instead.
         """
         reached = self.commands.index(failing)
         done = [
@@ -646,11 +722,14 @@ class TransactionFixture(unittest.TestCase):
                 self.commands.index(command) < reached
                 # A step whose undo went on the stack BEFORE the attempt is undone
                 # even when the attempt failed, because the machine may already be
-                # in the state the undo is about. `_reconnect` is that step, and
-                # this is the one place the rule differs.
+                # in the state the undo is about. `_reconnect` and the already-
+                # running `_start` are those steps, and this is the one place the
+                # rule differs.
                 or (command == failing and command in self.UNDO_REGISTERED_FIRST)
             )
         ]
+        if already_running:
+            done = [command for command in done if command not in self.ALREADY_SATISFIED]
         tail = []
         for group in (self.PROFILE_STEPS, (self.REACTIVATING_STEP,), self.UNIT_STEPS):
             completed = [command for command in group if command in done]
@@ -736,6 +815,23 @@ class TransactionFixture(unittest.TestCase):
         )
         self.runner = runner
         return runner
+
+    def already_running(self, *units):
+        """The machine an UPGRADE runs on: these units are active and enabled.
+
+        One definition for every case that needs it, because the two halves matter
+        together. `active` is what makes the transaction issue `try-restart`
+        rather than `start`, and `enabled` is what makes it register no `disable`
+        undo -- a unit that was enabled before this run began must be enabled
+        after a rollback too. A case that set only the first would compute a
+        rollback tail with a `disable` in it and prove nothing about the restart.
+        """
+        for unit in units:
+            self.answers[("systemctl", "is-active", unit)] = "active\n"
+            self.answers[("systemctl", "is-enabled", unit)] = "enabled\n"
+            self.returncodes[("systemctl", "is-active", unit)] = 0
+            self.returncodes[("systemctl", "is-enabled", unit)] = 0
+        return self
 
     def record_child(self, command):
         """What a child of this command would see in the four scrubbed names."""
@@ -2251,64 +2347,75 @@ class FailureMessageTests(TransactionFixture):
 class FailureInjectionTests(TransactionFixture):
     """A failure after each mutation, and what the rollback put back."""
 
-    def run_install_failing_at(self, failing, **kwargs):
-        """Run the install with ``failing`` failing, in the way that command fails.
+    def run_install_failing_at(self, row, **kwargs):
+        """Run the install with ``row``'s command failing, the way that command fails.
 
-        The reactivation is the one step whose undo is registered BEFORE the
-        attempt, so the rollback runs the same argument array again. `fail_first`
-        is the honest way to fail it -- the first `connection up` fails, the retry
-        succeeds -- and `fail` would fail both, which is a different machine and
-        has its own test.
+        The steps whose undo is registered BEFORE the attempt are failed with
+        `fail_first` -- the first call fails, the rollback's retry succeeds -- and
+        `fail` would fail both, which is a different machine and has its own test.
+        The machine is whichever one ``row`` asks for, because two of the commands
+        in the table are only reachable on one of them.
         """
-        if failing in self.UNDO_REGISTERED_FIRST:
-            return self.run_install(fail_first=[failing], **kwargs)
-        return self.run_install(fail=[failing], **kwargs)
+        if row.already_running:
+            self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        if row.failing in self.UNDO_REGISTERED_FIRST:
+            return self.run_install(fail_first=[row.failing], **kwargs)
+        return self.run_install(fail=[row.failing], **kwargs)
 
     def injection_points(self):
         """Every command after which something can go wrong, in order.
 
-        Each entry is a command whose failure the transaction has to survive, and
-        the case below asserts the whole rollback for it. The list is the
-        sequence's own commands, so a new step in the transaction shows up here.
+        Each entry names a command whose failure the transaction has to survive and
+        the machine it is reachable on, and the cases below assert the whole
+        rollback for it. The list is the sequence's own commands, so a new step in
+        the transaction shows up here.
+
+        The two `try-restart` rows are why a row is a row and not a bare command:
+        a first install never issues them, because the units are not running yet, so
+        a row naming one without saying which machine it is on would be a row whose
+        command never ran and whose assertions nothing.
         """
         return [
-            ("systemctl", "enable", RESOLVER_UNIT),
-            ("systemctl", "enable", ROUTER_UNIT),
-            PUBLISH_PREFIXES,
-            ("systemctl", "start", RESOLVER_UNIT),
-            ("systemctl", "start", ROUTER_UNIT),
-            MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"),
-            MODIFY + (UUID, "ipv6.ignore-auto-dns", "yes"),
-            MODIFY + (UUID, "ipv4.dns", LOCAL_DNS),
-            CONNECTION_UP + (UUID,),
-            ("resolvectl", "dns", DEVICE),
+            Injection(("systemctl", "enable", RESOLVER_UNIT)),
+            Injection(("systemctl", "enable", ROUTER_UNIT)),
+            Injection(PUBLISH_PREFIXES),
+            Injection(("systemctl", "start", RESOLVER_UNIT)),
+            Injection(("systemctl", "start", ROUTER_UNIT)),
+            Injection(TRY_RESTART + (RESOLVER_UNIT,), already_running=True),
+            Injection(TRY_RESTART + (ROUTER_UNIT,), already_running=True),
+            Injection(MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes")),
+            Injection(MODIFY + (UUID, "ipv6.ignore-auto-dns", "yes")),
+            Injection(MODIFY + (UUID, "ipv4.dns", LOCAL_DNS)),
+            Injection(CONNECTION_UP + (UUID,)),
+            Injection(("resolvectl", "dns", DEVICE)),
         ]
 
     def test_it_survives_a_failure_after_every_mutation(self):
-        for failing in self.injection_points():
-            with self.subTest(failing=failing):
+        for row in self.injection_points():
+            with self.subTest(failing=row.failing):
                 self.setUp()
-                result = self.run_install_failing_at(failing)
-                self.assertFalse(result.ok, f"a failure at {failing!r} was not a failure")
+                result = self.run_install_failing_at(row)
+                self.assertFalse(result.ok, f"a failure at {row.failing!r} was not a failure")
                 self.assertIsNone(
-                    result.rollback_error, f"the rollback of a failure at {failing!r} did not complete"
+                    result.rollback_error,
+                    f"the rollback of a failure at {row.failing!r} did not complete",
                 )
-                self.assertIn(failing, self.commands, "the failing command never ran")
+                self.assertIn(row.failing, self.commands, "the failing command never ran")
 
     def test_a_failure_after_every_mutation_is_followed_by_exactly_its_rollback(self):
         # The whole tail, compared as a list rather than as membership. A rollback
         # that skipped an undo, ran one twice, or -- the failure this shape exists
         # to catch -- also repeated a mutation it never reached all produce a tail
         # that no membership check would notice.
-        for failing in self.injection_points():
-            with self.subTest(failing=failing):
+        for row in self.injection_points():
+            with self.subTest(failing=row.failing):
                 self.setUp()
-                self.run_install_failing_at(failing)
-                reached = self.commands.index(failing)
+                self.run_install_failing_at(row)
+                reached = self.commands.index(row.failing)
                 self.assertEqual(
                     self.commands[reached + 1 :],
-                    self.expected_rollback(failing),
-                    f"a failure at {failing!r} was not followed by exactly its own rollback",
+                    self.expected_rollback(row.failing, already_running=row.already_running),
+                    f"a failure at {row.failing!r} was not followed by exactly its own rollback",
                 )
 
     def test_a_failed_reactivation_is_still_reactivated_by_the_rollback(self):
@@ -2372,13 +2479,139 @@ class FailureInjectionTests(TransactionFixture):
         self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
         self.assertIn("these changes are still applied", err)
 
+    # -- The upgrade's restart, which is the same hazard as the reactivation and
+    # was found by looking for the other one -----------------------------------
+
+    def test_a_failed_restart_of_a_unit_that_was_running_is_restarted_again(self):
+        # `systemctl try-restart` STOPS the unit on its way to restarting it, so a
+        # run in which it fails may have left a unit that WAS running down -- and
+        # the exit-3 message says every change this run made has been rolled back
+        # and nothing else is different about this machine. Before the fix the
+        # already-active branch returned before `apply_unit`, so it registered NO
+        # undo at all, the retry never ran, and a unit that was serving a machine
+        # whose connection had already been pointed at 127.0.0.1 stayed down.
+        #
+        # This is the state item 8's fix created and did not carry the safety
+        # property across: before it, `start` on an active unit was a no-op, so a
+        # bad new release left the OLD binary serving and the machine resolving.
+        self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        result = self.run_install(fail_first=[TRY_RESTART + (ROUTER_UNIT,)])
+        self.assertFalse(result.ok)
+        restarts = [
+            index
+            for index, command in enumerate(self.commands)
+            if command == TRY_RESTART + (RESOLVER_UNIT,)
+        ]
+        self.assertEqual(
+            len(restarts), 2,
+            f"{RESOLVER_UNIT} was restarted {len(restarts)} time(s); this run restarted a unit "
+            "that was already serving, so a rollback that does not restart it again leaves a "
+            "resolver down on a machine already pointed at the loopback",
+        )
+        # The tail is taken from the FAILING command, not from the first restart: the
+        # router's own restart attempt sits between them, and it is a forward step of
+        # this run rather than part of the rollback.
+        reached = self.commands.index(TRY_RESTART + (ROUTER_UNIT,))
+        self.assertEqual(
+            self.commands[reached + 1 :],
+            self.expected_rollback(TRY_RESTART + (ROUTER_UNIT,), already_running=True),
+            "a failed restart was not followed by the restart that puts the unit back",
+        )
+        self.assertIsNone(result.rollback_error, "the rollback of a failed restart did not finish")
+        self.assertIn(
+            "every change this run made has been rolled back",
+            self.stderr_of_install(fail_first=[TRY_RESTART + (ROUTER_UNIT,)]),
+            "the exit-3 sentence is the one this property is about, so it is asserted where it "
+            "is printed rather than reconstructed",
+        )
+
+    def test_a_unit_that_could_not_be_restarted_back_is_a_rollback_failure(self):
+        # The other machine, and the one the decision this round records is about.
+        # The unit was running, the restart failed, and the rollback's own restart
+        # failed too -- so the unit is DOWN, it was UP before this run, and no undo
+        # in the program can put it back. That has to be a rollback FAILURE (exit 4)
+        # and not a clean refusal, and the recovery line has to say the machine may
+        # have NO RESOLVER rather than "a unit this run started is still running",
+        # which is the opposite fact and would send an operator to `systemctl stop`
+        # on a machine that has nothing left listening.
+        self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        result = self.run_install(fail=[TRY_RESTART + (RESOLVER_UNIT,)])
+        self.assertFalse(result.ok)
+        self.assertIsNotNone(
+            result.rollback_error,
+            "a unit that was running and could not be restarted was reported as a clean "
+            "refusal, so exit 3 would claim a machine is as it was found with a resolver down",
+        )
+        recovery = result.recovery or ""
+        self.assertIn(
+            "MAY HAVE NO RESOLVER",
+            recovery,
+            f"the recovery message does not tell the operator the machine may have no resolver: "
+            f"{recovery!r}",
+        )
+        self.assertIn(RESOLVER_UNIT, recovery)
+        self.assertIn("emergency-rollback", recovery, "the recovery message does not name the action")
+        self.assertNotIn(
+            f"this run started {RESOLVER_UNIT}",
+            recovery,
+            "the message still says this run STARTED the unit, which is the opposite of what "
+            "happened: it was running before and the restart is what took it down",
+        )
+        # And a unit this run DID start, whose own stop failed, is still described as
+        # running -- the two are different facts and one sentence cannot be true of
+        # both, so this half is what stops the fix from fixing the message by
+        # deleting the older arm.
+        self.setUp()
+        result = self.run_install(
+            fail=[CONNECTION_UP + (UUID,), ("systemctl", "stop", ROUTER_UNIT)]
+        )
+        self.assertIn(f"this run started {ROUTER_UNIT}", result.recovery or "")
+        self.assertNotIn("MAY HAVE NO RESOLVER", result.recovery or "")
+
+    def test_the_exit_four_status_is_what_an_unrestartable_unit_gets(self):
+        self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        status, _out, err = self.install_cli(runner=self.good_runner(fail=[TRY_RESTART + (RESOLVER_UNIT,)]))
+        self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
+        self.assertIn("these changes are still applied", err)
+        self.assertIn(
+            "MAY HAVE NO RESOLVER", err, "the operator is not told the machine may have no resolver"
+        )
+
+    def test_a_unit_that_was_running_is_never_stopped_by_any_rollback(self):
+        # The other half of the pair, and the property the undo must not trade
+        # away: the undo of a restart is a RESTART, so the rollback cannot take a
+        # resolver away that was there before this run began -- whichever step it
+        # fails at.
+        for row in self.injection_points():
+            if not row.already_running:
+                continue
+            with self.subTest(failing=row.failing):
+                self.setUp()
+                self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+                if row.failing in self.UNDO_REGISTERED_FIRST:
+                    self.run_install(fail=[row.failing])
+                else:
+                    self.run_install(fail_first=[row.failing])
+                for unit in (RESOLVER_UNIT, ROUTER_UNIT):
+                    with self.subTest(unit=unit):
+                        self.assertNotIn(
+                            ("systemctl", "stop", unit),
+                            self.commands,
+                            f"a failure at {row.failing!r} stopped {unit}, which was running before "
+                            "this run began",
+                        )
+
+    def stderr_of_install(self, **kwargs):
+        """The install's own standard error, through `main` and the injected probe."""
+        _status, _out, err = self.install_cli(runner=self.good_runner(**kwargs))
+        return err
 
     def test_a_failure_stops_the_services_it_started_and_leaves_the_rest_running(self):
-        for failing in self.injection_points():
-            with self.subTest(failing=failing):
+        for row in self.injection_points():
+            with self.subTest(failing=row.failing):
                 self.setUp()
-                self.run_install(fail=[failing])
-                reached = self.commands.index(failing)
+                self.run_install_failing_at(row)
+                reached = self.commands.index(row.failing)
                 for unit in (RESOLVER_UNIT, ROUTER_UNIT):
                     started = ("systemctl", "start", unit)
                     with self.subTest(unit=unit):
@@ -2386,13 +2619,13 @@ class FailureInjectionTests(TransactionFixture):
                             self.assertIn(
                                 ("systemctl", "stop", unit),
                                 self.commands,
-                                f"a failure at {failing!r} left {unit} running; this install started it",
+                                f"a failure at {row.failing!r} left {unit} running; this install started it",
                             )
                         else:
                             self.assertNotIn(
                                 ("systemctl", "stop", unit),
                                 self.commands,
-                                f"a failure at {failing!r} stopped {unit}, which this install had not started",
+                                f"a failure at {row.failing!r} stopped {unit}, which this install had not started",
                             )
 
     def test_a_failure_at_a_property_restores_the_values_it_recorded(self):
@@ -2462,12 +2695,12 @@ class FailureInjectionTests(TransactionFixture):
         self.assertNotIn(("systemctl", "disable", RESOLVER_UNIT), self.commands)
 
     def test_the_backup_survives_every_rollback_as_the_record(self):
-        for failing in self.injection_points():
-            with self.subTest(failing=failing):
+        for row in self.injection_points():
+            with self.subTest(failing=row.failing):
                 self.setUp()
-                self.run_install(fail=[failing])
+                self.run_install_failing_at(row)
                 path = self.rooted(BACKUP_PATH)
-                self.assertTrue(path.exists(), f"a failure at {failing!r} removed the backup")
+                self.assertTrue(path.exists(), f"a failure at {row.failing!r} removed the backup")
                 self.assertEqual(stat.S_IMODE(path.lstat().st_mode), BACKUP_MODE)
                 self.assertEqual(
                     json.loads(path.read_text(encoding="utf-8"))["connection"]["uuid"],
@@ -2820,16 +3053,11 @@ class UpgradeRestartTests(TransactionFixture):
     `try-restart` is the verb that fixes it and it is conditional on the state
     being READ. A unit whose state could not be read is only `start`ed, because
     `try-restart` stops it first and stopping a unit this install may not own is
-    the harm the whole prior-state rule exists to prevent.
+    the harm the whole prior-state rule exists to prevent. That second half is a
+    judgement rather than an oversight and it is argued in `_start`'s own
+    docstring; `FailureInjectionTests` holds both halves, because the restart's own
+    undo is a property that only the injection table reaches.
     """
-
-    def already_running(self, *units):
-        for unit in units:
-            self.answers[("systemctl", "is-active", unit)] = "active\n"
-            self.answers[("systemctl", "is-enabled", unit)] = "enabled\n"
-            self.returncodes[("systemctl", "is-active", unit)] = 0
-            self.returncodes[("systemctl", "is-enabled", unit)] = 0
-        return self
 
     def test_a_unit_that_was_already_running_is_restarted_rather_than_started(self):
         self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
