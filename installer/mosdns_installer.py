@@ -1461,11 +1461,13 @@ def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = 
     the distinction between reporting a problem and fixing it is the distinction
     this program exists to keep.
 
-    ``run`` and ``root`` are the same two seams :func:`preflight` has, in the same
-    order. A command whose root could not be pointed elsewhere could only be
-    tested against the machine it ran on, and a test here that read the host's
-    NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the host
-    wearing a test's name.
+    ``run`` and ``root`` are the same two seams :func:`preflight` has, and they are
+    named in the other order here: :func:`preflight` takes ``(root, run)`` and this
+    takes ``(argv, run, root)``, so ``root`` is passed along positionally by name
+    rather than by position. A command whose root could not be pointed elsewhere
+    could only be tested against the machine it ran on, and a test here that read
+    the host's NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the
+    host wearing a test's name.
     """
     arguments = list(argv)
     if not arguments or arguments[0] != "preflight":
