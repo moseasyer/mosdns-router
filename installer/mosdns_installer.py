@@ -1620,6 +1620,36 @@ DISPATCHER_SCRIPT = "/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-b
 # instead of restoring a guess.
 BACKUP_SCHEMA_VERSION = 1
 
+# The fields a SECOND install of this package refreshes, and -- by naming the
+# complement rather than the list -- the fields it must carry forward untouched.
+#
+# A re-install happens on every upgrade: `postinst configure` runs the whole
+# transaction whatever dpkg passed as its second argument. By then this package
+# has already pointed the machine at 127.0.0.1, so the three properties the
+# backup records read `yes`/`yes`/`127.0.0.1` -- this package's own values -- and a
+# re-install that records them as "what the machine had" has destroyed the only
+# copy of the machine's real DNS settings. The next removal then writes the
+# loopback back, stops both units, and reports success. This tuple is the rule
+# that stops it, and the complement is the safer way to state it: a field added to
+# the document later is carried forward by default, because forgetting to record
+# that a new field is volatile is the mistake that destroys a machine's record.
+#
+#   * `created_at` and `package_version` are about THIS run, not about the machine.
+#   * `dhcp` is the lease as it is now, re-read by the capture on every install.
+#   * `connection` is a live observation, and its `device` in particular is: a
+#     machine whose interface was renamed carries the OLD name in the record, and
+#     an uninstall asks `resolvectl dns <device>` to prove the device took the
+#     restored values back. Carrying a stale name forward would leave a renamed
+#     machine refusing its own uninstall with a message about a rename. The UUID
+#     is not volatile and is not refreshed: the record is only ever about one
+#     connection, and a re-install naming a different one is refused rather than
+#     given a second record's worth of values.
+#
+# Everything else -- `original` above all, and with it the connection's own
+# properties, the configuration digest, the schema version and the project name --
+# describes the machine, and a re-install observes none of it anew.
+VOLATILE_BACKUP_FIELDS = ("created_at", "package_version", "dhcp", "connection")
+
 # The document the backup digests. It is the POLICY rather than the rendered
 # routing config because that is what this project already means by a
 # configuration digest: `internal/optimizer`'s PolicyDigest is the SHA-256 of the
@@ -2618,8 +2648,90 @@ def prepare_backup(root: Path, runner: CommandRunner, connection: Connection, no
     }
 
 
-def write_backup(root: Path, document: dict) -> Path:
-    """Write the backup at mode 0600 under the installer directory, and return its path.
+def _carried_forward(root: Path, document: dict) -> dict:
+    """The document a RE-install writes: the previous record kept, the rest fresh.
+
+    A first install reads the machine's DNS properties and records them; that is
+    the one moment the values mean what the backup says they mean. On a machine
+    this package has already installed, the same three properties hold
+    `yes`/`yes`/`127.0.0.1` -- this package's own values -- so the only correct
+    `original` block on a re-install is the one the FIRST install wrote. Carrying
+    it forward is what makes a re-install a re-install rather than a second
+    installation: refusing it outright would push an operator who wants to
+    re-run the install into hand-editing `/etc`, and silently re-recording the
+    loopback as the machine's own resolver is the one outcome this whole program
+    exists to prevent -- the next removal would then take the machine's resolver
+    with it while reporting that everything was fine.
+
+    Two things it will not do, and both are refusals rather than guesses:
+
+      * **Carry a record it cannot read.** If the marker claims this machine and
+        the record is absent or unreadable, the only values available are this
+        package's own, and writing them would manufacture a record rather than
+        keep one.
+      * **Keep a record that is about a different connection.** The record is
+        what `uninstall` and `emergency-rollback` restore from, and they restore
+        the one connection it names. A re-install working on a second connection
+        cannot have one record for both, and replacing the first would leave that
+        connection pointed at the loopback with nothing to put back.
+
+    The reader is `_read_backup`, the same one the uninstall uses and the same
+    standard of what a usable record is -- so a document carried forward here is
+    one an uninstall would act on rather than one that merely parsed.
+    """
+    if not _installation_is_ours(root):
+        return document
+    recorded, refusals = _read_backup(root)
+    if recorded is None:
+        raise InstallRefused(
+            f"{MANAGED_BY} says this machine is already running this package's DNS, and "
+            f"{BACKUP_PATH} is not a record this program can read ("
+            + "; ".join(refusals)
+            + "), so this install cannot record what the machine had: the values it would "
+            f"write down are the ones this package itself set -- {_set_values_now(document)} -- and "
+            "recording those would destroy the record of the machine's real settings rather than "
+            "keep it. Nothing has been changed. The record has to be restored by hand, or this "
+            "package removed with `dpkg --force-remove-reinstreq` once the connection is back on "
+            "the machine's own resolvers"
+        )
+    recorded_uuid = str(recorded["connection"]["uuid"])
+    fresh_uuid = str(document["connection"]["uuid"])
+    if recorded_uuid != fresh_uuid:
+        raise InstallRefused(
+            f"{BACKUP_PATH} records what connection {recorded_uuid} was set to, and this install "
+            f"is working on connection {fresh_uuid}; one record cannot describe two connections, "
+            "and replacing the first would leave it pointed at the loopback address with nothing to "
+            "put back. Nothing has been changed. Remove this package (which restores "
+            f"{recorded_uuid} through the record that is already there) and install it again to "
+            f"work on {fresh_uuid}"
+        )
+    carried = dict(recorded)
+    for field in VOLATILE_BACKUP_FIELDS:
+        carried[field] = document[field]
+    return carried
+
+
+def _set_values_now(document: dict) -> str:
+    """The three values a re-install would record, spelled out for a refusal.
+
+    Only ever used to say what this program is NOT going to write down, so an
+    operator reading the refusal can see the machine's record and the package's
+    own values side by side and tell which is which.
+    """
+    return ", ".join(
+        f"{prop}={document['original'][prop]['raw']!r}" for prop, _value in NM_MUTATIONS
+    )
+
+
+def write_backup(root: Path, document: dict) -> tuple:
+    """Write the backup at mode 0600 under the installer directory, and return it.
+
+    Returns ``(path, document)``, and the document is the one as WRITTEN, which on
+    a machine this package has already installed is not the one that was passed
+    in: :func:`_carried_forward` keeps the first install's record of the machine
+    and refreshes only the fields that are about this run. `validate_backup` is
+    handed the written document rather than the intended one, so a carry-forward
+    that did not survive the round trip is still caught here.
 
     The directory is created at 0700 when it is not there and is NOT
     re-permissioned when it is, for the reason preflight never repairs anything: a
@@ -2632,6 +2744,7 @@ def write_backup(root: Path, document: dict) -> Path:
     directory this function has just made root-only, so nothing else can reach the
     file while it is briefly at the umask's mode.
     """
+    document = _carried_forward(root, document)
     directory = root / INSTALLER_DIRECTORY.lstrip("/")
     if _path_state(directory) == "absent":
         try:
@@ -2652,7 +2765,7 @@ def write_backup(root: Path, document: dict) -> Path:
             f"{path} could not be written ({error}); this install changes NetworkManager's DNS and "
             "the record of what it was has to be readable before it does"
         ) from error
-    return path
+    return path, document
 
 
 def validate_backup(root: Path, document: dict) -> None:
@@ -2991,7 +3104,7 @@ def _run_transaction(
     _refuse_a_locally_answered_probe(root)
     _capture_dhcp(runner, connection.device)
     document = prepare_backup(root, runner, connection, now)
-    path = write_backup(root, document)
+    path, document = write_backup(root, document)
     validate_backup(root, document)
     transaction.backup = str(path)
 

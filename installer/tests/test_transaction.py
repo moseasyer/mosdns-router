@@ -236,6 +236,18 @@ DNS_UUID_PREFIX = ("nmcli", "-g")
 MODIFY = ("nmcli", "connection", "modify")
 CONNECTION_UP = ("nmcli", "connection", "up")
 
+# What the four recorded properties hold on a machine THIS package has already
+# taken over. It is the state a second install reads, and the reason the value of
+# the `original` block is visible at all: after an upgrade the connection holds
+# these, so anything that records "what the machine had" from a second install
+# records this package's own values instead of the machine's.
+ALREADY_OURS = {
+    "ipv4.ignore-auto-dns": "yes",
+    "ipv6.ignore-auto-dns": "yes",
+    "ipv4.dns": LOCAL_DNS,
+    "ipv6.dns": "",
+}
+
 # The verbs that change something, as distinct from the verbs that ask. The
 # assertion "nothing was mutated" is about these and not about the program that
 # carries them, because the preflight asks systemd read-only questions before the
@@ -611,8 +623,24 @@ class TransactionFixture(unittest.TestCase):
             tail += [self.undo_of(command) for command in reversed(completed)]
         return tail
 
-    def good_runner(self, outputs=None, returncodes=None, fail=(), fail_after=None, child_environment=None):
-        """A runner answering exactly what an installable machine answers."""
+    def good_runner(
+        self,
+        outputs=None,
+        returncodes=None,
+        fail=(),
+        fail_after=None,
+        child_environment=None,
+        already_installed=False,
+    ):
+        """A runner answering exactly what an installable machine answers.
+
+        ``already_installed`` answers the four properties with the values a machine
+        this package has already taken over holds -- `yes`/`yes`/`127.0.0.1` and an
+        empty IPv6 list -- which is what the SECOND install of an upgrade reads. A
+        runner that kept answering the machine's original values would make every
+        re-install look like a first install, and the bug this fixture exists to
+        catch is invisible from a first install.
+        """
         answers = {
             ("dpkg", "--print-architecture"): "amd64\n",
             ("systemctl", "--version"): "systemd 255 (255.1-1ubuntu1)\n",
@@ -639,6 +667,9 @@ class TransactionFixture(unittest.TestCase):
             ("ipv6.dns", ""),
         ):
             answers[DNS_UUID_PREFIX + (prop, "connection", "show", UUID)] = value + "\n"
+        if already_installed:
+            for prop, value in ALREADY_OURS.items():
+                answers[DNS_UUID_PREFIX + (prop, "connection", "show", UUID)] = value + "\n"
         for unit in (RESOLVER_UNIT, ROUTER_UNIT):
             answers[("systemctl", "is-active", unit)] = "inactive\n"
             answers[("systemctl", "is-enabled", unit)] = "disabled\n"
@@ -703,7 +734,7 @@ class TransactionFixture(unittest.TestCase):
 
         return datetime.datetime(2026, 9, 27, 9, 20, tzinfo=datetime.timezone.utc)
 
-    def run_install(self, runner=None, probe=None, deadline=0.0, poll=0.0, **kwargs):
+    def run_install(self, runner=None, probe=None, deadline=0.0, poll=0.0, clock=None, **kwargs):
         """Run the transaction against the fake root, with no real command."""
         self.events = []
         if runner is None:
@@ -711,7 +742,7 @@ class TransactionFixture(unittest.TestCase):
         return installer.install(
             self.root,
             runner,
-            clock=self.clock,
+            clock=clock or self.clock,
             probe=probe or self.probe_for(),
             deadline_seconds=deadline,
             poll_seconds=poll,
@@ -1916,6 +1947,176 @@ class MarkerTests(TransactionFixture):
         }
         installer.install(self.root, self.good_runner(outputs=answers), clock=self.clock, probe=self.probe_for())
         self.assertFalse(self.rooted(MANAGED_BY).exists())
+
+
+class ReinstallTests(TransactionFixture):
+    """What a SECOND install must not forget: the first install's recorded values.
+
+    This is the whole of a re-install, and it is one property: the ``original``
+    block is a record of the machine, not of a run. Once this package has taken
+    the machine's DNS over, the connection's three properties hold ``yes``/``yes``/
+    ``127.0.0.1`` -- THIS package's values -- so a second install that re-reads
+    them and writes them over the record has destroyed the only copy of what the
+    machine actually had. The removal that follows then writes the loopback back,
+    reactivates, stops both units, and reports that the connection is back on the
+    machine's own resolvers.
+
+    The three cases are the same property seen from the three places the record is
+    read, because one of them fixing it is not the property:
+
+      * the backup file itself, after the second install;
+      * ``uninstall``, which is what ``prerm remove`` runs;
+      * ``emergency-rollback``, on the same re-installed machine.
+    """
+
+    # The device the fake machine reports. It is the LOOPBACK for the whole of
+    # these cases, including after a restore, and that is deliberate: it models
+    # the real failure `_device_follows_the_backup` exists to catch -- a
+    # NetworkManager that accepted the profile writes and did not apply them to
+    # the device. The interesting consequence is the direction the two versions
+    # differ in, and it is asserted below rather than assumed.
+    def later_clock(self):
+        import datetime
+
+        return datetime.datetime(2026, 10, 4, 11, 5, tzinfo=datetime.timezone.utc)
+
+    def upgrade(self, **kwargs):
+        """Run a second install on a machine this package has already installed.
+
+        A LATER clock and a DIFFERENT package version, because the two are the
+        volatile half of the carry-forward and a test that kept them identical
+        could not tell a carry-forward from a refusal to re-run.
+        """
+        kwargs.setdefault("clock", self.later_clock)
+        kwargs.setdefault("outputs", {PACKAGE_VERSION_COMMAND: "1.5.0\n"})
+        return self.run_install(already_installed=True, **kwargs)
+
+    def recorded(self):
+        return json.loads(self.rooted(BACKUP_PATH).read_text(encoding="utf-8"))
+
+    def test_a_reinstall_refuses_to_replace_a_record_it_cannot_read(self):
+        # The marker says this machine is already ours and the record cannot be
+        # read. The only values left to write down are this package's own, so the
+        # one thing the install must not do is manufacture a record out of them.
+        self.install_succeeds()
+        self.rooted(BACKUP_PATH).unlink()
+        result = self.upgrade()
+        self.assertFalse(result.ok, "a re-install with no record to keep reported success")
+        self.assertIn(BACKUP_PATH, result.error or "")
+        self.assertIn("127.0.0.1", result.error or "")
+        self.assertFalse(
+            self.rooted(BACKUP_PATH).exists(),
+            "the refused re-install wrote a record built from this package's own values",
+        )
+        self.assertNothingChanged("a refused re-install")
+
+    def test_a_reinstall_refuses_when_the_record_belongs_to_another_connection(self):
+        # One record describes one connection, and both the uninstall and the
+        # emergency rollback restore the connection it names. A re-install working
+        # on a second one has to say so rather than replace the first record and
+        # leave that connection pointed at the loopback with nothing to put back.
+        self.install_succeeds()
+        before = self.recorded()
+        self.write(POLICY_CONFIG, POLICY_BODY + "# an operator edit\n")
+        second = {
+            NMCLI_CONNECTIONS: f"{CONNECTION_NAME}:{OTHER_UUID}:802-3-ethernet:{DEVICE}\n",
+            NMCLI_DEVICE_UUID: f"{OTHER_UUID}\n",
+        }
+        for prop, value in (
+            ("ipv4.ignore-auto-dns", "no"),
+            ("ipv6.ignore-auto-dns", "no"),
+            ("ipv4.dns", DHCP_UPSTREAM),
+            ("ipv6.dns", ""),
+        ):
+            second[DNS_UUID_PREFIX + (prop, "connection", "show", OTHER_UUID)] = value + "\n"
+        result = self.run_install(already_installed=True, outputs=second)
+        self.assertFalse(result.ok, "a re-install replaced a record about a different connection")
+        self.assertIn(OTHER_UUID, result.error or "")
+        self.assertIn(UUID, result.error or "")
+        self.assertEqual(self.recorded(), before, "the record about the first connection was replaced")
+        self.assertNothingChanged("a refused re-install onto a second connection")
+
+    def test_the_second_install_keeps_the_first_installs_recorded_values(self):
+        first = self.install_succeeds()
+        self.assertIsNotNone(first.backup)
+        before = self.recorded()
+
+        self.events = []
+        result = self.upgrade()
+        self.assertTrue(result.ok, f"a re-install on an installed machine failed: {result.error}")
+        after = self.recorded()
+
+        self.assertEqual(
+            after["original"],
+            before["original"],
+            "the second install rewrote the record of what the machine had, from the values "
+            "this package itself had just set",
+        )
+        # And the volatile half DID move, so this is a carry-forward and not a
+        # refusal to re-run: a backup that still claims the first release wrote
+        # it is a backup an operator cannot match against the release they are
+        # removing.
+        self.assertNotEqual(after["created_at"], before["created_at"])
+        self.assertNotEqual(after["package_version"], before["package_version"])
+        self.assertEqual(after["dhcp"], before["dhcp"], "the lease is re-read on every install")
+
+    def test_the_uninstall_after_a_reinstall_restores_the_first_installs_values(self):
+        self.install_succeeds()
+        before = self.recorded()
+        self.assertTrue(self.upgrade().ok)
+
+        self.events = []
+        result = installer.uninstall(self.root, self.good_runner(already_installed=True), probe=self.probe_for())
+        restored = [command[4:] for command in self.commands if command[:3] == MODIFY]
+        self.assertEqual(
+            sorted(restored),
+            sorted(
+                (
+                    (prop, before["original"][prop]["raw"] or "''")
+                    for prop in ("ipv4.dns", "ipv4.ignore-auto-dns", "ipv6.ignore-auto-dns")
+                ),
+            ),
+            "the uninstall after a re-install did not put the FIRST install's recorded values back",
+        )
+        # The device still reports the loopback this run took away from it -- the
+        # failure mode above -- and the recorded original does not contain it, so
+        # the check that guards the machine's resolver must refuse and the units
+        # must still be running. On the broken version the re-install had recorded
+        # the loopback as the machine's own, so the check passed and both units
+        # were stopped on a machine whose DNS pointed at a process that had gone.
+        self.assertFalse(result.ok, "the device check did not refuse a machine still on the loopback")
+        self.assertIn(LOCAL_DNS, (result.error or "") + (result.manual_recovery or ""))
+        for unit in (ROUTER_UNIT, RESOLVER_UNIT):
+            with self.subTest(unit=unit):
+                self.assertNotIn(
+                    ("systemctl", "stop", unit),
+                    self.commands,
+                    f"{unit} was stopped while the device was still using {LOCAL_DNS}",
+                )
+
+    def test_the_emergency_rollback_after_a_reinstall_restores_the_first_installs_values(self):
+        self.install_succeeds()
+        before = self.recorded()
+        self.assertTrue(self.upgrade().ok)
+
+        self.events = []
+        result = installer.emergency_rollback(
+            self.root, self.good_runner(already_installed=True), probe=self.probe_for()
+        )
+        restored = [command[4:] for command in self.commands if command[:3] == MODIFY]
+        self.assertEqual(
+            sorted(restored),
+            sorted(
+                (
+                    (prop, before["original"][prop]["raw"] or "''")
+                    for prop in ("ipv4.dns", "ipv4.ignore-auto-dns", "ipv6.ignore-auto-dns")
+                )
+            ),
+            "the emergency rollback on a re-installed machine did not put the FIRST install's "
+            "recorded values back",
+        )
+        self.assertIn(LOCAL_DNS, (result.error or "") + (result.manual_recovery or ""))
+        self.assertFalse(result.ok, "the rollback reported success on a device still on the loopback")
 
 
 class FailureInjectionTests(TransactionFixture):
