@@ -561,11 +561,61 @@ POLICY_VERBS = {
         "failed-upgrade", "purge", "remove", "upgrade",
     ),
 }
-# postinst configure takes a second argument that may be null (Policy 6.5 footnote
-# 7), and prerm deconfigure takes four. So the scripts may only ever look at $1, and
-# that is a separate assertion: a script that reads $2 unconditionally exits 1 on a
-# one-argument invocation, which is a real dpkg call.
-SCRIPTS = {"postinst": POSTINST, "prerm": PRERM, "postrm": POSTRM}
+# ON THE SECOND ARGUMENT. A maintainer script may be HANDED a second argument -- a
+# version -- and must not break on it: `postinst configure` is called as `postinst
+# configure most-recently-configured-version` and Policy 6.5 footnote 7 says that
+# argument may be null, `prerm deconfigure` is called with four arguments, and
+# `new-postrm abort-upgrade` with three. So the rule is NOT "the scripts may only ever
+# look at $1", which is what this table used to say here and which `postinst` itself
+# contradicts by reading `${2:-}` to tell a first install from an upgrade. The rule is
+# that an argument dpkg may not pass is never read unguarded: every `$N` for N >= 2
+# carries a `${N:-}` default, so a null one reads as empty rather than aborting the
+# script. Asserted per script, in
+# `test_an_argument_dpkg_may_not_pass_is_never_read_unguarded`.
+#
+# THE THREE SCRIPTS ARE RESOLVED AT CALL TIME, and the reason is load-bearing.
+# `SCRIPTS` used to be a dict literal binding three Path objects once, at import; the
+# test methods iterated it; and a control that swapped the `POSTINST`/`PRERM`/`POSTRM`
+# globals in order to run a method against a MUTATED script left every method reading
+# the file on disk. Those controls therefore passed while testing nothing, and the
+# report claimed them as evidence. Resolving the names at call time is what makes a
+# substitution reach the code under test, and
+# `test_a_missing_policy_verb_is_reported` holds that property: it asserts
+# `assertMethodFails` on a mutated postrm, which can only raise if the method really
+# read the replacement.
+SCRIPT_GLOBALS = ("postinst", "prerm", "postrm")
+
+
+def script_paths():
+    """The three maintainer scripts, resolved at CALL time from the globals."""
+    return {name: globals()[name.upper()] for name in SCRIPT_GLOBALS}
+
+
+class _Scripts:
+    """``SCRIPTS``, resolving through `script_paths()` on every access.
+
+    Not a dict: a dict is a snapshot, and a snapshot taken at import is exactly the
+    bug. Mapping-shaped so the methods can keep saying ``SCRIPTS.items()`` and mean
+    the current global rather than whatever the global was when the module loaded.
+    """
+
+    def items(self):
+        return sorted(script_paths().items())
+
+    def __getitem__(self, name):
+        return script_paths()[name]
+
+    def __contains__(self, name):
+        return name in script_paths()
+
+    def __iter__(self):
+        return iter(sorted(script_paths()))
+
+    def __len__(self):
+        return len(script_paths())
+
+
+SCRIPTS = _Scripts()
 
 
 def policy_verb_findings(name, text):
@@ -1290,11 +1340,22 @@ def scripts_replaced(**replacements):
     """Swap the module's POSTINST / PRERM / POSTRM globals for the length of a block.
 
     In memory and nothing else: the files on disk are untouched, so a control cannot
-    leave a broken maintainer script behind for the next run to read. The globals are
-    the ones the test METHODS read, not a lookup table -- swapping a table would leave
-    the methods reading the real file and the control would pass for the wrong reason,
-    which is the failure this exists to remove.
+    leave a broken maintainer script behind for the next run to read.
+
+    The globals it rebinds are the ones `SCRIPTS` -- an `_Scripts`, not a dict -- 
+    resolves, which are the ones the test METHODS read. That indirection is the whole
+    reason the substitution can work at all, and it did not work at all in the
+    previous version: `SCRIPTS` was a dict literal, so it held the three Path objects
+    from import time, the methods iterated it, and a control that removed a verb from
+    postrm still read the real file and watched the method PASS. A mechanism that
+    cannot reach the code under test is worse than no mechanism, because a control
+    written against it reports success while testing nothing.
     """
+    unknown = sorted(set(replacements) - set(SCRIPT_GLOBALS))
+    if unknown:
+        raise AssertionError(
+            f"scripts_replaced was asked for {unknown}, which are not maintainer scripts"
+        )
     previous = {name: globals()[name.upper()] for name in replacements}
     try:
         for name, script in replacements.items():
@@ -1875,7 +1936,7 @@ class MaintainerScriptTests(_Staged):
         failure into a half-installed package, and the test that should have caught it
         had enumerated the same six verbs.
         """
-        for name, script in sorted(SCRIPTS.items()):
+        for name, script in SCRIPTS.items():
             with self.subTest(script=name):
                 findings = policy_verb_findings(name, script.read_text())
                 self.assertEqual(
@@ -1891,7 +1952,7 @@ class MaintainerScriptTests(_Staged):
         expected a version. `postinst` does read it -- it is what tells a fresh
         install from an upgrade -- and the rule is therefore that every such reference
         is `${N:-}`-guarded rather than that none of them exists."""
-        for name, script in sorted(SCRIPTS.items()):
+        for name, script in SCRIPTS.items():
             body = shell_code(script.read_text())
             for number in ("2", "3", "4", "5"):
                 unguarded = body.count("$" + number)
@@ -3016,6 +3077,69 @@ class ControlTests(unittest.TestCase):
             ]
             self.assertEqual(shipped, ["/var/lib/mosdns/runtime/ech-state.json"])
 
+    def test_a_missing_policy_verb_is_reported(self):
+        """Round 2's control for the verb table, run against the METHOD.
+
+        Removing `failed-upgrade` from postrm's `case` list is the edit that shipped
+        in round 1. The method is what a reviewer reads, so the method is what has to
+        fail -- and it has to fail while the substitution is in place, which is the
+        part that did not work in the version this control was first written as.
+        `SCRIPTS` was a dict of Paths bound at import, so rebinding the module globals
+        left the method reading the file on disk and it passed.
+        """
+        good = POSTRM.read_text()
+        self.assertEqual(policy_verb_findings("postrm", good), [])
+        broken = good.replace("disappear | failed-upgrade)", "disappear)")
+        self.assertNotIn("failed-upgrade)", broken, "the mutation changed nothing")
+        self.assertTrue(
+            any("failed-upgrade" in finding for finding in policy_verb_findings("postrm", broken)),
+            "the reader does not name the missing verb, so the control cannot say what it caught",
+        )
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_every_maintainer_script_handles_every_call_dpkg_can_make",
+            postrm=broken,
+        )
+        # And the substitution reached the name the method iterates, rather than a
+        # second copy of the script. A control whose mechanism cannot deliver a
+        # replacement to the code under test reports success while testing nothing.
+        with scripts_replaced(postrm=broken):
+            self.assertIs(script_paths()["postrm"], SCRIPTS["postrm"])
+            self.assertIn("failed-upgrade", SCRIPTS["postrm"].read_text() or "")
+            self.assertTrue(policy_verb_findings("postrm", SCRIPTS["postrm"].read_text()))
+
+    def test_timers_enabled_before_the_transaction_are_reported(self):
+        """Round 2's control for the enable's POSITION, against the method that holds
+        it.
+
+        The swap helper's previous version matched `"systemctl enable" in line` over
+        every line, and the shipped postinst's comment at the head of STEP 5 contains
+        that string -- so it relocated a comment, `postinst_steps` was unchanged, the
+        findings were still `[]`, and the control passed on an unmutated order. It now
+        skips comments the way `postinst_steps` does, and the control below asserts
+        the mutation actually MOVED the enable, so a helper that goes quiet again is a
+        failure here rather than a control that quietly stops checking.
+        """
+        good = POSTINST.read_text()
+        self.assertEqual(
+            timer_position_findings(good), [],
+            "the shipped postinst does not pass its own order check",
+        )
+        broken = "\n".join(_swap_the_timer_enable_before_the_transaction(good))
+        self.assertNotEqual(broken, good, "the swap changed nothing")
+        positions = postinst_steps(broken)
+        self.assertIn("enable-timers", positions)
+        self.assertLess(
+            positions["enable-timers"], positions["install-transaction"],
+            "the swap did not move the enable before the transaction, so this proves nothing",
+        )
+        self.assertTrue(timer_position_findings(broken))
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_leaves_nothing_enabled_when_the_transaction_refuses",
+            postinst=broken,
+        )
+
     def test_a_reversed_provisioning_order_is_reported(self):
         """The METHOD, not the helper. A control that re-implemented the check would
         pass while the method it holds was inverted, and the class docstring's claim
@@ -3170,24 +3294,50 @@ class ControlTests(unittest.TestCase):
 
 
 def _swap_the_timer_enable_before_the_transaction(text):
-    """Move the three `systemctl enable` lines above the install transaction.
+    """Move the real `systemctl enable` lines above the install transaction.
 
     The commands, unchanged, in the wrong place: that is the mutation that shipped.
-    The enable is two lines (the command and its continuation) and the transaction is
-    guarded by an `if !`, so the insertion point is the guard rather than the call --
-    placing it inside the guard would be a different mutation, and one the failure-arm
-    assertion covers.
+    Three things the previous version of this helper got wrong, and all three made it
+    a no-op that reported success:
+
+    * it matched `"systemctl enable" in line` over EVERY line, and the shipped
+      postinst's COMMENT at the head of STEP 5 contains that string -- so the matcher
+      relocated a comment and left the real enable where it was;
+    * it therefore never checked that the thing it moved was a command;
+    * it inserted at the guard line, which is right, but computed the guard index from
+      the already-sliced list, so an index computed against the original lines was
+      used against a shorter one.
+
+    Comments are skipped for the same reason `postinst_steps` skips them: this helper
+    and that reader have to agree about which lines are commands, or the order they
+    report is a story about comments.
     """
     lines = text.splitlines()
-    enable = next(index for index, line in enumerate(lines) if "systemctl enable" in line)
-    moved = lines[enable:enable + 2]
-    if "mosdns-list-check.timer" not in moved[-1]:
-        moved = [lines[enable]]
-    rest = lines[:enable] + lines[enable + len(moved):]
+    commands = [index for index, line in enumerate(lines) if not line.lstrip().startswith("#")]
+
+    def first(predicate):
+        return next(index for index in commands if predicate(lines[index]))
+
+    enable = first(lambda line: "systemctl enable" in line)
+    # The enable is the command plus its continuation, and the continuation is the
+    # next line that ends the list of unit names.
+    moved = [lines[enable]]
+    cursor = enable + 1
+    while cursor < len(lines) and not lines[cursor].lstrip().startswith("#"):
+        moved.append(lines[cursor])
+        cursor += 1
+        if lines[cursor - 1].rstrip().endswith("mosdns-list-check.timer"):
+            break
     guard = next(
+        index for index, line in enumerate(lines)
+        if not line.lstrip().startswith("#") and line.strip().startswith('if ! "$INSTALLER" install')
+    )
+    assert enable > guard, "postinst already enables the timers before the transaction"
+    rest = lines[:enable] + lines[cursor:]
+    insertion = next(
         index for index, line in enumerate(rest) if line.strip().startswith('if ! "$INSTALLER" install')
     )
-    return rest[:guard] + moved + rest[guard:]
+    return rest[:insertion] + moved + rest[insertion:]
 
 
 def _swap_a_directory_pair(text):
