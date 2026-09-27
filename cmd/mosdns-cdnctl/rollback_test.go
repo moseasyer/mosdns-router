@@ -250,6 +250,32 @@ func TestTheLaunchersOwnStatusesAreNotTheInstallersRefusals(t *testing.T) {
 	}
 }
 
+// requiredShellNeedles is the floor for shellNeedles: the shapes this package
+// must never contain, by name. The empty check in the scan catches a map that was
+// emptied wholesale, which is how a weakened scan usually arrives; this catches the
+// quieter failure, one entry deleted, which the map's own contents cannot notice.
+var requiredShellNeedles = []string{
+	`exec.Command("sh"`,
+	`exec.Command("bash"`,
+	`exec.Command("/bin/sh"`,
+	`"-c"`,
+	"sh -c",
+	"bash -c",
+	"strings.Join(argv",
+}
+
+func TestTheNeedleListStillHoldsEveryShapeItExistsFor(t *testing.T) {
+	if len(shellNeedles) != len(requiredShellNeedles) {
+		t.Fatalf("the needle list has %d entries and the required list has %d, so one of them has been added or dropped without the other",
+			len(shellNeedles), len(requiredShellNeedles))
+	}
+	for _, needle := range requiredShellNeedles {
+		if _, ok := shellNeedles[needle]; !ok {
+			t.Errorf("the needle list no longer contains %q, so a %q in the sources would go unseen", needle, needle)
+		}
+	}
+}
+
 func TestEveryServicesValueCarriesTheRollbacksBoundary(t *testing.T) {
 	// A services literal that forgot the two fields would panic the moment the
 	// verb was used, and the other verbs would not notice. Every construction site
