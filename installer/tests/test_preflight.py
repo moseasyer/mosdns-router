@@ -1425,6 +1425,58 @@ class ECHTests(PreflightFixture):
         report = self.answered({("firefox", "--version"): "Mozilla Firefox 128.0.3\n"})
         self.assertEqual([problem for problem in report.problems() if "example.com" in problem], [])
 
+    @staticmethod
+    def fail_open_note(report, case):
+        """The one note that says the strict-ECH refusal was never considered."""
+        for note in report.notes():
+            if "policy.yaml" in note:
+                return note
+        raise AssertionError(f"the fail-open note is missing for {case}; the notes are {report.notes()}")
+
+    def test_the_unreadable_policy_note_does_not_predate_the_version_it_reports(self):
+        # The fail-open note carried the clause "a browser below 129 cannot deliver
+        # ECH" -- a claim about a browser -- and it was written before anything had
+        # run `firefox --version`. So on a machine with Firefox 130 the report
+        # asserted that a browser below 129 could not deliver ECH, when the browser
+        # it had is not below 129: a sentence about a machine that does not exist,
+        # in the one note whose whole job is to be honest about what was not
+        # checked.
+        #
+        # The note has to be written after the version is known and in the
+        # version's own terms, so all three states of the browser are asserted: too
+        # old, new enough, and no browser at all -- which is not a browser below
+        # the minimum either, and still has to produce the note.
+        for version, below in (("128.0.3", True), ("129.0", False), ("130.0.1", False)):
+            with self.subTest(firefox=version):
+                self.setUp()
+                self.force_list("example.com")
+                report = self.answered({("firefox", "--version"): f"Mozilla Firefox {version}\n"})
+                note = self.fail_open_note(report, f"Firefox {version}")
+                self.assertEqual(
+                    "below" in note,
+                    below,
+                    f"with Firefox {version} the fail-open note must not describe a browser "
+                    f"below the minimum that this machine does not have: {note}",
+                )
+                self.assertIn(
+                    version, note, f"the note has to name the version it actually read: {note}"
+                )
+        with self.subTest(firefox="none installed"):
+            self.setUp()
+            self.force_list("example.com")
+            report = self.preflight(self.good_runner(returncodes={("firefox", "--version"): 127}))
+            note = self.fail_open_note(report, "no Firefox")
+            self.assertNotIn(
+                "below",
+                note,
+                f"there is no browser on this machine, so none of them is below anything: {note}",
+            )
+            self.assertRegex(
+                note,
+                r"(?i)(no firefox|browser|version)",
+                f"the note has to say what it could not find out: {note}",
+            )
+
     def test_says_that_an_unreadable_policy_left_the_strict_ech_refusal_unconsidered(self):
         # The module's one fail-open, and the note that names it. An operator who
         # has written a forced-domain list and has a strict policy they intended

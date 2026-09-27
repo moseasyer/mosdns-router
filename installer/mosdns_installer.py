@@ -966,35 +966,66 @@ def check_ech(run: CommandRunner, root: Path, report: Preflight) -> None:
     """
     domains = _forced_ech_domains(root)
     strict = _ech_is_strict(root)
+
+    # The browser is read BEFORE the fail-open note is written, and the order is
+    # the fix rather than a style. That note used to carry the clause "a browser
+    # below 129 cannot deliver ECH" and was written first, so it described a
+    # browser nobody had asked about yet: on a machine with Firefox 130 the report
+    # asserted that a browser below 129 could not deliver ECH, when the only
+    # browser it has is not below 129. A note whose whole job is to say what was
+    # not checked cannot assert a fact about the machine it did not read. So the
+    # version comes first and the clause is derived from it.
+    completed = _ok(run, ("firefox", "--version"))
+    if completed is None:
+        version, major = None, None
+        report.note(
+            "no Firefox was found on this machine, so nothing here can use ECH; the router "
+            "still serves every other query, and a client on another machine is unaffected"
+        )
+    else:
+        version = completed.stdout.strip()
+        major = _firefox_major(version)
+        report.firefox = version
+        if major is None:
+            report.note(
+                f"Firefox reported {version!r}, whose version could not be read, so ECH "
+                "availability is unknown"
+            )
+        elif major >= MINIMUM_ECH_FIREFOX:
+            report.mark_ech_available()
+
     if strict is None and domains:
         # The one fail-open in this module, named in the report rather than left
         # to be discovered. It is a note and not a refusal because an absent policy
         # is the normal state before the first run -- but an operator who HAS
         # written a forced-domain list deserves to know that the strict-ECH
-        # refusal above did not get a chance to consider their machine, because
+        # refusal below did not get a chance to consider their machine, because
         # the policy it would have read is missing or unparseable.
+        #
+        # The browser clause is the version's own, and each of its three forms is
+        # what this machine can be shown to be: a browser below the minimum cannot
+        # deliver ECH, one at or above it can, and a machine with no Firefox at all
+        # has no browser to be below anything. The last of those is the case the
+        # unconditional "a browser below 129" was wrong about most plainly.
+        if version is None:
+            client = "this machine has no browser whose version could be read, so it is not known"
+        elif major is None:
+            client = f"Firefox reported {version!r}, so what it can do is not known"
+        elif major >= MINIMUM_ECH_FIREFOX:
+            client = f"Firefox is {version}, at or above {MINIMUM_ECH_FIREFOX}, and can deliver ECH"
+        else:
+            client = f"Firefox is {version}, below {MINIMUM_ECH_FIREFOX}, and cannot deliver ECH"
         report.note(
-            f"{len(domains)} domain(s) are forced for ECH and a browser below "
-            f"{MINIMUM_ECH_FIREFOX} cannot deliver ECH, but /etc/mosdns/policy.yaml could not be "
-            "read as a policy, so whether ECH is strict is unknown and this preflight is not "
-            "refusing on that basis; if the policy is meant to be strict, check that it parses"
+            f"{len(domains)} domain(s) are forced for ECH and {client}, but "
+            "/etc/mosdns/policy.yaml could not be read as a policy, so whether ECH is strict is "
+            "unknown and this preflight is not refusing on that basis; if the policy is meant to "
+            "be strict, check that it parses"
         )
 
-    completed = _ok(run, ("firefox", "--version"))
-    if completed is None:
-        report.note(
-            "no Firefox was found on this machine, so nothing here can use ECH; the router "
-            "still serves every other query, and a client on another machine is unaffected"
-        )
-        return
-    version = completed.stdout.strip()
-    report.firefox = version
-    major = _firefox_major(version)
-    if major is None:
-        report.note(f"Firefox reported {version!r}, whose version could not be read, so ECH availability is unknown")
-        return
-    if major >= MINIMUM_ECH_FIREFOX:
-        report.mark_ech_available()
+    # Above this line the only case left is a browser that is too old, and the
+    # cases that already reported what they know -- no browser, an unreadable
+    # version, and one that can do ECH -- have returned or marked themselves.
+    if version is None or major is None or major >= MINIMUM_ECH_FIREFOX:
         return
 
     report.note(
