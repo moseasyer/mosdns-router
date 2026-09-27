@@ -121,9 +121,12 @@ SANDBOX = (
 
 # The directories each identity writes, and therefore the only directories its unit
 # may make writable. One `mosdns` group serves two service users because a default
-# ACL grants by group, so `root:mosdns` 2750 with a default ACL for `mosdns` is
+# ACL grants by group, so `root:mosdns` 2770 with a default ACL for `mosdns` is
 # what lets either identity replace the other's files; per-service groups would
-# give the ACL to one identity and leave the other unable to write.
+# give the ACL to one identity and leave the other unable to write. The mode is
+# 2770 rather than 2750 because a group member cannot create a file in a 2750
+# directory at all -- measured on the system-level test machine, and the reason is
+# in the packaging plan's mode table.
 #
 # The rows are the code's write set, not a decision this module could make: each
 # one is derived from the writer that produces it and compared for equality, so a

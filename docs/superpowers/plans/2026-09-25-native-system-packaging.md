@@ -305,7 +305,8 @@ acquired through a read-only descriptor and a state file is created at mode
 0640 by whichever of the two service identities wins the race:
 
 - `/var/lib/mosdns` and `/var/lib/mosdns/runtime` exist, are owned by
-  `root:mosdns`, are setgid directories (`2750`), and carry a default ACL
+  `root:mosdns`, are setgid directories (`2770`, not the `2750` this plan first
+  named -- see the correction below), and carry a default ACL
   granting the service group `rwx` so a file created by one identity stays
   group-owned and group-writable for the other;
 - `/run/mosdns` is provisioned the same way for the DHCP bridge and the service
@@ -536,12 +537,32 @@ Package name `mosdns-router`, version `0.1.0`, architectures `amd64 arm64`, depe
 package-content test asserts the provisioned identity:
 
 ```text
-/var/lib/mosdns              root:mosdns  2750  (setgid, default ACL rwx for mosdns)
-/var/lib/mosdns/runtime      root:mosdns  2750  (setgid, default ACL rwx for mosdns)
-/var/lib/mosdns/lists        root:mosdns  2750  (setgid, default ACL rwx for mosdns)
+/var/lib/mosdns              root:mosdns  2770  (setgid, default ACL rwx for mosdns)
+/var/lib/mosdns/runtime      root:mosdns  2770  (setgid, default ACL rwx for mosdns)
+/var/lib/mosdns/lists        root:mosdns  2770  (setgid, default ACL rwx for mosdns)
 /var/lib/mosdns/runtime/control.lock  created on first acquire at 0640
-/run/mosdns                  root:mosdns  2750  (setgid, default ACL rwx for mosdns)
+/run/mosdns                  root:mosdns  2770  (setgid, default ACL rwx for mosdns)
 ```
+
+**Correction (Task 3, measured on the system-level test machine): the mode is
+`2770`, not `2750`.** The table above first said `2750` while the prose below
+asked for "a group-writable setgid directory", and only one of those is
+possible. A directory's group permission is what a member of the owning group
+gets on the *directory*, and it has to include `w`: creating a state file,
+renaming one over another and taking the control lock all need write on the
+directory. On a real `root:mosdns` directory at `2750`, a member of the `mosdns`
+group cannot create a file in it at all -- measured, not assumed -- while at
+`2770` the same member can. `postinst` runs as root and would not notice either
+way; the first thing that would notice is a service identity, and the first
+thing it would fail to do is create a state file.
+
+No mode reads `2750` while granting the group write, because when a directory
+carries an extended ACL the mode's group field **is** the group-class mask. So
+the default ACL granting `rwx` for new files and a group that can write the
+directory are the same permission in two places, and the check reads both: the
+mode for the directory, the default entries for what a new file inherits, and
+the access mask for what the kernel actually applies when a named ACL entry has
+narrowed it.
 
 `/var/lib/mosdns/lists` is here because the CDN selector plan's range cache lives
 at `/var/lib/mosdns/lists/cloudflare-ips.json` and the China list at

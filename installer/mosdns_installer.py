@@ -72,13 +72,25 @@ SUPPORTED_ARCHITECTURES = ("amd64", "arm64")
 
 # The state directories the package provisions, and what each has to hold.
 #
-# The mode and the setgid bit are half the answer and the ACL is the other half,
-# and neither alone is enough. A file's group comes from the directory's setgid
-# bit; a file's group *permissions* come from the directory's default ACL. A
-# directory at 2750 with no ACL passes every mode check and still produces a file
-# one identity creates that the other cannot read, because nothing told the kernel
-# to give a new file group write. The ACL therefore has to be read, never inferred
-# from the mode -- which is why the check asks getfacl rather than reasoning.
+# Three separate mechanisms, and none of them is visible in the mode alone.
+#
+# A file's group comes from the directory's setgid bit. A file's group
+# *permissions* come from the directory's default ACL. And the group's ability to
+# write the *directory* -- which it needs before it can create or replace
+# anything in it -- comes from the access ACL, and that is the group's own field
+# of the mode. So all three are read, and none is inferred: a directory at 2770
+# with no default ACL passes every mode check and still produces a state file one
+# identity creates that the other cannot write, and a directory whose *access*
+# mask is r-x produces the same failure while the mode still reads 2770, because
+# when an access ACL has a named entry the mode's group field is the mask.
+#
+# The mode is 2770 and not 2750 because the group has to be able to write. That
+# was measured on the system-level test machine rather than assumed: a member of
+# a root:mosdns directory's own group cannot create a file in it at 2750, at all,
+# and can at 2770. 2750 was in the plan's table and in ruling 142, while the same
+# plan's prose asked for "a group-writable setgid directory"; 2770 is that, and
+# no mode reads 2750 while granting the group write, because the group field *is*
+# the mask.
 STATE_DIRECTORIES = (
     "/var/lib/mosdns",
     "/var/lib/mosdns/runtime",
@@ -87,15 +99,18 @@ STATE_DIRECTORIES = (
 )
 STATE_OWNER = "root"
 STATE_GROUP = "mosdns"
-# The one mode a state directory may have: setgid (so a file created in it takes
-# this group rather than its creator's), group r-x, and nothing for the world.
-# The three are checked separately and reported separately, because an operator
-# fixing one of them has to know which one is wrong.
-STATE_MODE = "2750"
+# The one mode a state directory may have: the owner writes, the group writes --
+# both service identities are in it and both write here -- the world gets
+# nothing, and setgid is set so a new file takes this group rather than its
+# creator's. The four are checked separately and reported separately, because an
+# operator fixing one of them has to know which one is wrong.
+STATE_MODE = "2770"
 SETGID_BIT = 0o2000
-# The permission the group needs in the default ACL. rwx is required rather than
-# rw because the second identity has to be able to *replace* a state file, and a
-# rename needs write on the directory and no execute bit is implied for a file.
+# The permission the group needs, on the directory and in the default ACL a new
+# file inherits. rwx rather than rw because the second identity has to be able to
+# *replace* a state file and to acquire the lock, and both need to create and
+# rename; the x on a file is a no-op, and on the directory it is what lets the
+# group reach the names inside it.
 STATE_GROUP_PERMISSIONS = "rwx"
 
 # The control lock is created on first acquire by whichever of the two identities
@@ -954,15 +969,16 @@ def _file_type(stat_fields: Sequence[str]) -> Optional[str]:
     return f"neither a directory nor a regular file (raw mode {bits:x})"
 
 
-def _default_acl_of(root: Path, run: CommandRunner, path: str) -> Optional[str]:
-    """The default ACL of a directory, read with getfacl rather than inferred.
+def _acl_of(root: Path, run: CommandRunner, path: str) -> Optional[str]:
+    """A directory's whole ACL, read with getfacl rather than inferred.
 
-    This is the read that the whole ACL check rests on. The directory's mode says
-    what the directory permits today; the default ACL says what a *file created in
-    it* will get, and nothing about the first says anything about the second. A
-    check that inferred the ACL from the mode would pass a directory at 2750 with
-    no extended ACL -- which produces a state file one identity creates that the
-    other cannot read, and is exactly the case the check exists to catch.
+    This is the read that the ACL check rests on, and it is the whole ACL, not
+    the default half. Two of the three permissions this check needs live in the
+    access entries and one lives in the default entries, and the two halves
+    disagree in exactly the way that matters: a directory whose default ACL
+    grants the group rwx and whose access mask is r-x produces a state file one
+    identity creates that the other cannot write, and its mode reads the same as
+    a directory that works. A check that read only the default entries passes it.
     """
     absolute = root / path.lstrip("/")
     completed = _ok(run, ("getfacl", "-c", "-p", str(absolute)))
@@ -1001,30 +1017,45 @@ def _acl_entry(line: str):
     return is_default, kind, qualifier, effective
 
 
-def _acl_grants_group(acl: str) -> bool:
-    """Whether a default ACL grants this package's group write in the mask.
+def _acl_group_class(acl: str, default: bool):
+    """The mask and the effective group permissions of one half of an ACL.
 
-    The check accepts either shape the kernel offers: the owning-group entry,
-    which is this package's group because the directory is owned by it, or a
-    named entry for it. A named entry for any *other* group does not count, and
-    the mask is what the kernel actually applies, so both are read.
+    Returns ``(mask, permissions)``, where ``mask`` is the group-class mask or
+    ``None`` when the half has none, and ``permissions`` is the list of effective
+    permissions this package's group gets from the entries that apply to it.
+
+    Two entries can apply to that group: the owning-group entry, which is this
+    package's group because the directory is owned by it, and a named entry for
+    it, which Linux permits even when the qualifier names the owning group. A
+    process in the group gets the union of the entries that match it, so the
+    answer is a list and "can it write" is "can any of them write".
+
+    The mask is applied first, and that is the point of reading it. POSIX
+    requires a mask on the group class as soon as an access ACL carries a named
+    entry, and the mask -- not the entry -- is what the kernel applies. So an
+    access ACL of ``group::rwx / group:someone:rwx / mask::r-x`` grants the group
+    nothing beyond r-x, ``stat -c %a`` reports the mask as the mode's group field
+    (so the directory still reads 2770 if it was chmodded there afterwards), and a
+    check that read the entries rather than the mask would call it writable.
+
+    The mask is therefore collected in a pass of its own: getfacl prints it
+    *after* the group entries it applies to, so masking as the lines arrive would
+    mask nothing.
     """
+    entries = []
     mask = None
-    grants = {}
     for line in acl.splitlines():
         entry = _acl_entry(line)
         if entry is None:
             continue
         is_default, kind, qualifier, effective = entry
-        if not is_default:
+        if is_default != default:
             continue
         if kind == "mask":
             mask = effective
-        elif kind == "group":
-            grants[qualifier] = effective
-    if mask is not None:
-        grants = {key: _masked(value, mask) for key, value in grants.items()}
-    return grants.get("") == STATE_GROUP_PERMISSIONS or grants.get(STATE_GROUP) == STATE_GROUP_PERMISSIONS
+        elif kind == "group" and qualifier in ("", STATE_GROUP):
+            entries.append(effective)
+    return mask, [entry if mask is None else _masked(entry, mask) for entry in entries]
 
 
 def _masked(permissions: str, mask: str) -> str:
@@ -1037,12 +1068,13 @@ def _masked(permissions: str, mask: str) -> str:
 def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -> None:
     """Require each state directory to hold what two service identities need.
 
-    Kind, existence, ownership, mode, setgid and the default ACL, checked
-    separately and reported together for one directory, because an operator
-    fixing one has to know all of it at once. Every refusal names the path and
-    quotes the values found: "a state directory is wrong" is not actionable
-    across four directories that are not interchangeable, one of which is on a
-    tmpfs and is recreated by a tmpfiles.d entry rather than by a postinst.
+    Kind, existence, ownership, and then the four mode properties and the two
+    halves of the ACL, checked separately and reported together for one
+    directory, because an operator fixing one has to know all of it at once.
+    Every refusal names the path and quotes the values found: "a state directory
+    is wrong" is not actionable across four directories that are not
+    interchangeable, one of which is on a tmpfs and is recreated by a tmpfiles.d
+    entry rather than by a postinst.
     """
     for path in STATE_DIRECTORIES:
         stat_fields = _stat_of(root, run, path)
@@ -1093,31 +1125,51 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
                     "takes its creator's group rather than this package's, so the other service "
                     "identity cannot read it however the ACL is set"
                 )
+            if mode_bits & 0o070 != 0o070:
+                problems.append(
+                    f"its mode is {mode}, so the group permission is {mode_bits & 0o070:03o} "
+                    f"rather than 070: this package's two identities share {STATE_GROUP!r} and "
+                    "both create and replace what is created in here, and a group that cannot "
+                    "write this directory cannot create a state file in it at all"
+                )
+            if mode_bits & 0o700 != 0o700:
+                problems.append(
+                    f"its mode is {mode}, so the owner permission is {mode_bits & 0o700:03o} "
+                    "rather than 700: the package provisions it for root to maintain, and an "
+                    "owner that cannot write it is a shape nobody chose"
+                )
             if mode_bits & 0o007:
                 problems.append(
                     f"its mode is {mode}, which is readable by every local user; the state a "
                     "router keeps is readable through the group, and a world bit under it is a "
                     "widening nobody chose"
                 )
-            if mode_bits & 0o070 != 0o050:
-                problems.append(
-                    f"its mode is {mode}, so the group permission is {mode_bits & 0o070:03o} "
-                    f"rather than 050: this package's two identities share {STATE_GROUP!r} and "
-                    "both have to be able to read and replace what is created in here"
-                )
-        acl = _default_acl_of(root, run, path)
+        acl = _acl_of(root, run, path)
         if acl is None:
             problems.append(
-                "its default ACL could not be read with getfacl, so what a file created in it "
-                "will be group-writable for the other identity is unknown"
+                "its ACL could not be read with getfacl, so what the group may create and "
+                "replace in it, and what a file created in it will be, are both unknown"
             )
-        elif not _acl_grants_group(acl):
-            problems.append(
-                f"its default ACL does not grant the group {STATE_GROUP_PERMISSIONS!r} "
-                f"({acl.split()!r}): the mode says what the directory permits today and says "
-                "nothing about what a file created in it will get, and without the ACL a file "
-                "one identity creates comes out group-unwritable for the other"
-            )
+        else:
+            access_mask, access_group = _acl_group_class(acl, default=False)
+            if STATE_GROUP_PERMISSIONS not in access_group:
+                problems.append(
+                    f"its access ACL gives the group {access_group or 'nothing'} "
+                    f"(mask {access_mask or 'none'}) rather than {STATE_GROUP_PERMISSIONS!r}: "
+                    "this is the permission that decides whether a service identity can create, "
+                    "replace and lock anything in this directory, and when the ACL carries a "
+                    "named entry the mask is what the kernel applies -- so the mode above can "
+                    "read rwx for the group while the group still cannot write here"
+                )
+            default_mask, default_group = _acl_group_class(acl, default=True)
+            if STATE_GROUP_PERMISSIONS not in default_group:
+                problems.append(
+                    f"its default ACL does not grant the group {STATE_GROUP_PERMISSIONS!r} "
+                    f"(grants {default_group or 'nothing'}, mask {default_mask or 'none'}, "
+                    f"{acl.split()!r}): the mode says what the directory permits today and says "
+                    "nothing about what a file created in it will get, and without the ACL a "
+                    "file one identity creates comes out group-unwritable for the other"
+                )
         if problems:
             # The stat values go in the message whether or not they are the
             # problem. An operator fixing one of these has to confirm the others

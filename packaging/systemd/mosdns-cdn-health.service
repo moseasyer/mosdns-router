@@ -84,7 +84,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # checker from three paths, all of them in the runtime directory, and the prober it
 # proves addresses with offers no transfer and no cache -- so it writes nothing
 # anywhere else. The identity reads the published China list through its DAC
-# permissions (the state directories are root:mosdns 2750 with a default ACL for
+# permissions (the state directories are root:mosdns 2770 with a default ACL for
 # the group this user has as its primary group), which is how it reads a document
 # the optimizer replaces, and a mount grant for a directory this command does not
 # write in would add no access the identity does not already have.

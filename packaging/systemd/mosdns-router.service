@@ -18,7 +18,7 @@
 # loopback and has to come up on a machine NetworkManager does not call online.
 # What guarantees DNS is ready is the installer's ordering, not a target.
 #
-# The state directories are root:mosdns 2750 with a default ACL granting the
+# The state directories are root:mosdns 2770 with a default ACL granting the
 # group rwx, provisioned by the package's postinst and recreated by its
 # tmpfiles.d entry. Nothing here creates them: a ReadWritePaths entry naming a
 # directory that is absent fails this unit at start with a mount-namespace error,

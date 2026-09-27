@@ -122,7 +122,11 @@ STATE_DIRECTORIES = (
 )
 STATE_OWNER = "root"
 STATE_GROUP = "mosdns"
-STATE_MODE = "2750"
+# A gid that is nobody's here, used to build a named ACL entry for a group that is
+# not the directory's own. That is what creates a mask: an entry for the owning
+# group is redundant, and one for the owning group would leave the mask wide.
+ANOTHER_GID = 4242
+STATE_MODE = "2770"
 # The control lock is a file, created on first acquire by whichever of the two
 # identities wins the race, at this mode. A pre-existing one at any other mode is
 # a file this package did not create.
@@ -208,16 +212,23 @@ PROJECT_TIMERS = (
 )
 
 
-def setfacl(path, entry):
-    """Give ``path`` the default ACL ``entry``, with the real tool.
+def setfacl(path, entry, default=True):
+    """Give ``path`` an ACL entry, with the real tool.
 
-    The ACL check is worth nothing if the ACL it reads is a description. A
-    directory with mode 2750 and no extended ACL is exactly the case the check
-    exists for: the mode says what the directory permits today and nothing about
-    what a file created in it will look like, and without a default ACL a file one
-    identity creates comes out group-*unwritable* for the other.
+    The ACL check is worth nothing if the ACL it reads is a description. The two
+    cases it exists for are both invisible in the mode: a directory with mode
+    2770 and no extended ACL produces a state file one identity creates that the
+    other cannot write, and a directory whose *access* mask is r-x produces one
+    the other cannot write either -- the mode reads the same either way, because
+    when an extended ACL exists the mode's group field IS the mask.
+
+    ``default=False`` sets an access entry, which is what creates the mask.
     """
-    subprocess.run(["setfacl", "-d", "-m", entry, str(path)], check=True)
+    command = ["setfacl"]
+    if default:
+        command.append("-d")
+    command += ["-m", entry, str(path)]
+    subprocess.run(command, check=True)
 
 
 def fingerprint(root):
@@ -369,32 +380,41 @@ class PreflightFixture(unittest.TestCase):
     def unmark(self):
         self.rooted(MANAGED_BY).unlink()
 
-    def build_state_directories(self, mode=STATE_MODE, acl="g::rwx"):
+    def build_state_directories(self, mode=STATE_MODE, acl="g::rwx", access=None):
         """Create the four state directories with real modes and real ACLs.
+
+        The mode is applied *last*, because that is the order the interesting
+        cases happen in: a named access entry creates a mask, and a chmod after it
+        sets that mask, which is the whole of the access-mask case. A chmod does
+        not touch a default ACL, so the default half is unaffected by the order.
 
         ``acl=None`` means *no extended ACL at all*, and it has to take one away
         rather than add nothing. setUp already gave these directories a default
-        ACL and a chmod leaves a default ACL in place, so a case that wanted "the
-        right mode and no ACL" would otherwise be handed the very ACL it is
-        asserting the absence of, and the check under test would never run.
+        ACL, so a case that wanted "the right mode and no ACL" would otherwise be
+        handed the very ACL it is asserting the absence of.
+
+        ``access`` is an optional *access* ACL entry, which is what creates the
+        mask.
         """
         for relative in STATE_DIRECTORIES:
             path = self.rooted(relative)
             path.mkdir(parents=True, exist_ok=True)
-            path.chmod(int(mode, 8))
             if acl is None:
                 # -k drops the default ACL, -b the extended access entries.
                 subprocess.run(["setfacl", "-b", "-k", str(path)], check=True)
             else:
                 setfacl(path, acl)
+            if access is not None:
+                setfacl(path, access, default=False)
+            path.chmod(int(mode, 8))
 
     @staticmethod
     def stat_answer(mode, owner=STATE_OWNER, group=STATE_GROUP, kind=stat.S_IFDIR):
         """What ``stat -c "%a %U %G %f"`` prints for a path of this shape.
 
         The fourth field is the whole raw mode, type and permissions, so the
-        answer is the one a real ``stat`` would give: 2750 on a directory is
-        ``45e8``, not ``40000``, and a fixture that answered only the type would
+        answer is the one a real ``stat`` would give: 2770 on a directory is
+        ``45f0``, not ``40000``, and a fixture that answered only the type would
         be answering something no tool produces.
         """
         return f"{mode} {owner} {group} {kind | int(mode, 8):x}"
@@ -1116,16 +1136,82 @@ class ECHTests(PreflightFixture):
 class StateDirectoryTests(PreflightFixture):
     """The four state directories, and the properties each one has to hold.
 
-    Two of these are invisible in the mode and are the reason the check reads the
-    extended ACL. A file's group comes from the directory's setgid bit; a file's
-    group *permissions* come from the directory's default ACL. A directory with
-    mode 2750 and no ACL passes every mode check and still produces a file the
-    other service identity cannot read, because nothing told the kernel to give a
-    new file group write.
+    Three of the properties are invisible in the mode, and they are the reason
+    this check reads the extended ACL rather than reasoning about the bits.
+
+    A file's group comes from the directory's setgid bit. A file's group
+    *permissions* come from the directory's default ACL, so a directory with mode
+    2770 and no default ACL produces a state file one identity creates that the
+    other cannot write. And the group's ability to write *the directory* -- which
+    it needs before it can create or rename anything in it -- comes from the
+    access ACL, so a restrictive access mask produces the same failure while the
+    mode still reads 2770: when an extended ACL exists, the mode's group field IS
+    the mask. Both were confirmed on the system-level test machine, where a
+    member of the directory's own group cannot create a file in a 2750 directory
+    at all, which is why the provisioned mode is 2770 and not 2750.
     """
 
     def test_accepts_directories_provisioned_the_way_the_plan_says(self):
         self.assertPasses()
+
+    def test_the_group_can_actually_write_to_the_directory(self):
+        # What this suite cannot prove, and where the proof is instead.
+        #
+        # The fake root's directories are owned by the user running the suite, so
+        # a write here succeeds on the *owner* bits and says nothing about the
+        # group. The group case needs a second identity, which means either root
+        # or a real user, and the suite has neither by design. So the suite proves
+        # the check refuses a directory the group cannot write to -- 2750, and a
+        # restrictive access mask -- and the fact itself is proved on the
+        # system-level test machine, where a member of the directory's own group
+        # cannot create a file in a 2750 directory and can in a 2770 one. Both
+        # numbers are in the task report.
+        self.assertEqual(STATE_MODE, "2770", "the provisioned mode is the group-writable one")
+        self.assertPasses()
+
+    def test_reports_a_directory_the_group_cannot_write_to(self):
+        # The reviewer's case, built with the real tools: a named access entry
+        # creates a mask, and a later chmod to 2750 sets that mask to r-x. The
+        # default ACL still grants the group rwx, so a check that read only the
+        # default entries would call this directory correct.
+        #
+        # The mode's group field and the access mask are the same number -- POSIX
+        # makes the mode report the mask whenever an access ACL has a named entry
+        # -- so the mode check refuses this too, and no directory exists whose
+        # mode says 2770 while the mask says r-x. What the access half adds is the
+        # *reason*: the refusal has to say the mask is what denies the group, or
+        # an operator reads a mode, chmods the same number back, and is refused
+        # again with no new information. That is asserted below.
+        self.build_state_directories(mode="2750", access=f"g:{ANOTHER_GID}:rwx")
+        before = fingerprint(self.root)
+        acl = subprocess.run(
+            ["getfacl", "-c", "-p", str(self.rooted("/var/lib/mosdns"))],
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn("mask::r-x", acl, "the fixture did not produce the mask the case is about")
+        problems = " ".join(self.preflight().problems())
+        self.assertRegex(
+            problems,
+            r"(?i)mask",
+            "a restrictive access mask has to be reported as a mask: it is not the default ACL, "
+            "and an operator who was told only the mode would change the wrong thing",
+        )
+        self.assertEqual(fingerprint(self.root), before, "preflight changed the ACL it was refusing")
+
+    def test_accepts_an_access_mask_that_grants_the_group(self):
+        # The control: the same named access entry with the mode the package
+        # provisions, so the mask is rwx and the group can write. Without this, a
+        # scan that reported every mask as a problem would satisfy the test above.
+        self.build_state_directories(mode=STATE_MODE, access=f"g:{ANOTHER_GID}:rwx")
+        for relative in STATE_DIRECTORIES:
+            acl = subprocess.run(
+                ["getfacl", "-c", "-p", str(self.rooted(relative))], capture_output=True, text=True
+            ).stdout
+            self.assertIn(
+                "mask::rwx", acl, f"{relative} does not have the permissive mask the control needs"
+            )
+        self.assertPasses(self.good_runner(self.state_stat_answers(mode=STATE_MODE)))
 
     def test_reports_a_directory_with_the_right_mode_and_no_acl(self):
         # The case the design exists for, and the one a mode check passes.
@@ -1153,27 +1239,27 @@ class StateDirectoryTests(PreflightFixture):
         self.assertRegex(problems, r"(?i)acl", "a group ACL without rwx has to be reported")
 
     def test_reports_a_directory_that_is_world_readable(self):
-        # 2755 hands every local user a listing of the state a router keeps, and
+        # 2775 hands every local user a listing of the state a router keeps, and
         # the group ACL the directory is supposed to carry is the narrower
         # mechanism; a world bit under it is a widening nobody chose.
-        self.build_state_directories(mode="2755", acl=None)
+        self.build_state_directories(mode="2775", acl=None)
         before = fingerprint(self.root)
         # The stat answers have to move with the fixture's mode. `stat` is asked
         # through the runner, so a fixture that chmodded the directory and left
-        # the runner answering 2750 would be testing the runner, not the check.
+        # the runner answering the provisioned mode would be testing the runner.
         problems = " ".join(
-            self.preflight(self.good_runner(self.state_stat_answers(mode="2755"))).problems()
+            self.preflight(self.good_runner(self.state_stat_answers(mode="2775"))).problems()
         )
         self.assertIn(
-            "2755", problems, "a world-readable directory has to be refused with the mode it has"
+            "2775", problems, "a world-readable directory has to be refused with the mode it has"
         )
         self.assertEqual(fingerprint(self.root), before, "preflight changed the directory it was refusing")
 
     def test_reports_a_directory_group_writable_by_an_unrelated_group(self):
         # 2770 with a group this package does not use is the failure where somebody
         # else's group can replace the control lock and the selector.
-        self.build_state_directories(mode="2770")
-        outputs = self.state_stat_answers(mode="2770", group="staff")
+        self.build_state_directories(mode=STATE_MODE)
+        outputs = self.state_stat_answers(group="staff")
         before = fingerprint(self.root)
         problems = " ".join(self.preflight(self.good_runner(outputs)).problems())
         self.assertIn(
@@ -1196,29 +1282,59 @@ class StateDirectoryTests(PreflightFixture):
         )
         self.assertEqual(fingerprint(self.root), before)
 
-    def test_reports_a_directory_this_package_does_not_own(self):
-        for owner, group, mode, acl in (
-            ("mosdns", STATE_GROUP, STATE_MODE, "g::rwx"),
-            (STATE_OWNER, "www-data", STATE_MODE, "g::rwx"),
-            ("ubuntu", "ubuntu", "2775", "g::rwx"),
+    def test_reports_a_directory_whose_owner_cannot_write(self):
+        # 2570: setgid is set, the group is fine, and the owner has r-x only.
+        # postinst runs as root and does not care, but a directory the owner
+        # cannot write is a directory whose shape nobody chose -- and the refusal
+        # used to quote a provisioned mode it had not actually verified.
+        self.build_state_directories(mode="2570")
+        before = fingerprint(self.root)
+        problems = " ".join(
+            self.preflight(self.good_runner(self.state_stat_answers(mode="2570"))).problems()
+        )
+        self.assertIn("2570", problems, "the refusal has to quote the mode it found")
+        self.assertRegex(
+            problems, r"(?i)owner", "an owner without write has to be named as the owner, not the group"
+        )
+        self.assertEqual(fingerprint(self.root), before)
+
+    def test_reports_every_mode_the_check_cannot_accept(self):
+        # One case per bit, so a check that stopped looking at a bit is a failure
+        # here rather than a permission nobody noticed. The owner, group and other
+        # fields are each wrong in exactly one case with the other two right, so a
+        # check reading the wrong field cannot pass by accident, and the
+        # provisioned mode is in the table as the case that must be accepted. The
+        # default ACL the package provisions is in place throughout, so what is
+        # under test is the mode.
+        for mode, why in (
+            ("1770", "no setgid"),
+            ("4770", "setuid, and no setgid"),
+            ("2750", "the group cannot write"),
+            ("2700", "the group can neither write nor list"),
+            ("2570", "the owner cannot write"),
+            ("2775", "readable by every local user"),
+            ("2777", "writable by every local user"),
+            (STATE_MODE, "the mode the package provisions"),
         ):
-            with self.subTest(owner=owner, group=group, mode=mode):
+            with self.subTest(mode=mode, why=why):
                 self.setUp()
-                self.build_state_directories(mode=mode, acl=acl)
-                before = fingerprint(self.root)
-                outputs = self.state_stat_answers(mode=mode, owner=owner, group=group)
-                problems = " ".join(self.preflight(self.good_runner(outputs)).problems())
-                self.assertIn(owner, problems, f"a directory owned by {owner} rather than root has to say so")
+                self.build_state_directories(mode=mode, acl="g::rwx")
+                report = self.preflight(self.good_runner(self.state_stat_answers(mode=mode)))
+                accepted = report.problems() == []
                 self.assertEqual(
-                    fingerprint(self.root), before, "preflight changed the directory it was refusing"
+                    accepted,
+                    mode == STATE_MODE,
+                    f"a directory at {mode} ({why}) "
+                    + ("should have been accepted" if mode == STATE_MODE else "was accepted"),
                 )
 
     def test_reports_a_state_path_that_is_not_a_directory(self):
-        # A regular file at 2750 with a group ACL would pass every mode check, and
-        # a file is not somewhere the package can put a state file. The type comes
-        # from the raw mode rather than from stat's `%F`, because that word is
-        # "regular empty file" for an empty file and "regular file" for a full
-        # one -- a check keyed on it would be a check on how big the file was.
+        # A regular file at the provisioned mode with a group ACL would pass every
+        # mode check, and a file is not somewhere the package can put a state
+        # file. The type comes from the raw mode rather than from stat's `%F`,
+        # because that word is "regular empty file" for an empty file and "regular
+        # file" for a full one -- a check keyed on it would be a check on how big
+        # the file was.
         path = self.rooted("/var/lib/mosdns/lists")
         path.rmdir()
         path.write_text("", encoding="utf-8")
@@ -1288,7 +1404,8 @@ class StateDirectoryTests(PreflightFixture):
         self.assertRegex(
             " ".join(self.preflight().problems()),
             r"(?i)acl",
-            "a mode of 2750 with a group ACL of r-x is the case a mode check cannot see",
+            "a directory at the provisioned mode with a group default ACL of r-x is the case a "
+            "mode check cannot see",
         )
 
         self.setUp()
