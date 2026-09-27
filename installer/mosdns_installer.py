@@ -2887,21 +2887,48 @@ def _start(
     states: dict,
     unreadable: Sequence[str],
 ) -> None:
-    """Start a unit, and record how to take that back if it was not running.
+    """Put the unit into the state this run needs, and record how to undo that.
 
-    A unit whose prior state could not be read is NOT given a stop, and the
-    transaction is told, because the stop is the one undo that would act on a unit
-    this install may not own. Leaving it running is recorded rather than hidden, so
-    the report can name the unit it left as it found it instead of claiming the
-    machine is unchanged.
+    Three cases, and the middle one is the reason this function is not one line.
+
+    **Not running before** -- `start`, and a stop is registered, because this run
+    is what made it run.
+
+    **Running before** -- `try-restart`, and NO stop, because it was already
+    running and a rollback must leave it that way. `try-restart` rather than
+    `start` because `start` on an active unit is a no-op: this is the ordinary
+    path of an UPGRADE, where dpkg has just unpacked a new binary and a new
+    generated `/etc/mosdns/mosdns.yaml` over a machine that is already running
+    the old ones. Starting nothing would leave every check that follows -- the two
+    waits, the barrier, the device's verification, the exit-0 message about ports
+    53 and 15353 -- describing the processes that were there before the upgrade,
+    and the caller would be told it verified this release. The wait the caller
+    does next is what makes the restart observable rather than merely issued.
+
+    **State unreadable** -- `start` only, never `try-restart`, and no stop, and
+    the transaction is told. `try-restart` STOPS the unit first, and the only
+    reason this case exists is that this program does not know whether the unit
+    was already running; stopping somebody else's unit is the harm the prior
+    state rule exists to prevent. Leaving one running is recorded rather than
+    hidden, so the report can name the unit it left as it found it instead of
+    claiming the machine is unchanged.
     """
-    _checked(runner, ("systemctl", "start", unit), f"starting {unit}")
-    # The unreadable case is asked FIRST, because an unreadable state reads as
+    uncertain = unit in unreadable
+    if states[unit][UNIT_ACTIVE] and not uncertain:
+        _checked(
+            runner,
+            ("systemctl", "try-restart", unit),
+            f"restarting {unit}, which was already running, so the version this package just "
+            f"installed is the one that serves {LOCAL_DNS}",
+        )
+    else:
+        _checked(runner, ("systemctl", "start", unit), f"starting {unit}")
+    # The unreadable case is asked SECOND, because an unreadable state reads as
     # "was already running" and the early return below would swallow it: the
     # transaction would push no stop, correctly, and record nothing, so the
     # report would claim a machine is unchanged while a unit this run started is
     # still running.
-    if unit in unreadable:
+    if uncertain:
         transaction.note_uncertain_unit(unit)
         return
     if states[unit][UNIT_ACTIVE]:
@@ -3128,6 +3155,11 @@ def _run_transaction(
         "publishing the Cloudflare prefix list, which the router refuses to start without",
     )
 
+    restarted = [
+        unit
+        for unit, _port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT))
+        if unit not in unreadable and states[unit][UNIT_ACTIVE]
+    ]
     for unit, port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT)):
         _start(runner, transaction, unit, states, unreadable)
         if not wait_for_dns(LOCAL_DNS, port, ask, deadline_seconds, poll_seconds):
@@ -3137,6 +3169,13 @@ def _run_transaction(
                 "NetworkManager at; nothing has been pointed at anything and the transaction is "
                 "being undone"
             )
+    if restarted:
+        notes.append(
+            " and ".join(restarted)
+            + " were already running, so they were RESTARTED rather than started: everything "
+            "verified below describes the binaries and the configuration this package just "
+            "installed, and not the ones that were running before it"
+        )
 
     # The barrier. Everything above is reversible by stopping two units; the three
     # properties below are the ones that can leave a machine with no resolver at all,
@@ -4190,6 +4229,109 @@ def _restore_unfinished(
     )
 
 
+def _never_applied(root: Path) -> bool:
+    """Whether no transaction of THIS PACKAGE ever reached a mutation here.
+
+    Two absences, and the second one is the whole of the argument:
+      * **no record.** The install writes the record of the machine's original DNS
+        settings, reads it back, compares it field by field and checks its mode
+        BEFORE the first mutation, and refuses if it cannot. So a machine with no
+        record at all is a machine on which no transaction of this package ever
+        got as far as changing anything -- which is a fact about the ORDER the
+        transaction runs in, not a hope. There is nothing to put back, because
+        nothing was ever taken.
+
+      * **no claim.** The marker is the other proof, and it is checked FIRST and
+        for the opposite reason: it is written last, so every install that failed
+        anywhere above it left none, and its absence on its own says nothing. A
+        marker that is present and readable says the opposite -- this package
+        claims the machine's DNS -- and a marker that is present and unreadable, or
+        present and not this package's, also fails this check, because a machine
+        whose DNS somebody else claims is not a machine this program may tidy up.
+        The two conditions together are one fact: nothing of this package ever ran
+        to completion on this machine, and nothing of it ever got as far as
+        changing anything.
+
+    What the claim does NOT cover: a record deleted by hand after a successful
+    install. That is not a state this program produces, and a package that removed
+    the resolver of such a machine would be the harm this whole section exists to
+    prevent. The absence it does cover is the one a refused install leaves.
+    """
+    if not _read_marker(root):
+        return False
+    return _path_state(root / BACKUP_PATH.lstrip("/")) == "absent"
+
+
+def _remove_what_was_never_applied(
+    root: Path, run: CommandRunner, notes: List[str], purge: bool
+) -> UninstallResult:
+    """Finish a removal of a package that never changed this machine.
+
+    The one place in this program that takes a machine's resolver away without a
+    record saying where the machine's own resolvers are, so the sentence is the
+    deliverable as much as the commands are: it says plainly what was established,
+    that no connection was written to, and that the removal may go ahead.
+
+    No `resolvectl` is asked and no connection is named, because there is no
+    connection to name and nothing on any connection is ours to read or change.
+    The units are stopped in the same two groups and under the same
+    read-the-state-first rule as a restoration, the hook is removed, systemd is
+    reloaded, and a `--purge` removes the state directory -- which here holds no
+    record, only a prefix list and a range cache.
+    """
+    left = _stop_units(run, PROJECT_TIMERS, notes)
+    left += _stop_units(run, (ROUTER_UNIT, RESOLVER_UNIT), notes)
+    _remove_dispatcher(root, notes)
+    try:
+        _checked(
+            run,
+            ("systemctl", "daemon-reload"),
+            "reloading systemd (systemctl daemon-reload) so its copy of the unit files is current",
+        )
+    except InstallRefused as error:
+        notes.append(str(error))
+    purged = False
+    if purge:
+        try:
+            _purge_state(root)
+        except InstallRefused as error:
+            notes.append(str(error))
+        else:
+            purged = True
+    # Two sentences and not one, because the two states are different facts. A
+    # machine whose installer directory is empty never had this package applied to
+    # it; a machine that still carries the directory had it, and the absence of
+    # the record is a refused install that rolled itself back. Both end in the
+    # same place -- no connection was written to, and the removal may proceed --
+    # and neither may say "never applied" about a machine that was.
+    if _path_state(root / INSTALLER_DIRECTORY.lstrip("/")) == "absent":
+        notes.append(
+            f"there is nothing of this package left on this machine: no ownership marker at "
+            f"{MANAGED_BY}, no record at {BACKUP_PATH}, and not even the directory they live in, "
+            f"which is where they are after a purge. No connection was touched; the units this "
+            "package installs have been stopped, the dispatcher hook has been removed, and the "
+            "removal may proceed"
+        )
+    else:
+        notes.append(
+            f"nothing of this package was ever applied to this machine: there is no ownership "
+            f"marker at {MANAGED_BY} and no record at {BACKUP_PATH}, and the install writes that "
+            "record -- then reads it back and compares it -- before it changes anything, so a "
+            "machine with neither had no DNS setting of its own changed by this package. No "
+            "connection was touched: the units this package installs have been stopped, the "
+            "dispatcher hook has been removed, and the removal may proceed"
+        )
+    return UninstallResult(
+        ok=True,
+        notes=notes,
+        refusals=[],
+        error=None,
+        manual_recovery=None,
+        left_running=left,
+        purged=purged,
+    )
+
+
 def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -> UninstallResult:
     """Put this machine's DNS back the way the backup says it was, and stop.
 
@@ -4214,6 +4356,14 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
     ownership = _ownership(root, run)
     notes = list(ownership.notes)
     if ownership.refusals:
+        # The absence of the RECORD has its own verdict, and it is not a refusal.
+        # See `_never_applied`: the install writes and verifies the record before
+        # its first mutation, so a machine with no record is a machine this package
+        # never changed -- and refusing it is what leaves a failed install
+        # permanently unremovable, because dpkg aborts a removal whose
+        # pre-removal script exits non-zero.
+        if _never_applied(root):
+            return _remove_what_was_never_applied(root, run, notes, purge)
         # Two summaries, because there are two reports. When the record could not
         # be read there is no connection to name and no command block to point
         # at -- the report printed a template -- and a summary that interpolated

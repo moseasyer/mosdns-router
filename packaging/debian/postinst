@@ -140,31 +140,66 @@ setfacl -d -m g::rwx /var/lib/mosdns/lists
 install -d -o root -g mosdns -m 2770 /run/mosdns
 setfacl -d -m g::rwx /run/mosdns
 
-# --- STEP 3: the pinned China list, placed and verified ----------------------
+# --- STEP 3: the pinned China list, placed once and never re-pinned ----------
 
-# `install` rather than `cp`, so the mode and the group are the published ones and
-# not whatever the caller's umask left behind: 0640 root:mosdns is the mode
-# internal/rules publishes at, and it is the mode that lets the list-check identity
-# read a document the optimizer replaces.
-install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"
-install -o root -g mosdns -m 0640 "$SOURCE_LOCK" "$PUBLISHED_LOCK"
+# Two files under /var/lib/mosdns/lists are the OPERATOR's, not this package's:
+# `mosdns-cdnctl update-lists --pin-remote HEAD` writes both of them there, and
+# the render reads the list. Replacing them with the snapshot this package ships
+# is the same act as re-pinning them -- it is how a pin somebody reviewed becomes
+# a pin nobody reviewed -- and doing it on `configure` means every upgrade of
+# every machine does it.
+#
+# It is also invisible, which is what made it worth fixing rather than only
+# documenting. The pair an operator's pin wrote is SELF-CONSISTENT: the lock's
+# list_sha256 is the digest of the list beside it. Replace both with the shipped
+# pair and the pair is still self-consistent, the digest check below still passes,
+# and nothing reports anything until `update-lists --check` notices that the
+# selector was built from a list other than the one now on disk.
+#
+# So the pair is placed ONLY when it is absent or unreadable, and otherwise both
+# files are left exactly as they are. The PAIR is the unit: one half of it is not
+# a record of anything, so a missing lock means the pair is placed rather than the
+# lock alone.
+if [ ! -r "$PUBLISHED_LIST" ] || [ ! -r "$PUBLISHED_LOCK" ]; then
+	# `install` rather than `cp`, so the mode and the group are the published ones
+	# and not whatever the caller's umask left behind: 0640 root:mosdns is the mode
+	# internal/rules publishes at, and it is the mode that lets the list-check
+	# identity read a document the optimizer replaces.
+	install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"
+	install -o root -g mosdns -m 0640 "$SOURCE_LOCK" "$PUBLISHED_LOCK"
+	echo "postinst: placed the reviewed snapshot this package ships at $PUBLISHED_LIST," >&2
+	echo "postinst: because the published pair was absent or unreadable. Nothing has" >&2
+	echo "postinst: been re-pinned." >&2
+else
+	echo "postinst: $PUBLISHED_LIST and $PUBLISHED_LOCK are already published and" >&2
+	echo "postinst: readable, so they are left exactly as they are. An upgrade does" >&2
+	echo "postinst: not re-pin an operator's list; mosdns-cdnctl(1) says how an" >&2
+	echo "postinst: operator re-pins one deliberately." >&2
+fi
 
 # The digest is compared, not recomputed from a re-pin, and a mismatch is fatal here
 # rather than a warning: a list nobody can verify is a routing document whose
 # domestic branch this project cannot account for. The comparison reads the two
 # files as they are now on disk, so what it verifies is the list the router is
-# ABOUT to read and not the archive the archive claims to contain.
+# ABOUT to read -- the operator's own list where there is one, and the shipped
+# snapshot on a first install -- and not the archive the package claims to carry.
 expected_digest=$(sed -n 's/.*"list_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$PUBLISHED_LOCK")
 if [ -z "$expected_digest" ]; then
-	echo "postinst: $PUBLISHED_LOCK names no list_sha256, so the pinned list cannot be verified" >&2
+	echo "postinst: $PUBLISHED_LOCK names no list_sha256, so the published list cannot" >&2
+	echo "postinst: be verified, and a list this project cannot account for is not one" >&2
+	echo "postinst: it will install over a pair it cannot read. Nothing has been" >&2
+	echo "postinst: changed on this machine's DNS, and the published pair was left" >&2
+	echo "postinst: exactly as it was found. Re-pin it deliberately with:" >&2
+	echo "postinst:   sudo mosdns-cdnctl update-lists --pin-remote HEAD" >&2
 	exit 1
 fi
 actual_digest=$(sha256sum "$PUBLISHED_LIST" | cut -d' ' -f1)
 if [ "$actual_digest" != "$expected_digest" ]; then
 	echo "postinst: $PUBLISHED_LIST is $actual_digest and the lock says $expected_digest;" >&2
 	echo "postinst: refusing to install a routing list this project cannot account for." >&2
-	echo "postinst: nothing has been changed on this machine's DNS. The reviewed snapshot" >&2
-	echo "postinst: this package carries is $SOURCE_LIST; compare the two, and read" >&2
+	echo "postinst: nothing has been changed on this machine's DNS, and the published" >&2
+	echo "postinst: pair was left exactly as it was found. The reviewed snapshot this" >&2
+	echo "postinst: package carries is $SOURCE_LIST; compare the two, and read" >&2
 	echo "postinst: mosdns-cdnctl(1) for how an operator re-pins the list deliberately." >&2
 	exit 1
 fi

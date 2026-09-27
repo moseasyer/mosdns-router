@@ -355,6 +355,13 @@ class UninstallFixture(unittest.TestCase):
         self.overrides = {}
         self.failing = set()
         self.codes = {}
+        # The recording list is created here rather than lazily by the property
+        # that reads it. `record` appends to `self.commands`, and a getter that
+        # returned a fresh `[]` for a list that does not exist yet would throw
+        # every recorded command away -- so a case that runs the module without
+        # going through `run_uninstall` (which resets it) recorded nothing and
+        # asserted nothing.
+        self._commands = []
         self.installed()
         self.runner = None
 
@@ -945,6 +952,10 @@ class OwnershipRefusalTests(UninstallFixture):
         self.refuse_with()
 
     def test_it_refuses_when_the_backup_is_absent(self):
+        # The record is gone but the CLAIM is not, and that is the half that
+        # matters: this machine says the DNS is ours, so it may still be using
+        # 127.0.0.1 and there is nothing to put back. (Both absent is a different
+        # machine, and a different verdict -- see NeverAppliedRemovalTests.)
         self.rooted(BACKUP_PATH).unlink()
         result = self.refuse_with()
         self.assertIn(BACKUP_PATH, " ".join(result.refusals))
@@ -1179,6 +1190,11 @@ class OwnershipRefusalTests(UninstallFixture):
         # pointed at "the commands above" when the report had printed no commands
         # at all -- only a template with <uuid> in it.
         self.rooted(BACKUP_PATH).unlink()
+        self.assertTrue(
+            self.rooted(MANAGED_BY).exists(),
+            "this case is about a machine that CLAIMS the DNS is ours with no record of it, so "
+            "it still refuses; both absent is the other verdict",
+        )
         before = self.snapshot()
         self.result = self.run_uninstall()
         self.assertNothingChanged("a refusal with no backup")
@@ -1229,6 +1245,11 @@ class OwnershipRefusalTests(UninstallFixture):
 
     def test_the_report_of_a_machine_with_no_backup_names_the_file_instead_of_commands(self):
         self.rooted(BACKUP_PATH).unlink()
+        self.assertTrue(
+            self.rooted(MANAGED_BY).exists(),
+            "this case is about a machine that CLAIMS the DNS is ours with no record of it, so "
+            "it still refuses; both absent is the other verdict",
+        )
         report = self.refuse_with().manual_recovery or ""
         self.assertIn(BACKUP_PATH, report)
         self.assertIn("nmcli", report, "an operator still has to be told the shape of the command")
@@ -1895,17 +1916,27 @@ class PurgeTests(UninstallFixture):
 
     def test_a_second_purge_removes_nothing_more(self):
         # The purge takes the marker with it, because the marker lives inside the
-        # state directory. So the second run has no claim to act on and refuses,
-        # which is the right answer: there is nothing left to restore and nothing
-        # left to prove, and inventing a second permission for it would be the one
-        # way this verb could delete something it had no business deleting.
+        # state directory -- so the second run has no claim to act on and no record
+        # to restore from, and it says so and removes nothing rather than refusing.
+        # The refusal is what this used to do, and it is what left a package that
+        # no documented means could remove: dpkg aborts a removal whose
+        # pre-removal script exits non-zero, so an operator whose machine ended up
+        # here could not get rid of it. What the refusal was protecting against --
+        # this verb deleting something it had no business deleting -- is still
+        # held, and by a stronger assertion than the exit status: nothing at all
+        # disappeared.
         self.result = self.run_uninstall(purge=True)
         self.assertTrue(self.result.ok, result_error(self.result))
         before = self.snapshot()
         self.result = self.run_uninstall(purge=True)
-        self.assertFalse(self.result.ok, "a second purge claimed a machine with nothing left on it")
-        self.assertIn(MANAGED_BY, " ".join(self.result.refusals))
-        self.assertEqual(self.removed_paths(before), [], "a refused second purge removed something")
+        self.assertTrue(self.result.ok, result_error(self.result))
+        self.assertEqual(self.result.refusals, [])
+        self.assertIn(
+            "nothing of this package left on this machine",
+            " ".join(self.result.notes),
+            "the second purge reported success without saying that there was nothing left to do",
+        )
+        self.assertEqual(self.removed_paths(before), [], "a second purge removed something")
 
     def test_a_purge_leaves_the_run_directory_alone(self):
         # `/run` is a tmpfs the init system rebuilds, and the plan names
@@ -2565,6 +2596,134 @@ class CliTests(UninstallFixture):
                     self.assertIn(verb, err, f"the usage line does not name {verb}")
                 self.assertIn("--purge", err)
                 self.assertNotIn("--fix", err)
+
+
+class NeverAppliedRemovalTests(UninstallFixture):
+    """A machine this package provably never changed has to be removable.
+
+    The marker is written LAST, so every install that failed anywhere above it
+    left none, and `uninstall` refused on that alone -- which means a failed
+    install leaves a package that no documented means can remove. `prerm` turns
+    the refusal into `exit 1`, dpkg aborts a removal whose pre-removal script
+    fails, and the refusal's own advice ("put the connection back by hand, or
+    reboot, and then remove the package") does not work, because rebooting does
+    not create a marker.
+
+    The refinement is provable rather than hopeful, and it is the ORDER the
+    transaction runs in: the record of the machine's original DNS settings is
+    written, read back, compared field by field and mode-checked BEFORE the first
+    mutation, and a transaction that cannot do that refuses. So **no record at
+    all** means no transaction of this package ever reached a mutation -- there is
+    nothing to put back, because nothing was ever taken. In that state stopping
+    the units and removing the hook is safe, and only the connection restore
+    needed the record.
+
+    The other half matters as much: a machine with a record and no marker is a
+    DIFFERENT machine, and it still refuses. That is the case where an install
+    got far enough to record and then failed, and it is the case the connection
+    restore is for.
+    """
+
+    def refused_at_the_barrier(self):
+        """This package's own install, refused before it recorded anything.
+
+        The fake root has no `/etc/os-release`, so preflight refuses the machine
+        at its first gate -- before the capture, before the record, before any
+        mutation. The two absences this test then asserts are the ones the whole
+        refinement rests on, so they are produced by the real install rather than
+        arranged by hand.
+        """
+        self.remove_marker()
+        self.rooted(BACKUP_PATH).unlink()
+        result = installer.install(self.root, self.good_runner(), probe=self.probe_for())
+        self.assertFalse(result.ok, "a machine with no /etc/os-release was installable")
+        self.assertFalse(
+            self.rooted(MANAGED_BY).exists(),
+            "an install refused at preflight left an ownership marker behind",
+        )
+        self.assertFalse(
+            self.rooted(BACKUP_PATH).exists(),
+            "an install refused at preflight left a record behind, and a record is what makes "
+            "'nothing was ever applied' unprovable",
+        )
+        return result
+
+    def test_an_install_refused_at_the_barrier_leaves_no_marker_and_no_record(self):
+        self.refused_at_the_barrier()
+
+    def test_such_a_package_is_removable_and_dpkg_is_told_so(self):
+        self.refused_at_the_barrier()
+        before = self.snapshot()
+        status, out, err = self.run_cli("uninstall")
+        self.assertEqual(
+            status,
+            installer.EXIT_OK,
+            f"the uninstall refused a machine this package never changed, and prerm turns that "
+            f"into exit 1, which aborts the removal and leaves the operator with a package they "
+            f"cannot remove: {err}",
+        )
+        self.assertEqual(err, "", "a removal that succeeded complained about something")
+        for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
+            with self.subTest(unit=unit):
+                self.assertIn(("systemctl", "stop", unit), self.commands)
+        self.assertFalse(
+            [command for command in self.commands if command[:2] == MODIFY],
+            "a removal with nothing to restore wrote to the connection anyway",
+        )
+        self.assertNotIn(DISPATCHER_SCRIPT, self.snapshot())
+        self.assertEqual(
+            sorted(set(before) - set(self.snapshot())),
+            [DISPATCHER_SCRIPT.lstrip("/")],
+            "the removal removed something other than the one file under /etc this package installs",
+        )
+        # And the sentence that matters, because this is the one place in the
+        # program that removes a machine's resolver WITHOUT the record that says
+        # where the machine's own resolvers are.
+        self.assertIn("nothing of this package was ever applied", out)
+
+    def test_prerm_passes_this_status_through_so_dpkg_removes_the_package(self):
+        # The composition of two things this file does not own: the status the
+        # installer returns, and what `prerm` does with it. dpkg aborts a removal
+        # whose pre-removal script exits non-zero, so the one non-zero exit in the
+        # remove arm has to be the branch where the uninstall failed -- and the
+        # script's last word has to be success, or a status of zero would still
+        # not let the removal happen.
+        self.refused_at_the_barrier()
+        status, _out, _err = self.run_cli("uninstall")
+        self.assertEqual(status, installer.EXIT_OK)
+        text = (REPO / "packaging" / "debian" / "prerm").read_text(encoding="utf-8")
+        # The whole arm, cut at the NEXT outer label. Cutting at the first `;;`
+        # would stop inside the nested `case` on the installer's status, whose
+        # arms also end in `;;` -- and would then report an arm with no exit in it
+        # for a script that has one.
+        arm = text.split("remove|deconfigure)", 1)[1].split("upgrade | failed-upgrade)", 1)[0]
+        self.assertIn('"$INSTALLER" uninstall', arm)
+        self.assertEqual(
+            [line.strip() for line in arm.splitlines() if line.strip().startswith("exit ")],
+            ["exit 1"],
+            "prerm's remove arm exits somewhere other than the branch where the uninstall failed, "
+            "so a status of 0 would not remove the package",
+        )
+        self.assertTrue(
+            text.rstrip().endswith("exit 0"),
+            "prerm does not end in success, so a status of 0 would still abort the removal",
+        )
+
+    def test_a_record_without_a_marker_still_refuses(self):
+        # The other half of the refinement, and the case the refinement must not
+        # swallow: an install that got as far as recording and then failed leaves a
+        # record and no marker, and there the connection restore is exactly what
+        # is needed.
+        self.remove_marker()
+        result = self.run_uninstall()
+        self.assertFalse(result.ok, "a machine with a record and no marker reported a clean removal")
+        self.assertNotIn(
+            ("systemctl", "stop", ROUTER_UNIT),
+            self.commands,
+            "the router was stopped on a machine whose record says the connection may still be "
+            "using 127.0.0.1",
+        )
+        self.assertIn(MANAGED_BY, " ".join(result.refusals))
 
 
 class SourceScanTests(unittest.TestCase):

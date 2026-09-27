@@ -686,8 +686,203 @@ def case_arms(text):
     return arms
 
 
+def postinst_step_body(text, number):
+    """The body of one `postinst` STEP, as the script's own lines.
+
+    Cut at the two `--- STEP N` headers rather than at a line count, so a step that
+    grows does not silently become a different step to the reader. The leading
+    header is kept: it carries no logic, and a reader that dropped it would still
+    be reading the script.
+    """
+    header = re.compile(r"^#\s*-{2,}\s*STEP\s+" + str(number) + r"\b", re.MULTILINE)
+    any_header = re.compile(r"^#\s*-{2,}\s*STEP\s+\d+\b", re.MULTILINE)
+    found = list(header.finditer(text))
+    if len(found) != 1:
+        raise AssertionError(
+            f"postinst has {len(found)} STEP {number} headers, so this step cannot be cut out of it"
+        )
+    start = found[0].start()
+    following = any_header.search(text, found[0].end())
+    if following is None:
+        raise AssertionError(f"postinst has a STEP {number} with no STEP after it")
+    return text[start : following.start()]
+
+
+def sandboxed_postinst_step(number, published, source_pair, text=None):
+    """Run one `postinst` step's own lines in a throwaway tree, and return the tree.
+
+    The point of this helper is that the DECISION is the script's own text. The
+    paths are the script's own variables -- read out of its own assignments by
+    `shell_assignments`, so a renamed variable is a failure here rather than a
+    silent divergence -- with the sandbox root in front, and the one tool that
+    cannot run on this host replaced by a `PATH` shim.
+
+    The shim is `install`, and the reason is narrow and stated in the shim itself:
+    the script asks for group `mosdns`, which does not exist on a build machine,
+    and `install -g` on a missing group fails. Ownership is not what this step
+    decides, so the shim drops `-o` and `-g` and execs the real `install`. The
+    readability test, the `sed`, the `sha256sum` and the comparison are the
+    script's own, unrewritten.
+
+    `published` maps an absolute destination path to bytes, or is `{}` to plant
+    nothing there; `source_pair` maps the two shipped paths to their bytes.
+    """
+    text = text if text is not None else POSTINST.read_text()
+    body = postinst_step_body(text, number)
+    root = Path(scratch_directory("mosdns-postinst-step.")) / "root"
+    # Only the variables this step NAMES, and only from the script's own
+    # assignments. `shell_assignments` reads the whole file, so it also finds the
+    # `expected_digest=$(...)` and `actual_digest=$(...)` lines inside the step --
+    # and emitting those into the header ran the step's own digest comparison
+    # against an empty tree before the step had placed anything, which is a
+    # failure of the harness wearing the step's name.
+    referenced = set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", body))
+    variables = {
+        name: value
+        for name, value in shell_assignments(text).items()
+        # Only a LITERAL. `shell_assignments` reads the whole file, so it also
+        # finds the `expected_digest=$(sed ...)` and `actual_digest=$(sha256sum
+        # ...)` lines inside the step -- and the body references both, so a filter
+        # on the name alone would put them in the header and run the step's own
+        # digest comparison against an empty tree before the step had placed
+        # anything. A harness cannot precompute a value the script computes.
+        if name in referenced and "$(" not in value and "`" not in value
+    }
+    for name in ("SOURCE_LIST", "SOURCE_LOCK", "PUBLISHED_LIST", "PUBLISHED_LOCK"):
+        if name not in variables:
+            raise AssertionError(f"postinst does not assign {name}, so this step cannot be read")
+    for name, value in variables.items():
+        if value.startswith("/"):
+            variables[name] = str(root) + value
+    for name in ("SOURCE_LIST", "SOURCE_LOCK"):
+        path = Path(variables[name])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source_pair[name], encoding="utf-8")
+    for destination, contents in published.items():
+        path = root / destination.lstrip("/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    for name in ("PUBLISHED_LIST", "PUBLISHED_LOCK"):
+        Path(variables[name]).parent.mkdir(parents=True, exist_ok=True)
+
+    shim = root.parent / "shim"
+    shim.mkdir(exist_ok=True)
+    install = shim / "install"
+    install.write_text(
+        "#!/usr/bin/env python3\n"
+        "# A stand-in for install(1) that drops -o and -g: this build host has no\n"
+        "# `mosdns` group and `install -g` on a missing group fails. Ownership is not\n"
+        "# what the step being run decides, so the decision runs unrewritten.\n"
+        "import os, sys\n"
+        "args, skip = [], 0\n"
+        "for word in sys.argv[1:]:\n"
+        "    if skip:\n"
+        "        skip -= 1\n"
+        "        continue\n"
+        "    if word in ('-o', '-g'):\n"
+        "        skip = 1\n"
+        "        continue\n"
+        "    args.append(word)\n"
+        "os.execv('/usr/bin/install', ['install'] + args)\n"
+    )
+    install.chmod(0o755)
+    header = "set -e\n" + "".join(f"{name}={value}\n" for name, value in variables.items())
+    script = root.parent / "step.sh"
+    script.write_text(header + body + "\n")
+    environment = dict(os.environ)
+    environment["PATH"] = f"{shim}{os.pathsep}{environment.get('PATH', '')}"
+    completed = subprocess.run(
+        ["sh", str(script)], capture_output=True, text=True, check=False, env=environment
+    )
+    return root, variables, completed
+
+
+def unpinned_pair(list_body, commit="0000000000000000000000000000000000000000"):
+    """A self-consistent China list and lock of an operator's own re-pin.
+
+    Self-consistent on purpose: the published lock's `list_sha256` is the digest
+    of the published list, exactly as `mosdns-cdnctl update-lists --pin-remote`
+    writes them. So nothing but the overwrite itself can reveal that postinst
+    replaced an operator's pin -- which is the whole of the property.
+    """
+    digest = hashlib.sha256(list_body.encode("utf-8")).hexdigest()
+    lock = json.dumps(
+        {
+            "schema_version": 1,
+            "repository": "v2fly/domain-list-community",
+            "commit": commit,
+            "sha256": hashlib.sha256(commit.encode("ascii")).hexdigest(),
+            "list_sha256": digest,
+            "entry": "data/cn",
+        },
+        indent=2,
+    ) + "\n"
+    return list_body, lock
+
+
+def unconditional_publish(text):
+    """`postinst` with the pair published on every run, as it was before the fix."""
+    line = 'if [ ! -r "$PUBLISHED_LIST" ] || [ ! -r "$PUBLISHED_LOCK" ]; then'
+    if line not in text:
+        raise AssertionError(f"postinst does not guard the published pair with {line!r}")
+    return text.replace(line, "if true; then")
+
+
+def executed_lines(text):
+    """The lines a shell script RUNS, with comments and `echo`s removed.
+
+    Two removals and both are needed, and neither is a weakening of the check it
+    serves. A comment that explains why the script never re-pins a list names the
+    re-pinning command, and an operator is told to re-pin one by name when the
+    published pair cannot be verified -- so a scan of the raw text cannot tell a
+    script that RE-PINS from a script that says out loud that it does not, and the
+    only ways to satisfy both are to delete the explanation or to delete the
+    advice. What is forbidden is RUNNING the re-pin, and an `echo` does not run
+    the string it prints.
+    """
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if re.match(r"^echo\b", stripped):
+            continue
+        lines.append(stripped)
+    return lines
+
+
 def _labels(text):
     return [label.strip() for label in text.split("|") if label.strip()]
+
+
+def numeric_case_arms(text):
+    """``{label: body}`` for a ``case`` whose arms are exit-status NUMBERS.
+
+    `case_arms` deliberately refuses a numeric label, because a maintainer
+    script's dpkg verbs are words and a reader that accepted anything would read a
+    `case` on an exit status as a `case` on a verb. This reader is the other
+    half: it reads only a number or the `*` default arm, so the two cannot be
+    confused, and it is what lets a test ask "does prerm say something different
+    for the installer's two refusals" as a question about two BODIES rather than
+    about two substrings of a paragraph.
+    """
+    label_line = re.compile(r"^\s*([0-9]+|\*)\)(?P<inline>.*)$")
+    lines = text.splitlines()
+    arms = {}
+    for index, line in enumerate(lines):
+        match = label_line.match(line)
+        if match is None:
+            continue
+        if match.group("inline").strip() in ("", ";;"):
+            body = []
+            cursor = index + 1
+            while cursor < len(lines) and lines[cursor].strip() != ";;":
+                body.append(lines[cursor])
+                cursor += 1
+            arms[match.group(1)] = "\n".join(body)
+        else:
+            arms[match.group(1)] = match.group("inline")
+    return arms
 
 
 def arm_bodies(text):
@@ -2070,14 +2265,23 @@ class MaintainerScriptTests(_Staged):
 
     def test_postinst_places_the_pinned_list_and_never_re_pins_it(self):
         """Re-pinning at install time is how an operator's reviewed pin becomes
-        something nobody reviewed."""
-        text = POSTINST.read_text()
+        something nobody reviewed.
+
+        The three tokens are still read out of the text, and they are still worth
+        reading: a re-pin through any other spelling -- a `curl` of the archive
+        beside an `install` -- would be caught by none of the behaviour below,
+        because the behaviour is about what happens to the pair that is already
+        there. What the behaviour adds is the half a grep cannot reach: whether
+        the pair survives an upgrade, which is the next test.
+        """
+        text = SCRIPTS["postinst"].read_text()
+        run = "\n".join(executed_lines(text))
         for forbidden in ("--pin-remote", "pin-remote", "update-lists"):
             with self.subTest(token=forbidden):
                 self.assertNotIn(
-                    forbidden, text,
-                    f"postinst contains {forbidden!r}, so an install or an upgrade would "
-                    "re-pin the reviewed list",
+                    forbidden, run,
+                    f"postinst RUNS something containing {forbidden!r}, so an install or an "
+                    "upgrade would re-pin the reviewed list",
                 )
         self.assertIn(PUBLISHED_LIST, text)
         self.assertIn(PUBLISHED_LOCK, text)
@@ -2089,6 +2293,93 @@ class MaintainerScriptTests(_Staged):
         ):
             with self.subTest(path=destination):
                 self.assertIn(source, text, f"postinst never places {source} at {destination}")
+
+    def shipped_pair(self):
+        """The two files the package carries, as the staged tree holds them."""
+        return {
+            "SOURCE_LIST": self.read(CHINA_LIST),
+            "SOURCE_LOCK": self.read(SOURCE_LOCK),
+        }
+
+    def test_postinst_leaves_a_pair_an_operator_re_pinned_alone(self):
+        """The property the grep above cannot see, run as the script runs it.
+
+        The published pair at `/var/lib/mosdns/lists` is the OPERATOR's:
+        `mosdns-cdnctl update-lists --pin-remote HEAD` writes both files there.
+        Replacing them with the shipped snapshot on every `configure` is the same
+        act as re-pinning -- the plan's own ruling 59 forbids it -- and it is
+        invisible, because the pair an operator's pin wrote is self-consistent
+        and stays self-consistent after the overwrite. Nothing detects it until
+        `update-lists --check` reports drift days later.
+
+        So the gate has to be behavioural: plant a DIFFERING and internally
+        consistent pair, run the step's own lines, and assert the bytes on disk are
+        the bytes that were there. The other two cases are here so a script that
+        simply never publishes anything cannot pass: absent, the pair is placed;
+        half-present, the pair is placed, because the pair is the unit the lock
+        describes and one half of it is not a record of anything.
+        """
+        shipped = self.shipped_pair()
+        list_body, lock_body = unpinned_pair("domain:operator.example\n")
+        planted = {"PUBLISHED_LIST": PUBLISHED_LIST, "PUBLISHED_LOCK": PUBLISHED_LOCK}
+        cases = {
+            "differing": {"PUBLISHED_LIST": list_body, "PUBLISHED_LOCK": lock_body},
+            "absent": {},
+        }
+        for label, before in cases.items():
+            with self.subTest(published=label):
+                _root, variables, completed = sandboxed_postinst_step(
+                    3,
+                    {planted[name]: body for name, body in before.items()},
+                    shipped,
+                    text=SCRIPTS["postinst"].read_text(),
+                )
+                self.assertEqual(
+                    completed.returncode, 0,
+                    f"the published-pair step failed on a {label} pair: "
+                    f"{completed.stdout}{completed.stderr}",
+                )
+                for name, source in (
+                    ("PUBLISHED_LIST", "SOURCE_LIST"),
+                    ("PUBLISHED_LOCK", "SOURCE_LOCK"),
+                ):
+                    self.assertEqual(
+                        Path(variables[name]).read_text(encoding="utf-8"),
+                        before.get(name, shipped[source]),
+                        f"the {label} case did not leave the {name} as it found it",
+                    )
+        # And the words, because a silent correct behaviour is a behaviour an
+        # operator cannot tell from one that happened by accident.
+        _root, _variables, completed = sandboxed_postinst_step(
+            3,
+            {planted[name]: body for name, body in cases["differing"].items()},
+            shipped,
+            text=SCRIPTS["postinst"].read_text(),
+        )
+        self.assertIn("left exactly as they are", completed.stderr)
+
+    def test_postinst_publishes_the_pair_when_it_is_not_readable(self):
+        """A destination that is not a readable file is the other half of the rule.
+
+        One half of the pair missing is the case: the lock describes the list
+        beside it, so a list with no lock is a document nothing can account for,
+        and the pair -- not the lock alone -- is what gets placed.
+        """
+        shipped = self.shipped_pair()
+        list_body, _lock_body = unpinned_pair("domain:operator.example\n")
+        _root, variables, completed = sandboxed_postinst_step(
+            3, {PUBLISHED_LIST: list_body}, shipped, text=SCRIPTS["postinst"].read_text()
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for name, source in (
+            ("PUBLISHED_LIST", "SOURCE_LIST"),
+            ("PUBLISHED_LOCK", "SOURCE_LOCK"),
+        ):
+            self.assertEqual(
+                Path(variables[name]).read_text(encoding="utf-8"),
+                shipped[source],
+                f"the pair was not placed even though the lock was unreadable ({name})",
+            )
 
     def test_postinst_provisions_before_it_runs_the_install_transaction(self):
         """`postinst` provisions, then the transaction enables and starts; that
@@ -2147,6 +2438,62 @@ class MaintainerScriptTests(_Staged):
                     f"{function} gained a disable step: a plain uninstall with no package removal "
                     "would disable a unit the operator still has installed",
                 )
+
+    def test_prerm_tells_the_installers_two_refusals_apart_and_says_what_dpkg_will_do(self):
+        """dpkg ABORTS a removal whose pre-removal script exits non-zero.
+
+        So the one sentence the old script printed -- "the files are about to be
+        removed with this machine's DNS still pointed at 127.0.0.1 ... do not
+        restart the machine" -- described a removal that is not happening, and it
+        described both refusals with it. The installer distinguishes them
+        precisely and for good reasons: exit 5 is "nothing was changed, because I
+        could not prove the DNS is mine to change" and exit 6 is "a restore was
+        attempted and did not finish". They are the same dpkg outcome and two
+        different situations, and an operator reading one sentence for both is
+        told to do the wrong thing.
+        """
+        text = PRERM.read_text()
+        arms = numeric_case_arms(text)
+        for status in ("5", "6"):
+            with self.subTest(status=status):
+                self.assertIn(
+                    status, arms,
+                    f"prerm has no arm for the installer's exit {status}, so it says the same "
+                    "thing about both of its refusals",
+                )
+        self.assertNotEqual(
+            arms["5"].strip(), arms["6"].strip(),
+            "prerm says the same thing about a refusal that changed nothing and about a restore "
+            "that did not finish",
+        )
+        for status in ("5", "6"):
+            body = arms[status]
+            with self.subTest(status=status, claim="what dpkg will do"):
+                self.assertIn("still installed", body)
+                self.assertIn("aborting", body.lower())
+            with self.subTest(status=status, claim="not what it would do"):
+                for false_claim in (
+                    "the files are about to be removed",
+                    "do not restart the machine",
+                ):
+                    self.assertNotIn(false_claim, text)
+        # The distinction itself, in the words the two situations are told apart by.
+        self.assertIn("nothing", arms["5"].lower())
+        self.assertIn("still", arms["6"].lower())
+        # And a default arm, because a status this script does not know is a
+        # fact about the machine rather than about the script.
+        self.assertIn("*", arms, "prerm has no default arm for an unrecognised status")
+
+    def test_prerm_branches_on_the_installers_status_rather_than_its_own_success(self):
+        # The status has to be captured, and `if ! cmd` cannot capture it: `$?`
+        # after `!` is the status of the `!`, which is always zero. A script that
+        # read it that way would print the same arm for every failure.
+        text = PRERM.read_text()
+        arm = arm_bodies(text)["remove"]
+        self.assertIn('"$INSTALLER" uninstall', arm)
+        self.assertNotIn("if ! \"$INSTALLER\" uninstall", arm)
+        self.assertIn("status=$?", arm)
+        self.assertIn('case "$status" in', arm)
 
     def test_postrm_purges_only_when_purge_was_asked_for(self):
         """The data goes on `dpkg --purge` and not on `dpkg --remove`, and the
@@ -2874,6 +3221,12 @@ class ControlTests(unittest.TestCase):
         else is a maintainer script held in memory. The method is called directly,
         which is the whole point: a control that called the helper instead would be a
         second implementation of the check rather than evidence about the first.
+
+        BOTH kinds apply at once, and they used not to: the staged branch returned
+        before the script substitutions were made, so a control that wanted to
+        plant a file AND hand the method a different maintainer script silently
+        tested the real script. A control that cannot deliver a replacement to the
+        code under test reports success while testing nothing.
         """
         staged = kwargs.pop("staged", None)
         if staged is None:
@@ -2889,11 +3242,12 @@ class ControlTests(unittest.TestCase):
             planted.parent.mkdir(parents=True, exist_ok=True)
             planted.write_text(contents, encoding="utf-8")
         root = Path(target)
-        case = case_class(method)
-        case.root = str(root)
-        case.inventory = staged_inventory(root)
-        with self.assertRaises(AssertionError):
-            getattr(case, method)()
+        with scripts_replaced(**kwargs):
+            case = case_class(method)
+            case.root = str(root)
+            case.inventory = staged_inventory(root)
+            with self.assertRaises(AssertionError):
+                getattr(case, method)()
 
     def copy(self, mutate):
         """A private copy of the staged tree with ``mutate`` applied to it."""
@@ -3107,6 +3461,60 @@ class ControlTests(unittest.TestCase):
             self.assertIs(script_paths()["postrm"], SCRIPTS["postrm"])
             self.assertIn("failed-upgrade", SCRIPTS["postrm"].read_text() or "")
             self.assertTrue(policy_verb_findings("postrm", SCRIPTS["postrm"].read_text()))
+
+    def test_a_pair_an_operator_re_pinned_is_reported_by_the_method(self):
+        """The control for the published-pair gate, and the reason it is behavioural.
+
+        The old gate only grepped for the re-pinning tokens and for the shape of
+        the two `install` lines -- and it PASSED the script that replaced an
+        operator's pair on every upgrade, because that script does contain exactly
+        that shape. A gate that cannot fail on the defect it was written for is
+        worse than no gate, so the control restores the unconditional publish and
+        asks the METHOD to fail.
+        """
+        broken = unconditional_publish(POSTINST.read_text())
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_leaves_a_pair_an_operator_re_pinned_alone",
+            postinst=broken,
+            # The method reads the two shipped files out of the staged tree, so
+            # the control asks for a copy of it even though it plants nothing.
+            staged={},
+        )
+        # And the mutation really is the old script: the tokens the old grep
+        # looked for are all still present in it, which is why the old gate
+        # passed it.
+        run = "\n".join(executed_lines(broken))
+        for token in ("--pin-remote",):
+            self.assertNotIn(
+                token, run, "the control no longer reproduces the script the old gate passed"
+            )
+        self.assertIn(
+            'install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"', broken
+        )
+
+    def test_one_sentence_for_both_of_the_installers_refusals_is_reported(self):
+        """The control for prerm's two arms.
+
+        Flattened to one arm per status with the SAME text, which is precisely the
+        defect: a script that cannot tell a refusal that changed nothing from a
+        restore that did not finish.
+        """
+        text = PRERM.read_text()
+        arms = numeric_case_arms(text)
+        flattened = text.replace(
+            arms["6"].strip(), arms["5"].strip()
+        )
+        self.assertEqual(
+            numeric_case_arms(flattened)["5"].strip(),
+            numeric_case_arms(flattened)["6"].strip(),
+            "the control did not flatten the two arms",
+        )
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_prerm_tells_the_installers_two_refusals_apart_and_says_what_dpkg_will_do",
+            prerm=flattened,
+        )
 
     def test_timers_enabled_before_the_transaction_are_reported(self):
         """Round 2's control for the enable's POSITION, against the method that holds

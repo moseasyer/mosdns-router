@@ -25,6 +25,25 @@
 # That refusal is the correct answer, and the report it prints is the deliverable
 # rather than a log line.
 #
+# WHAT dpkg DOES WITH A FAILURE, because it is the sentence the first version of
+# this script got wrong in the direction that matters. dpkg ABORTS a removal whose
+# pre-removal script exits non-zero: the package stays installed and not one file
+# is removed. So this script must never say that the files are about to be
+# removed, and it must never tell an operator to avoid rebooting a machine dpkg is
+# not touching. What it does say, per status, is what the situation is -- because
+# the installer's two refusals are two different machines and an operator told
+# they are the same one does the wrong thing:
+#
+#   5  nothing was changed, because this program could not prove the DNS on this
+#      machine is its own to change. There is no half-restored connection to
+#      finish, and the report above is the whole deliverable.
+#   6  a restore was attempted and did not finish, so some of this package's
+#      values may still be on the connection and the units are still running.
+#
+# The status is captured from an `if`/`else` rather than from `if !`, because `$?`
+# after `!` is the status of the `!` -- which is always zero -- so a script that
+# read it there would print the same arm for every failure there is.
+#
 # For a purge, the state directory goes in postrm, and only when the purge was
 # asked for: `dpkg --purge` is the operator saying the data goes too, and a plain
 # `dpkg --remove` must leave /var/lib/mosdns with the backup and the marker in it,
@@ -50,14 +69,37 @@ remove|deconfigure)
 			mosdns-list-check.timer
 	fi
 
-	if ! "$INSTALLER" uninstall; then
-		# A refusal or an unfinished restore is a failure of THIS script, and dpkg
-		# has to hear about it: a package half removed while the machine is still
-		# pointed at a resolver it no longer has is the worst state available here.
-		echo "prerm: the uninstall did not finish, so the files are about to be removed" >&2
-		echo "prerm: with this machine's DNS still pointed at 127.0.0.1. See the" >&2
-		echo "prerm: recovery report above, and do not restart the machine until" >&2
-		echo "prerm: this machine can resolve something other than itself." >&2
+	if "$INSTALLER" uninstall; then
+		:
+	else
+		status=$?
+		case "$status" in
+		5)
+			echo "prerm: the uninstaller exited 5: it would not change a connection it" >&2
+			echo "prerm: cannot prove this package set, so it changed NOTHING and printed" >&2
+			echo "prerm: the recovery report above. The machine's DNS is not this package's" >&2
+			echo "prerm: to change and there is no half-finished restore to complete. dpkg is" >&2
+			echo "prerm: ABORTING this removal: the package is still installed and not one file" >&2
+			echo "prerm: has been removed. Follow the report above, then remove the package" >&2
+			echo "prerm: with:" >&2
+			echo "prerm:   sudo dpkg --remove mosdns-router" >&2
+			;;
+		6)
+			echo "prerm: the uninstaller exited 6: it began putting this package's recorded DNS" >&2
+			echo "prerm: settings back and did not finish, so SOME of them may still be on the" >&2
+			echo "prerm: connection and the units this package installs have NOT been stopped." >&2
+			echo "prerm: The recovery report above is the command block that finishes the job;" >&2
+			echo "prerm: it is the deliverable, not a log line. dpkg is ABORTING this removal:" >&2
+			echo "prerm: the package is still installed and not one file has been removed, so" >&2
+			echo "prerm: the units and the files are both still here. Complete the report, then" >&2
+			echo "prerm: try the removal again." >&2
+			;;
+		*)
+			echo "prerm: the uninstaller exited $status, which is not a status this script" >&2
+			echo "prerm: knows; the messages above say why. dpkg is ABORTING this removal: the" >&2
+			echo "prerm: package is still installed and not one file has been removed." >&2
+			;;
+		esac
 		exit 1
 	fi
 	;;

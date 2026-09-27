@@ -2596,6 +2596,90 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1, "the wait did not try even once")
 
 
+class UpgradeRestartTests(TransactionFixture):
+    """A unit that was already running is RESTARTED, so the upgrade is what is verified.
+
+    `systemctl start` on an already-active unit is a no-op, so an upgrade of a
+    running machine installs a new `mosdns-router`, a new `dnscrypt-proxy`, a new
+    `mosdns-cdnctl` and a new generated `/etc/mosdns/mosdns.yaml`, and then
+    verifies the OLD processes against the NEW document. Everything the
+    transaction reports after the start -- the two waits, the barrier, the
+    verification of the device and the machine's own resolvers -- describes the
+    binaries that were running before dpkg unpacked the new ones, and the exit-0
+    message claims ports 53 and 15353 are served by what this package just
+    installed.
+
+    `try-restart` is the verb that fixes it and it is conditional on the state
+    being READ. A unit whose state could not be read is only `start`ed, because
+    `try-restart` stops it first and stopping a unit this install may not own is
+    the harm the whole prior-state rule exists to prevent.
+    """
+
+    def already_running(self, *units):
+        for unit in units:
+            self.answers[("systemctl", "is-active", unit)] = "active\n"
+            self.answers[("systemctl", "is-enabled", unit)] = "enabled\n"
+            self.returncodes[("systemctl", "is-active", unit)] = 0
+            self.returncodes[("systemctl", "is-enabled", unit)] = 0
+        return self
+
+    def test_a_unit_that_was_already_running_is_restarted_rather_than_started(self):
+        self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        result = self.install_succeeds()
+        for unit in (RESOLVER_UNIT, ROUTER_UNIT):
+            with self.subTest(unit=unit):
+                self.assertIn(("systemctl", "try-restart", unit), self.commands)
+                self.assertNotIn(
+                    ("systemctl", "start", unit),
+                    self.commands,
+                    f"{unit} was already running and was only started, so the running process is "
+                    "still the one this package had before the upgrade",
+                )
+        # And the wait is asked again afterwards, so the verification describes the
+        # process that is now running rather than the one that was.
+        for unit, port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT)):
+            with self.subTest(unit=unit):
+                after = self.commands.index(("systemctl", "try-restart", unit))
+                self.assertIn(
+                    ("probe", LOCAL_DNS, port),
+                    self.events[after:],
+                    f"nothing asked {LOCAL_DNS}:{port} after {unit} was restarted, so the "
+                    "verification describes the process that was there before the upgrade",
+                )
+        self.assertIn(
+            f"{RESOLVER_UNIT} and {ROUTER_UNIT} were already running",
+            " ".join(result.notes),
+            "an operator reading the report cannot tell that the daemons were restarted",
+        )
+
+    def test_a_unit_that_was_already_running_is_never_stopped_by_the_rollback(self):
+        self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        self.run_install(fail=[MODIFY + (UUID, "ipv4.dns", LOCAL_DNS)])
+        for unit in (RESOLVER_UNIT, ROUTER_UNIT):
+            with self.subTest(unit=unit):
+                self.assertNotIn(("systemctl", "stop", unit), self.commands)
+                self.assertNotIn(("systemctl", "disable", unit), self.commands)
+
+    def test_a_unit_whose_state_could_not_be_read_is_only_started(self):
+        # The unreadable state reads as "was already running", so the two cases are
+        # one branch in the code and must not be one branch in what the code DOES.
+        self.answers[("systemctl", "is-active", RESOLVER_UNIT)] = ""
+        self.returncodes[("systemctl", "is-active", RESOLVER_UNIT)] = 1
+        self.install_succeeds()
+        self.assertNotIn(
+            ("systemctl", "try-restart", RESOLVER_UNIT),
+            self.commands,
+            "a unit whose prior state could not be read was try-restarted, which stops it first",
+        )
+        self.assertIn(("systemctl", "start", RESOLVER_UNIT), self.commands)
+        # The router's state WAS readable, so the other half of the pair is
+        # restarted; a fix that stopped restarting anything would pass the case above.
+        self.setUp()
+        self.already_running(ROUTER_UNIT)
+        self.install_succeeds()
+        self.assertIn(("systemctl", "try-restart", ROUTER_UNIT), self.commands)
+
+
 class CliTransactionTests(TransactionFixture):
     """The command as a person runs it, and the two statuses that mean things."""
 
