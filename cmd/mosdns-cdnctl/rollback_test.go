@@ -222,12 +222,31 @@ func TestEmergencyRollbackReportsAnInstallerThatCouldNotBeStarted(t *testing.T) 
 // have mattered is 3: the launcher uses it for "the installer could not be
 // started" and the installer for a state it could not read. Both mean "this did
 // not happen", so they do not read differently to a caller.
-func TestTheLaunchersOwnStatusesDoNotCollideWithAnInstallersRefusal(t *testing.T) {
-	if exitInvalidCLI == 5 || exitInvalidCLI == 6 {
-		t.Fatalf("a usage error is reported as %d, which is the installer's own refusal", exitInvalidCLI)
+// TestTheLaunchersOwnStatusesAreNotTheInstallersRefusals is what it says: the two
+// statuses this launcher raises on its own account are not the two the installer
+// uses to mean "I did not change anything" and "I started and did not finish".
+//
+// The name is deliberately narrower than "do not collide". exitStateUnavailable is
+// 3, and so is the installer's EXIT_INSTALL_FAILED -- an install whose own
+// rollback finished -- and the two agree operationally: both mean "this thing did
+// not happen". A caller that has to tell them apart would have to know which
+// program it invoked, and the honest statement is that it does not, rather than a
+// claim of collision-freedom that is false.
+func TestTheLaunchersOwnStatusesAreNotTheInstallersRefusals(t *testing.T) {
+	// The installer's two refusals, named here rather than imported: this test is
+	// about two numbers from two programs, and a literal is the thing that says so.
+	const (
+		ownershipRefused  = 5
+		restoreIncomplete = 6
+	)
+	for _, status := range []int{exitInvalidCLI, exitStateUnavailable} {
+		if status == ownershipRefused || status == restoreIncomplete {
+			t.Errorf("this launcher reports one of its own failures as %d, which the installer uses for a refusal or a half-finished restore", status)
+		}
 	}
-	if exitStateUnavailable == 5 || exitStateUnavailable == 6 {
-		t.Fatalf("an installer that could not be started is reported as %d, which is the installer's own restore failure", exitStateUnavailable)
+	if exitStateUnavailable == 3 {
+		t.Log("exitStateUnavailable is 3, which the installer also uses for a failed install; " +
+			"both mean the thing asked for did not happen, so a caller can read either the same way")
 	}
 }
 
@@ -248,6 +267,20 @@ func TestEveryServicesValueCarriesTheRollbacksBoundary(t *testing.T) {
 	}
 }
 
+// shellNeedles is the production needle list for the source scan, and the control
+// case below reads THIS rather than re-typing three of them. A control that kept
+// its own copy would pass while the production map lost an entry, which is the one
+// thing a control is for.
+var shellNeedles = map[string]string{
+	"exec.Command(\"sh\"":      "a shell runs a string",
+	"exec.Command(\"bash\"":    "a shell runs a string",
+	"exec.Command(\"/bin/sh\"": "a shell runs a string",
+	"\"-c\"":                   "-c is how a command is handed to a shell as a string",
+	"sh -c":                    "a shell runs a string",
+	"bash -c":                  "a shell runs a string",
+	"strings.Join(argv":        "a joined command line is a string a shell would have to interpret",
+}
+
 // The source scan is the half of the rule that covers the paths no test reaches:
 // an "if the machine is unusual" branch that reached for a shell would be
 // invisible to a fake runner, because the shell would be started before the
@@ -257,14 +290,8 @@ func TestTheCommandBoundaryNamesNoShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	forbidden := map[string]string{
-		"exec.Command(\"sh\"":      "a shell runs a string",
-		"exec.Command(\"bash\"":    "a shell runs a string",
-		"exec.Command(\"/bin/sh\"": "a shell runs a string",
-		"\"-c\"":                   "-c is how a command is handed to a shell as a string",
-		"sh -c":                    "a shell runs a string",
-		"bash -c":                  "a shell runs a string",
-		"strings.Join(argv":        "a joined command line is a string a shell would have to interpret",
+	if len(shellNeedles) == 0 {
+		t.Fatal("the needle list is empty, so the scan can never find anything")
 	}
 	for _, entry := range entries {
 		if strings.HasSuffix(entry, "_test.go") {
@@ -275,7 +302,7 @@ func TestTheCommandBoundaryNamesNoShell(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := string(source)
-		for needle, why := range forbidden {
+		for needle, why := range shellNeedles {
 			if strings.Contains(text, needle) {
 				t.Errorf("%s contains %q: %s", entry, needle, why)
 			}
@@ -284,10 +311,9 @@ func TestTheCommandBoundaryNamesNoShell(t *testing.T) {
 }
 
 func TestTheScanFiresOnAShellInvocation(t *testing.T) {
-	forbidden := []string{"exec.Command(\"sh\"", "-c", "sh -c"}
 	offending := `command := exec.Command("sh", "-c", "mosdns_installer.py emergency-rollback")`
 	fired := false
-	for _, needle := range forbidden {
+	for needle := range shellNeedles {
 		if strings.Contains(offending, needle) {
 			fired = true
 		}
@@ -296,7 +322,7 @@ func TestTheScanFiresOnAShellInvocation(t *testing.T) {
 		t.Fatal("the scan cannot see the shape it forbids, so it proves nothing")
 	}
 	clean := `command := exec.Command("/usr/lib/mosdns-router/mosdns_installer.py", "emergency-rollback")`
-	for _, needle := range forbidden {
+	for needle := range shellNeedles {
 		if strings.Contains(clean, needle) {
 			t.Fatalf("the scan fires on the argument array this program actually uses: %q", needle)
 		}
