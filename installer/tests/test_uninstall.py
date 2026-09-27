@@ -134,6 +134,11 @@ RESOLVECTL_DNS = ("resolvectl", "dns", DEVICE)
 DAEMON_RELOAD = ("systemctl", "daemon-reload")
 
 POLICY_BODY = "schema_version: 1\ncdn:\n  provider: cloudflare\nech:\n  enabled: true\n"
+# The words the report uses for a value it could not read, and for a list that is
+# empty. Both are restated rather than imported: the report is a thing an
+# operator reads, and its wording is part of what these tests hold.
+COULD_NOT_BE_READ = "(could not be read)"
+UNSET = "(unset)"
 POLICY_DIGEST = hashlib.sha256(POLICY_BODY.encode("utf-8")).hexdigest()
 CREATED_AT = "2026-09-27T09:20:00Z"
 OBSERVED_AT = "2026-09-27T09:15:00Z"
@@ -444,6 +449,17 @@ class UninstallFixture(unittest.TestCase):
     def unit_answers(self, answer="active\n"):
         for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
             self.overrides[("systemctl", "is-active", unit)] = answer
+
+    def resolvectl_fails(self, code=1, output=""):
+        """Make the read that proves the device took the restored values fail.
+
+        A status and no output is the shape of a read that did not happen, and
+        `nmcli` and `resolvectl` both answer a question they cannot answer with a
+        status rather than with a sentence. Measured on real resolved 24.04: a
+        device that does not exist exits 1 with nothing on standard output.
+        """
+        self.codes[RESOLVECTL_DNS] = code
+        self.overrides[RESOLVECTL_DNS] = output
 
     def probe_for(self, stub=HEALTHY, local=HEALTHY):
         """A DNS probe that answers from a script and records what it was asked.
@@ -790,7 +806,11 @@ class OwnershipRefusalTests(UninstallFixture):
         self.assertNotIn(DHCP_UPSTREAM, never, "the IPv6 list is carrying the IPv4 address")
 
     def test_the_manual_recovery_report_carries_the_commands_a_person_can_run(self):
-        self.property_value(IPV4_DNS, "192.0.2.99")
+        # Provoked by the missing marker rather than by a changed property, so
+        # every property still holds what this installation set and the whole
+        # command block is the one an operator would be handed on the commonest
+        # refusal there is.
+        self.remove_marker()
         report = self.refuse_with().manual_recovery or ""
         for command in restore_commands():
             self.assertIn(
@@ -800,6 +820,84 @@ class OwnershipRefusalTests(UninstallFixture):
                 "connection from a description of it",
             )
         self.assertIn(f"resolvectl dns {DEVICE}", report, "the operator has to be told how to check")
+
+    def test_a_property_a_person_changed_gets_a_leave_line_and_no_modify(self):
+        # The refusal above is the report's own contract in one place: it says
+        # "this program will not write over it", and then the command block twelve
+        # lines below hands over the command that writes over it. The report has
+        # both value sets, so it can tell the two cases apart, and for a property
+        # somebody deliberately set the right instruction is to LEAVE IT.
+        self.property_value(IPV6_DNS, "2001:db8::1")
+        report = self.refuse_with().manual_recovery or ""
+        self.assertNotIn(
+            f"nmcli connection modify {UUID} {IPV6_DNS}",
+            report,
+            "the report hands over a modify for the property whose refusal is that nobody may "
+            "write to it",
+        )
+        self.assertIn(f"leave {IPV6_DNS} at 2001:db8::1", report)
+        self.assertIn("changed after the install", report)
+
+    def test_a_property_a_person_changed_is_leaved_in_the_report_that_refuses_about_it(self):
+        # The same property as the refusal it belongs to. A refusal whose whole
+        # subject is "somebody changed ipv4.dns" and whose command block then says
+        # "set ipv4.dns to the recorded value" is a report that undoes its own
+        # sentence.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        report = self.refuse_with().manual_recovery or ""
+        self.assertIn("leave ipv4.dns at 192.0.2.99", report)
+        self.assertNotIn(f"nmcli connection modify {UUID} {IPV4_DNS}", report)
+
+    def test_a_property_this_program_wrote_still_gets_its_modify(self):
+        # The other half, and the case a too-broad rule would get wrong. On an
+        # installed machine `ipv4.ignore-auto-dns` holds `yes` and the backup
+        # recorded `no`, so "the value found is not the recorded value" is true --
+        # and it is exactly the property most in need of the recorded value, since
+        # leaving it at `yes` leaves the machine ignoring its own lease.
+        self.remove_marker()
+        report = self.refuse_with().manual_recovery or ""
+        for prop, value in ((IPV4_IGNORE, "no"), (IPV6_IGNORE, "no"), (IPV4_DNS, DHCP_UPSTREAM)):
+            self.assertIn(
+                f"nmcli connection modify {UUID} {prop} {value}",
+                report,
+                f"{prop} is a property this installation set, so the report has to hand over the "
+                "command that puts it back",
+            )
+        self.assertNotIn("leave ", report, "no property on this machine was changed by anybody else")
+
+    def test_the_report_says_which_order_and_why(self):
+        self.remove_marker()
+        report = self.refuse_with().manual_recovery or ""
+        self.assertIn(
+            "the recorded values, then the reconnection",
+            report,
+            "the block says 'in this order' without saying which order, and the recorded order is "
+            "not the order the program itself uses",
+        )
+
+    def test_the_refusal_summary_is_accurate_when_there_is_no_backup(self):
+        # The summary interpolated the UUID unconditionally, so a machine whose
+        # backup could not be read was told "of what connection  was set to" and
+        # pointed at "the commands above" when the report had printed no commands
+        # at all -- only a template with <uuid> in it.
+        self.rooted(BACKUP_PATH).unlink()
+        before = self.snapshot()
+        self.result = self.run_uninstall()
+        self.assertNothingChanged("a refusal with no backup")
+        self.assertNothingTouched(before, "a refusal with no backup")
+        self.refused()
+        report = self.result.manual_recovery or ""
+        self.assertNotIn(
+            "connection  was set to",
+            report,
+            "the summary names a connection with an empty UUID, which is not a sentence",
+        )
+        self.assertNotIn(
+            "the commands above",
+            report,
+            "the summary points an operator at commands the report did not print",
+        )
+        self.assertIn(BACKUP_PATH, report, "and it still has to name the file the record would be in")
 
     def test_the_manual_recovery_report_says_why_and_what_it_did_not_do(self):
         self.remove_marker()
@@ -1235,6 +1333,89 @@ class FailedRestorationTests(UninstallFixture):
         self.assertIn("daemon-reload", " ".join(self.result.notes) + (self.result.error or ""))
 
 
+class UnreadableDeviceCheckTests(UninstallFixture):
+    """The read that proves the device took the values has to have happened.
+
+    This is the one check in the section that stands between a restore and
+    stopping the resolver, so the case where it cannot be performed is a case
+    where the router must not be stopped. It was not, and the reason is an
+    asymmetry: `_text` returns `None` only when the call RAISES, so a
+    `resolvectl` that exits non-zero with nothing on standard output comes back
+    as the empty string, and the loopback is not in `"".split()`.
+    """
+
+    def assertTheRouterKeptRunning(self, why):
+        self.assertFalse(self.result.ok, why)
+        self.assertNotIn(
+            ("systemctl", "stop", ROUTER_UNIT),
+            self.commands,
+            why + ": the router was stopped on a machine whose state nobody could read",
+        )
+        self.assertNotIn(("systemctl", "stop", RESOLVER_UNIT), self.commands, why)
+        self.assertTrue(self.rooted(STATE_DIRECTORY).is_dir(), why + ": the state was purged anyway")
+        self.assertTrue(self.rooted(DISPATCHER_SCRIPT).exists(), why + ": the hook was removed anyway")
+
+    def test_a_resolvectl_that_exits_non_zero_with_no_output_refuses(self):
+        # Measured on real systemd-resolved 24.04: `resolvectl dns <dev>` for a
+        # device that does not exist exits 1, prints nothing on standard output,
+        # and puts `Failed to resolve interface "<dev>": No such device` on
+        # standard error. That is the machine this case is about.
+        self.resolvectl_fails()
+        self.result = self.run_uninstall()
+        self.assertTheRouterKeptRunning("a failed device check")
+        self.assertIn("resolvectl", (self.result.error or ""))
+
+    def test_a_resolvectl_that_succeeds_with_no_output_at_all_refuses(self):
+        # Real resolved always prints the `Link N (<dev>):` line for a link that
+        # exists, even a link with no DNS on it, so a run of nothing at all is
+        # not a link with no resolvers -- it is a run this program cannot read.
+        self.resolvectl_fails(code=0)
+        self.result = self.run_uninstall()
+        self.assertTheRouterKeptRunning("a device check that printed nothing")
+        self.assertIn("resolvectl", (self.result.error or ""))
+
+    def test_a_resolvectl_that_could_not_be_run_at_all_refuses(self):
+        # The other failure shape, kept distinct: the call raised, so there is no
+        # output and no status, only the absence of a runner answer.
+        before = self.snapshot()
+        self.result = self.run_uninstall(runner=self.good_runner(fail=[RESOLVECTL_DNS]))
+        self.assertTheRouterKeptRunning("a device check that could not run")
+        self.assertIn("resolvectl", (self.result.error or ""))
+        self.assertNothingTouched(before, "a machine nobody could read lost its dispatcher hook")
+
+    def test_a_link_with_no_dns_at_all_is_not_a_failed_read(self):
+        # The measured case that a too-broad check would get wrong. Real resolved
+        # exits 0 and prints `Link 2 (ens33):` with nothing after the colon, so
+        # the answer is a real one that happens to say there are no resolvers,
+        # and this program is about to put the recorded ones there.
+        self.overrides[RESOLVECTL_DNS] = f"Link 2 ({DEVICE}):\n"
+        self.result = self.run_uninstall()
+        self.assertTrue(self.result.ok, f"a link with no DNS was read as a failure: {self.result.error}")
+        self.assertIn(("systemctl", "stop", ROUTER_UNIT), self.commands)
+
+    def test_the_report_says_a_device_check_that_could_not_be_done(self):
+        self.resolvectl_fails()
+        self.result = self.run_uninstall()
+        report = self.result.manual_recovery or ""
+        self.assertIn("resolvectl", report, "the report has to name the check that could not be made")
+        self.assertIn(
+            "the commands above",
+            report,
+            "the report's own summary tells an operator the commands above are the way to finish, so "
+            "it is still the deliverable after a failed check",
+        )
+
+    def test_the_check_runs_before_the_units_it_gates(self):
+        # The ordering, asserted on its own: a gate that runs after the thing it
+        # gates is not a gate.
+        self.result = self.run_uninstall()
+        self.restored()
+        self.assertLess(
+            self.commands.index(RESOLVECTL_DNS),
+            self.commands.index(("systemctl", "stop", ROUTER_UNIT)),
+        )
+
+
 class PurgeTests(UninstallFixture):
     """``/var/lib/mosdns`` is the operator's, and a purge is a last step."""
 
@@ -1492,11 +1673,133 @@ class EmergencyRollbackTests(UninstallFixture):
         self.assertTrue(self.result.ok, f"the rollback did not finish: {self.result.error}")
         self.assertEqual(
             self.commands,
-            [MODIFY + (UUID, prop, value) for prop, value in RESTORE_ORDER]
+            self.rollback_reads()
+            + [MODIFY + (UUID, prop, value) for prop, value in RESTORE_ORDER]
             + [CONNECTION_UP + (UUID,), RESOLVECTL_DNS],
-            "a rollback ran something other than the restoration, and an emergency command that "
-            "stops a unit or removes a file is one more thing that can be wrong",
+            "a rollback ran something other than reading the connection and restoring it, and an "
+            "emergency command that stops a unit or removes a file is one more thing that can be "
+            "wrong",
         )
+
+    def rollback_reads(self):
+        """The four read-only property reads a rollback makes before it writes.
+
+        They are here so the verb is visible in the report it hands over: a
+        rollback that overwrites a connection without having read it can tell an
+        operator nothing about what it just replaced.
+        """
+        return [PROPERTY_READ + (prop, "connection", "show", UUID) for prop in RECORDED_PROPERTIES]
+
+    def test_it_reads_the_connection_before_it_overwrites_it(self):
+        self.result = self.run_rollback()
+        self.assertTrue(self.result.ok, f"the rollback did not finish: {self.result.error}")
+        for command in self.rollback_reads():
+            self.assertIn(
+                command,
+                self.commands,
+                f"{command!r} never ran, so the report cannot show what the connection held",
+            )
+        first_write = next(
+            index for index, command in enumerate(self.commands) if self.changing(command)
+        )
+        self.assertLess(
+            self.commands.index(self.rollback_reads()[-1]),
+            first_write,
+            "the first write happened before the last read, so the report describes a connection "
+            "this run had already changed",
+        )
+
+    def test_its_reads_change_nothing(self):
+        self.result = self.run_rollback()
+        self.assertTrue(self.result.ok, f"the rollback did not finish: {self.result.error}")
+        for command in self.rollback_reads():
+            self.assertFalse(
+                self.changing(command), f"{command!r} is recorded as a read and is a mutation"
+            )
+
+    def test_the_set_of_commands_it_writes_is_exactly_the_recorded_ones(self):
+        # The reads are new; the WRITES must not be. Compared as a set against
+        # the recorded values, so a rollback that grew a fourth property or lost a
+        # reactivation fails here.
+        document = backup_document()
+        self.write_backup(document)
+        self.result = self.run_rollback()
+        self.assertTrue(self.result.ok, f"the rollback did not finish: {self.result.error}")
+        written = [command for command in self.commands if self.changing(command)]
+        self.assertEqual(
+            written,
+            [MODIFY + (UUID, prop, value) for prop, value in RESTORE_ORDER]
+            + [CONNECTION_UP + (UUID,)],
+            "the rollback's writes are not the three recorded properties and one reconnection",
+        )
+
+    def test_its_report_shows_what_the_connection_held(self):
+        # A property this program is about to overwrite, read rather than assumed.
+        # The report exists on the paths that need one, so this is the failing
+        # reactivation, and the read of the property is what makes its row differ.
+        self.property_value(IPV6_DNS, "2001:db8::1")
+        self.result = self.run_rollback(
+            runner=self.good_runner(fail=[CONNECTION_UP + (UUID,)])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        self.assertIn("now 2001:db8::1", report, "the report has no column for what was there")
+        self.assertIn("recorded", report, "and the column it has is not the recorded one")
+        for prop in RECORDED_PROPERTIES:
+            self.assertIn(prop, report, f"the report says nothing about {prop}")
+
+    def test_a_read_it_could_not_do_says_so_and_does_not_change_what_is_written(self):
+        # Which way this fails: the READING is for the report, so a read that
+        # fails makes the report less complete and the rollback no less
+        # effective. The writes are unconditional by design -- the machine this
+        # verb exists for is one whose install died partway.
+        #
+        # The read that fails is a `yes`/`no`, because that is the half of the
+        # asymmetry that matters: `nmcli -g` exits non-zero with nothing on
+        # standard output for a connection it cannot find, and that arrives as the
+        # empty string, which for a `yes`/`no` is not a value it can hold.
+        self.resolve_property_read_fails(prop=IPV4_IGNORE)
+        self.result = self.run_rollback()
+        self.assertTrue(self.result.ok, f"a failed read stopped the rollback: {self.result.error}")
+        self.assertEqual(
+            [command for command in self.commands if self.changing(command)],
+            [MODIFY + (UUID, prop, value) for prop, value in RESTORE_ORDER]
+            + [CONNECTION_UP + (UUID,)],
+            "a read that failed changed what the rollback wrote",
+        )
+        self.assertIn(
+            COULD_NOT_BE_READ,
+            (self.result.manual_recovery or "") + " ".join(self.result.notes),
+            "a read that failed is reported as a read that failed",
+        )
+
+    def test_a_read_of_an_address_list_that_came_back_empty_is_a_value_not_a_failure(self):
+        # The other half of the same asymmetry. An empty address list is a link
+        # with no manual DNS, which is a real answer, and reading it as a failed
+        # read would put "I could not look" in a column that has an answer in it.
+        self.resolve_property_read_fails(prop=IPV6_DNS)
+        self.result = self.run_rollback()
+        self.assertTrue(self.result.ok, f"a failed read stopped the rollback: {self.result.error}")
+        self.assertNotIn(COULD_NOT_BE_READ, " ".join(self.result.notes))
+        self.result = self.run_rollback(runner=self.good_runner(fail=[CONNECTION_UP + (UUID,)]))
+        report = self.result.manual_recovery or ""
+        self.assertIn(f"now {UNSET}", report, "an empty list is a value and the report says so")
+        self.assertNotIn(COULD_NOT_BE_READ, report)
+
+    def test_a_read_it_could_not_do_says_so_in_the_report_it_hands_over(self):
+        self.resolve_property_read_fails(prop=IPV6_IGNORE)
+        self.result = self.run_rollback(runner=self.good_runner(fail=[CONNECTION_UP + (UUID,)]))
+        self.assertFalse(self.result.ok)
+        self.assertIn(COULD_NOT_BE_READ, self.result.manual_recovery or "")
+        self.assertIn(
+            COULD_NOT_BE_READ,
+            " ".join(self.result.notes),
+            "the operator has to be told which property the report cannot speak for",
+        )
+
+    def resolve_property_read_fails(self, prop=IPV4_IGNORE):
+        self.codes[PROPERTY_READ + (prop, "connection", "show", UUID)] = 1
+        self.overrides[PROPERTY_READ + (prop, "connection", "show", UUID)] = ""
 
     def test_it_never_consults_preflight(self):
         for relative in ("/var/lib/mosdns", "/var/lib/mosdns/runtime", "/var/lib/mosdns/lists", "/run/mosdns"):
@@ -1637,12 +1940,23 @@ class CliTests(UninstallFixture):
         self.assertFalse(self.rooted(STATE_DIRECTORY).exists())
 
     def test_a_refused_ownership_exits_five_and_prints_the_report(self):
-        self.property_value(IPV4_DNS, "192.0.2.99")
+        # Two refusals with two different reports, because they have two
+        # different next steps: one where nothing was changed by anybody and the
+        # report is the whole command block, and one where a property was changed
+        # after the install and the report must tell the operator to leave it.
+        self.remove_marker()
         status, out, err = self.run_cli("uninstall")
         self.assertEqual(status, installer.EXIT_OWNERSHIP_REFUSED, err)
         self.assertEqual(out, "", "a refusal reported a result on standard output")
         for command in restore_commands():
             self.assertIn(command, err, "the report did not reach the operator")
+
+        self.setUp()
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        status, out, err = self.run_cli("uninstall")
+        self.assertEqual(status, installer.EXIT_OWNERSHIP_REFUSED, err)
+        self.assertIn("leave ipv4.dns at 192.0.2.99", err)
+        self.assertNotIn(f"nmcli connection modify {UUID} {IPV4_DNS} {DHCP_UPSTREAM}", err)
 
     def test_an_incomplete_restore_exits_six(self):
         status, out, err = self.run_cli(

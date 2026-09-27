@@ -3383,6 +3383,57 @@ def _render_command(args: Sequence[str]) -> str:
     return " ".join(words)
 
 
+def _changed_after_the_install(prop: str, current: str, original: dict) -> bool:
+    """Whether ``current`` is a value this package never put there.
+
+    Three-way, exactly as :func:`_ownership` asks the same question, and for the
+    same reason: the report must not tell an operator to overwrite a value
+    somebody else put there.
+
+    The middle case is the one a two-way rule gets wrong, and on this machine it
+    is the common one. After a successful install ``ipv4.ignore-auto-dns`` holds
+    ``yes`` and the backup recorded ``no``, so "the value found is not the
+    recorded value" is true of the property most in need of the recorded value --
+    leaving it at ``yes`` leaves the machine ignoring its own DHCP lease. So the
+    question is not whether the two differ but whether the value found is one this
+    installation set, and the answer for the three properties it set is yes.
+
+    A `None` here means the property could not be read at all, and it is not a
+    value anybody put there, so the caller hands over the recorded value. The
+    report is the manual recovery for a machine in trouble; "put this back to what
+    the record says" is the right instruction when the record is all there is.
+    """
+    if current is None:
+        return False
+    found = _as_current(prop, current)
+    if found == _as_current(prop, original[prop]["raw"]):
+        return False
+    ours = dict(NM_MUTATIONS).get(prop)
+    return ours is None or found != _as_current(prop, ours)
+
+
+def _shown_now(prop: str, found: Optional[str]) -> str:
+    """How a report shows what one property holds at this moment.
+
+    The same distinction :func:`_ownership` makes, for the same reason and with
+    the same asymmetry behind it: `_text` returns `None` only when the call
+    raises, so a `nmcli -g` that exits non-zero having printed nothing comes back
+    as the empty string. For an ADDRESS LIST that is a real value -- a link with no
+    manual DNS -- and reads as ``(unset)``. For a `yes`/`no` it is not a value the
+    property can hold at all, and reading it as "unset" would put a fact about
+    this program in a column whose whole job is to hold a fact about the machine.
+
+    The report is what a person acts on, and a column that says `(unset)` when it
+    means "I could not look" is a column that misleads in the direction that
+    matters: it looks like a machine this run examined.
+    """
+    if found is None:
+        return COULD_NOT_BE_READ
+    if not found and prop in IGNORED_AUTOMATICALLY:
+        return COULD_NOT_BE_READ
+    return found or UNSET
+
+
 def manual_recovery_report(
     uuid: str,
     original: Optional[dict],
@@ -3403,6 +3454,14 @@ def manual_recovery_report(
     even hold these four properties in this shape, and a partial set of commands
     is worse than none: an operator who runs three of four believes the connection
     is back.
+
+    And a property whose current value is one this package never put there gets a
+    LEAVE line instead of a modify. The reasons above this block exist to say
+    that this program will not write over such a value, and a block twelve lines
+    below handing over the command that writes over it makes the whole report a
+    thing nobody can act on. The two value sets are both in hand here, so the
+    distinction costs nothing -- see :func:`_changed_after_the_install` for the
+    three-way comparison and for the case a two-way rule gets wrong.
     """
     lines = [f"MANUAL RECOVERY REPORT for connection {uuid}" if uuid else "MANUAL RECOVERY REPORT", ""]
     if reasons:
@@ -3420,17 +3479,27 @@ def manual_recovery_report(
                 raw = str(entry.get("raw", ""))
                 recorded = raw if raw else UNSET
             if observed:
-                found = observed.get(prop)
                 lines.append(
-                    f"  {prop:<20}    recorded {recorded}    now "
-                    f"{COULD_NOT_BE_READ if found is None else (found if found else UNSET)}"
+                    f"  {prop:<20}    recorded {recorded}    now {_shown_now(prop, observed.get(prop))}"
                 )
             else:
                 lines.append(f"  {prop:<20}    recorded {recorded}")
         lines.append("")
     if uuid and original:
-        lines.append("to put the connection back by hand, run these as root, in this order:")
+        lines.append(
+            "to put the connection back by hand, run these as root: the recorded values, then the "
+            "reconnection. The recorded order is the order they are read in here; the order matters "
+            "only in that all of them come before the reconnection, which is what makes them live"
+        )
         for prop in RECORDED_PROPERTIES:
+            current = observed.get(prop) if observed else None
+            if _changed_after_the_install(prop, current, original):
+                lines.append(
+                    f"  leave {prop} at {current or UNSET} -- changed after the install, not the "
+                    f"recorded value, and overwriting somebody else's change is what this program "
+                    "refused to do"
+                )
+                continue
             value = _restore_value(prop, original)
             rendered = _render_command(("nmcli", "connection", "modify", uuid, prop, value))
             quoted = quoted or "''" in rendered
@@ -3749,12 +3818,31 @@ def _device_follows_the_backup(run: CommandRunner, ownership: Ownership) -> None
     machine that was already using a local resolver before this package was
     installed is restored TO the loopback, and calling that a leftover would
     refuse the correct result.
+
+    And a read that PRODUCED NOTHING is a refusal, which is the one case this
+    check had wrong. `_text` returns `None` only when the call raises, so a
+    `resolvectl` that exits non-zero having printed nothing comes back as the
+    empty string -- and the loopback is not in `"".split()`, so the check passed
+    and the units were stopped on a machine whose state nobody had read. Measured
+    on real resolved 24.04: a device that does not exist exits 1 with nothing on
+    standard output. Real resolved always prints the `Link N (<dev>):` line for a
+    link that exists, even one with no DNS on it, so an empty answer is never a
+    real one and the reading that decides it is a blank line rather than a missing
+    loopback.
     """
     forwarding = _text(run, ("resolvectl", "dns", ownership.device))
     if forwarding is None:
         raise InstallRefused(
             f"resolvectl could not be asked what {ownership.device} is using for DNS, so nothing "
             "has confirmed that the connection picked the values that were just put back"
+        )
+    if not forwarding.strip():
+        raise InstallRefused(
+            f"resolvectl was asked what {ownership.device} is using for DNS and printed nothing at "
+            f"all. A link that exists is always printed as `Link N ({ownership.device}):` even when "
+            f"it has no resolvers, so this is a read that did not happen -- a device that is gone, "
+            "or a resolvectl that failed -- and nothing has confirmed that the connection picked the "
+            "values that were just put back"
         )
     recorded = _as_current(IPV4_DNS, ownership.original[IPV4_DNS]["raw"])
     if LOCAL_DNS in forwarding.split() and LOCAL_DNS not in recorded:
@@ -3944,6 +4032,29 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
     ownership = _ownership(root, run)
     notes = list(ownership.notes)
     if ownership.refusals:
+        # Two summaries, because there are two reports. When the record could not
+        # be read there is no connection to name and no command block to point
+        # at -- the report printed a template -- and a summary that interpolated
+        # the empty UUID and said "the commands above" would be a sentence about
+        # a machine and a set of commands that are not there.
+        if ownership.uuid:
+            summary = (
+                f"nothing on this machine has been changed by this run, and {BACKUP_PATH} is the "
+                f"record of what connection {ownership.uuid} was set to before anything was "
+                f"changed. The units this package installs are still here and the machine may still "
+                f"be using {LOCAL_DNS}, so REMOVING THE PACKAGE NOW would take away a resolver "
+                "this machine is still pointing at; put the connection back with the commands "
+                "above first, or reboot, and then remove the package"
+            )
+        else:
+            summary = (
+                f"nothing on this machine has been changed by this run, and there is no record of "
+                f"what any connection here was set to: {BACKUP_PATH} is where it would be, and it "
+                f"is not a record this program can read. The units this package installs are still "
+                f"here and the machine may still be using {LOCAL_DNS}, so REMOVING THE PACKAGE NOW "
+                "would take away a resolver this machine is still pointing at; put the connection "
+                "back by hand, or reboot, and then remove the package"
+            )
         return UninstallResult(
             ok=False,
             notes=notes,
@@ -3958,14 +4069,7 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
                 ownership.observed,
                 ownership.refusals,
                 device=ownership.device,
-                summary=(
-                    f"nothing on this machine has been changed by this run, and {BACKUP_PATH} is "
-                    f"the record of what connection {ownership.uuid} was set to before anything was "
-                    f"changed. The units this package installs are still here and the machine may "
-                    f"still be using {LOCAL_DNS}, so REMOVING THE PACKAGE NOW would take away a "
-                    "resolver this machine is still pointing at; put the connection back with the "
-                    "commands above first, or reboot, and then remove the package"
-                ),
+                summary=summary,
             ),
             left_running=[],
             purged=False,
@@ -4055,6 +4159,29 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
     )
 
 
+def _read_current_properties(run: CommandRunner, uuid: str) -> dict:
+    """What the four properties hold now, for a report to show beside the record.
+
+    Read-only, and read for the REPORT rather than for a decision: every write
+    below is unconditional, because the machine this verb exists for is one whose
+    install died partway and whose connection may hold any mixture of this
+    package's values and the recorded originals. Asking for a gate here would
+    refuse the case the command is for.
+
+    But a rollback that overwrites a connection without having read it can tell an
+    operator nothing about what it just replaced, and on a fully installed machine
+    whose owner has since hand-edited the connection that overwrite is silent and
+    exits 0. So the four reads happen first, the values go into the report's
+    "now" column, and the report is the thing that makes the overwrite visible.
+
+    A read that fails is `None` in the report's own words -- it could not be read
+    -- and changes nothing about what is written. The direction of that failure is
+    deliberate and is stated in :func:`emergency_rollback`: the report gets less
+    complete, the rollback does not get less effective.
+    """
+    return {prop: _text(run, ("nmcli", "-g", prop, "connection", "show", uuid)) for prop in RECORDED_PROPERTIES}
+
+
 def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackResult:
     """Put the recorded DNS back on a machine whose install died, and say whether it works.
 
@@ -4065,6 +4192,12 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
     No ownership check -- the connection is expected to hold some mixture of this
     package's values and the recorded originals, and requiring it to hold exactly
     the former would refuse the case the command is for.
+
+    What it does read is the connection itself, before it writes to it, and only so
+    that the report can show both value sets. That is not a gate and nothing turns
+    on the answer: a hand-edited connection is overwritten exactly as before, and
+    the only difference is that an operator is now told what it was holding. A
+    read that fails costs the report a column and nothing else.
 
     It restores ONLY the connection. It does not stop a unit, remove a file,
     disable anything or reload systemd, and the binaries and the configuration
@@ -4113,7 +4246,14 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
     uuid = str(connection["uuid"])
     device = str(connection["device"])
     original = document["original"]
-    ownership = Ownership(uuid, device, original, {}, _as_restored(original), [], [])
+    observed = _read_current_properties(run, uuid)
+    unread = [prop for prop, value in observed.items() if _shown_now(prop, value) == COULD_NOT_BE_READ]
+    notes = [
+        f"{prop} of {uuid} is {COULD_NOT_BE_READ} in this report, so it cannot say what that "
+        "property held; the values in the backup were written back regardless"
+        for prop in unread
+    ]
+    ownership = Ownership(uuid, device, original, observed, _as_restored(original), [], [])
     for prop, value in ownership.restores:
         try:
             _checked(
@@ -4122,7 +4262,7 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
                 f"putting {prop} back to {value!r} on {uuid}",
             )
         except InstallRefused as error:
-            return _rollback_stopped(ownership, str(error), False, None)
+            return _rollback_stopped(ownership, str(error), False, None, notes)
     try:
         _checked(
             run,
@@ -4130,16 +4270,19 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
             f"reactivating {uuid} to apply what was put back",
         )
     except InstallRefused as error:
-        return _rollback_stopped(ownership, str(error), True, None)
+        return _rollback_stopped(ownership, str(error), True, None, notes)
     try:
         _device_follows_the_backup(run, ownership)
     except InstallRefused as error:
-        return _rollback_stopped(ownership, str(error), True, None)
+        return _rollback_stopped(ownership, str(error), True, None, notes)
     resolves = ask(RESOLVED_STUB_ADDRESS, DNS_PORT).resolves
-    notes = [
+    # The read failures collected before the first write stay on the notes: they
+    # are still true of this run, and a report that lost them is a report that
+    # looks complete.
+    notes.append(
         f"connection {uuid} was put back on the resolvers {BACKUP_PATH} recorded, and the "
         "binaries and the configuration were left installed for diagnosis"
-    ]
+    )
     if not resolves:
         return RollbackResult(
             ok=False,
@@ -4154,7 +4297,7 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
             manual_recovery=manual_recovery_report(
                 uuid,
                 original,
-                {},
+                observed,
                 [
                     f"a query for {INSTALL_PROBE_NAME} through {RESOLVED_STUB_ADDRESS} did not "
                     "resolve after the restore, so the values this backup recorded are in place and "
@@ -4174,14 +4317,24 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
     return RollbackResult(ok=True, restored=True, notes=notes, error=None, manual_recovery=None, resolves=True)
 
 
+
 def _rollback_stopped(
-    ownership: Ownership, error: str, restored: bool, resolves: Optional[bool]
+    ownership: Ownership,
+    error: str,
+    restored: bool,
+    resolves: Optional[bool],
+    notes: Optional[List[str]] = None,
 ) -> RollbackResult:
-    """A rollback that put some of the recorded values back and then stopped."""
+    """A rollback that put some of the recorded values back and then stopped.
+
+    ``notes`` carries the read failures collected before the first write, because
+    a report that cannot name the property it could not read is a report that
+    looks like a report about a machine this run never looked at.
+    """
     return RollbackResult(
         ok=False,
         restored=restored,
-        notes=[],
+        notes=list(notes or []),
         error=(
             f"the rollback did not finish, so the connection is still partly as this package left "
             f"it: {error}"
