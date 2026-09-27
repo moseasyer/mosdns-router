@@ -25,6 +25,11 @@
 # machine is already running this router, and removing them on an ordinary removal
 # would turn a re-install into a second installation. A `dpkg --purge` is the
 # operator saying the data goes too.
+#
+# The seven verbs in the two arms below are Debian Policy 6.5's complete list for a
+# postrm. The test holds this script against that list in both directions, so a verb
+# the policy adds and this script does not handle fails the build rather than an
+# upgrade.
 set -e
 
 case "$1" in
@@ -53,12 +58,26 @@ purge)
 		rm -f "$hook"
 	fi
 	;;
-remove|upgrade|abort-install|abort-upgrade|disappear)
-	# remove and upgrade keep /var/lib/mosdns. abort-* never got far enough to write
-	# anything worth removing. disappear is the case where the files were removed
-	# without dpkg running any of this, and the data is left: an operator who
-	# removed the files by hand can remove the directory by hand too, and guessing
-	# here would delete a recorded backup of a machine whose DNS state is unknown.
+remove | upgrade | abort-install | abort-upgrade | disappear | failed-upgrade)
+	# Every one of these keeps /var/lib/mosdns, and the reason is the same for all of
+	# them: the state directory is the recorded backup of what this machine's DNS was
+	# set to, plus the marker that lets a later install know the machine is already
+	# running this package. Removing it on anything but an explicit purge turns a
+	# re-install into a second installation.
+	#
+	# `failed-upgrade` is in this arm because Debian Policy 6.5 lists it --
+	# `new-postrm failed-upgrade old-version new-version`, called when the old
+	# `postrm upgrade` failed -- and it is what the first version of this script got
+	# wrong: it had six of the seven verbs, this was the seventh, and a verb with no
+	# arm falls into the default arm, which exits 1. Policy 6.2 requires a maintainer
+	# script to be idempotent across its error paths, so a mid-upgrade unwind that
+	# turned a recoverable failure into a half-installed package is exactly the case
+	# this arm now covers. The test that holds it reads the list from the policy.
+	#
+	# disappear is the case where the files were removed without dpkg running any of
+	# this, and the data is left: an operator who removed the files by hand can remove
+	# the directory by hand too, and guessing here would delete a recorded backup of a
+	# machine whose DNS state is unknown.
 	;;
 *)
 	echo "postrm called with an argument this script does not understand: $*" >&2

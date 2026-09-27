@@ -30,6 +30,11 @@
 # `dpkg --remove` must leave /var/lib/mosdns with the backup and the marker in it,
 # because a machine with no marker is a machine a later install will treat as
 # somebody else's.
+#
+# The four verbs below are Debian Policy 6.5's complete list for a prerm, and the
+# test holds this script against that list rather than against a copy of it, so a
+# verb added to the policy and not here fails the build rather than a mid-upgrade
+# unwind.
 set -e
 
 INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
@@ -56,10 +61,18 @@ remove|deconfigure)
 		exit 1
 	fi
 	;;
-upgrade|failed-upgrade|abort-install|abort-upgrade)
+upgrade | failed-upgrade)
 	# An upgrade keeps everything enabled and running: the units are about to be
 	# replaced, not removed, and the transaction in postinst is idempotent for a
 	# machine that is already running this router.
+	#
+	# `failed-upgrade` is here because Debian Policy 6.5 lists it: dpkg calls
+	# `new-prerm failed-upgrade old-version new-version` when `old-prerm upgrade`
+	# failed, and this package's new prerm is idempotent, so doing nothing here is
+	# right. The two arms Policy does NOT list for prerm -- abort-install and
+	# abort-upgrade -- are gone rather than handled anyway: a case dpkg cannot reach
+	# is a case nobody reasoned about, and a default arm that refuses an argument
+	# dpkg never passes is a fact about dpkg this package can be loud about.
 	;;
 *)
 	echo "prerm called with an argument this script does not understand: $*" >&2

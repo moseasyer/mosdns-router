@@ -1,6 +1,6 @@
 #!/bin/sh
 # Provision what the services need, and then let the installer take the machine's
-# DNS over. The order in this file is the whole of its design, and three of its
+# DNS over. The order in this file is the whole of its design, and four of its
 # steps are load-bearing in a way that is easy to get backwards.
 #
 # STEP 1 is the accounts. The group comes first, then the two users, and both
@@ -40,12 +40,29 @@
 # reviewed, and a refusal to install because a reviewed list cannot be verified is a
 # machine that is left exactly as it was.
 #
-# STEP 4 is the install transaction itself, and it is last because everything above
-# is a prerequisite for it: a ReadWritePaths entry naming a directory that is not
-# there fails its unit at start with a mount-namespace error, which on the only
-# resolver this machine has is an outage rather than a failed installation. The
-# transaction rolls itself back on any failure, so a postinst that fails here leaves
-# the machine as it was found and says so.
+# STEP 4 is the install transaction, and it is after everything above because
+# everything above is a prerequisite for it: a ReadWritePaths entry naming a
+# directory that is not there fails its unit at start with a mount-namespace error,
+# which on the only resolver this machine has is an outage rather than a failed
+# installation. The transaction rolls itself back on any failure.
+#
+# STEP 5 is the three timers, and it is LAST and not next to the transaction on
+# purpose. The first version of this script enabled them immediately before the
+# transaction, and then said, in the arm that runs when the transaction refuses, that
+# nothing was enabled and running. That was false, and the difference was three
+# enabled root timers: a nightly `mosdns-cdnctl test --apply` publishing into
+# /var/lib/mosdns/lists, a health check every two minutes, and a daily list check,
+# all running on a machine whose install had been refused and whose operator had
+# been told nothing was going on. Enabling them after a transaction that returned
+# zero makes the sentence true.
+#
+# It also means the failure arm has to be honest about WHICH case it is in, because
+# on an UPGRADE the claim is different and equally false in the other direction. dpkg
+# hands `postinst configure` the previously configured version as its second
+# argument, and a null one means there was none: a fresh install leaves nothing
+# enabled, while an upgrade of an installation that was already running this package
+# leaves whatever was already enabled, because this run did not touch it. The two
+# sentences below say which of those happened.
 set -e
 
 STATE_GROUP=mosdns
@@ -58,10 +75,15 @@ SOURCE_LOCK=/usr/share/mosdns-router/source-lock.json
 PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains.txt
 PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock.json
 
+# Debian Policy 6.5 lists four ways dpkg may call this script. `configure` is the one
+# that does the work; the other three are error unwinds, and all three still unpack
+# the files, so all three provision and then hand the machine to the transaction --
+# which is idempotent for a machine that is already running this router, and which is
+# the only reason an unwind can safely go through the same path as an install.
 case "$1" in
 configure | abort-upgrade | abort-remove | abort-deconfigure) ;;
 *)
-	echo "postinst called with an argument this script does not understand: $*" >&2
+	echo "postinst called with an argument Debian Policy 6.5 does not list: $*" >&2
 	exit 1
 	;;
 esac
@@ -73,6 +95,22 @@ esac
 # runs again and none of them may fail because the account is already there. The
 # `--system` forms put the accounts below UID 1000 with no home directory and a
 # non-expiring password, which is what a service identity is.
+#
+# A group this package did not create is a collision, and `addgroup --system` exits
+# zero when the group is already there, so without the check below this install would
+# silently adopt somebody else's ids. That is a real case for the resolver: the
+# upstream `dnscrypt-proxy` package creates a group of the same name, and a machine
+# carrying both would have two packages claiming one identity. It is reported rather
+# than refused because a re-run of THIS package's own postinst also finds the group
+# already there, and refusing that would make a `dpkg --configure` retry impossible.
+# The message says which state it found, so an operator can see which package the
+# group came from and decide.
+if getent group "$RESOLVER_USER" >/dev/null 2>&1; then
+	echo "postinst: the $RESOLVER_USER group already exists ($(getent group "$RESOLVER_USER"))" >&2
+	echo "postinst: and this install is using it rather than creating it. If the upstream" >&2
+	echo "postinst: dnscrypt-proxy package is also installed on this machine, the two" >&2
+	echo "postinst: are now sharing one identity." >&2
+fi
 addgroup --system "$STATE_GROUP"
 adduser --system --no-create-home --home /nonexistent \
 	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
@@ -133,16 +171,12 @@ fi
 
 # --- STEP 4: the install transaction -----------------------------------------
 
-# The three timers are enabled here and nowhere else. Their services are oneshots
-# that must not be enabled: a timer is what starts them, and an enabled oneshot
-# would run a nightly measurement at boot as well. The two daemons are enabled and
-# started by the installer, which is the one thing that knows whether they were
-# already active -- an upgrade on a machine that is already running this router is
-# the normal case, not a conflict.
+# The unit files are new, so systemd's cached copy of them is stale and the
+# transaction's own `systemctl enable` and `start` would be acting on the previous
+# version's units. A reload is a cache refresh and changes nothing else, so it is the
+# one thing that can safely happen before the transaction.
 if [ -d /run/systemd/system ]; then
 	systemctl daemon-reload || true
-	systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
-		mosdns-list-check.timer
 fi
 
 # The argument array, never a shell string. A path an operator could influence
@@ -152,11 +186,33 @@ fi
 if ! "$INSTALLER" install; then
 	echo "postinst: the install transaction refused this machine, so nothing has been" >&2
 	echo "postinst: changed: see the messages above and /var/lib/mosdns/installer for" >&2
-	echo "postinst: what was recorded. Nothing is enabled and running; to try again" >&2
-	echo "postinst: after fixing what it named:" >&2
+	echo "postinst: what was recorded." >&2
+	if [ -n "${2:-}" ]; then
+		echo "postinst: This machine had this package configured before (it was at" >&2
+		echo "postinst: version $2), so whatever was enabled and running is still" >&2
+		echo "postinst: enabled and running: this run did not enable anything, because" >&2
+		echo "postinst: the three timers are enabled only after this step succeeds." >&2
+	else
+		echo "postinst: Nothing is enabled and nothing was started: this was a first" >&2
+		echo "postinst: install, and the three timers are enabled only after this step" >&2
+		echo "postinst: succeeds, so there is nothing here for them to run against." >&2
+	fi
+	echo "postinst: to try again after fixing what it named:" >&2
 	echo "postinst:   sudo $INSTALLER preflight --check-only" >&2
 	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
 	exit 1
+fi
+
+# --- STEP 5: the three timers, and only now ----------------------------------
+
+# Their services are oneshots that must not be enabled: a timer is what starts them,
+# and an enabled oneshot would run a nightly measurement at boot as well. The two
+# daemons were enabled and started by the transaction above, which is the one thing
+# that knows whether they were already active -- an upgrade on a machine that is
+# already running this router is the normal case, not a conflict.
+if [ -d /run/systemd/system ]; then
+	systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
+		mosdns-list-check.timer
 fi
 
 exit 0
