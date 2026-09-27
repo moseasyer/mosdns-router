@@ -1,5 +1,8 @@
 # The two-minute health check of the address in service: mosdns-cdnctl
-# health-check.
+# health-check, and then one question to this machine's own resolver.
+#
+# It is Type=oneshot with TWO ExecStart lines, which systemd allows only for a
+# oneshot, and both commands must succeed for the unit to succeed.
 #
 # This is the only command in the project whose job is to take an address out of
 # service. It proves the published winner and every published CloudFront mapping
@@ -33,9 +36,40 @@ Type=oneshot
 User=mosdns-cdn
 Group=mosdns
 ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl health-check
+# The second command, and the whole of the "nothing notices the router stopped"
+# gap this unit used to have. `health-check` proves the CDN ADDRESS in service --
+# it opens sockets to a foreign edge and asks it to prove itself -- so a router
+# that was down, or a resolver behind it that could not reach its upstream, passed
+# this unit every two minutes for ever, and there was no other path from a dead
+# router back to the machine's own resolvers.
+#
+# `mosdns_installer.py verify-local` asks the machine's OWN resolver the one
+# question, over the installer's own probe, with the installer's own resolvable
+# predicate: a NOERROR or an NXDOMAIN, and not a SERVFAIL, a REFUSED or silence.
+# That predicate is the same one the install's barrier uses, which is the reason
+# this is the installer and not a Go flag: "resolvable" has one definition in this
+# package, and a second one in the health command would be a second answer to the
+# same question.
+#
+# It takes no root, reads no file, changes nothing, and opens one UDP socket to
+# loopback for at most two seconds -- so it runs here, as this unit's unprivileged
+# identity, inside the same sandbox as the health check above it.
+#
+# WHAT A FAILED UNIT MEANS is not this package's decision. A unit that runs
+# `emergency-rollback` on a timer would mutate a machine's DNS unattended, at two
+# minutes' notice, with nobody watching; whether that should happen is an open
+# question for the operator who owns this machine, and it is recorded as open. What
+# an operator does today: this unit failing is the signal, and
+# `sudo mosdns-cdnctl emergency-rollback` is the action.
+#
+# It is LAST so the CDN verdict is recorded in the health document before the
+# machine's own verdict is given -- a check that publishes its measurement and is
+# then killed by a timeout would leave a document nobody can explain.
+ExecStart=/usr/lib/mosdns-router/mosdns_installer.py verify-local
 # A pass is bounded at 60 seconds by internal/health and a transition's proof at
 # 15, so 110 is above everything this command can legitimately spend and below the
-# two-minute cadence. A check that hangs is killed before the next elapse instead
+# two-minute cadence; the local probe is one 2 s query, so the budget is still the
+# health check's. A check that hangs is killed before the next elapse instead
 # of overlapping it, and a check that overlaps itself is measuring a state the
 # previous check already changed.
 TimeoutStartSec=110
@@ -44,7 +78,9 @@ TimeoutStartSec=110
 # own pin or apply, and the timer asks again in two minutes. Every other non-zero
 # exit fails this unit, and that includes a refused transition -- an address in
 # service that is failing and that this command could not move is the one outcome
-# an operator has to be told about.
+# an operator has to be told about -- and a local resolver that did not resolve,
+# which is exit 1 from the second command and is not excused here for the same
+# reason: a machine with no working resolver is not a successful run.
 SuccessExitStatus=4
 CapabilityBoundingSet=
 # 0007 for the same reason as the optimizer's: the health document and the

@@ -38,6 +38,21 @@ Description=mosdns-router DNS router (loopback only)
 Documentation=man:mosdns-router(8)
 After=dnscrypt-proxy.service network.target
 Wants=dnscrypt-proxy.service
+# The start rate limit, STATED rather than inherited, and the reason is below.
+# systemd's defaults are StartLimitIntervalSec=10s and StartLimitBurst=5; with the
+# RestartSec=5s below, every ten-second window holds at most three starts, so the
+# burst of five is never reached and the unit restarts for ever. Measured
+# arithmetic, not a guess: 5 retries x 5s = 25s of starts, and the window is 10s.
+#
+# These two make the claim the Restart comment makes TRUE: with a 60s window and
+# a burst of 5, the sixth start is refused 25 seconds in, and a permanently
+# missing prerequisite -- the Cloudflare prefix list is a hard start requirement --
+# ends in a visible failed unit with the reason in the journal rather than in a
+# loop. Raising the interval rather than lowering RestartSec is deliberate: a
+# five-second retry is right for a router that is up and being asked to restart,
+# and the limit is what makes the permanent case visible.
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -54,9 +69,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # clear group access, and must not open a file to the world.
 UMask=0007
 # A router that stays down after a crash leaves the host with no resolver. The
-# default start rate limit bounds the retries, so a permanently missing
+# start rate limit above bounds the retries, so a permanently missing
 # prerequisite -- the Cloudflare prefix list is a hard start requirement -- ends in
-# a visible failed unit with the reason in the journal rather than in a loop.
+# a visible failed unit with the reason in the journal rather than in a loop. That
+# is true because StartLimitIntervalSec and StartLimitBurst are stated in this
+# file and not inherited: the defaults would never reach the burst at this
+# unit's RestartSec, which is what the comment above them is about.
 Restart=on-failure
 RestartSec=5s
 

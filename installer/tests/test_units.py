@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections import Counter
@@ -72,6 +73,12 @@ TIMERS = (OPTIMIZER_TIMER, HEALTH_TIMER, LIST_CHECK_TIMER)
 ROUTER_BINARY = "/usr/lib/mosdns-router/mosdns-router"
 CDNCTL_BINARY = "/usr/lib/mosdns-router/mosdns-cdnctl"
 DNSCRYPT_BINARY = "/usr/lib/mosdns-router/dnscrypt-proxy"
+# The installer as a program. It is the only part of this package that already
+# knows what "resolvable" means -- one predicate, `response_resolves`, shared by
+# the install's barrier, its waits and its verification -- and the health unit's
+# second ExecStart is here rather than a Go re-implementation for exactly that
+# reason.
+INSTALLER = "/usr/lib/mosdns-router/mosdns_installer.py"
 ROUTER_CONFIG = "/etc/mosdns/mosdns.yaml"
 DNSCRYPT_CONFIG = "/etc/mosdns/dnscrypt-proxy.toml"
 POLICY = "/etc/mosdns/policy.yaml"
@@ -227,6 +234,15 @@ UNIT_DIRECTIVES = {
             # binds loopback and must come up on a machine whose network is not up.
             ("After", "dnscrypt-proxy.service network.target"),
             ("Wants", "dnscrypt-proxy.service"),
+            # The start rate limit, stated rather than inherited. The defaults are
+            # StartLimitIntervalSec=10s and StartLimitBurst=5, and with this unit's
+            # RestartSec=5s the fifth retry is already outside a ten-second window,
+            # so the burst is never reached and the unit loops every five seconds
+            # for ever. These two make the claim the Restart comment below makes
+            # true: a permanently missing prerequisite -- the Cloudflare prefix list
+            # is a hard start requirement -- ends in a visible failed unit.
+            ("StartLimitIntervalSec", "60s"),
+            ("StartLimitBurst", "5"),
         ),
         "Service": (
             ("Type", "simple"),
@@ -327,10 +343,23 @@ UNIT_DIRECTIVES = {
             ("User", "mosdns-cdn"),
             ("Group", "mosdns"),
             ("ExecStart", f"{CDNCTL_BINARY} health-check"),
+            # The second command, and the whole of the "nothing notices the router
+            # stopped" gap: `health-check` proves the CDN address, not the machine's
+            # own resolver at 127.0.0.1:53, so a router that is down passed this
+            # unit every two minutes for ever. This one asks the LOCAL resolver --
+            # with the installer's own resolvable predicate, so "resolvable" has one
+            # definition in this package and not two -- and fails the unit when the
+            # answer is a SERVFAIL or silence.
+            #
+            # It is last so the CDN verdict is recorded before the machine's, and it
+            # runs as the same identity with the same sandbox: the installer only
+            # reads and opens a socket.
+            ("ExecStart", f"{INSTALLER} verify-local"),
             # A pass is bounded by 60 s and a transition's proof by 15 s, so 110 s
             # is above everything the command can legitimately spend and below the
             # two-minute cadence: a check that hangs is killed before the next
-            # elapse instead of overlapping it.
+            # elapse instead of overlapping it. The local probe is a single
+            # two-second query, so the budget is still the health check's.
             ("TimeoutStartSec", "110"),
             # The same control-lock race as the optimizer's, and the same reason.
             ("SuccessExitStatus", "4"),
@@ -479,6 +508,21 @@ def one_directive(sections, section, key):
             f"[{section}] {key}= appears {len(values)} time(s), want exactly 1: {values!r}"
         )
     return values[0]
+
+
+def duration_seconds(value):
+    """A systemd duration in seconds, for the two spellings this package uses.
+
+    Only the forms the units actually carry, and it says so when it meets another:
+    a reader that silently read `5min` as five would let a rate-limit check pass on
+    a unit whose window is five minutes, which is the direction the check exists to
+    catch.
+    """
+    text = value.strip()
+    for suffix, scale in (("ms", 0.001), ("s", 1.0), ("min", 60.0), ("h", 3600.0)):
+        if text.endswith(suffix):
+            return float(text[: -len(suffix)]) * scale
+    raise AssertionError(f"{value!r} is not a duration this reader knows how to read")
 
 
 def compare_directives(name, expected, actual):
@@ -885,6 +929,70 @@ class UnitTextTests(unittest.TestCase):
             "first'; every other non-zero exit, including a refusal to publish, fails the "
             "unit, and the list check excuses nothing because it takes no lock at all",
         )
+
+    def test_the_health_unit_also_asks_whether_the_local_resolver_resolves(self):
+        # The gap this closes: `health-check` proves the CDN address in service, so
+        # a router that is DOWN passed this unit every two minutes for ever, and
+        # there was no other path from a dead router back to the machine's own
+        # resolvers. The unit fails; what an operator does with that failure is
+        # `emergency-rollback`, and that is a decision this package does not make
+        # for them.
+        starts = directive_value(parsed(HEALTH), "Service", "ExecStart")
+        self.assertEqual(
+            starts,
+            [f"{CDNCTL_BINARY} health-check", f"{INSTALLER} verify-local"],
+            "the health service runs the CDN check and nothing else, so a machine whose local "
+            "resolver stopped answering looks healthy to it",
+        )
+        # The probe must fail the unit, and `SuccessExitStatus=4` must not excuse
+        # it: the installer's "it did not resolve" is exit 1, so the two cannot
+        # collide by accident -- and this is the assertion that says so.
+        self.assertNotIn(
+            "1",
+            directive_value(parsed(HEALTH), "Service", "SuccessExitStatus"),
+            "a local resolver that does not resolve must fail this unit",
+        )
+
+    def test_the_local_probe_reuses_the_installers_resolvable_predicate(self):
+        # One definition of "resolvable" in this package, not two. The installer's
+        # `response_resolves` is the one the barrier, the waits and the
+        # verification all use, and a Go re-implementation of it in the health
+        # command is a second answer to the same question.
+        source = (REPO / "installer" / "mosdns_installer.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "def response_resolves(", source,
+            "the installer's resolvable predicate is gone, so the health unit's second ExecStart "
+            "has nothing to reuse",
+        )
+        command = subprocess.run(
+            [sys.executable, str(REPO / "installer" / "mosdns_installer.py")],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(command.returncode, 2, "the installer no longer refuses a usage error")
+        self.assertIn("verify-local", command.stderr, "the verb the health unit runs is not there")
+
+    def test_the_router_retry_burst_is_reachable_so_a_missing_prerequisite_ends_in_a_failed_unit(self):
+        # The router's comment justifies `Restart=on-failure` by claiming the start
+        # rate limit "bounds the retries, so a permanently missing prerequisite ...
+        # ends in a visible failed unit ... rather than in a loop". With the
+        # systemd defaults (StartLimitIntervalSec=10s, StartLimitBurst=5) and this
+        # unit's RestartSec=5s, the counter never reaches the burst: every window of
+        # ten seconds holds at most three starts, so the unit restarts for ever and
+        # the claim is false in the direction that matters.
+        sections = parsed(ROUTER)
+        interval = duration_seconds(one_directive(sections, "Unit", "StartLimitIntervalSec"))
+        burst = int(one_directive(sections, "Unit", "StartLimitBurst"))
+        restart = duration_seconds(one_directive(sections, "Service", "RestartSec"))
+        self.assertEqual(one_directive(sections, "Service", "Restart"), "on-failure")
+        self.assertLessEqual(
+            burst * restart, interval,
+            f"{burst} restarts {restart:g}s apart span {burst * restart:g}s, which is more than the "
+            f"{interval:g}s window, so the burst is never reached and the unit loops for ever "
+            "instead of ending in a visible failed unit",
+        )
+        # And the teeth: the same arithmetic against the defaults this unit used to
+        # inherit, so the assertion above is known to be able to fail.
+        self.assertGreater(5 * restart, 10.0, "the defaults would not have failed this check")
 
     def test_the_router_waits_for_dnscrypt_without_requiring_it(self):
         sections = parsed(ROUTER)

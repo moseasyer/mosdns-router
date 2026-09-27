@@ -4830,7 +4830,63 @@ def _usage() -> str:
         "       mosdns_installer.py install\n"
         "       mosdns_installer.py uninstall [--purge]\n"
         "       mosdns_installer.py emergency-rollback\n"
+        "       mosdns_installer.py verify-local\n"
     )
+
+
+def _run_verify_local(probe) -> int:
+    """Ask the machine's own resolver one question, and fail if it cannot answer it.
+
+    This is the SECOND command of `mosdns-cdn-health.service`, and it exists
+    because `health-check` proves the CDN address in service -- not
+    `127.0.0.1:53`, which is the machine's whole path to DNS. With only the former,
+    a router that had stopped passed a health check every two minutes for ever.
+
+    The question is the installer's own, asked with the installer's own
+    `probe_dns`, so "resolvable" has one definition in this package: a NOERROR or
+    an NXDOMAIN, and not a SERVFAIL, a REFUSED or silence. That is the same
+    predicate the install's barrier and its verification use, and re-implementing
+    it here -- or, worse, in the health command's own Go -- is how two programs end
+    up disagreeing about whether a machine has DNS.
+
+    It takes no root, reads no file, changes nothing, and takes a `run` it does
+    not need: the only thing it does is open a UDP socket to a loopback address
+    and wait two seconds. So the health unit runs it as its own unprivileged
+    identity inside the same sandbox as the health check.
+
+    What a failed unit means is a DECISION this package does not make. Putting
+    `emergency-rollback` on a timer would mutate a machine's DNS unattended, and
+    an operator who has watched their DNS die is better served by a signal and a
+    person: the health unit failing is the signal, `sudo mosdns-cdnctl
+    emergency-rollback` is the action.
+    """
+    ask = probe or (lambda address, port: probe_dns(address, port))
+    answer = ask(LOCAL_DNS, DNS_PORT)
+    if answer.resolves:
+        sys.stdout.write(
+            f"verify-local: {LOCAL_DNS}:{DNS_PORT} resolved {INSTALL_PROBE_NAME}, so this machine's "
+            "resolver is answering and the health check's verdict is about a working machine\n"
+        )
+        return EXIT_OK
+    if answer.answered:
+        sys.stderr.write(
+            f"verify-local: {LOCAL_DNS}:{DNS_PORT} ANSWERED a query for {INSTALL_PROBE_NAME} and did "
+            "not resolve it -- a SERVFAIL is a confident answer from a chain that reached nobody, "
+            "and reading it as health is how a machine with no DNS is called healthy. The router or "
+            "the resolver it forwards to is not working.\n"
+        )
+        sys.stderr.write(
+            "verify-local: nothing has been changed by this command. The action is yours: "
+            "`sudo mosdns-cdnctl emergency-rollback` puts the recorded DNS settings back.\n"
+        )
+        return EXIT_REFUSED
+    sys.stderr.write(
+        f"verify-local: nothing at all answered a query for {INSTALL_PROBE_NAME} at "
+        f"{LOCAL_DNS}:{DNS_PORT} within {PROBE_TIMEOUT_SECONDS:g}s, so the machine's own resolver is "
+        "not answering. Nothing has been changed by this command. The action is yours: "
+        "`sudo mosdns-cdnctl emergency-rollback` puts the recorded DNS settings back.\n"
+    )
+    return EXIT_REFUSED
 
 
 def _run_preflight(root: Path, run: CommandRunner) -> int:
@@ -4960,13 +5016,16 @@ def main(
     root: Path = Path("/"),
     probe=None,
 ) -> int:
-    """Run ``preflight`` to report, or one of the three verbs that change the machine.
+    """Run ``preflight`` to report, or one of the verbs that change the machine.
 
-    Two verbs rather than one verb and a flag, because the difference between
+    Three verbs change a machine and two do not, and the difference between
     reporting a problem and changing the machine is the difference this program
-    exists to keep, and a flag is the kind of thing a script passes because it read
-    it somewhere else. ``preflight`` changes nothing by construction; ``install``
-    changes a machine's DNS and puts it back if anything goes wrong.
+    exists to keep, so it is a verb and not a flag. ``preflight`` changes nothing by
+    construction; ``install`` changes a machine's DNS and puts it back if anything
+    goes wrong. ``verify-local`` is the odd one: it is a verb because it is a
+    QUESTION with an exit status rather than a mode of another verb, it is
+    read-only, and a `mosdns-cdn-health.service` ExecStart line needs a program to
+    run.
 
     ``--check-only`` is accepted for ``preflight`` and is not a flag in disguise: it
     names the only mode that verb has. ``--purge`` is the only flag ``uninstall``
@@ -4981,7 +5040,9 @@ def main(
     be tested against the machine it ran on, and a test here that read the host's
     NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the host
     wearing a test's name. ``probe`` is here for the same reason and one more: a
-    DNS query is a real request to a real resolver, and the last two verbs ask one.
+    DNS query is a real request to a real resolver, and the last three verbs ask
+    one. ``verify-local`` needs no root and no runner, and a test that could not
+    inject the probe into it would be a test that queried a real resolver.
     """
     arguments = list(argv)
     if arguments[:1] == ["preflight"]:
@@ -5001,6 +5062,8 @@ def main(
         return _run_uninstall(root, run or RealCommandRunner(), purge, probe)
     if arguments == ["emergency-rollback"]:
         return _run_emergency_rollback(root, run or RealCommandRunner(), probe)
+    if arguments == ["verify-local"]:
+        return _run_verify_local(probe)
     sys.stderr.write(f"{_usage()}\n")
     return EXIT_USAGE
 

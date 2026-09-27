@@ -2888,6 +2888,71 @@ class UpgradeRestartTests(TransactionFixture):
         self.assertIn(("systemctl", "try-restart", ROUTER_UNIT), self.commands)
 
 
+class LocalResolverVerbTests(TransactionFixture):
+    """`verify-local`: the question the health unit's second command asks.
+
+    The two-minute health check proves the CDN address in service and nothing
+    else, so a machine whose local resolver had stopped was called healthy every
+    two minutes for ever. This verb is the second ExecStart of
+    `mosdns-cdn-health.service` and it asks the one question that was missing,
+    with the installer's own probe so that "resolvable" has one definition in this
+    package rather than two.
+    """
+
+    def run_verify(self, shape):
+        out, err = io.StringIO(), io.StringIO()
+        import contextlib
+
+        self.events = []
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = installer.main(
+                ["verify-local"],
+                self.good_runner(),
+                root=self.root,
+                probe=self.probe_for({(LOCAL_DNS, DNS_PORT): shape}),
+            )
+        return status, out.getvalue(), err.getvalue()
+
+    def test_a_resolvable_local_resolver_exits_zero(self):
+        status, out, err = self.run_verify(HEALTHY)
+        self.assertEqual(status, installer.EXIT_OK, err)
+        self.assertIn(f"{LOCAL_DNS}:{DNS_PORT}", out)
+        self.assertIn(INSTALL_PROBE_NAME, out)
+
+    def test_it_asks_the_local_resolver_and_nothing_else(self):
+        self.run_verify(HEALTHY)
+        asked = [event for event in self.events if event[0] == "probe"]
+        self.assertEqual(asked, [("probe", LOCAL_DNS, DNS_PORT)])
+
+    def test_a_servfail_is_a_failure_and_says_why_it_is_not_health(self):
+        # The predicate's whole point: something answered, confidently, from a
+        # chain that reached nobody. Calling that healthy is the failure mode.
+        for shape in (SERVFAIL, REFUSED):
+            with self.subTest(shape=shape):
+                self.setUp()
+                status, out, err = self.run_verify(shape)
+                self.assertEqual(status, installer.EXIT_REFUSED, out)
+                self.assertIn("did not resolve", err)
+                self.assertIn("SERVFAIL", err)
+                self.assertEqual(out, "", "a failure reported a result on standard output")
+
+    def test_silence_is_a_failure_and_is_told_apart_from_a_servfail(self):
+        status, _out, err = self.run_verify(SILENT)
+        self.assertEqual(status, installer.EXIT_REFUSED)
+        self.assertIn("nothing at all answered", err)
+        self.assertNotIn("SERVFAIL", err)
+
+    def test_it_names_the_action_and_changes_nothing(self):
+        status, _out, err = self.run_verify(SILENT)
+        self.assertEqual(status, installer.EXIT_REFUSED)
+        self.assertIn("emergency-rollback", err)
+        self.assertIn("Nothing has been changed", err)
+        self.assertEqual(
+            self.commands, [], "the verb issued a command, and it is documented as read-only"
+        )
+        self.assertFalse(self.rooted(BACKUP_PATH).exists())
+
+
 class CliTransactionTests(TransactionFixture):
     """The command as a person runs it, and the two statuses that mean things."""
 
@@ -2901,24 +2966,6 @@ class CliTransactionTests(TransactionFixture):
                 runner or self.good_runner(),
                 root=self.root,
             )
-        return status, out.getvalue(), err.getvalue()
-
-    def install_cli(self, runner=None):
-        """``main`` with the injected probe, which ``main`` does not take."""
-        out, err = io.StringIO(), io.StringIO()
-        import contextlib
-
-        original = installer.install
-
-        def install(root, run, clock=None, probe=None, **kwargs):
-            return original(root, run, clock=clock, probe=probe or self.probe_for(), **kwargs)
-
-        installer.install = install
-        try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                status = installer.main(["install"], runner or self.good_runner(), root=self.root)
-        finally:
-            installer.install = original
         return status, out.getvalue(), err.getvalue()
 
     def test_a_successful_install_exits_zero_and_says_what_it_did(self):
