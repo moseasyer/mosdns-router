@@ -627,7 +627,7 @@ func TestUpdateListsRefreshRangesDefaultsAreTheInstalledPaths(t *testing.T) {
 	// The packaged installer runs the command with no paths at all, so the
 	// defaults are the only thing that makes it publish the file the shipped
 	// routing document names.
-	options, err := parseUpdateListOptions([]string{"--refresh-ranges"})
+	options, err := parseUpdateListOptions(io.Discard, []string{"--refresh-ranges"})
 	if err != nil {
 		t.Fatalf("parse the refresh defaults: %v", err)
 	}
@@ -643,7 +643,7 @@ func TestUpdateListsRefreshRangesDefaultsAreTheInstalledPaths(t *testing.T) {
 	// The two modes the command already had are unchanged, and they gain the two
 	// path flags with the same installed defaults so a report can name them.
 	for _, args := range [][]string{{"--check"}, {"--pin-remote", "HEAD"}} {
-		parsed, err := parseUpdateListOptions(args)
+		parsed, err := parseUpdateListOptions(io.Discard, args)
 		if err != nil {
 			t.Fatalf("parse %v: %v", args, err)
 		}

@@ -763,16 +763,76 @@ func containsPathFlag(args []string) bool {
 	return false
 }
 
+func TestUpdateListsHelpIsPrintedRatherThanDiscarded(t *testing.T) {
+	// `--help` used to parse, print the usage into io.Discard, and exit two with a
+	// diagnostic that said nothing about the flags. An operator who typed it got
+	// a line of prose and no way to learn that `--check` also reports the ranges
+	// or that `--refresh-ranges` is the mode that publishes them.
+	//
+	// The usage now goes to the command's own stderr, names every flag, and
+	// carries the flag descriptions -- so the manual page Task 6 writes inherits
+	// the same text this asserts on, rather than a second copy of it.
+	for _, flag := range []string{"-h", "--help"} {
+		t.Run(flag, func(t *testing.T) {
+			paths := newListPaths(t)
+			origin := newFakeOrigin(t, remoteCommit, nil)
+			code, stdout, stderr := runCLI(t, origin.services(), flag,
+				"--source-lock", paths.sourceLock, "--list-file", paths.listFile)
+			if code != exitInvalidCLI {
+				t.Fatalf("`%s` exit = %d, want %d", flag, code, exitInvalidCLI)
+			}
+			if stdout != "" {
+				t.Errorf("`%s` wrote stdout: %q", flag, stdout)
+			}
+			for _, want := range []string{
+				"update-lists",
+				"-check",
+				"-pin-remote",
+				"-refresh-ranges",
+				"-ranges-cache",
+				"-control-lock",
+			} {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("`%s` usage does not mention %s:\n%s", flag, want, stderr)
+				}
+			}
+			if len(origin.requests) != 0 {
+				t.Errorf("`%s` reached the remote: %v", flag, origin.requests)
+			}
+		})
+	}
+}
+
+func TestTheCheckFlagSaysWhatItNowReports(t *testing.T) {
+	// The reviewer's finding: the brief asked the command to "state explicitly
+	// what --check now means for the ranges", and the only place that meaning
+	// existed was a doc comment and a report. Task 6 owns the manual page, so the
+	// flag's own description is where the page inherits it from.
+	paths := newListPaths(t)
+	origin := newFakeOrigin(t, remoteCommit, nil)
+	_, _, usage := runCLI(t, origin.services(), "--help",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile)
+	for _, want := range []string{
+		"ranges",
+		"writes nothing",
+		"--refresh-ranges",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("the usage does not say %q about --check:\n%s", want, usage)
+		}
+	}
+}
+
 func TestUpdateListsDefaultsAreTheInstalledPaths(t *testing.T) {
 	// The packaged timer runs the command with no paths at all, so the defaults
 	// are the only thing that makes it update the list the router reads. A
 	// default that pointed anywhere else would leave the router on a list no
 	// pin ever replaced.
-	options, err := parseUpdateListOptions([]string{"--check"})
+	options, err := parseUpdateListOptions(io.Discard, []string{"--check"})
 	if err != nil {
 		t.Fatalf("parse defaults: %v", err)
 	}
-	pinned, err := parseUpdateListOptions([]string{"--pin-remote", "HEAD"})
+	pinned, err := parseUpdateListOptions(io.Discard, []string{"--pin-remote", "HEAD"})
 	if err != nil {
 		t.Fatalf("parse pin defaults: %v", err)
 	}

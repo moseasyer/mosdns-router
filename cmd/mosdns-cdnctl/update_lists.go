@@ -168,12 +168,24 @@ type updateListOptions struct {
 // wrong carriers. `--check` is documented to write nothing and takes no lock, so
 // it cannot publish, and `--pin-remote` re-pins the China list, which ruling 59
 // forbids during an install.
-func parseUpdateListOptions(args []string) (updateListOptions, error) {
+//
+// diagnostics is where the flag set's own messages go. It used to be io.Discard,
+// which made `-h` and `--help` print the usage into nothing: an operator who asked
+// for help got "flag: help requested" and no flags, and an unknown flag produced a
+// diagnostic that did not say which flags existed. It is the command's own stderr
+// rather than a fresh writer, so the usage lands where everything else this command
+// says lands and a caller that captures stderr captures the usage with it.
+func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOptions, error) {
 	flags := flag.NewFlagSet("update-lists", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	check := flags.Bool("check", false, "report whether the pinned source has changed, writing nothing")
+	flags.SetOutput(diagnostics)
+	// The --check description has to say what the command now reports, not only
+	// what it reported when the flag was written: the ranges half of the report is
+	// the half that says whether the prefix list the rewriter refuses to start
+	// without is actually on disk, and the man page inherits this string rather
+	// than a second copy of it.
+	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "accept the current reviewed default-branch commit and publish it")
-	refreshRanges := flags.Bool("refresh-ranges", false, "refresh the published Cloudflare ranges and their prefix list, measuring nothing")
+	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
 	listFile := flags.String("list-file", defaultListFilePath, "path to the converted list")
 	controlLock := flags.String("control-lock", defaultControlLockPath, "path to the shared control lock")
@@ -223,7 +235,11 @@ func parseUpdateListOptions(args []string) (updateListOptions, error) {
 }
 
 func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
-	options, err := parseUpdateListOptions(args)
+	// The flag set writes its own diagnostics to stderr rather than discarding
+	// them, so `-h` reaches the operator. The usage goes to stderr and not stdout
+	// because `-h` is a usage error here: it names no mode, and every mode in this
+	// command either writes or reaches the network.
+	options, err := parseUpdateListOptions(stderr, args)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitInvalidCLI
