@@ -46,8 +46,11 @@ __all__ = [
     "CommandRunner",
     "Completed",
     "Connection",
+    "Holder",
+    "Owner",
     "Preflight",
     "RealCommandRunner",
+    "check_architecture",
     "check_connection",
     "check_control_lock",
     "check_dependencies",
@@ -865,6 +868,25 @@ def _ech_is_strict(root: Path) -> Optional[bool]:
     A policy that cannot be read is not a strict one. The install renders the
     document itself, and refusing here would stop an install because a file has
     not been written yet -- which is the normal state before the first run.
+
+    **This is the module's one documented fail-open, and it makes the strict-ECH
+    refusal below unreachable on a fresh installation.** A policy file that is
+    absent, that has no ``ech:`` section, or whose ``ech:`` block this cannot parse
+    all answer the same way: not strict. The install renders ``policy.yaml`` itself
+    from a template, so on a machine this package has not run on yet there is no
+    policy to read, and the browser-too-old refusal that exists to stop an operator
+    installing a configuration this machine cannot deliver will not fire. An
+    operator who has written a strict policy with a forced domain, on a machine
+    with Firefox below 129, is refused; an operator who has written the same
+    policy and then had a typo in it is not.
+
+    It is a fail-open on purpose, for the reason in the first paragraph, and it is
+    recorded here and in the plan rather than left as an omission. The narrow fix
+    would be to treat an unparseable policy as a refusal while still treating an
+    absent one as the fresh-install state, which is a different rule from this one
+    and a ruling rather than a fix; and the whole check is better than nothing for
+    the case that matters, which is the operator who configured strict ECH on a
+    machine that cannot deliver it.
     """
     try:
         contents = (root / "etc/mosdns/policy.yaml").read_text(encoding="utf-8")
@@ -896,9 +918,25 @@ def check_ech(run: CommandRunner, root: Path, report: Preflight) -> None:
     domain is unreachable rather than merely unprotected. Fallback is the same
     request with a working answer for such a client, and a policy with ECH off
     does not ask for anything, so neither is refused.
+
+    Read :func:`_ech_is_strict` for why that refusal does not fire on a fresh
+    installation, where there is no policy file yet.
     """
     domains = _forced_ech_domains(root)
     strict = _ech_is_strict(root)
+    if strict is None and domains:
+        # The one fail-open in this module, named in the report rather than left
+        # to be discovered. It is a note and not a refusal because an absent policy
+        # is the normal state before the first run -- but an operator who HAS
+        # written a forced-domain list deserves to know that the strict-ECH
+        # refusal above did not get a chance to consider their machine, because
+        # the policy it would have read is missing or unparseable.
+        report.note(
+            f"{len(domains)} domain(s) are forced for ECH and a browser below "
+            f"{MINIMUM_ECH_FIREFOX} cannot deliver ECH, but /etc/mosdns/policy.yaml could not be "
+            "read as a policy, so whether ECH is strict is unknown and this preflight is not "
+            "refusing on that basis; if the policy is meant to be strict, check that it parses"
+        )
 
     completed = _ok(run, ("firefox", "--version"))
     if completed is None:

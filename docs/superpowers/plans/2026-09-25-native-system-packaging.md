@@ -295,10 +295,24 @@ Cover:
 
 - `/etc/resolv.conf` not pointing to the resolved stub;
 - missing active NetworkManager connection;
-- occupied 53, 15353, or timer conflict;
+- **53 held by systemd-resolved's own stub listener, which every stock Ubuntu has
+  and which this install keeps** — resolved stays in front of the router and
+  forwards to it, so the stub is the machine working, not a conflict to clear
+  first. The exemption is matched on the *owning process* (its pid, resolved to
+  `systemd-resolved.service`'s `MainPID`) **and** on the address being loopback; a
+  foreign process that has taken `127.0.0.53` is still two answers for one query
+  and is refused. A holder this user cannot name is refused too, because that is
+  what an unprivileged run sees for every other user's socket. `ss -p` is asked
+  for, and the local-address column is found by shape rather than by index — the
+  count is not stable, and a hand-written fixture that omits the `Netid` column
+  agrees with an off-by-one parser. The suite pins an `ss` answer captured from
+  the system-level test machine for exactly that reason.
+- 53 or 15353 held by anything else, including a `mosdns-router` process when
+  nothing claims it: the ownership marker is the same claim `check_foreign_services`
+  makes, and a second installation is not excused by the port check;
 - `mosdns` or `dnscrypt-proxy` service already active outside this package;
 - Firefox below 129: ECH disabled/reported, but basic routing preflight passes;
-- user-provided forced ECH domain on a system that cannot meet Firefox 129: reject only when ECH strict is enabled.
+- user-provided forced ECH domain on a system that cannot meet Firefox 129: reject only when ECH strict is enabled. **Recorded fail-open: an absent, section-less or unparseable `/etc/mosdns/policy.yaml` is treated as not strict, so on a fresh installation — where the install has not yet rendered the policy — this refusal cannot fire. That is deliberate (refusing would stop an install because a file has not been written yet) and it is reported as a note when a forced domain exists, not passed in silence. Narrowing it to "unparseable is a refusal, absent is the fresh-install state" is a ruling, not a fix.**
 
 Also cover the runtime directory prerequisites, because the control lock is
 acquired through a read-only descriptor and a state file is created at mode
@@ -314,9 +328,21 @@ acquired through a read-only descriptor and a state file is created at mode
 - a pre-existing directory that is world-readable, group-writable by an
   unrelated group, or missing its setgid bit is a preflight failure reported
   before any mutation, with the exact `stat` values in the message;
+- a pre-existing directory whose **access** ACL group class does not grant the
+  group `rwx` after the mask is applied, even when the mode and the default ACL
+  both read correctly. A named ACL entry creates a mask and a later `chmod 2750`
+  sets that mask to `r-x`; the mode then reports the mask as its group field, so
+  the two agree and the directory is unusable. This is the case the default-ACL
+  check cannot see, and the check reads the whole ACL for it;
+- a pre-existing directory whose **owner** cannot write, which the mode bits show
+  and no other check was reading;
 - a pre-existing control lock file whose mode is not `0640`, or which is not
   owned by `root:mosdns`, is reported rather than silently repaired by an
-  installer running as an unrelated user.
+  installer running as an unrelated user. The lock path is asked with `lstat`,
+  not `Path.exists()`: a dangling symlink, a path under a non-directory and a
+  path under an unsearchable parent all read as "no lock here" to `exists()`, and
+  all three are a refusal — a symlink in particular, because the control
+  operations open this path and open follows it.
 
 - [ ] **Step 3: Run tests and verify failure**
 
@@ -329,6 +355,18 @@ Expected: import failure.
 - [ ] **Step 4: Implement `--check-only`**
 
 Use subprocess argument arrays only. Parse `nmcli -t -f NAME,UUID,TYPE,DEVICE connection show --active`, identify the primary wired/wireless connection, and verify systemd-resolved controls DNS. Do not write files or call mutating `nmcli` commands in preflight.
+
+The process boundary is guarded three ways rather than one, because `os` is
+imported at module scope for `readlink` and `lstat` and a needle list could not
+therefore refuse the module: a named list of process-creating attributes across
+`os`/`pty` (the earlier list missed `os.fork` and `os.posix_spawn`, both of which
+start a process the injected runner never sees), an allowlist of the `os`
+attributes this module may use, and the existing needle list for the ways it
+argues about shells. All three read the code with comments and string literals
+blanked out, so a docstring explaining why there is no shell does not fail the
+scan that says there is none. Each has a control case proving it fires, and the
+documented limit is that a call spelled through `getattr` passes all three — the
+layer below is the `FakeRunner`, which refuses a string.
 
 - [ ] **Step 5: Run tests**
 
@@ -578,6 +616,33 @@ set of state files: whichever process creates a file does so at mode 0640 inside
 a group-writable setgid directory, so the other identity can read it, rename
 over it, and acquire the lock without any additional privilege. Do not grant
 world access and do not rely on a per-file `chown` from an unprivileged unit.
+
+**The group and the setgid bit are not sufficient, and the mode table above first
+said `2750` because it looked sufficient.** A default ACL grants the *new file*
+its permissions; it does not grant the *directory* anything. Creating a file,
+renaming one over another and taking the control lock all need write on the
+directory, and at `2750` a member of the `mosdns` group has `r-x` on it. This was
+measured on the system-level test machine rather than reasoned about: a member of
+a `root:mosdns` directory's own group cannot create a file in it at `2750`, and
+can at `2770`. There is no third option — when a directory carries an extended
+ACL, the mode's group field *is* the group-class mask, so no mode reads `2750`
+while granting the group write.
+
+**What preflight checks, and therefore what postinst must produce:** for each of
+the four directories, the type, the owner (`root`), the group (`mosdns`), the mode
+bits the package provisions (owner `rwx`, group `rwx`, world none, setgid), the
+group's *effective access* permission after the mask is applied, and the group's
+effective *default* permission for a new file. The access half and the default
+half are separate checks because they fail separately: a named ACL entry creates
+a mask, and a later `chmod 2750` sets that mask to `r-x` while the default ACL
+still reads `rwx` — a directory that passes every default-ACL check and that
+neither service identity can write.
+
+`postinst` therefore provisions with `install -d -o root -g mosdns -m 2770`
+followed by `setfacl -d -m g::rwx`, in that order: the mode last, so a default ACL
+that `install` has not disturbed survives it, and the mask a default ACL implies
+is not left narrower than the group needs. The `tmpfiles.d` entry provisions
+`/run/mosdns` the same way, since it is the same directory on a different boot.
 
 `/run/mosdns` is the one directory on that list that `postinst` cannot keep: `/run`
 is a tmpfs, so the group, the setgid bit and the default ACL are all gone after a

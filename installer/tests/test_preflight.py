@@ -1132,6 +1132,37 @@ class ECHTests(PreflightFixture):
         report = self.answered({("firefox", "--version"): "Mozilla Firefox 128.0.3\n"})
         self.assertEqual([problem for problem in report.problems() if "example.com" in problem], [])
 
+    def test_says_that_an_unreadable_policy_left_the_strict_ech_refusal_unconsidered(self):
+        # The module's one fail-open, and the note that names it. An operator who
+        # has written a forced-domain list and has a strict policy they intended
+        # is refused; one whose policy will not parse is not, and the difference is
+        # between "this machine cannot do what you asked" and "preflight could not
+        # read what you asked for". The second is worth a line of its own, because
+        # the install renders the policy itself and the file an operator edited is
+        # not necessarily the one that will be in force.
+        for name, write_policy in {
+            "the policy is absent": lambda: None,
+            "the policy has no ech section": lambda: self.write(
+                "/etc/mosdns/policy.yaml", "schema_version: 1\n"
+            ),
+        }.items():
+            with self.subTest(policy=name):
+                self.setUp()
+                write_policy()
+                self.force_list("example.com")
+                report = self.answered({("firefox", "--version"): "Mozilla Firefox 128.0.3\n"})
+                self.assertEqual(
+                    [problem for problem in report.problems() if "example.com" in problem],
+                    [],
+                    f"{name} must not refuse, because an absent policy is the fresh-install state",
+                )
+                self.assertRegex(
+                    " ".join(report.notes()),
+                    r"(?i)(policy\.yaml|policy)",
+                    f"with {name} and a forced domain, the report has to say that the strict-ECH "
+                    "refusal could not be considered rather than passing in silence",
+                )
+
 
 class StateDirectoryTests(PreflightFixture):
     """The four state directories, and the properties each one has to hold.
