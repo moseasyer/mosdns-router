@@ -706,6 +706,19 @@ def _main_pid_of(run: CommandRunner, unit: str) -> Optional[int]:
     return int(value)
 
 
+def _owner_is_exempt(owner: Owner, address: str, resolved_pid: Optional[int], own_pids: dict) -> bool:
+    """Whether this one process is one of the two the install expects to find.
+
+    A pid `ss` could not read is not exempt: the question could not be asked, and
+    preflight's rule is that an unanswered question is a refusal.
+    """
+    if owner.pid is None:
+        return False
+    if resolved_pid is not None and owner.pid == resolved_pid and _is_loopback(address):
+        return True
+    return owner.pid in own_pids
+
+
 def _is_exempt(holder: Holder, resolved_pid: Optional[int], own_pids: dict) -> bool:
     """Whether a holder is one this install expects to find already there.
 
@@ -717,22 +730,33 @@ def _is_exempt(holder: Holder, resolved_pid: Optional[int], own_pids: dict) -> b
     Both are matched on the owning process and not on the port, and the resolved
     one is matched on the address as well: a foreign process that has taken
     127.0.0.53 is two answers for one query, and the port being the right number
-    is not a reason to let it stand. A socket with no identifiable owner is not
-    exempt, and neither is one whose only match is a different address from the
-    stub's. The second exemption is gated on the ownership marker, which is the
-    same claim check_foreign_services makes -- a mosdns-router process this install
-    did not start is a foreign installation whatever it is called.
+    is not a reason to let it stand. The second exemption is gated on the ownership
+    marker, which is the same claim check_foreign_services makes -- a
+    mosdns-router process this install did not start is a foreign installation
+    whatever it is called.
+
+    EVERY owner has to be exempt, and that is the whole of the rule. `ss` prints
+    one line per socket and names every process holding it in a single
+    `users:((...),(...))` field, so a socket this install may bind can arrive with
+    a foreign process on it beside resolved -- or beside this package's own router
+    -- and answering for its share of the queries on the way in. A guard that asked
+    "is any owner exempt" would wave that through, and the answer it gives is
+    indistinguishable from the answer for a socket nobody else holds. This package's
+    own router sharing a descriptor with a foreign process is the same shape, and
+    the same refusal: the exemption is about who holds the socket, not about
+    whether one of them is familiar. It needs no cooperation from the foreign
+    process to arise -- a child that inherits a listening fd is named on the same
+    line as its parent -- and unlike two sockets on 127.0.0.53 it is not something
+    the operator had to ask for.
+
+    A socket with no identifiable owner is not exempt either: that is a holder
+    nobody can name, and so nobody can clear.
     """
     if not holder.owners:
         return False
-    for owner in holder.owners:
-        if owner.pid is None:
-            continue
-        if resolved_pid is not None and owner.pid == resolved_pid and _is_loopback(holder.address):
-            return True
-        if owner.pid in own_pids:
-            return True
-    return False
+    return all(
+        _owner_is_exempt(owner, holder.address, resolved_pid, own_pids) for owner in holder.owners
+    )
 
 
 def _describe_owners(holder: Holder) -> str:

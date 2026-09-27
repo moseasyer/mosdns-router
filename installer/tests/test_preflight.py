@@ -203,6 +203,22 @@ tcp LISTEN 0      53     127.0.0.1:8080  0.0.0.0:* users:(("python3",pid=310,fd=
 UNRELATED_PORT_WITH_QUEUE_53_TCP_ONLY = """\
 LISTEN 0      53         127.0.0.1:8080  0.0.0.0:* users:(("python3",pid=310,fd=3))
 """
+# ONE socket, TWO processes, ONE line -- captured the same way, from a python
+# process on the test machine that forked and left the child holding the
+# listening descriptor it was born with (`tests/system/shared_listener.py`). No
+# SO_REUSEPORT and no cooperation of any kind: a process that inherits a listening
+# fd holds the same socket, and `ss` names every holder of a socket in a single
+# `users:((...),(...))` field rather than one line per holder.
+#
+# This is the shape the port check's exemption has to be reasoned about, and the
+# one a two-line fixture cannot represent: a fixture that prints a line per
+# process describes two sockets, and a guard that exempts on the first owner it
+# sees passes a socket resolved shares with a foreign process while every test
+# built that way still agreed with it.
+SHARED_LISTENER_LINE = (
+    "tcp LISTEN 0      5          127.0.0.1:18081 0.0.0.0:*"
+    ' users:(("python3",pid=110,fd=3),("python3",pid=108,fd=3))\n'
+)
 # The pids those lines name, and the two this package's own units would use.
 RESOLVED_PID = "39"
 ROUTER_PID = "41"
@@ -467,6 +483,26 @@ class PreflightFixture(unittest.TestCase):
         columns += [state, "0", str(queue), local, "0.0.0.0:*"]
         if process is not None:
             columns.append(f'users:(("{process}",pid={pid},fd={fd}))')
+        return " ".join(columns) + "\n"
+
+    @staticmethod
+    def shared_line(protocol, state, local, queue, owners, netid=True, peer=None):
+        """One `ss -H -lntu` line whose single ``users:`` field names SEVERAL processes.
+
+        ``owners`` is a sequence of ``(process, pid, fd)`` triples, and they all
+        land in ONE ``users:(("a",pid=1,fd=3),("b",pid=2,fd=3))`` field, because
+        that is what `ss` prints for a socket more than one process holds -- see
+        :data:`SHARED_LISTENER_LINE` for the captured line and the fork that
+        produced it. :meth:`ss_line` builds the one-owner shape, which is what
+        `ss` prints when a socket has one holder, and the two shapes have to stay
+        distinguishable: a fixture written as one line per process describes two
+        sockets, and a check that only ever sees that shape cannot tell an
+        exemption that reads "this socket is resolved's" from one that reads
+        "this socket is resolved's *and nobody else's*".
+        """
+        named = ",".join(f'("{process}",pid={pid},fd={fd})' for process, pid, fd in owners)
+        columns = [protocol] if netid else []
+        columns += [state, "0", str(queue), local, peer if peer is not None else "0.0.0.0:*", f"users:(({named}))"]
         return " ".join(columns) + "\n"
 
     def listener(self, port, address="127.0.0.1", process="dnsmask", pid="1234", protocol="tcp", netid=True):
@@ -916,18 +952,91 @@ class PortTests(PreflightFixture):
                 )
 
     def test_reports_a_foreign_process_sharing_the_stub_socket(self):
-        # `ss` names every process sharing a socket, and two processes can share
-        # one with SO_REUSEPORT. A socket resolved holds alongside a foreign
-        # process is not resolved's alone: the foreign one gets a share of the
-        # queries, which is the two-answers problem this check exists for, and an
-        # exemption that looked at the first owner would wave it through.
-        shared = self.ss_line(
-            "tcp", "LISTEN", "127.0.0.53%lo:53", 4096, "systemd-resolve", RESOLVED_PID, fd=15
-        ) + self.ss_line(
-            "tcp", "LISTEN", "127.0.0.53%lo:53", 4096, "snatch", "777", fd=9
+        # ONE line, TWO owners, one `users:((...),(...))` field -- the shape `ss`
+        # prints for a socket two processes hold, captured in SHARED_LISTENER_LINE.
+        # A socket resolved holds alongside a foreign process is not resolved's
+        # alone: the foreign one answers for a share of the queries that arrive on
+        # 53, which is the two-answers problem this check exists for, and `ss` names
+        # both of them in the same breath.
+        #
+        # So the exemption has to be "every owner of this socket is one of ours",
+        # not "some owner of this socket is one of ours". The previous version of
+        # this test built two lines -- one per process -- and passed a guard that
+        # only ever looked for the first owner that matched: a shape `ss` does not
+        # print for one shared socket, so the guard was never exercised. Each
+        # half was a socket with a single owner, and each half is decided on its
+        # own.
+        line = self.shared_line(
+            "tcp",
+            "LISTEN",
+            "127.0.0.53%lo:53",
+            4096,
+            [("systemd-resolve", RESOLVED_PID, 15), ("snatch", "777", 9)],
         )
-        problems = " ".join(self.answered({SS_LISTENERS: shared}).problems())
-        self.assertIn("snatch", problems, "a foreign process on a socket resolved also holds was accepted")
+        problems = " ".join(self.answered({SS_LISTENERS: line}).problems())
+        self.assertIn(
+            "snatch", problems, "a foreign process on a socket resolved also holds was accepted"
+        )
+
+    def test_a_shared_socket_is_exempt_only_when_every_owner_is(self):
+        # The whole truth table for one socket in one place, because the guard it
+        # exercises is one boolean and the two ways to get that boolean wrong --
+        # "any owner" and "no owners" -- both come out as an install that binds a
+        # port it does not own. Every row is a single `ss` line, and the owners
+        # are named in the field `ss` actually names them in.
+        resolved = ("systemd-resolve", RESOLVED_PID, 15)
+        router = ("mosdns-router", ROUTER_PID, 3)
+        snatch = ("snatch", "777", 9)
+        for owners, accepted, why in (
+            ((resolved,), True, "resolved alone on the stub is the machine working"),
+            ((router,), True, "this package's own router on 53 is the state after an install"),
+            ((resolved, router), True, "every owner is ours, so nothing foreign can answer here"),
+            ((resolved, snatch), False, "one foreign owner is enough to refuse: it answers too"),
+            ((snatch, resolved), False, "and it does not matter which owner comes first"),
+            ((router, snatch), False, "an exempt owner does not excuse a foreign one beside it"),
+            ((snatch,), False, "a single foreign owner was always refused"),
+            ((), False, "no owner at all is a holder nobody can name, so nobody can clear it"),
+        ):
+            with self.subTest(owners=[name for name, _, _ in owners], accepted=accepted):
+                self.setUp()
+                line = self.shared_line("tcp", "LISTEN", "127.0.0.53%lo:53", 4096, owners)
+                answers = {
+                    SS_LISTENERS: line,
+                    MAIN_PID + (ROUTER_UNIT,): f"{ROUTER_PID}\n",
+                }
+                if accepted:
+                    self.assertPasses(
+                        self.good_runner(answers),
+                        f"{why}, but the socket was refused",
+                    )
+                else:
+                    problems = " ".join(self.answered(answers).problems())
+                    self.assertIn("53", problems, f"{why}, but the socket was accepted")
+
+    def test_a_socket_with_no_process_column_is_refused_on_a_shared_address(self):
+        # `ss` prints no process column for a socket this user may not read, and
+        # that is what an unprivileged run sees for every other user's process.
+        # A holder nobody can name is a holder nobody can clear, so it is refused --
+        # including on the stub's own address, where the address alone is the thing
+        # the last version of this check keyed on.
+        line = self.ss_line("tcp", "LISTEN", "127.0.0.53%lo:53", 4096)
+        problems = " ".join(self.answered({SS_LISTENERS: line}).problems())
+        self.assertIn(
+            "53", problems, "a port 53 with no nameable holder was accepted on the stub's address"
+        )
+
+    def test_reports_two_processes_on_one_socket_when_named_separately(self):
+        # The shape the old fixture used, kept because it is a shape `ss` can
+        # print: two DISTINCT sockets that happen to be on the same address and
+        # port, which two processes get with SO_REUSEPORT. It is two holders and
+        # the foreign one is refused, and it is a different situation from the
+        # shared-descriptor one above -- two sockets, rather than one socket with
+        # two holders -- so the refusal has to be reached for the right reason.
+        two_lines = self.ss_line(
+            "tcp", "LISTEN", "127.0.0.53%lo:53", 4096, "systemd-resolve", RESOLVED_PID, fd=15
+        ) + self.ss_line("tcp", "LISTEN", "127.0.0.53%lo:53", 4096, "snatch", "777", fd=9)
+        problems = " ".join(self.answered({SS_LISTENERS: two_lines}).problems())
+        self.assertIn("snatch", problems, "a foreign socket on the stub's port was accepted")
 
     def test_reports_resolved_holding_the_dns_port_off_loopback(self):
         # The exemption is the stub on a loopback address, not resolved's process
