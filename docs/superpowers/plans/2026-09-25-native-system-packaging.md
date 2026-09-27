@@ -100,9 +100,10 @@ installer/tests/test_transaction.py
 installer/tests/test_uninstall.py
 installer/tests/test_package.py
 bridge/tests/test_capture_current.py
-bridge/tests/test_fixture.py
+bridge/tests/test_collect.py, test_publish.py, test_fixture.py
+bridge/tests/fixtures/
 tests/system/Dockerfile, tests/system/entrypoint.sh, tests/system/*.py
-tests/vm/ (the parked machine's scripts; nothing here runs them)
+tests/vm/autoinstall.yaml, tests/vm/run.sh (the parked machine; nothing here runs them)
 
 --- the build
 scripts/build-deb.sh
