@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -81,10 +82,85 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 		return runCDNUnpin(args[1:], stdout, stderr, services)
 	case "health-check":
 		return runCDNHealthCheck(ctx, args[1:], stdout, stderr, services)
+	case "emergency-rollback":
+		return runEmergencyRollback(args[1:], stdout, stderr, services)
 	default:
 		writeCLIError(stderr, "unknown command %q", args[0])
 		return exitInvalidCLI
 	}
+}
+
+// installerScriptPath is where the package installs the installer, and it is a
+// constant rather than a flag for the same reason the other paths are: a rollback
+// an operator can point at a different script is a rollback that can be pointed
+// somewhere else. The script is the thing that decides what a machine's DNS is
+// put back to, and that decision is not this program's to delegate to a path.
+const installerScriptPath = "/usr/lib/mosdns-router/mosdns_installer.py"
+
+// rollbackCommand is the argument array, and a fresh one every call: two runs
+// cannot share a slice, because a caller that changed one of them would then be
+// changing what the next rollback executes.
+//
+// It has no flags and takes no input. The verb the installer runs is a constant
+// here, so nothing a caller can supply reaches the array -- which is what makes
+// "no shell interpolation" a property of the code rather than a claim about it.
+func rollbackCommand() []string {
+	return []string{installerScriptPath, "emergency-rollback"}
+}
+
+// runEmergencyRollback puts a machine's DNS back from the installer's own backup
+// and reports what the installer said.
+//
+// It is a launcher and nothing else, which is the right division: the installer
+// holds the record of what the connection was set to, and a second
+// implementation of "put it back" in Go would be a second thing that can be wrong
+// about a machine's resolver. So this decides three things and then gets out of
+// the way:
+//
+//   - that the caller is root. The installer rewrites a NetworkManager profile
+//     and stops units; a non-root run would fail somewhere less legible than here.
+//   - that the array is an array. There is no shell between this program and the
+//     script, so nothing in a connection UUID, a device name or a path is ever
+//     interpreted.
+//   - that the installer's own status survives. 0 is restored, 5 is "this
+//     connection is not mine to change", 6 is "I started and did not finish", and
+//     each of those is a different fact about a machine. A launcher that reported
+//     them all as one failure would take away the only thing a script or an
+//     operator can act on.
+//
+// The two statuses this launcher raises itself are 2 and 3, both before or instead
+// of the installer running, and neither is one the installer uses to mean a
+// refusal. Its standard streams are inherited by the child, so the manual recovery
+// report -- which is the whole deliverable of a refusal -- reaches the terminal.
+func runEmergencyRollback(args []string, stdout, stderr io.Writer, services services) int {
+	if len(args) != 0 {
+		writeCLIError(stderr, "emergency-rollback: takes no arguments: %s", strings.Join(args, " "))
+		return exitInvalidCLI
+	}
+	if services.effectiveUID == nil || services.runInstaller == nil {
+		writeCLIError(stderr, "emergency-rollback: this build has no installer boundary")
+		return exitStateUnavailable
+	}
+	if uid := services.effectiveUID(); uid != 0 {
+		writeCLIError(
+			stderr,
+			"emergency-rollback: uid %d, and this command rewrites a NetworkManager profile and "+
+				"stops units, so it runs as root (uid 0) only",
+			uid,
+		)
+		return exitInvalidCLI
+	}
+	if err := services.runInstaller(rollbackCommand()); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			// The installer's own status, unchanged. Its messages went to the
+			// terminal already, because the child's streams are this process's.
+			return exitErr.ExitCode()
+		}
+		writeCLIError(stderr, "emergency-rollback: %v", err)
+		return exitStateUnavailable
+	}
+	return exitSuccess
 }
 
 // runValidate checks a policy and reports whether the documents the operator has

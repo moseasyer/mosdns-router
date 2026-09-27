@@ -192,6 +192,12 @@ func (o *rangeOrigin) services(github *http.Client) services {
 		},
 		documents:   productionDocumentPaths(),
 		documentOps: defaultDocumentOps(),
+		// The two boundaries the emergency-rollback verb uses are the real ones
+		// here, because this fixture replaces the network and the filesystem and
+		// says nothing about who the caller is or what running the installer
+		// would do.
+		effectiveUID: productionServices().effectiveUID,
+		runInstaller: productionServices().runInstaller,
 	}
 }
 

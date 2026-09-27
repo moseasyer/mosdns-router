@@ -517,7 +517,9 @@ func servicesFor(prober optimizer.Prober, set candidate.CandidateSet, moment tim
 		readCandidates: func(context.Context, candidateSource) (candidate.CandidateSet, error) {
 			return set, nil
 		},
-		now: func() time.Time { return moment },
+		now:          func() time.Time { return moment },
+		effectiveUID: productionServices().effectiveUID,
+		runInstaller: productionServices().runInstaller,
 	}
 }
 

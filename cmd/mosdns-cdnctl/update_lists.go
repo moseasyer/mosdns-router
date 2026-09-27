@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -70,6 +71,28 @@ type services struct {
 	// now is the clock. Every timestamp a report and a selector carry comes from
 	// it, so all of them are one reading in production.
 	now func() time.Time
+	// effectiveUID is who this process is, and emergency-rollback refuses to run
+	// as anyone else. It is a field rather than a call to os.Geteuid() inside the
+	// command so that a test can say "this is not root" without a container, and
+	// so that the refusal is a branch rather than an assumption.
+	effectiveUID func() int
+	// runInstaller is the whole process boundary of the emergency-rollback verb:
+	// it takes the argument array and runs it, or reports why it could not. It is
+	// an argv and never a string, so there is no shell between this program and
+	// the installer, and it is a field so a test can see the exact array instead
+	// of running the installer on whatever machine the test runs on.
+	runInstaller func(argv []string) error
+}
+
+// productionServicesWith is productionServices with the two boundaries the
+// emergency-rollback verb uses replaced. It exists so the rollback's own test can
+// name a UID and a fake runner while every other boundary stays the real one, and
+// so there is exactly one production definition of both.
+func productionServicesWith(effectiveUID func() int, runInstaller func(argv []string) error) services {
+	value := productionServices()
+	value.effectiveUID = effectiveUID
+	value.runInstaller = runInstaller
+	return value
 }
 
 // productionServices is what the executable runs with: a plain client that
@@ -91,7 +114,35 @@ func productionServices() services {
 		newProber:      func() optimizer.Prober { return networkProber{inner: prober.New(prober.Options{})} },
 		readCandidates: readOfficialAndUserCandidates,
 		now:            time.Now,
+		effectiveUID:   os.Geteuid,
+		runInstaller:   runInstallerScript,
 	}
+}
+
+// runInstallerScript is the one place in this program that starts another
+// program, and it is here rather than inside the command so that the command's
+// only job is deciding whether to call it.
+//
+// Three properties, all of them the reason this is a five-line function rather
+// than an exec.Command call at the point of use:
+//
+//   - the argument array is passed through as an array, so nothing a caller or a
+//     machine can put in a connection UUID or a device name is ever interpreted;
+//   - the standard streams are inherited, so the installer's own messages -- which
+//     include a manual recovery report an operator has to be able to read -- reach
+//     the terminal instead of being captured and re-printed;
+//   - the child's status is not translated, because each of the installer's
+//     statuses is a fact about the machine and flattening them would take away the
+//     only thing a caller can act on.
+func runInstallerScript(argv []string) error {
+	if len(argv) == 0 {
+		return errors.New("no command to run")
+	}
+	command := exec.Command(argv[0], argv[1:]...)
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	return command.Run()
 }
 
 // readOfficialAndUserCandidates is where a run's addresses come from: the
