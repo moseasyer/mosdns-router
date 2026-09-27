@@ -724,15 +724,17 @@ class TransactionFixture(unittest.TestCase):
         self.assertTrue(result.ok)
         return result
 
-    def full_sequence(self):
-        """The commands and probes of a successful install, in order.
+    def preflight_commands(self):
+        """Preflight's own read-only commands, as a literal.
 
-        Written out rather than summarised: this is the literal the order test
-        compares against, and every entry is a value a reader can check against
-        the plan without running anything.
+        Separate from :meth:`full_sequence` because one assertion needs to say
+        "the transaction stopped at the check, so nothing after preflight's reads
+        ran at all" -- and an assertion like that is only worth anything if the
+        thing it compares against is a literal rather than a list built from the
+        run being tested.
         """
         rooted = lambda relative: str(self.rooted(relative))  # noqa: E731
-        preflight = [
+        commands = [
             ("dpkg", "--print-architecture"),
             ("systemctl", "--version"),
             ("systemctl", "is-active", "NetworkManager.service"),
@@ -742,11 +744,21 @@ class TransactionFixture(unittest.TestCase):
             SS_LISTENERS,
             MAIN_PID + (RESOLVED_UNIT,),
         ]
-        preflight += [("systemctl", "is-active", unit) for unit in PROJECT_UNITS]
-        preflight.append(("firefox", "--version"))
+        commands += [("systemctl", "is-active", unit) for unit in PROJECT_UNITS]
+        commands.append(("firefox", "--version"))
         for relative in STATE_DIRECTORIES:
-            preflight.append(STAT_FIELDS + (rooted(relative),))
-            preflight.append((GETFACL, "-c", "-p", rooted(relative)))
+            commands.append(STAT_FIELDS + (rooted(relative),))
+            commands.append((GETFACL, "-c", "-p", rooted(relative)))
+        return commands
+
+    def full_sequence(self):
+        """The commands and probes of a successful install, in order.
+
+        Written out rather than summarised: this is the literal the order test
+        compares against, and every entry is a value a reader can check against
+        the plan without running anything.
+        """
+        preflight = self.preflight_commands()
         transaction = [
             capture_command(),
             PACKAGE_VERSION_COMMAND,
@@ -1765,14 +1777,38 @@ class LocallyAnsweredProbeTests(TransactionFixture):
         result = self.run_install()
         self.assertFalse(result.ok, "a silent policy was read as the safe one rather than the default")
 
-    def test_the_check_costs_no_command(self):
-        # It reads two files and must not add a command, so the sequence literal is
-        # the one every other order assertion is written against.
+    def test_the_check_costs_no_command_and_runs_before_the_capture(self):
+        # The first version of this case compared `full_sequence()` with itself,
+        # which is a literal compared with a literal: it would have passed with the
+        # guard issuing a command per file it read. So the comparison is against
+        # what the runner ACTUALLY recorded, and against the literal half of it
+        # that a refused transaction can legitimately reach.
+        #
+        # Two properties, and they are separate. "Costs no command" is that the
+        # guard added nothing to the sequence a successful install runs, which is
+        # checked against the full literal. "Runs before the capture" is that the
+        # refusal is literal about changing nothing -- the capture publishes a
+        # state and a generation, so a guard after it could not say so -- and it is
+        # checked against the recorded commands being preflight's reads and no
+        # more.
         before = self.full_sequence()
         self.force_ech(INSTALL_PROBE_NAME)
-        with self.assertRaises(AssertionError):
-            self.install_succeeds()
-        self.assertEqual(self.full_sequence(), before, "the refusal added a command to the sequence")
+        result = self.run_install()
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            self.full_sequence(),
+            before,
+            "the refusal added a step to the sequence, so every order assertion in this file is "
+            "written against a sequence that no longer exists",
+        )
+        self.assertEqual(
+            self.commands,
+            self.preflight_commands(),
+            "a refused run issued commands beyond preflight's own reads, so the refusal's "
+            "'nothing has been changed' is not literally true -- the capture publishes a state and "
+            "a generation, so a check that runs after it has changed something",
+        )
+        self.assertNotIn(capture_command(), self.commands, "the capture ran before the guard refused")
 
 
 class MarkerTests(TransactionFixture):
@@ -2480,6 +2516,52 @@ class CliTransactionTests(TransactionFixture):
             "only the unit whose undo failed may be named: the resolver was stopped successfully, "
             "so naming it would send the operator after a unit that is already down",
         )
+
+    def test_the_exit_four_message_names_every_stuck_unit_in_the_plural_branch(self):
+        # Both units' undos failing is reachable -- a systemd wedged partway
+        # through a rollback is the ordinary way -- and the plural arm of the
+        # message used to print the literal `systemctl stop <unit>`, which is not
+        # a command. The singular arm was fixed in round 2 and its test cannot
+        # pass by accident; this is the same property on the other arm, and the
+        # two have to stay distinguishable in the output.
+        status, out, err = self.install_cli(
+            self.good_runner(
+                fail=[
+                    ("resolvectl", "dns", DEVICE),
+                    ("systemctl", "stop", ROUTER_UNIT),
+                    ("systemctl", "stop", RESOLVER_UNIT),
+                ]
+            )
+        )
+        self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
+        for unit in (ROUTER_UNIT, RESOLVER_UNIT):
+            self.assertIn(
+                f"systemctl stop {unit}",
+                err,
+                f"the recovery line has to print the command with {unit} in it, because an "
+                "unsubstituted placeholder is not a command an operator can run",
+            )
+        self.assertNotIn("<unit>", err, "a placeholder reached the operator")
+        self.assertIn("which are still running", err, "the two units have to be distinguishable from the one-unit case")
+        self.assertNotIn("which is still running", err, "two units are not one unit")
+
+    def test_the_exit_four_message_distinguishes_one_stuck_unit_from_two(self):
+        one, _, one_err = self.install_cli(
+            self.good_runner(fail=[("resolvectl", "dns", DEVICE), ("systemctl", "stop", ROUTER_UNIT)])
+        )
+        two, _, two_err = self.install_cli(
+            self.good_runner(
+                fail=[
+                    ("resolvectl", "dns", DEVICE),
+                    ("systemctl", "stop", ROUTER_UNIT),
+                    ("systemctl", "stop", RESOLVER_UNIT),
+                ]
+            )
+        )
+        self.assertEqual(one, installer.EXIT_ROLLBACK_FAILED)
+        self.assertEqual(two, installer.EXIT_ROLLBACK_FAILED)
+        self.assertIn("which is still running", one_err)
+        self.assertIn("which are still running", two_err)
 
     def test_the_exit_three_message_excepts_a_unit_it_could_not_ask_about(self):
         # "Nothing is different about this machine" is a claim, and there is one

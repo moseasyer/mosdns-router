@@ -208,6 +208,17 @@ PRIMARY_CONNECTION_TYPES = ("802-3-ethernet", "802-11-wireless", "ethernet", "wi
 RESOLVED_STUB_PATH = "run/systemd/resolve/stub-resolv.conf"
 RESOLVED_STUB_ADDRESS = "127.0.0.53"
 
+# The operator's force-ECH list, and the one line in it that is prose. Both readers
+# of this file are in the preflight half and both are here rather than down with
+# the transaction: `check_ech` decides whether a forced domain under strict ECH can
+# be delivered by the browser on this machine, and the install transaction's guard
+# decides whether its own health check would be answered by the router instead of
+# by a resolver. Two spellings of the path, or two readers of it, in a path that
+# decides whether strict ECH is forced for a name, is the last place that should
+# be able to drift.
+FORCE_ECH_DOMAINS = "/etc/mosdns/force-ech-domains.txt"
+FORCE_ECH_COMMENT = "#"
+
 # The timeout for one read-only command. Every question here is a local query
 # against a running manager, so a slow answer means a machine that is not in a
 # state worth installing onto rather than a slow network.
@@ -924,17 +935,66 @@ def _firefox_major(version: str) -> Optional[int]:
 
 
 def _forced_ech_domains(root: Path) -> List[str]:
-    """The domains the operator forces ECH for, ignoring blanks and comments."""
+    """The names on the operator's force-ECH list, as the router's own reader sees them.
+
+    ONE definition for TWO callers, and the reason is that they must not be able to
+    drift. `check_ech` reads this list to decide whether a forced domain under
+    strict ECH can be delivered by the browser on this machine, and the install
+    transaction's guard reads it to decide whether its own health check would be
+    answered by the router instead of by a resolver. A second copy of this read
+    would mean a change to one silently changes the other, in a path that decides
+    whether strict ECH is forced for a name -- a censorship-resistance path, which
+    is the last place two readings of one operator file should be able to disagree.
+
+    What it mirrors, and what re-deriving it would cost:
+
+    * the file, `FORCE_ECH_DOMAINS` above, which is the path the router's unit and
+      `cmd/mosdns-cdnctl`'s default both use;
+    * the rule, `internal/statewatch.NewTrimmedLines` (see `text.go:31-56`): a
+      trimmed line that starts with a comment marker is prose, a blank line is
+      nothing, and everything else is an entry kept verbatim. A `#` anywhere but
+      the start is a malformed entry rather than a comment, because a list that
+      guessed which lines were annotated would be guessing about a
+      censorship-resistance setting;
+    * the match, `cdn_rewrite.forcesECH` (`cdn_rewrite.go:799-810`), which
+      compares each entry to the canonical name with `strings.EqualFold` -- see
+      :func:`_forces_ech`.
+
+    A list that cannot be read is an empty one, and that is the direction this
+    guess is made in on purpose: the router's own watcher refuses a list it cannot
+    parse and keeps the LAST GOOD one, which this installer cannot see from here.
+
+    Two places this mirror is not faithful, named here because the report is the
+    slower reader and because both fail in the direction that lets an install
+    proceed:
+
+    * an entry written with a trailing dot (`install-probe.example.`) is treated
+      here as a match and refuses, while `text.go:230` refuses the WHOLE file for a
+      trailing dot -- so the router would keep its last good list and not force
+      anything. The mirror is stricter than the router, which costs a needless
+      refusal and not a false pass;
+    * a malformed line makes the watcher keep its last good list, which could still
+      contain the probe name, while this reader keeps the malformed line as an
+      entry and finds no match in it. The precondition is that the operator
+      previously listed the probe's name by hand and has since broken the file, so
+      the router is still forcing and this guard is silent.
+
+    Neither is fixed here. Both would need this installer to reproduce the
+    watcher's whole validation -- length, label count, punycode, trailing dot,
+    address-shaped lines -- and a partial reproduction is the failure mode that
+    produced both of them.
+    """
     try:
-        contents = (root / "etc/mosdns/force-ech-domains.txt").read_text(encoding="utf-8")
+        contents = (root / FORCE_ECH_DOMAINS.lstrip("/")).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return []
-    domains = []
+    entries = []
     for line in contents.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            domains.append(stripped)
-    return domains
+        entry = line.strip()
+        if not entry or entry.startswith(FORCE_ECH_COMMENT):
+            continue
+        entries.append(entry)
+    return entries
 
 
 def _ech_is_strict(root: Path) -> Optional[bool]:
@@ -1630,8 +1690,9 @@ RECORDED_PROPERTIES = IGNORED_AUTOMATICALLY + ADDRESS_LISTS
 # at all.
 PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--refresh-ranges")
 
-# The operator's force-ECH list, and the one entry in it that would make this
-# install's own health check meaningless.
+# The operator's force-ECH list -- read by :func:`_forced_ech_domains` above, which
+# is shared with the preflight on purpose -- and the one entry in it that would
+# make this install's own health check meaningless.
 #
 # The rewriter's strict short circuit is the FIRST thing its Exec does: for a name
 # on this list, with the policy's failure policy fail-closed, an A or AAAA query is
@@ -1647,19 +1708,14 @@ PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--r
 # run while its own probe would be answered that way, because a barrier that
 # cannot be lied to is the only kind worth having, and the refusal names the file,
 # the entry and the remedy.
-FORCE_ECH_DOMAINS = "/etc/mosdns/force-ech-domains.txt"
+# The path. Named once and used by BOTH readers of this file -- the preflight's
+# `check_ech` and the transaction's guard below -- because two spellings of the
+# path would be two chances to look at different files.
 # The policy's ECH failure policy value the plugin maps to its fail-closed
 # behaviour. `failurePolicyOf` in the plugin returns FailClosed for anything that
 # is not "fallback", and `internal/config`'s default is "strict", so both the
 # default and a typo land on the short circuit.
 ECH_FALLBACK = "fallback"
-# A list line that starts with this, after trimming, is prose rather than an
-# entry -- the same rule internal/statewatch's trimmed-lines reader uses, and the
-# same reason: a `#` anywhere else is a malformed entry rather than a comment,
-# because a list that guessed which lines were annotated would be guessing about a
-# censorship-resistance setting.
-FORCE_ECH_COMMENT = "#"
-
 # The two units this transaction owns, in the order it enables them. The router
 # is enabled as well as started: a machine whose NetworkManager points DNS at the
 # loopback and whose router is not enabled comes back from a reboot with no
@@ -2394,7 +2450,8 @@ def _ech_may_answer_locally(root: Path) -> bool:
 
     * the plugin's `forcesECH` returns false when the policy has ECH turned OFF,
       whatever the list says -- there is no ECH to force, so there is no short
-      circuit; and
+      circuit (`ECHPolicy.Enabled` is the model, `internal/config/policy.go:71`,
+      and it is a plain bool, so the document's spelling of "off" is YAML's); and
     * the plugin's `failurePolicyOf` maps every failure policy except "fallback"
       onto `dnsrewrite.FailClosed`, and `internal/config`'s default is "strict".
 
@@ -2429,33 +2486,6 @@ def _ech_section(root: Path) -> Optional[str]:
         return None
     section = re.search(r"^ech:\s*$(.*?)(?=^\S|\Z)", contents, flags=re.MULTILINE | re.DOTALL)
     return None if section is None else section.group(1)
-
-
-def _forced_ech_domains(root: Path) -> List[str]:
-    """The names on the operator's force-ECH list, as the plugin's reader sees them.
-
-    Trimmed lines, with a line that starts with a comment marker dropped and
-    everything else kept verbatim -- the same rule
-    `internal/statewatch.NewTrimmedLines` applies, and the same reason: a `#`
-    anywhere but the start is a malformed entry rather than a comment.
-
-    A list that cannot be read is an empty one. The router's own watcher refuses a
-    list it cannot parse and keeps the last good one, which this install cannot
-    see from here; that blind spot belongs to the plugin and is recorded rather
-    than papered over, because guessing "it probably does not list the probe" in
-    order to let an install proceed is the wrong direction to guess in.
-    """
-    try:
-        contents = (root / FORCE_ECH_DOMAINS.lstrip("/")).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return []
-    entries = []
-    for line in contents.splitlines():
-        entry = line.strip()
-        if not entry or entry.startswith(FORCE_ECH_COMMENT):
-            continue
-        entries.append(entry)
-    return entries
 
 
 def _forces_ech(entries: Sequence[str], name: str) -> bool:
@@ -2913,8 +2943,14 @@ def _run_transaction(
     that order written out, and the barrier comment below is the one line of it
     that a future edit must not move.
     """
-    _capture_dhcp(runner, connection.device)
+    # Before the capture, and that order is the point rather than an accident.
+    # The capture PUBLISHES: it writes the DHCP state and a new generation, so a
+    # guard that ran after it could not honestly say "nothing has been changed".
+    # This one has no dependency on the capture -- it reads the policy and the
+    # operator's list, two files, and issues no command -- so it costs nothing to
+    # put first, and putting it first makes the refusal's claim literally true.
     _refuse_a_locally_answered_probe(root)
+    _capture_dhcp(runner, connection.device)
     document = prepare_backup(root, runner, connection, now)
     path = write_backup(root, document)
     validate_backup(root, document)
@@ -3104,11 +3140,22 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
     stuck = sorted(
         {failure.unit for failure in failures if failure.group == Transaction.UNITS and failure.unit}
     )
-    if stuck:
+    if len(stuck) == 1:
         steps.append(
-            "this run started "
+            f"this run started {stuck[0]}, which is still running, and `systemctl stop "
+            f"{stuck[0]}` stops it"
+        )
+    elif stuck:
+        # Both units' undos failing is reachable -- a systemd wedged partway
+        # through a rollback is the ordinary way -- so this arm is not a formality
+        # and it names every unit rather than printing a placeholder. The two
+        # branches are worded differently on purpose, so a message that got the
+        # count wrong is visible rather than merely wrong.
+        commands = " and ".join(f"`systemctl stop {unit}`" for unit in stuck)
+        steps.append(
+            f"this run started {len(stuck)} units, which are still running: "
             + " and ".join(stuck)
-            + (" which is still running, and `systemctl stop " + stuck[0] + "` stops it" if len(stuck) == 1 else " which are still running, and `systemctl stop <unit>` stops each of them")
+            + f", and {commands} stop them"
         )
     return InstallResult(
         ok=False,
