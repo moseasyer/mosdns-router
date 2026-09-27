@@ -29,6 +29,7 @@ wearing a test's name.
 """
 
 import atexit
+import contextlib
 import gzip
 import hashlib
 import json
@@ -253,6 +254,113 @@ FORBIDDEN_PROVIDERS = (
     "wpad",
 )
 
+# An ALLOWLIST of the addresses a shipped configuration document may name, applied
+# to the shipped documents only.
+#
+# The two tables above are DENYLISTS, and a denylist of twelve IPv4 literals and
+# twenty-five provider strings has two holes this one closes. First, it cannot know
+# an address nobody has written down: 1.2.4.8, 210.2.4.8, 211.98.20.20 and
+# 221.5.88.88 are all public resolvers inside the network this project routes out of
+# and all four would pass. Second, it is IPv4-only by construction, so every domestic
+# IPv6 literal -- 2400:3200::1, 2402:4e00::, and the rest -- would pass too.
+#
+# An allowlist inverts the question: not "is this forbidden?" but "is this one of the
+# handful of addresses this package is allowed to name?". The answer is four
+# categories and no more:
+#
+#   * loopback, because the router and the resolver are this machine's own and
+#     nothing in this package is reachable from another host;
+#   * 127.0.0.53 and 127.0.0.54, which are inside 127/8 and are resolved's own stub,
+#     which this install KEEPS and reads;
+#   * the two pinned Quad9 bootstrap resolvers, which resolve DNSCrypt provider
+#     names and never receive a user query (`ignore_system_dns = true` is asserted
+#     separately, and it is what makes the distinction true);
+#   * the RFC 5737 and RFC 3849 documentation ranges, which are what an EXAMPLE in a
+#     comment has to use. An example with a real address in it is a copy-paste
+#     accident waiting to happen.
+#
+# Anything else in a shipped configuration document is a finding, including an
+# address nobody has heard of. The two scans are kept because they catch different
+# things: the allowlist cannot see a provider by NAME, and the denylist cannot see an
+# address that is not on it.
+ALLOWED_ADDRESSES = (
+    "127.0.0.1",
+    "::1",             # loopback, the IPv6 spelling of the same thing
+    "9.9.9.9",
+    "149.112.112.9",
+)
+ALLOWED_NETWORKS = (
+    "127.0.0.0/8",       # loopback, including resolved's stub at .53 and .54
+    "192.0.2.0/24",      # RFC 5737 TEST-NET-1
+    "198.51.100.0/24",   # RFC 5737 TEST-NET-2
+    "203.0.113.0/24",    # RFC 5737 TEST-NET-3
+    "2001:db8::/32",     # RFC 3849 documentation
+)
+# The documents an operator's resolver behaviour comes from. The installer, the
+# bridge and the manual pages are code and prose: an address in a code comment is
+# not something the machine is pointed at, and `mosdns_installer.py` carries the
+# 192.0.2.0/24 range in a report-format example on purpose.
+CONFIG_VALUE_DOCUMENTS = tuple(EDITABLE_DOCUMENTS)
+
+# One address, in every spelling a document can use: dotted quad, colon-hex, and the
+# IPv4-mapped form an IPv6 socket prints. Read with ipaddress rather than with a
+# regex, because a regex cannot tell 1.2.3.4 from 1.2.3.4:5 and would either miss the
+# port or swallow it.
+# Ordered so the IPv4-mapped form is matched as ONE address: the generic IPv6
+# alternative would otherwise swallow the `::ffff` prefix and leave a bare `::ffff`
+# for `ipaddress` to call a valid address of its own, which is both a false finding
+# and a false negative for the address that was actually there.
+ADDRESS_TOKEN = re.compile(
+    r"(?<![0-9A-Za-z._-])("
+    r"::(?:[Ff]{4}:)?(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+    r"|(?:[0-9]{1,3}\.){3}[0-9]{1,3}"
+    r"|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[0-9A-Za-z._-]+)?"
+    r")(?![0-9A-Za-z._-])"
+)
+
+
+def address_findings(root, documents=CONFIG_VALUE_DOCUMENTS, inventory=None):
+    """Every address in a shipped configuration document that is not an allowed one.
+
+    Comments and blank lines are skipped, because that is where a documentation-range
+    example lives and an example is not configuration. Everything else in a routing
+    document or a resolver document IS configuration, which is why the skip is by
+    line rather than by anything cleverer: a `#` mid-line is a value in a URL or a
+    path, not a comment marker in any format these documents use.
+    """
+    import ipaddress
+
+    allowed_exact = {ipaddress.ip_address(value) for value in ALLOWED_ADDRESSES}
+    allowed_networks = [ipaddress.ip_network(value) for value in ALLOWED_NETWORKS]
+    findings = []
+    for document in documents:
+        path = Path(root) / document.lstrip("/")
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for token in ADDRESS_TOKEN.findall(stripped):
+                candidate = token.split("%", 1)[0]
+                try:
+                    address = ipaddress.ip_address(candidate)
+                except ValueError:
+                    continue
+                # An IPv4-mapped IPv6 address is the IPv4 address it maps, and a
+                # socket prints it that way; comparing it as IPv6 would put
+                # ::ffff:127.0.0.1 outside 127/8 and call loopback a finding.
+                mapped = getattr(address, "ipv4_mapped", None)
+                comparable = [address] + ([mapped] if mapped is not None else [])
+                if any(value in allowed_exact for value in comparable):
+                    continue
+                if any(value in network for network in allowed_networks for value in comparable):
+                    continue
+                findings.append(
+                    f"{document}:{number}: {address} is not one of the addresses this package "
+                    "is allowed to configure"
+                )
+    return findings
+
+
 # The one file the provider scan skips, and why it is not a hole: its bytes are
 # pinned by digest against a lock the package also ships, and every line of it is
 # checked to be one of the four rule forms the gateway can read, which is what
@@ -430,26 +538,132 @@ def mode_findings(inventory, modes):
     return findings
 
 
+# Debian Policy 6.5, "Summary of ways maintainer scripts are called", Debian Policy
+# Manual 4.7.4.1. This is the COMPLETE set of first arguments dpkg may pass each
+# script, transcribed once, and every script's `case` arms are compared against it in
+# both directions.
+#
+# It is transcribed from the policy rather than from the scripts, and that is the
+# whole point of the test: a list copied out of the scripts is a list that can be
+# wrong in the same way twice. This one was wrong exactly once -- `postrm` was given
+# six of the seven, `failed-upgrade` was missing, and a test that enumerated the same
+# six said so -- which is a failure the table below is designed to make impossible.
+# `new-postrm failed-upgrade old-version new-version` is what dpkg calls when
+# `old-postrm upgrade` fails, mid-unwind, and Policy 6.2 requires a maintainer script
+# to be idempotent across its error paths; a script that exits 1 on it turns a
+# recoverable unwind into a half-installed package.
+POLICY_VERBS = {
+    "postinst": ("abort-deconfigure", "abort-remove", "abort-upgrade", "configure"),
+    "prerm": ("deconfigure", "failed-upgrade", "remove", "upgrade"),
+    "postrm": (
+        "abort-install", "abort-upgrade", "disappear",
+        "failed-upgrade", "purge", "remove", "upgrade",
+    ),
+}
+# postinst configure takes a second argument that may be null (Policy 6.5 footnote
+# 7), and prerm deconfigure takes four. So the scripts may only ever look at $1, and
+# that is a separate assertion: a script that reads $2 unconditionally exits 1 on a
+# one-argument invocation, which is a real dpkg call.
+SCRIPTS = {"postinst": POSTINST, "prerm": PRERM, "postrm": POSTRM}
+
+
+def policy_verb_findings(name, text):
+    """Every way ``text`` disagrees with Policy 6.5 about what dpkg may pass it.
+
+    Three things, and all three have to hold: every policy verb has an arm, the arm
+    set is not larger than the policy's (a script that handles a verb dpkg cannot
+    pass it is a script carrying a case nobody reasoned about), and there is a default
+    arm that refuses rather than silently succeeding on an argument it was not
+    written for.
+    """
+    findings = []
+    labels = shell_alternatives(text)
+    wanted = set(POLICY_VERBS[name])
+    for verb in sorted(wanted - set(labels)):
+        findings.append(
+            f"dpkg may call this script with {verb!r} (Policy 6.5) and the script has no "
+            f"arm for it, so it falls into the default arm and exits 1"
+        )
+    for verb in sorted(set(labels) - wanted - {"*"}):
+        # `*` is the default arm and is checked by the rule below, not by this one.
+        findings.append(f"the script handles {verb!r}, which Policy 6.5 does not list as a way to call it")
+    if not re.search(r"(?m)^\s*\*\)", text):
+        findings.append(
+            "the script has no default arm, so an argument dpkg does pass it that is not in "
+            "Policy 6.5's list would be accepted as success"
+        )
+    return findings
+
+
+def case_arms(text):
+    """A shell script's ``case`` arms as ``[(labels, body)]``, in script order.
+
+    ``labels`` is a list because arms share lines: ``remove|disappear) ... ;;`` is ONE
+    arm with two labels, and a reader that cut at a literal ``disappear)`` would call
+    the rest of the arm part of ``remove`` and read a statement that really belongs to
+    a different situation as belonging to a plain removal. That is the false assurance
+    a hand-cut reader produces, and it is why the arms are computed from the label
+    set rather than from a delimiter.
+
+    A case label is a line that starts at column zero with one or more ``|``-separated
+    words and a ``)``. Column zero is what keeps an indented ``if ... )`` out, and the
+    optional trailing command is what keeps a one-line arm from reporting an empty
+    body -- which would read as "this arm does nothing" when it does something.
+    """
+    label = r"[A-Za-z*][A-Za-z0-9*-]*"
+    # Whitespace on BOTH sides of the bar: `remove|deconfigure) ;;` and
+    # `configure | abort-upgrade) ;;` are the same construct, and a pattern that
+    # only allowed one of them would read a spaced list as no list at all.
+    label_line = re.compile(
+        r"^\s*(" + label + r"(?:\s*\|\s*" + label + r")*)\)(?P<inline>.*)$"
+    )
+    lines = text.splitlines()
+    arms = []
+    for index, line in enumerate(lines):
+        match = label_line.match(line)
+        if match is None:
+            continue
+        if match.group("inline").strip() in ("", ";;"):
+            body = []
+            cursor = index + 1
+            while cursor < len(lines) and lines[cursor].strip() != ";;":
+                body.append(lines[cursor])
+                cursor += 1
+            arms.append((_labels(match.group(1)), "\n".join(body)))
+        else:
+            arms.append((_labels(match.group(1)), match.group("inline")))
+    return arms
+
+
+def _labels(text):
+    return [label.strip() for label in text.split("|") if label.strip()]
+
+
+def arm_bodies(text):
+    """``{label: body}`` for a maintainer script's ``case`` arms. See case_arms."""
+    bodies = {}
+    for labels, body in case_arms(text):
+        for label in labels:
+            bodies[label] = body
+    return bodies
+
+
+def destructive_commands(label, body):
+    """The removal commands in one arm, as the lines that carry them."""
+    return [
+        line.strip() for line in body.splitlines()
+        if re.search(r"\brm\s+-[a-z]*[rf]", line) and not line.strip().startswith("#")
+    ]
+
+
 def shell_alternatives(text):
     """The `case` labels a maintainer script branches on, in the order it lists them.
 
-    A dpkg maintainer script is handed one argument and has to answer for every value
-    dpkg can pass, so the set of labels is the set of situations the script was
-    written for -- and a script that forgot one would take a path it was never
-    reviewed for. Read rather than grepped, because the labels are usually written on
-    one `|`-separated line and a per-label regex would only ever see the first.
+    Read by `case_arms`, so the label set a script handles and the body attributed to
+    each label can never come from two different parsers that disagree about where an
+    arm ends.
     """
-    alternatives = []
-    pattern = re.compile(r"^[A-Za-z][A-Za-z0-9-]*(\s*\|\s*[A-Za-z][A-Za-z0-9-]*)*\)$")
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not pattern.match(stripped):
-            continue
-        for label in stripped.rstrip(")").split("|"):
-            label = label.strip()
-            if label and not label.startswith('"$'):
-                alternatives.append(label)
-    return alternatives
+    return [label for labels, _body in case_arms(text) for label in labels]
 
 
 def shell_code(text):
@@ -494,9 +708,14 @@ def recorded_digest():
         line for line in SOURCE_DIGEST.read_text().splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    if len(lines) != 1:
-        raise AssertionError(f"{SOURCE_DIGEST.name} has {len(lines)} digest lines, want exactly one")
-    return lines[0].split()
+    # The file carries the tag's commit as a `key: value` line beside the one digest
+    # line, so it is filtered out here rather than being mistaken for a second digest.
+    digests = [line for line in lines if re.match(r"^[0-9a-f]{64}\s", line)]
+    if len(digests) != 1:
+        raise AssertionError(
+            f"{SOURCE_DIGEST.name} has {len(digests)} digest lines, want exactly one"
+        )
+    return digests[0].split()
 
 
 def manifest_entries(text):
@@ -566,26 +785,42 @@ def is_ancestor_of_any(path, paths):
     return any(other.startswith(prefix) for other in paths)
 
 
-def unit_exec_paths(root, unit_names=SHIPPED_UNITS):
-    """The absolute executable of every ExecStart in the staged unit directory.
+# Every directive systemd runs a program from, and the prefixes it allows in front
+# of the path. Reading only ExecStart would miss an ExecStartPre=, an ExecStopPost=
+# or an ExecReload= naming a path the package omits, and no unit uses one today --
+# which is exactly why the check has to be about the family and not about the member
+# in use this month.
+EXEC_DIRECTIVES = (
+    "ExecStartPre", "ExecStart", "ExecStartPost",
+    "ExecReload", "ExecStop", "ExecStopPost",
+)
+# `-` ignores a failure, `+`/`!`/`!!` change the privileged/user execution, `:` leaves
+# the environment alone. All of them are prefixes ON the path, so all of them have to
+# come off before the path can be read.
+EXEC_PREFIXES = "-+!:"
 
-    Read back out of the unit files rather than out of a table, because the
-    failure this catches is a unit naming a path the package does not install, and
-    a table could only agree with itself.
+
+def unit_exec_paths(root, unit_names=SHIPPED_UNITS):
+    """The absolute executable of every Exec* directive in the staged unit directory.
+
+    Read back out of the unit files rather than out of a table, because the failure
+    this catches is a unit naming a path the package does not install, and a table
+    could only agree with itself.
     """
     found = {}
     for name in unit_names:
         text = (Path(root) / (UNIT_DIRECTORY + "/" + name).lstrip("/")).read_text()
-        for key, value in parse_unit(text, name).get("Service", []):
-            if key != "ExecStart":
-                continue
-            executable = value.split()[0]
-            if not executable.startswith("/"):
-                raise AssertionError(
-                    f"{name}: ExecStart={value!r} names no absolute path, so nothing can decide "
-                    "where the file goes"
-                )
-            found.setdefault(executable, []).append(name)
+        for section in ("Service", "Unit"):
+            for key, value in parse_unit(text, name).get(section, []):
+                if key not in EXEC_DIRECTIVES:
+                    continue
+                executable = value.lstrip(EXEC_PREFIXES).split()[0]
+                if not executable.startswith("/"):
+                    raise AssertionError(
+                        f"{name}: {key}={value!r} names no absolute path, so nothing can decide "
+                        "where the file goes"
+                    )
+                found.setdefault(executable, []).append(f"{name}:{key}")
     return found
 
 
@@ -639,6 +874,18 @@ def tmpfiles_findings(text):
     acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
     if not acls:
         findings.append("/run/mosdns is created with no ACL at all")
+    elif creating and entries.index(acls[0]) < entries.index(creating[0]):
+        # The shipped order is mode first, then the ACL, and it is the same
+        # load-bearing pair postinst gets wrong so easily: systemd-tmpfiles applies
+        # the `d` line's mode and the `a` line's ACL, and an ACL narrowed by a later
+        # chmod is a directory that no service identity can write. An entry whose `a`
+        # line comes first is exactly that, and a check that only asked "is there an
+        # ACL" would pass it.
+        findings.append(
+            "the ACL on /run/mosdns is set BEFORE the line that creates it, so the mode is "
+            "written after the ACL and narrows the mask the ACL created -- the same defect "
+            "postinst's own order exists to avoid"
+        )
     for _kind, _path, fields in acls:
         spec = " ".join(fields)
         if "g::rwx" not in spec:
@@ -742,6 +989,81 @@ def expand_shell(line, variables):
     return re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", replace, line)
 
 
+# The three things postinst must do in this order, and the reader that sees it.
+# The transaction is the last of them because the two provisioning steps are its
+# prerequisites, and the timer enable is after it because a refusal must leave
+# nothing enabled: a nightly `mosdns-cdnctl test --apply` running against a machine
+# whose install was refused is this project's optimizer publishing into state
+# directories nobody enabled it to publish into.
+POSTINST_STEPS = (
+    "state-directories",
+    "install-transaction",
+    "enable-timers",
+)
+
+
+def postinst_steps(text):
+    """Where postinst performs each of the three steps, in script order.
+
+    Returned as ``(step, index)`` over the script's lines, so a caller can ask which
+    of two came first without either of them being reported twice.
+    """
+    positions = {}
+    for number, line in enumerate(text.splitlines()):
+        if line.lstrip().startswith("#"):
+            continue
+        if "setfacl -d -m g::rwx" in line and "state-directories" not in positions:
+            positions["state-directories"] = number
+        if '"$INSTALLER" install' in line and "install-transaction" not in positions:
+            positions["install-transaction"] = number
+        if "systemctl enable" in line and "enable-timers" not in positions:
+            positions["enable-timers"] = number
+    return positions
+
+
+def timer_position_findings(text):
+    """Every way postinst could leave an enabled timer behind a refused install.
+
+    The claim the script makes in its failure arm is "nothing is enabled and running",
+    and it is only true if nothing was enabled before the transaction. So the enable
+    has to come after a transaction that returned zero, and the arm that prints the
+    claim has to contain no enable of its own.
+    """
+    findings = []
+    positions = postinst_steps(text)
+    for step in POSTINST_STEPS:
+        if step not in positions:
+            findings.append(f"postinst never performs {step}")
+    transaction = positions.get("install-transaction")
+    timers = positions.get("enable-timers")
+    if transaction is not None and timers is not None and timers < transaction:
+        findings.append(
+            "postinst enables the timers BEFORE the install transaction, so a refused "
+            "install leaves three enabled root timers behind while the failure message "
+            "says nothing is enabled"
+        )
+    # The failure arm: everything between the `if !` that guards the transaction and
+    # the `fi` that closes it. An enable in there is the same defect with an extra
+    # step of indirection.
+    lines = text.splitlines()
+    start = next(
+        (number for number, line in enumerate(lines) if '"$INSTALLER" install' in line), None
+    )
+    if start is not None:
+        closing = next(
+            (number for number in range(start + 1, len(lines)) if lines[number].strip() == "fi"),
+            None,
+        )
+        if closing is not None:
+            failure_arm = "\n".join(lines[start:closing + 1])
+            if "systemctl enable" in failure_arm:
+                findings.append(
+                    "the install transaction's failure arm enables the timers, so the "
+                    "refusal arm both leaves them enabled and claims nothing is"
+                )
+    return findings
+
+
 def order_findings(text):
     """Every way the provisioning in ``text`` can be wrong: the order AND the commands.
 
@@ -836,6 +1158,48 @@ def render_for_installed_layout(stage, policy, cdnctl):
 # --- the shared build --------------------------------------------------------
 
 _SHARED = {}
+# A copy of a maintainer script, swapped in for the duration of a `with` block, so a
+# control can run a test METHOD against a broken script rather than re-implementing
+# what the method checks. Re-implementing is how a control passes while the method it
+# is meant to hold is inverted: the control and the method were then two
+# implementations, and only one of them was ever exercised.
+@contextlib.contextmanager
+def scripts_replaced(**replacements):
+    """Swap the module's POSTINST / PRERM / POSTRM globals for the length of a block.
+
+    In memory and nothing else: the files on disk are untouched, so a control cannot
+    leave a broken maintainer script behind for the next run to read. The globals are
+    the ones the test METHODS read, not a lookup table -- swapping a table would leave
+    the methods reading the real file and the control would pass for the wrong reason,
+    which is the failure this exists to remove.
+    """
+    previous = {name: globals()[name.upper()] for name in replacements}
+    try:
+        for name, script in replacements.items():
+            globals()[name.upper()] = _ScriptText(script)
+        yield
+    finally:
+        for name, path in previous.items():
+            globals()[name.upper()] = path
+
+
+class _ScriptText:
+    """A Path-shaped object whose read_text() returns a given string.
+
+    The script readers take a path and call read_text on it. Rather than change their
+    signatures for the sake of a test helper, the helper supplies the one method they
+    use -- and nothing else, so a reader that grew a second file access would fail
+    here rather than silently read the real one.
+    """
+
+    def __init__(self, text):
+        self._text = text
+
+    def read_text(self, encoding=None):
+        return self._text
+
+    def __str__(self):
+        return "<a maintainer script held in memory>"
 
 
 def scratch_directory(prefix):
@@ -1267,6 +1631,54 @@ class ForbiddenContentTests(_Staged):
         )
         self.assertTrue((REPO / "configs" / "cn-domains.txt").is_file())
 
+    def test_every_address_a_shipped_document_names_is_one_this_package_may_configure(self):
+        """An allowlist, not the denylist above, and the reason is that a denylist
+        cannot know an address nobody wrote down.
+
+        Twelve IPv4 literals were on the denylist, and 1.2.4.8, 210.2.4.8,
+        211.98.20.20 and 221.5.88.88 are all public resolvers inside the network this
+        project routes out of. The denylist was also IPv4-only, so every domestic IPv6
+        literal would have passed. This asks the other question -- is this one of the
+        handful of addresses this package is allowed to name? -- and the answer is
+        loopback, resolved's stub, the two pinned Quad9 bootstrap resolvers, and the
+        RFC 5737 / RFC 3849 documentation ranges an EXAMPLE has to use."""
+        findings = address_findings(self.root)
+        self.assertEqual(
+            findings, [],
+            "a shipped configuration document names an address this package may not "
+            "configure:\n" + "\n".join(f"  {finding}" for finding in findings),
+        )
+
+    def test_the_allowlist_admits_exactly_the_addresses_this_project_chose(self):
+        """The allowlist is a hole in a gate, so the hole is asserted: loopback, the
+        resolved stub inside it, the two pinned Quad9 bootstrap resolvers, ::1, and
+        the four documentation ranges. One more address would be one more way to
+        point a machine at a resolver, and the test that would notice is this one."""
+        self.assertEqual(
+            sorted(ALLOWED_ADDRESSES),
+            sorted(("127.0.0.1", "::1", "9.9.9.9", "149.112.112.9")),
+        )
+        self.assertEqual(
+            sorted(ALLOWED_NETWORKS),
+            sorted(("127.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")),
+        )
+        # Every allowed address really is reachable only from this machine or is a
+        # pinned bootstrap, which is the claim the allowlist is making.
+        import ipaddress
+
+        for value in ALLOWED_ADDRESSES:
+            address = ipaddress.ip_address(value)
+            with self.subTest(address=value):
+                self.assertTrue(
+                    address.is_loopback or value in ("9.9.9.9", "149.112.112.9"),
+                    f"{value} is in the allowlist and is neither loopback nor a pinned bootstrap",
+                )
+        # And the document a resolver is configured from is one of the six, so the
+        # scan cannot be narrowed to a file this package does not ship.
+        for document in CONFIG_VALUE_DOCUMENTS:
+            with self.subTest(document=document):
+                self.assertIn(document, EDITABLE_DOCUMENTS)
+
     def test_the_compiled_programs_are_exempt_from_the_content_scan_for_a_reason(self):
         """The exemption is a claim, so it is asserted rather than assumed: the
         router's own control tool embeds the resolvers it refuses."""
@@ -1328,6 +1740,128 @@ class MaintainerScriptTests(_Staged):
         fields = control_fields(self.read(DEBIAN + "/control"))
         self.assertIn("acl", dependency_names(fields))
         self.assertIn("setfacl", POSTINST.read_text())
+
+    def test_every_maintainer_script_handles_every_call_dpkg_can_make(self):
+        """Debian Policy 6.5, compared in both directions and against a table
+        transcribed from the policy rather than from these scripts.
+
+        The failure this exists for is real and was shipped: `postrm` had six of the
+        seven first arguments dpkg may pass it, `failed-upgrade` was the missing one,
+        and the arm that was missing falls into the default arm, which exits 1.
+        `new-postrm failed-upgrade old-version new-version` is what dpkg calls when
+        `old-postrm upgrade` fails, so a mid-upgrade unwind turned a recoverable
+        failure into a half-installed package, and the test that should have caught it
+        had enumerated the same six verbs.
+        """
+        for name, script in sorted(SCRIPTS.items()):
+            with self.subTest(script=name):
+                findings = policy_verb_findings(name, script.read_text())
+                self.assertEqual(
+                    findings, [],
+                    f"{name} disagrees with Debian Policy 6.5 about how it may be called:\n"
+                    + "\n".join(f"  {finding}" for finding in findings),
+                )
+
+    def test_an_argument_dpkg_may_not_pass_is_never_read_unguarded(self):
+        """`postinst configure` is called with a second argument that MAY be null
+        (Policy 6.5, footnote 7) and `prerm deconfigure` with four, so a script that
+        reads `$2` on a `postinst configure` may read an empty string where it
+        expected a version. `postinst` does read it -- it is what tells a fresh
+        install from an upgrade -- and the rule is therefore that every such reference
+        is `${N:-}`-guarded rather than that none of them exists."""
+        for name, script in sorted(SCRIPTS.items()):
+            body = shell_code(script.read_text())
+            for number in ("2", "3", "4", "5"):
+                unguarded = body.count("$" + number)
+                guarded = body.count("${" + number)
+                with self.subTest(script=name, argument=number):
+                    self.assertEqual(
+                        unguarded, guarded,
+                        f"{name} reads ${number} somewhere without a ${{{number}:-}} default",
+                    )
+
+    def test_only_the_purge_arm_removes_anything(self):
+        """A removal command in any other arm is a plain `dpkg --remove` deleting the
+        operator's recorded backup, and the arms are computed from the label set so
+        that two labels sharing one arm cannot hide it."""
+        bodies = arm_bodies(POSTRM.read_text())
+        for label, body in sorted(bodies.items()):
+            if label in ("purge", "*"):
+                continue
+            with self.subTest(label=label):
+                self.assertEqual(
+                    destructive_commands(label, body), [],
+                    f"postrm's {label!r} arm removes something, and only a purge may",
+                )
+        self.assertTrue(
+            destructive_commands("purge", bodies["purge"]),
+            "postrm's purge arm removes nothing, so --purge leaves the state directory",
+        )
+
+    def test_postinst_leaves_nothing_enabled_when_the_transaction_refuses(self):
+        """The failure arm says "nothing is enabled and running". That is only true
+        if nothing was enabled before the transaction, and the three timers are the
+        thing that would be left behind: a nightly `mosdns-cdnctl test --apply`
+        publishing into state directories an operator was told nothing was using."""
+        findings = timer_position_findings(POSTINST.read_text())
+        self.assertEqual(
+            findings, [],
+            "postinst could leave a timer enabled behind a refused install:\n"
+            + "\n".join(f"  {finding}" for finding in findings),
+        )
+        positions = postinst_steps(POSTINST.read_text())
+        self.assertLess(
+            positions["state-directories"], positions["install-transaction"],
+            "the transaction runs before the state directories are provisioned",
+        )
+        self.assertLess(
+            positions["install-transaction"], positions["enable-timers"],
+            "the timers are enabled before the transaction that has to succeed first",
+        )
+
+    def test_postinst_says_which_of_its_two_claims_it_can_make_on_a_refusal(self):
+        """A fresh install enables nothing; an UPGRADE of an installation that is
+        already running this package leaves whatever was already enabled, and saying
+        "nothing is enabled" there would be the same kind of false claim this round is
+        about. `postinst configure` is handed the previously configured version as its
+        second argument, and a null one means there was none."""
+        text = POSTINST.read_text()
+        self.assertIn(
+            '${2:-}', text,
+            "the failure message cannot tell an upgrade from a fresh install",
+        )
+        # Two claims, one per case, and each a single line so that a rewrap does not
+        # change what the test is looking for. A refusal on an UPGRADE leaves whatever
+        # was already enabled, so the sentence "nothing is enabled" there would be
+        # false in the other direction.
+        for claim in ("Nothing is enabled", "configured before"):
+            with self.subTest(claim=claim):
+                self.assertIn(
+                    claim, text,
+                    "the failure arm does not distinguish a fresh install from an upgrade, so "
+                    "one of its two claims is false",
+                )
+
+    def test_postinst_reports_a_service_account_it_did_not_create(self):
+        """`addgroup --system dnscrypt-proxy` exits 0 when the group is already there,
+        so on a machine that also carries the upstream dnscrypt-proxy package this
+        one silently adopts its group. That is worth a line on the install's own
+        output, because nothing else in the transaction would ever mention it."""
+        text = POSTINST.read_text()
+        self.assertIn("RESOLVER_USER=dnscrypt-proxy", text)
+        check = 'getent group "$RESOLVER_USER"'
+        self.assertIn(
+            check, text,
+            "postinst never asks whether the resolver group is already there, and "
+            "`addgroup --system` exits 0 when it is, so a collision with the upstream "
+            "dnscrypt-proxy package is adopted silently",
+        )
+        # The check has to come BEFORE the addgroup, or it reports a group this
+        # script created itself and calls that a collision on every upgrade.
+        self.assertLess(
+            text.index(check), text.index('addgroup --system "$RESOLVER_USER"'),
+            "the resolver group is created before postinst asks whether it already existed",
+        )
 
     def test_postinst_provisions_the_state_directories_in_the_load_bearing_order(self):
         """Mode first, then the ACL, for each directory. The reverse leaves a
@@ -1458,11 +1992,15 @@ class MaintainerScriptTests(_Staged):
                 )
         # The purge case must be the one that removes the data, and the remove case
         # must not be: a plain removal that deleted the state directory would delete
-        # the recorded backup of what this machine's DNS was set to.
-        purge_case = text.split("purge)", 1)[1].split(";;", 1)[0]
-        remove_case = text.split("disappear)", 1)[1].split(";;", 1)[0]
-        self.assertIn("rm -rf /var/lib/mosdns", purge_case)
-        self.assertNotIn("rm -rf", remove_case)
+        # the recorded backup of what this machine's DNS was set to. The bodies come
+        # from `arm_bodies`, which computes them from the label SET, so the two verbs
+        # that share one arm cannot hide a removal from this assertion -- which is the
+        # way a hand-cut reader produced a false pass on the previous version of it.
+        bodies = arm_bodies(text)
+        self.assertIn("rm -rf /var/lib/mosdns", bodies["purge"])
+        for label in ("remove", "disappear", "upgrade", "abort-install", "abort-upgrade"):
+            with self.subTest(label=label):
+                self.assertNotIn("rm -rf", bodies[label])
 
     def test_the_operator_has_a_purge_verb_that_does_both_halves_in_one_place(self):
         """The half postrm cannot do is still available, and it is the installer's
@@ -1510,6 +2048,7 @@ class TmpfilesTests(_Staged):
             + "\n".join(f"  {finding}" for finding in findings),
         )
 
+    def test_the_tmpfiles_acl_is_comma_separated(self):
         """Measured, not guessed: `parse_acl` splits the specification on commas, and
         a space-separated one is IGNORED with a diagnostic on stderr while the rest
         of the entry is applied -- so the directory is created with no ACL at all and
@@ -1670,6 +2209,93 @@ class BuildTests(_Staged):
                     "that digest",
                 )
 
+    def test_the_shipped_binaries_carry_the_build_identity_not_dev_unknown_unknown(self):
+        """`internal/buildinfo` exists so a shipped router can say which tree it is,
+        and the first version of build-deb.sh injected no metadata at all -- so the
+        router in the .deb reported dev/unknown/unknown while `make verify` was
+        checking a DIFFERENT binary in build/. The flags are asserted here rather than
+        the report, because a build that quietly drops them produces a package that
+        looks right and answers nothing."""
+        script = shell_code(BUILD_SCRIPT.read_text())
+        for variable in ("Version=", "Revision=", "BuildTime="):
+            with self.subTest(variable=variable):
+                self.assertIn(
+                    variable, script,
+                    f"the build does not inject buildinfo.{variable.rstrip('=')} into the shipped "
+                    "binaries",
+                )
+        self.assertIn("mosdns-router/internal/buildinfo", script)
+        self.assertIn(
+            '-ldflags "-s -w $METADATA_LDFLAGS"', script,
+            "the Go build does not pass the metadata flags at all",
+        )
+        manifest = self.read(BUILD_MANIFEST)
+        for field in ("version:", "revision:", "build time:"):
+            with self.subTest(field=field):
+                self.assertIn(field, manifest, f"the manifest records no {field}")
+        # And the identity in the manifest is not the placeholder: `dev` and
+        # `unknown` are what a build with no metadata injection and no git checkout
+        # produce, and they are the two values this assertion exists to catch.
+        for placeholder in ("revision:         unknown", "version:          dev"):
+            with self.subTest(placeholder=placeholder):
+                self.assertNotIn(placeholder, manifest)
+
+    def test_the_shipped_router_reports_the_build_identity_it_was_given(self):
+        """Run the SHIPPED file through the project's own build-info check.
+
+        A flag that is present in the build script and absent from the binary is the
+        failure a text assertion cannot see, and it is the one this task had:
+        `build-deb.sh` passed `-s -w` and no metadata, so the router in the .deb
+        answered with the compiled-in placeholders while `make verify` was checking a
+        DIFFERENT binary in build/. `mosdns-router build-info` is a read-only
+        subcommand that binds no socket and reaches nothing, and `internal/buildinfo`'s
+        `Check` is the same function `make verify-build-info` uses -- so this asks the
+        shipped bytes the same question the gate asks the built ones.
+        """
+        # `build-info` is a subcommand of the ROUTER, which is the program whose
+        # identity an operator asks about; the control tool has no such verb and no
+        # use for one.
+        shipped = str(Path(self.root) / ROUTER_BINARY.lstrip("/"))
+        result = subprocess.run(
+            [shipped, "build-info"], capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"the packaged router cannot be interrogated: {result.stderr[:300]}",
+        )
+        info = json.loads(result.stdout)
+        for field in ("version", "revision", "build_time"):
+            with self.subTest(field=field):
+                self.assertNotIn(
+                    str(info.get(field, ""))[:3], ("dev", "unk"),
+                    f"the shipped router reports {field}={info.get(field)!r}, which is a "
+                    "compiled-in placeholder",
+                )
+        self.assertRegex(str(info.get("revision", "")), r"^[0-9a-f]{7,}")
+        # And the identity the manifest recorded is the identity the binary carries:
+        # a manifest that described a different build would be a manifest nobody could
+        # use to say what a .deb is.
+        manifest = self.read(BUILD_MANIFEST)
+        self.assertIn(f"revision:         {info['revision']}", manifest)
+        self.assertIn(f"version:          {info['version']}", manifest)
+
+    def test_the_manifest_records_the_pinned_tag_commit_not_only_the_archive_digest(self):
+        """A digest proves the archive is the same bytes every time and says nothing
+        about whether those bytes are what the tag points at today. With the commit
+        beside it, a future divergence is attributable to a re-tag rather than to a
+        transport change -- and a re-tag is a change somebody has to look at."""
+        recorded = re.search(r"^tag-commit:\s*([0-9a-f]{40})", SOURCE_DIGEST.read_text(), re.MULTILINE)
+        self.assertIsNotNone(
+            recorded,
+            "packaging/debian/dnscrypt-proxy.sha256 records no tag commit, so a re-tag upstream "
+            "and a corrupted download would be indistinguishable",
+        )
+        self.assertIn(
+            f"tag commit:       {recorded.group(1)}", self.read(BUILD_MANIFEST),
+            "the manifest does not record the pinned tag's commit",
+        )
+        self.assertIn("tag commit:", shell_code(BUILD_SCRIPT.read_text()))
+
     def test_the_manifest_records_the_module_digests_that_were_built(self):
         text = self.read(BUILD_MANIFEST)
         for committed in ("go.mod", "go.sum"):
@@ -1679,6 +2305,40 @@ class BuildTests(_Staged):
                     digest, text,
                     f"the manifest does not record the {committed} digest that was built against",
                 )
+
+    def test_the_programs_the_build_verifies_with_are_the_programs_it_ships(self):
+        """Same source, same flags, same architecture, differing only in `-o`.
+
+        This is the claim the task report's first version got wrong: it said the three
+        executed binaries were the shipped ones on an amd64 host, and for
+        mosdns-router and mosdns-cdnctl that was FALSE, because this script passed
+        `-s -w` and no `METADATA_LDFLAGS` while the Makefile passed both -- two
+        different compilations of one source, one of which shipped and one of which
+        the gate verified. With the metadata injected it is true, and MEASURED: two
+        builds of cmd/mosdns-cdnctl with identical flags and an identical BuildTime
+        produce digest 4b1bec2748665482fb6db7a7d1f4c850e0419ac3d94a174e7d88b141c617ea6c
+        on both sides. The claim is asserted here as a property of the build rather
+        than left as prose, because prose is what let it drift."""
+        script = shell_code(BUILD_SCRIPT.read_text())
+        # One function builds all three, and the flags it passes are the flags the
+        # shipped copy and the verifier copy both get.
+        self.assertEqual(
+            script.count("build_go_binary ./cmd/"), 3,
+            "the router, the control tool and the verifier's control tool are not all built by "
+            "one function, so the shipped and verified copies can drift apart again",
+        )
+        self.assertEqual(
+            script.count('build_go_binary ./cmd/mosdns-cdnctl "$verifier_dir/mosdns-cdnctl" "$HOST_ARCH"'),
+            1,
+        )
+        self.assertIn("-ldflags \"-s -w $METADATA_LDFLAGS\"", script)
+        # dnscrypt-proxy has no buildinfo of ours, so its two builds differ by nothing
+        # at all -- same source, same flags, same arch.
+        self.assertEqual(
+            script.count('-mod=vendor -trimpath -ldflags "-s -w"'), 2,
+            "the resolver is not built with one set of flags for the package and another for "
+            "the verification",
+        )
 
     def test_the_recorded_source_digest_is_a_digest_of_the_named_archive(self):
         fields = recorded_digest()
@@ -1720,6 +2380,32 @@ class BuildTests(_Staged):
         self.assertNotIn(
             '"$STAGE/usr/lib/mosdns-router/mosdns-cdnctl" render', script,
             "the render runs the SHIPPED control tool, which a cross build cannot execute",
+        )
+
+    def test_the_redundant_postinst_path_is_a_link_to_the_one_script(self):
+        """`packaging/mosdns-router.postinst` is in this plan's file map and
+        `packaging/debian/postinst` is too, which is one script and two required
+        paths. It is a COMMITTED SYMLINK rather than a second copy, and it is
+        committed because a build script that created it would be writing into the
+        source tree on every run: deleting the link would then break nothing, satisfy
+        nothing, and come back unannounced. A test is what makes it real."""
+        redundant = REPO / "packaging" / "mosdns-router.postinst"
+        self.assertTrue(
+            redundant.is_symlink(),
+            f"{redundant.relative_to(REPO)} is not a symbolic link, so the plan's two required "
+            "paths are either two copies of a maintainer script or one missing one",
+        )
+        self.assertEqual(
+            os.readlink(redundant), "debian/postinst",
+            "the link does not point at packaging/debian/postinst",
+        )
+        self.assertTrue(
+            (redundant.parent / os.readlink(redundant)).is_file(),
+            "the link's target is not a file",
+        )
+        self.assertNotIn(
+            "ln -sf", shell_code(BUILD_SCRIPT.read_text()),
+            "the build script creates the link, so it writes into the source tree on every run",
         )
 
     def test_the_build_script_refuses_to_build_an_unverified_source_tree(self):
@@ -1925,6 +2611,34 @@ class ControlTests(unittest.TestCase):
         cls.original = source
         cls.copies = {}
 
+    def assertMethodFails(self, case_class, method, **kwargs):
+        """Assert that a test METHOD fails once the inputs it reads are replaced.
+
+        ``staged=`` replaces a file in a private copy of the staging root; anything
+        else is a maintainer script held in memory. The method is called directly,
+        which is the whole point: a control that called the helper instead would be a
+        second implementation of the check rather than evidence about the first.
+        """
+        staged = kwargs.pop("staged", None)
+        if staged is None:
+            with scripts_replaced(**kwargs):
+                case = case_class(method)
+                with self.assertRaises(AssertionError):
+                    getattr(case, method)()
+            return
+        target = os.path.join(scratch_directory("mosdns-method-control."), "staging")
+        shutil.copytree(self.original, target, symlinks=True)
+        for relative, contents in staged.items():
+            planted = Path(target) / relative.lstrip("/")
+            planted.parent.mkdir(parents=True, exist_ok=True)
+            planted.write_text(contents, encoding="utf-8")
+        root = Path(target)
+        case = case_class(method)
+        case.root = str(root)
+        case.inventory = staged_inventory(root)
+        with self.assertRaises(AssertionError):
+            getattr(case, method)()
+
     def copy(self, mutate):
         """A private copy of the staged tree with ``mutate`` applied to it."""
         target = os.path.join(scratch_directory("mosdns-package-control."), "staging")
@@ -1979,6 +2693,45 @@ class ControlTests(unittest.TestCase):
         )
 
     # -- the two ways a package can put a machine on the wrong resolver ------
+
+    def test_a_planted_resolver_address_is_found_by_the_method_that_scans_for_them(self):
+        """The METHOD, against a staged copy carrying one planted address.
+
+        The address is one the DENYLIST covers, because that is the only thing this
+        control can prove about this method. An address the denylist does not cover is
+        the allowlist's business, and the control below plants exactly those.
+        """
+        address = "223.5.5.5"
+        self.assertIn(
+            address, FORBIDDEN_ADDRESSES,
+            "the control plants an address the denylist does not list, so it proves nothing",
+        )
+        self.assertMethodFails(
+            ForbiddenContentTests,
+            "test_no_forbidden_resolver_address_appears_anywhere_in_the_package",
+            staged={CONFIG_DIRECTORY + "/mosdns.yaml": f"listen: {address}:53\n"},
+        )
+
+    def test_an_unlisted_address_is_found_by_the_allowlist_method(self):
+        """The allowlist's own control, and the one the denylist could not have: six
+        addresses that are on neither list, four of them IPv4 and two IPv6, none of
+        which the twelve-literal denylist would have named."""
+        for address in ("1.2.4.8", "210.2.4.8", "211.98.20.20", "221.5.88.88", "2400:3200::1", "2402:4e00::"):
+            with self.subTest(address=address):
+                self.assertNotIn(
+                    address, "".join(FORBIDDEN_ADDRESSES),
+                    f"{address} is already on the denylist, so this control proves nothing about "
+                    "the allowlist",
+                )
+                # The shape is an upstream line rather than a `listen:` line, because
+                # `listen: <ipv6>:53` is ambiguous text and a control that plants an
+                # unparseable line would be testing the tokeniser's tolerance rather
+                # than the allowlist.
+                self.assertMethodFails(
+                    ForbiddenContentTests,
+                    "test_every_address_a_shipped_document_names_is_one_this_package_may_configure",
+                    staged={CONFIG_DIRECTORY + "/mosdns.yaml": f"  - addr: {address}\n"},
+                )
 
     def test_a_planted_resolver_address_is_reported(self):
         path = CONFIG_DIRECTORY + "/mosdns.yaml"
@@ -2069,10 +2822,20 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(shipped, ["/var/lib/mosdns/runtime/ech-state.json"])
 
     def test_a_reversed_provisioning_order_is_reported(self):
+        """The METHOD, not the helper. A control that re-implemented the check would
+        pass while the method it holds was inverted, and the class docstring's claim
+        would be false; so the mutation is applied to a copy of the script and the
+        method is called against it."""
         good = POSTINST.read_text()
-        self.assertEqual(order_findings(good), [], "the shipped postinst does not pass its own check")
         broken = "\n".join(_swap_a_directory_pair(good))
         self.assertNotEqual(broken, good, "the mutation changed nothing, so the control is empty")
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_provisions_the_state_directories_in_the_load_bearing_order",
+            postinst=broken,
+        )
+        # And the method is what fails, for the reason it names, not for some other
+        # reason it happens to have found.
         findings = order_findings(broken)
         self.assertTrue(
             any("narrows" in finding for finding in findings),
@@ -2084,19 +2847,23 @@ class ControlTests(unittest.TestCase):
         cannot create a state file in it at all. Measured, not assumed."""
         broken = POSTINST.read_text().replace("-m 2770", "-m 2750")
         self.assertNotIn("-m 2770", broken, "the mutation changed nothing")
-        findings = order_findings(broken)
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_provisions_the_state_directories_in_the_load_bearing_order",
+            postinst=broken,
+        )
         self.assertTrue(
-            any("-m 2770" in finding for finding in findings),
-            f"provisioning the state directories at 2750 is not reported: {findings}",
+            any("-m 2770" in finding for finding in order_findings(broken)),
+            "provisioning the state directories at 2750 is not named by the reader",
         )
 
     def test_a_directory_created_without_its_group_is_reported(self):
         broken = POSTINST.read_text().replace("-g mosdns", "-g root")
         self.assertNotIn("-g mosdns", broken, "the mutation changed nothing")
-        findings = order_findings(broken)
-        self.assertTrue(
-            any("-g mosdns" in finding for finding in findings),
-            f"provisioning the state directories without the service group is not reported: {findings}",
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_provisions_the_state_directories_in_the_load_bearing_order",
+            postinst=broken,
         )
 
     def test_a_tmpfiles_entry_with_no_default_acl_is_reported(self):
@@ -2108,6 +2875,26 @@ class ControlTests(unittest.TestCase):
         self.assertTrue(
             any("DEFAULT group entry" in finding for finding in findings),
             f"a /run/mosdns ACL with no default entry is not reported: {findings}",
+        )
+
+    def test_a_reversed_tmpfiles_entry_is_reported(self):
+        """The `a` line before the `d` line is the same load-bearing pair the postinst
+        order is about, and nothing held it: a check that asked "is there an ACL" would
+        pass an entry that creates the directory with no ACL at all."""
+        good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
+        lines = [line for line in good.splitlines() if line]
+        create = next(index for index, line in enumerate(lines) if line.startswith("d "))
+        acl = next(index for index, line in enumerate(lines) if line.startswith("a "))
+        self.assertLess(create, acl, "the shipped entry does not have the order it should")
+        lines[create], lines[acl] = lines[acl], lines[create]
+        self.assertMethodFails(
+            TmpfilesTests,
+            "test_the_tmpfiles_entry_recreates_run_mosdns_with_the_same_properties",
+            staged={TMPFILES_PATH: "\n".join(lines) + "\n"},
+        )
+        self.assertTrue(
+            any("BEFORE" in finding for finding in tmpfiles_findings("\n".join(lines))),
+            "the reversed order is not named by the reader",
         )
 
     def test_a_space_separated_acl_is_reported(self):
@@ -2185,6 +2972,27 @@ class ControlTests(unittest.TestCase):
             sorted(listed - shipped - GENERATED), [TMPFILES_PATH],
             "the manifest lists a file the package does not contain, and nothing noticed",
         )
+
+
+def _swap_the_timer_enable_before_the_transaction(text):
+    """Move the three `systemctl enable` lines above the install transaction.
+
+    The commands, unchanged, in the wrong place: that is the mutation that shipped.
+    The enable is two lines (the command and its continuation) and the transaction is
+    guarded by an `if !`, so the insertion point is the guard rather than the call --
+    placing it inside the guard would be a different mutation, and one the failure-arm
+    assertion covers.
+    """
+    lines = text.splitlines()
+    enable = next(index for index, line in enumerate(lines) if "systemctl enable" in line)
+    moved = lines[enable:enable + 2]
+    if "mosdns-list-check.timer" not in moved[-1]:
+        moved = [lines[enable]]
+    rest = lines[:enable] + lines[enable + len(moved):]
+    guard = next(
+        index for index, line in enumerate(rest) if line.strip().startswith('if ! "$INSTALLER" install')
+    )
+    return rest[:guard] + moved + rest[guard:]
 
 
 def _swap_a_directory_pair(text):
