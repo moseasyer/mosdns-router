@@ -19,6 +19,28 @@ INSTALLER_TESTS := installer/tests
 #
 # Nothing in it installs anything on the machine that runs it, and the entry-point
 # regression below asserts that as well.
+#
+# BUILD PREREQUISITES, in the order you meet them:
+#
+#   go 1.25.8          exact, not a minor version. `check-go` refuses anything else
+#                      and so does the build script, because the packaged resolver's
+#                      own go.mod asks for exactly this release.
+#   bwrap              the bubblewrap package. The two generated documents are
+#                      rendered for the INSTALLED layout, and a private view of / is
+#                      what makes /etc/mosdns/policy.yaml resolve without a byte being
+#                      written to the build host's /etc. Without it the build stops
+#                      with a message naming the package; it does not fall back.
+#   the source archive below, seeded once with
+#                      mkdir -p build && curl -L -o build/dnscrypt-proxy-2.1.18.tar.gz \
+#                        https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/2.1.18.tar.gz
+#                      and thereafter verified against packaging/debian/dnscrypt-proxy.sha256
+#                      on every build. The digest and the tag's commit are both there.
+#
+# GOTMPDIR and GOCACHE: this host's /tmp is a 1.7 GB tmpfs, so a Go build fails with
+# "disk quota exceeded" unless both are pointed at the disk-backed filesystem. That
+# is an environment note and not a Makefile change, for the reason the ledger gives:
+# the failure is loud enough that it cannot produce a false pass, a Makefile cannot
+# know a disk-backed path on an arbitrary host, and this file's contents are asserted.
 DNSCRYPT_ARCHIVE ?= build/dnscrypt-proxy-2.1.18.tar.gz
 PACKAGE_SCRIPT := scripts/build-deb.sh
 
@@ -134,8 +156,23 @@ test-python:
 # `make verify` builds a package. That is the point: the package is the artifact
 # whose content matters, and a content test that read a checked-in expectation
 # instead of the build would be testing the expectation.
+#
+# Which is also why GO and the archive location are passed here and not left to the
+# environment. `scripts/build-deb.sh` requires exactly Go 1.25.8 and verifies the
+# pinned dnscrypt-proxy archive's digest, and it reads both from the environment, so
+# a `test-installer` recipe that passed neither would build the staging root with
+# whatever `go` happened to be first on PATH and with whatever archive happened to
+# sit in build/ -- while `package`, three lines below, was given the pinned toolchain
+# explicitly. That is not a theoretical split: a gate run as `make GO=… verify` would
+# have tested the package with one toolchain and built it with another, and a host with
+# no Go at all produced nine setUpClass errors and a gate that looked like a pass
+# because the failures were in a class that never ran.
+#
+# Both variables are named here rather than derived, so `make -n test-installer`
+# prints the same command a run would use and the entry-point regression can read it.
 test-installer:
-	@$(PYTHON) -m unittest discover -s $(INSTALLER_TESTS)
+	@GO='$(GO)' MOSDNS_DNSCRYPT_ARCHIVE='$(DNSCRYPT_ARCHIVE)' \
+		$(PYTHON) -m unittest discover -s $(INSTALLER_TESTS)
 
 # This is a separate, non-recursive target: the regression harness inspects the
 # real Makefile with `make -n` and never invokes `make test` recursively.
@@ -167,8 +204,15 @@ verify-build-info: build
 # GO and the archive location are passed through rather than read out of the
 # environment, so `make -n package` prints the same command a run would use -- and
 # so the entry-point regression can read what this target plans.
+#
+# The three build-identity values go in as well, for the reason the recipe of
+# test-installer now explains: a build that injects no metadata ships a router that
+# reports dev/unknown/unknown, and `make build` and `make package` must not be two
+# different compilations of the same source.
 package:
-	@GO='$(GO)' MOSDNS_DNSCRYPT_ARCHIVE='$(DNSCRYPT_ARCHIVE)' sh $(PACKAGE_SCRIPT)
+	@GO='$(GO)' MOSDNS_DNSCRYPT_ARCHIVE='$(DNSCRYPT_ARCHIVE)' \
+		VERSION='$(VERSION)' REVISION='$(REVISION)' BUILD_TIME='$(BUILD_TIME)' \
+		sh $(PACKAGE_SCRIPT)
 
 verify: test test-integration test-installer verify-build-info package
 	@$(GO) vet -mod=readonly ./...

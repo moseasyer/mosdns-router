@@ -237,6 +237,19 @@ for target in test-installer verify; do
 		fail "$target does not run the python installer suite"
 		sed 's/^/    /' "$work/dryrun" >&2 || true
 	fi
+	# The suite BUILDS a package -- it runs scripts/build-deb.sh --stage -- and that
+	# script requires exactly Go 1.25.8 from $PATH and verifies the pinned
+	# dnscrypt-proxy archive's digest. So the recipe has to hand it the toolchain and
+	# the archive the way `package` does, or `make GO=… verify` tests the package with
+	# one toolchain and builds it with another. This is not theoretical: a host with
+	# no Go on PATH produced nine setUpClass errors, and the gate looked healthy
+	# because the failing class never ran.
+	for wiring in "GO=" "MOSDNS_DNSCRYPT_ARCHIVE="; do
+		if ! grep -q "$wiring" "$work/dryrun"; then
+			fail "$target does not pass $wiring to the installer suite, so the package it tests is built with whatever toolchain is on PATH"
+			sed 's/^/    /' "$work/dryrun" >&2 || true
+		fi
+	done
 done
 
 # 6c. `package` is part of the gate, and it installs nothing. A package that cannot
@@ -258,6 +271,25 @@ for forbidden in 'dpkg -i' 'apt-get' 'systemctl ' 'nmcli '; do
 	if grep -q -- "$forbidden" "$work/dryrun"; then
 		fail "the acceptance gate plans a command that would change this machine: $forbidden"
 	fi
+done
+# And the two halves of the gate must be given the SAME toolchain and the same
+# archive. `package` already passed them; this is the assertion that keeps
+# `test-installer` passing them too, in the one place a reader looks when the gate
+# has tested a package it did not build.
+for target in package test-installer; do
+	status=0
+	make --no-print-directory -n "$target" GO="$work/go-required-version" >"$work/dryrun" 2>&1 || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "dry run of $target exited $status"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+		continue
+	fi
+	for wiring in "GO='$work/go-required-version'" "MOSDNS_DNSCRYPT_ARCHIVE='"; do
+		if ! grep -q -- "$wiring" "$work/dryrun"; then
+			fail "$target does not receive $wiring, so it builds the package with a toolchain or an archive the caller did not ask for"
+			sed 's/^/    /' "$work/dryrun" >&2 || true
+		fi
+	done
 done
 
 # 7. The acceptance gate runs the end-to-end suite. tests/integration is the only
