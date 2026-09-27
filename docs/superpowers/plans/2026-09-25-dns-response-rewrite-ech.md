@@ -367,10 +367,12 @@ Task 3 shipped and was reviewed. Five defects were Important and are fixed; the 
 now states the behaviour they changed, because two of them are decisions a package
 cannot make on its own and a third is a rule Task 5 inherits.
 
-**Interfaces (shipped).** `internal/dnsrewrite` exports, and this is the shape Task
-5 compiles against. The block itself now lives in **Interfaces produced by this
-plan** above, with the rest of that package's surface, so there is one copy of it to
-be right; it is:
+**Interfaces (shipped, historical).** `internal/dnsrewrite` exports, and this is the
+shape Task 5 compiled against. The corrected block now lives in **Interfaces produced
+by this plan** above, with the rest of that package's surface; that block is the one
+to be right. The copy below is the shape as it stood at Task 3, kept because it is
+what the Task 3 review was written against, and it is SUPERSEDED wherever the two
+differ — the block above wins. It is:
 
 ```go
 func HTTPS(in HTTPSInput) (*dns.Msg, error)
