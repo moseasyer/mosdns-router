@@ -203,14 +203,35 @@ fi
 # directory, because the pin names a bare file name. This is the line that makes
 # "never builds an unverified tree" true: it runs before the archive is opened, and
 # a mismatch exits non-zero out of `set -e`.
-recorded_digest=$(grep -v '^[[:space:]]*#' "$DNSCRYPT_PIN" | grep -v '^[[:space:]]*$' | cut -d' ' -f1)
-[ -n "$recorded_digest" ] || die "$DNSCRYPT_PIN records no digest"
-# The tag's commit is recorded beside the archive's digest, and it is not a
-# checksum: a digest proves the archive is the same bytes every time and says nothing
-# about whether those bytes are what the tag points at today. With both recorded, a
-# future divergence is attributable to a RE-TAG -- which moves this SHA -- rather than
-# to a transport change, which would not.
-recorded_commit=$(sed -n 's/^tag-commit:[[:space:]]*\([0-9a-f]\{40\}\).*/\1/p' "$DNSCRYPT_PIN")
+# SELECTED BY SHAPE, and the shape is a 64-lowercase-hex first field. Not by
+# position, and the first version of this line was exactly that -- "the first
+# non-comment, non-blank line, first field" -- which broke the moment a labelled line
+# was added above the digest: `recorded_digest` became the literal string
+# `tag-commit:`, the non-empty guard was satisfied by a label, and the shipped
+# BUILD-MANIFEST printed
+#
+#     archive sha256:   tag-commit:
+#
+# with the real digest on the NEXT line, where a person reading the .deb would not
+# see it. A pin is a file that gains lines; position is not a stable way to find the
+# one that matters. A label cannot be mistaken for a digest because a label ends in a
+# colon, and a 64-hex field cannot be a label because a label is not hex.
+recorded_digest=$(
+	sed -n 's/^\([0-9a-f]\{64\}\)[[:space:]]\{1,\}\S\{1,\}$/\1/p' "$DNSCRYPT_PIN"
+)
+[ -n "$recorded_digest" ] ||
+	die "$DNSCRYPT_PIN records no archive digest, and this build refuses to build from a tree
+     whose digest nobody pinned. The line it wants is a sha256sum line: 64 hex characters,
+     whitespace, and the archive's file name."
+# The tag's commit, selected by LABEL inside a comment. A comment, not a bare
+# `tag-commit:` line, because this file is a `sha256sum -c` file: a bare label above
+# the digest makes that command print "WARNING: 1 line is improperly formatted" on a
+# file whose own comment tells the reader to run it. Recorded here so that a future
+# divergence is attributable to a RE-TAG -- which moves this SHA -- rather than to a
+# transport change, which would not, and neither number is a signature.
+recorded_commit=$(
+	sed -n 's/^#[[:space:]]*tag-commit:[[:space:]]*\([0-9a-f]\{40\}\)[[:space:]]*$/\1/p' "$DNSCRYPT_PIN"
+)
 [ -n "$recorded_commit" ] ||
 	die "$DNSCRYPT_PIN records no tag commit, so a re-tag upstream and a corrupted
      download would be indistinguishable and the pin would absorb the first silently"
@@ -439,18 +460,18 @@ fi
 	echo
 	echo "dnscrypt-proxy $DNSCRYPT_VERSION"
 	echo "----------------------$(printf '%*s' ${#DNSCRYPT_VERSION} '' | tr ' ' '-')"
-	echo "source:           $DNSCRYPT_SOURCE_URL"
-	echo "archive:          $DNSCRYPT_ARCHIVE"
-	echo "archive sha256:   $recorded_digest"
-	echo "tag commit:       $recorded_commit"
-	echo "go.mod sha256:    $(sha256sum "$DNSCRYPT_DIR/go.mod" | cut -d' ' -f1)"
-	echo "go.sum sha256:    $(sha256sum "$DNSCRYPT_DIR/go.sum" | cut -d' ' -f1)"
+	echo "source:             $DNSCRYPT_SOURCE_URL"
+	echo "archive:            $DNSCRYPT_ARCHIVE"
+	echo "archive sha256:     $recorded_digest"
+	echo "tag commit:         $recorded_commit"
+	echo "go.mod sha256:      $(sha256sum "$DNSCRYPT_DIR/go.mod" | cut -d' ' -f1)"
+	echo "go.sum sha256:      $(sha256sum "$DNSCRYPT_DIR/go.sum" | cut -d' ' -f1)"
 	echo "modules.txt sha256: $(sha256sum "$DNSCRYPT_DIR/vendor/modules.txt" | cut -d' ' -f1)"
-	echo "build flags:      -mod=vendor CGO_ENABLED=0 -trimpath -ldflags -s -w"
-echo "built for:        $ARCH"
-echo "verified with:    the host's own build of the same sources ($HOST_ARCH), because"
-echo "                  the render and the resolver's -check are steps this build machine"
-echo "                  runs and neither has an architecture-dependent result"
+	echo "build flags:        -mod=vendor CGO_ENABLED=0 -trimpath -ldflags -s -w"
+	echo "built for:          $ARCH"
+	echo "verified with:      the host's own build of the same sources ($HOST_ARCH), because"
+	echo "                    the render and the resolver's -check are steps this build machine"
+	echo "                    runs and neither has an architecture-dependent result"
 	echo
 	echo "Shipped binary digests (sha256)"
 	echo "--------------------------------"

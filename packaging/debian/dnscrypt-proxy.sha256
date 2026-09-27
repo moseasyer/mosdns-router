@@ -1,5 +1,23 @@
 # The pinned dnscrypt-proxy source, and the digest it has to carry.
 #
+# This file is a `sha256sum -c` file and is meant to be used as one, from the
+# directory holding the archive:
+#
+#   sha256sum -c packaging/debian/dnscrypt-proxy.sha256     # from the repository root
+#   (cd build && sha256sum -c ../packaging/debian/dnscrypt-proxy.sha256)
+#
+# That is why EVERY non-comment line below is a `<64 hex>  <file name>` line and
+# nothing else. The first version of this file carried the tag's commit as a bare
+# `tag-commit: <40 hex>` line, and `sha256sum -c` answered it with
+#
+#   sha256sum: WARNING: 1 line is improperly formatted
+#
+# on a file whose own comment told the reader to run exactly that command. The
+# alternative -- dropping the instruction -- was rejected: the file is a checksum
+# file, and telling a checksum file's reader not to use the checksum tool is worse
+# than one extra comment. The commit therefore lives in a COMMENT, and the build
+# script reads it back out by label.
+#
 # dnscrypt-proxy is not a dependency of this package: the binary is built from
 # source into the package, so there is a source tree to pin. scripts/build-deb.sh
 # verifies the line below against the archive it was given BEFORE it extracts
@@ -12,16 +30,14 @@
 #   curl -L -o build/dnscrypt-proxy-2.1.18.tar.gz \
 #     https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/2.1.18.tar.gz
 #
-# `sha256sum -c packaging/debian/dnscrypt-proxy.sha256` from the repository root
-# checks a copy already placed in build/.
-#
-# The tag's COMMIT is recorded as well as the archive's digest, and it is not a
+# THE TAG'S COMMIT is recorded as well as the archive's digest, and it is not a
 # checksum: it is `git ls-remote https://github.com/DNSCrypt/dnscrypt-proxy
 # refs/tags/2.1.18` from the same fetch. A digest proves the archive is the same
 # bytes every time and says nothing about whether those bytes are what the tag
-# points at today, so a future divergence is attributable to a RE-TAG (which moves
-# this SHA) rather than to a transport change (which would not) -- and a re-tag is a
-# change somebody has to look at, not one a pin silently absorbs. Neither number is a
-# signature; see the task report's NOT VERIFIED list.
-tag-commit: 30c0a9e91c12a15c081ac90546dd657c4ab98fbc
+# points at today, so with both recorded a future divergence is attributable to a
+# RE-TAG -- which moves this SHA -- rather than to a transport change, which would
+# not. A re-tag is a change somebody has to look at rather than one a pin silently
+# absorbs. Neither number is a signature; see the task report's NOT VERIFIED list.
+#
+# tag-commit: 30c0a9e91c12a15c081ac90546dd657c4ab98fbc
 9b810d862ba07c383cc0b8f9f7f1f2ca8f74a02f849d818c4c4d37cc21a7dfa6  dnscrypt-proxy-2.1.18.tar.gz

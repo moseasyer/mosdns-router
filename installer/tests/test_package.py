@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -697,25 +698,146 @@ def function_body(source, name):
     return rest[: end.start()] if end is not None else rest
 
 
-def recorded_digest():
-    """The pinned source digest as ``(digest, file name)``, comments ignored.
+# The label every digest in this project is written under, and the label the pinned
+# tag's commit is written under. Two readers, two labels, and a reader that selects
+# by LABEL rather than by position -- because the first version of the build script's
+# reader took the first non-comment line, and the moment a labelled line was added
+# above the digest that reader returned the literal string "tag-commit:" and wrote it
+# into the shipped BUILD-MANIFEST as the archive's digest.
+#
+# Position is the wrong thing to depend on, and the reason is not theoretical: a pin
+# is a file that GAINS lines. Every new fact recorded beside the digest -- a second
+# checksum, a source URL, a note about which release it is -- becomes the first line
+# a positional reader picks up, and the failure is silent because the reader's own
+# guard ("is it non-empty?") is answered by a label.
+DIGEST_LABEL = "archive sha256:"
+COMMIT_LABEL = "tag commit:"
+# A sha256sum line: 64 lowercase hex, a separator, and the file name. A label cannot
+# match it, because a label ends in a colon and the first field here is hex.
+SHA256SUM_LINE = re.compile(r"^([0-9a-f]{64})[ \t]+\*?(\S+)$")
+PIN_COMMIT_LINE = re.compile(r"^#\s*tag-commit:\s*([0-9a-f]{40})\s*$")
+# A manifest field: `label` then whitespace then the value, to end of line. Anchored
+# on the label WITH its colon so `archive sha256:` cannot match `archive sha256: xx`.
+MANIFEST_FIELD = re.compile(r"^([a-z][a-z0-9 ]*):[ \t]+(\S.*?)[ \t]*$", re.MULTILINE)
 
-    The file is in ``sha256sum`` format so that ``sha256sum -c`` can check it
-    directly, which means it can carry comments saying where the archive comes
-    from, and a reader that did not skip them would read a sentence as a digest.
+
+def manifest_field(text, label):
+    """One `label: value` line of a BUILD-MANIFEST, by label.
+
+    The point of reading it this way is that "the digest appears somewhere in the
+    file" is not the claim. The shipped manifest printed a real digest on the line
+    BELOW the `archive sha256:` field, so a presence check passed while the field a
+    person reads said `tag-commit:` -- and the gate was blind to the difference.
     """
-    lines = [
-        line for line in SOURCE_DIGEST.read_text().splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-    # The file carries the tag's commit as a `key: value` line beside the one digest
-    # line, so it is filtered out here rather than being mistaken for a second digest.
-    digests = [line for line in lines if re.match(r"^[0-9a-f]{64}\s", line)]
-    if len(digests) != 1:
+    matches = MANIFEST_FIELD.findall(text)
+    # The label the caller passes INCLUDES the colon, because that is how the field
+    # reads in the file; the capture does not, because the colon is what separates the
+    # two halves. Comparing the two directly is a field that can never be found, which
+    # is a check that passes for the wrong reason whenever it is allowed to raise.
+    values = [value for name, value in matches if name + ":" == label]
+    if len(values) != 1:
         raise AssertionError(
-            f"{SOURCE_DIGEST.name} has {len(digests)} digest lines, want exactly one"
+            f"the manifest has {len(values)} {label!r} fields, want exactly one"
         )
-    return digests[0].split()
+    return values[0]
+
+
+def pin_digest(text, where="the pin"):
+    """The one `<64 hex>  <file name>` line of a pin, selected by SHAPE.
+
+    Shape, not position, and not "the first line that is not a comment": the pin
+    carries the tag's commit as a comment above the one `sha256sum -c` line, and a
+    reader that took the first non-comment line took a comment's payload. A 64-hex
+    first field is something a label cannot be, because a label ends in a colon.
+    """
+    digests = [
+        match.groups()
+        for match in (SHA256SUM_LINE.match(line.strip()) for line in text.splitlines())
+        if match is not None
+    ]
+    if len(digests) != 1:
+        raise AssertionError(f"{where} has {len(digests)} sha256sum lines, want exactly one")
+    return digests[0]
+
+
+def pin_commit(text, where="the pin"):
+    """The one `# tag-commit: <40 hex>` of a pin, selected by LABEL.
+
+    A comment, so that `sha256sum -c` stays clean on the pin: a bare
+    `tag-commit: <40 hex>` line is neither a comment nor a digest, and `sha256sum -c`
+    answers such a line with "WARNING: 1 line is improperly formatted" -- on a file
+    whose own comment tells the reader to run exactly that command.
+    """
+    commits = [
+        match.group(1) for match in
+        (PIN_COMMIT_LINE.match(line) for line in text.splitlines())
+        if match is not None
+    ]
+    if len(commits) != 1:
+        raise AssertionError(f"{where} has {len(commits)} tag-commit lines, want exactly one")
+    return commits[0]
+
+
+def recorded_digest():
+    """The pinned archive's digest and file name. See pin_digest for the rule."""
+    return pin_digest(SOURCE_DIGEST.read_text(), SOURCE_DIGEST.name)
+
+
+def recorded_commit():
+    """The pinned tag's commit. See pin_commit for why it lives in a comment."""
+    return pin_commit(SOURCE_DIGEST.read_text(), SOURCE_DIGEST.name)
+
+
+# The reader the SHIPPED build script uses, extracted from the script and run here.
+#
+# Not a copy of it. The first version of the manifest test proved the TEST's reader
+# correct while the shipped one stayed positional, so the shipped manifest printed a
+# label where a checksum belongs and the gate passed; a copy of the shipped reader
+# would have been free to drift the same way. Extracting the script's own sed
+# expression and running `sed` with it means a change to the build script's reader is
+# a change to what this control measures.
+def shipped_reader_digest(text, where="the planted pin"):
+    """What `scripts/build-deb.sh` would read as the archive's digest, from `text`.
+
+    The script's OWN `$( ... )` extraction block is extracted and run, with
+    `DNSCRYPT_PIN` pointed at a temporary copy of `text`. Not a copy of the reader, and
+    not an assumption about its shape: the first version of the manifest test proved
+    the TEST's reader correct while the shipped one stayed positional, so a copy of the
+    shipped reader would have been free to drift the same way, and an earlier attempt
+    at this control required the reader to be a `sed -n` and so reported "the reader
+    changed shape" instead of "the reader returned the wrong value" -- which is a
+    message about the control rather than about the defect.
+    """
+    script = BUILD_SCRIPT.read_text()
+    block = re.search(
+        r"^recorded_digest=\$\((?P<body>.*?)^\)$", script, re.MULTILINE | re.DOTALL
+    )
+    if block is None:
+        raise AssertionError(
+            "scripts/build-deb.sh no longer reads the digest from a $( ... ) block, so this "
+            "control cannot run what the build actually runs"
+        )
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".pin", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(text)
+        planted = handle.name
+    try:
+        program = (
+            f'DNSCRYPT_PIN={shlex.quote(planted)}\n'
+            "recorded_digest=$(" + block.group("body") + ")\n"
+            'printf %s "$recorded_digest"\n'
+        )
+        result = subprocess.run(
+            ["sh", "-c", program], capture_output=True, text=True, check=False
+        )
+    finally:
+        os.unlink(planted)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"the shipped reader failed on {where}: {result.stderr.strip()[:300]}"
+        )
+    return result.stdout.strip()
 
 
 def manifest_entries(text):
@@ -2198,8 +2320,15 @@ class BuildTests(_Staged):
         self.assertIn("dnscrypt-proxy", text)
         self.assertIn(DNSCRYPT_VERSION, text)
         self.assertIn(DNSCRYPT_SOURCE_URL, text)
+        # The FIELD, not "the digest appears somewhere". The shipped manifest printed
+        # a real digest on the line below `archive sha256:` and the field itself said
+        # `tag-commit:`, and a presence check passed while a person holding the .deb
+        # read a label where a checksum belongs.
         digest = recorded_digest()[0]
-        self.assertIn(digest, text, "the manifest does not record the verified source digest")
+        self.assertEqual(
+            manifest_field(text, DIGEST_LABEL), digest,
+            "the manifest's archive sha256 field is not the pinned archive's digest",
+        )
         for binary in COMPILED:
             with self.subTest(binary=binary):
                 actual = hashlib.sha256(self.read_bytes(binary)).hexdigest()
@@ -2284,17 +2413,20 @@ class BuildTests(_Staged):
         about whether those bytes are what the tag points at today. With the commit
         beside it, a future divergence is attributable to a re-tag rather than to a
         transport change -- and a re-tag is a change somebody has to look at."""
-        recorded = re.search(r"^tag-commit:\s*([0-9a-f]{40})", SOURCE_DIGEST.read_text(), re.MULTILINE)
-        self.assertIsNotNone(
-            recorded,
+        commit = recorded_commit()
+        self.assertIn(
+            f"# tag-commit: {commit}", SOURCE_DIGEST.read_text(),
             "packaging/debian/dnscrypt-proxy.sha256 records no tag commit, so a re-tag upstream "
             "and a corrupted download would be indistinguishable",
         )
-        self.assertIn(
-            f"tag commit:       {recorded.group(1)}", self.read(BUILD_MANIFEST),
-            "the manifest does not record the pinned tag's commit",
+        # In the manifest it is a FIELD OF ITS OWN, read by label for the same reason
+        # the digest is: its whole purpose is being attributable later, and a value
+        # that has to be found by searching the file for a 40-hex string is not.
+        self.assertEqual(
+            manifest_field(self.read(BUILD_MANIFEST), COMMIT_LABEL), commit,
+            "the manifest does not record the pinned tag's commit under its own field",
         )
-        self.assertIn("tag commit:", shell_code(BUILD_SCRIPT.read_text()))
+        self.assertIn("tag-commit:", shell_code(BUILD_SCRIPT.read_text()))
 
     def test_the_manifest_records_the_module_digests_that_were_built(self):
         text = self.read(BUILD_MANIFEST)
@@ -2338,6 +2470,69 @@ class BuildTests(_Staged):
             script.count('-mod=vendor -trimpath -ldflags "-s -w"'), 2,
             "the resolver is not built with one set of flags for the package and another for "
             "the verification",
+        )
+
+    def test_a_decoy_line_above_the_digest_does_not_become_the_digest(self):
+        """The control for the reader, and the shape of the bug this round fixed.
+
+        The shipped build script's reader took the first non-comment line's first
+        field. The moment a labelled line was added above the digest -- a `tag-commit:`
+        line, recorded for a reason -- that reader returned the literal string
+        `tag-commit:`, its own non-empty guard was satisfied by a label, and the
+        BUILD-MANIFEST shipped in the .deb printed `archive sha256:   tag-commit:`
+        with the real digest on the NEXT line, where a person reading the package
+        would not see it. Provenance verification was unaffected: `sha256sum -c` still
+        checked the archive and exited 0.
+
+        A pin is a file that GAINS lines, so the reader is asked about four extra ones
+        above the digest and has to return the digest for all of them. The build
+        script's own sed is run on the same file, because a test that proved the
+        TEST's reader correct while the SHIPPED one stayed positional is exactly what
+        the first version of this test did.
+        """
+        real = SOURCE_DIGEST.read_text()
+        digest = recorded_digest()[0]
+        decoys = [
+            "tag-commit: 30c0a9e91c12a15c081ac90546dd657c4ab98fbc",
+            "source: https://example.invalid/dnscrypt-proxy-2.1.18.tar.gz",
+            "fetched: 2026-09-27",
+            "note: the digest below is the one that matters",
+        ]
+        head, _, tail = real.rpartition("\n" + digest)
+        self.assertTrue(tail, "the pin no longer ends with the digest line")
+
+        for decoy in decoys:
+            with self.subTest(decoy=decoy):
+                planted = f"{head}\n{decoy}\n{digest}{tail}"
+                self.assertEqual(
+                    shipped_reader_digest(planted), digest,
+                    "a labelled line above the digest changed the digest the build script reads",
+                )
+                # And the TEST's reader, which is the one every other assertion here
+                # and in the build class use.
+                self.assertEqual(pin_digest(planted, "the planted pin")[0], digest)
+
+    def test_the_pin_is_clean_for_the_command_its_own_comment_names(self):
+        """`sha256sum -c packaging/debian/dnscrypt-proxy.sha256` is the command the
+        file's comment tells a reader to run. A bare `tag-commit: <40 hex>` line above
+        the digest made it print `WARNING: 1 line is improperly formatted` -- on a
+        checksum file, from a line that is not a checksum. Every non-comment,
+        non-blank line is now a sha256sum line and nothing else, which is why the tag
+        commit lives in a COMMENT."""
+        entries = [
+            line for line in SOURCE_DIGEST.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertTrue(entries, "the pin records nothing")
+        for line in entries:
+            with self.subTest(line=line):
+                self.assertIsNotNone(
+                    SHA256SUM_LINE.match(line.strip()),
+                    f"{line!r} is not a sha256sum line, so `sha256sum -c` on this file warns",
+                )
+        self.assertIn(
+            "sha256sum -c", SOURCE_DIGEST.read_text(),
+            "the pin no longer tells the reader how to check it",
         )
 
     def test_the_recorded_source_digest_is_a_digest_of_the_named_archive(self):
