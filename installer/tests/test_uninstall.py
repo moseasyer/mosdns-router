@@ -641,6 +641,39 @@ class UnreadableValueTests(UninstallFixture):
             "an unreadable property has no value to leave, so the record is what the operator needs",
         )
 
+    def test_a_property_read_that_could_not_run_says_so(self):
+        # The other unreadable shape, and the one half of the merged refusal
+        # message that had no coverage at all: the call RAISED rather than
+        # printing nothing. The verdict is the same either way -- the table pins
+        # both -- so this is about the wording, and about the report agreeing with
+        # it.
+        before = self.snapshot()
+        self.result = self.run_uninstall(
+            runner=self.good_runner(fail=[PROPERTY_READ + (IPV6_IGNORE, "connection", "show", UUID)])
+        )
+        self.assertNothingChanged("a refusal over a read that could not run")
+        self.assertNothingTouched(before, "a refusal over a read that could not run")
+        result = self.refused()
+        reason = " ".join(result.refusals)
+        self.assertIn(
+            "did not run",
+            reason,
+            "the refusal has to say the call never happened, which is a different fact from one "
+            "that printed nothing",
+        )
+        report = result.manual_recovery or ""
+        self.assertIn(
+            f"{IPV6_IGNORE}    recorded {RECORDED_RAW[IPV6_IGNORE]}    now {COULD_NOT_BE_READ}",
+            report,
+            "the row has to agree with the refusal reason about the same property",
+        )
+        self.assertNotIn(
+            f"leave {IPV6_IGNORE}",
+            report,
+            "the report claims somebody changed a property whose read never ran",
+        )
+        self.assertNotIn("changed after the install", report)
+
 
 class ValueSpaceTests(unittest.TestCase):
     """The whole value space, one table, all three consumers read from it.
@@ -664,6 +697,12 @@ class ValueSpaceTests(unittest.TestCase):
         #    installed machine, and the one a two-way rule got wrong.
         (IPV4_IGNORE, "yes", "yes", "no", "ours", "yes", False),
         (IPV6_IGNORE, "yes", "yes", "no", "ours", "yes", False),
+        (IPV4_IGNORE, "yes", "yes", "yes", "ours", "yes", False),
+        # -- a yes/no where the value this installation set IS the recorded one.
+        #    The only row that can see the order of the classifier's first two
+        #    questions, because it is the only one where the two answers differ.
+        #    A machine that already ignored auto-DNS before the install lands
+        #    here, and asking RECORDED first would call it untouched.
         # -- a yes/no already back where the record says.
         (IPV4_IGNORE, "no", "yes", "no", "recorded", "no", False),
         (IPV6_IGNORE, "no", "yes", "no", "recorded", "no", False),
@@ -774,6 +813,15 @@ class ValueSpaceTests(unittest.TestCase):
             {"ours", "recorded", "somebody_else", "unreadable"},
             f"the value-space table does not exercise every verdict: {sorted(verdicts)}",
         )
+        self.assertTrue(
+            any(row[2] == row[3] for row in self.ROWS),
+            "the table has no row where the value this install sets equals the recorded one, so it "
+            "cannot see which of the first two questions is asked first",
+        )
+        # The one row that can see the order of the first two questions: a value
+        # this install set that IS the recorded one. Without it, asking RECORDED
+        # before OURS passes every other row, because on all of them only one of
+        # the two can be true.
         yes_no = (IPV4_IGNORE, IPV6_IGNORE)
         unreadable_yes_no = {
             row[1] for row in self.ROWS if row[0] in yes_no and row[4] == "unreadable"
@@ -1569,6 +1617,42 @@ class FailedRestorationTests(UninstallFixture):
         self.result = self.run_uninstall()
         self.assertTrue(self.result.ok, f"a recorded loopback was treated as a failure: {self.result.error}")
 
+    def test_the_report_of_a_failed_restore_says_which_values_it_had_already_written(self):
+        # The THIRD report path, and the one that was never told. `_restore_unfinished`
+        # hands the report its PRE-WRITE observation too, so its table reads
+        # "what the connection holds now" while it has already written -- and the
+        # second modify failing renders `ipv4.dns now 127.0.0.1` for a profile
+        # that already holds 192.0.2.53.
+        self.result = self.run_uninstall(
+            runner=self.good_runner(fail=[MODIFY + (UUID, IPV6_IGNORE, "no")])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        self.assertIn(
+            "what the connection held before this run wrote to it",
+            report,
+            "the table is the state before the writes and does not say so",
+        )
+        self.assertIn(
+            "this run already wrote the recorded value for ipv4.dns",
+            report,
+            "the report does not name what it wrote, so an operator cannot tell which of the "
+            "modify lines is already true of the profile",
+        )
+
+    def test_a_failed_restore_that_wrote_nothing_claims_nothing(self):
+        self.result = self.run_uninstall(
+            runner=self.good_runner(fail=[MODIFY + (UUID, IPV4_DNS, DHCP_UPSTREAM)])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        self.assertNotIn("already wrote", report, "the report claims a write that never happened")
+        self.assertIn(
+            "what the connection holds now",
+            report,
+            "and with nothing written the table is the current state, so it should say so",
+        )
+
     def test_a_stop_that_fails_is_reported_and_the_rest_of_the_uninstall_happens(self):
         self.result = self.run_uninstall(runner=self.good_runner(fail=[("systemctl", "stop", ROUTER_UNIT)]))
         self.assertTrue(self.result.ok, "the restoration finished, so the uninstall itself did")
@@ -1654,6 +1738,40 @@ class UnreadableDeviceCheckTests(UninstallFixture):
             "the report's own summary tells an operator the commands above are the way to finish, so "
             "it is still the deliverable after a failed check",
         )
+
+    def test_a_property_this_install_never_changed_is_not_announced_as_untouched(self):
+        # A refactor changed this output silently, so the test says what it is.
+        # `ipv6.dns` is a property the install never sets, so on a machine it
+        # installed "already holds the value the backup recorded" is a tautology
+        # about a property nothing ever touched -- and it appeared in every
+        # normal uninstall's notes. The note is about THIS INSTALL's changes, and
+        # a property it never made cannot be one.
+        self.result = self.run_uninstall()
+        self.restored()
+        notes = " ".join(self.result.notes)
+        self.assertNotIn(
+            f"{IPV6_DNS} of {UUID} already holds",
+            notes,
+            "the note is about this installation's own changes, and it never changed the IPv6 list",
+        )
+        for prop in (IPV4_DNS, IPV4_IGNORE, IPV6_IGNORE):
+            self.assertNotIn(
+                f"{prop} of {UUID} already holds",
+                notes,
+                f"{prop} holds what this installation set, so it is not 'already back'",
+            )
+        self.assertNotIn("already holds", notes, "nothing on this machine is already back")
+
+    def test_a_machine_that_is_already_back_keeps_the_note_for_the_properties_it_set(self):
+        # The other half: when a property this install DID set is already holding
+        # the recorded original, that is worth saying -- it is the difference
+        # between "I put it back" and "it was already there".
+        for prop, raw in RECORDED_RAW.items():
+            self.property_value(prop, raw)
+        self.result = self.run_uninstall()
+        self.restored()
+        for prop in (IPV4_DNS, IPV4_IGNORE, IPV6_IGNORE):
+            self.assertIn(f"{prop} of {UUID} already holds", " ".join(self.result.notes))
 
     def test_the_check_runs_before_the_units_it_gates(self):
         # The ordering, asserted on its own: a gate that runs after the thing it
@@ -2155,6 +2273,35 @@ class EmergencyRollbackTests(UninstallFixture):
         self.assertNotIn("ipv6.ignore-auto-dns,", report.split("already wrote the recorded value for")[1])
         self.assertNotIn(f"leave {IPV4_DNS}", report, "the first write happened, so nothing to leave")
 
+    def test_a_partial_write_set_does_not_claim_the_profile_holds_the_others(self):
+        # Two accounts of one property, three lines apart, is Finding A's shape
+        # with the polarity flipped. The reason says the second write FAILED and
+        # the paragraph said every modify line is what the profile holds now --
+        # which is false for the two properties whose write never happened. The
+        # claim has to be scoped to the properties it just named.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        self.result = self.run_rollback(
+            runner=self.good_runner(fail=[MODIFY + (UUID, IPV6_IGNORE, "no")])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        # Every occurrence of the claim has to be scoped. The unscoped sentence
+        # ends there, so its remainder starts with a full stop or a newline; the
+        # scoped one continues with "for those properties".
+        for occurrence in report.split("the modify lines above are what the profile holds now")[1:]:
+            self.assertTrue(
+                occurrence.startswith(" for those properties"),
+                f"the report makes an unscoped claim about the profile: {occurrence[:40]!r}",
+            )
+        self.assertIn(
+            "the others are still what the table above shows",
+            report,
+            "and the report has to say what is true of the properties it did not write",
+        )
+        # And the first half must survive the narrowing, or the fix has hidden
+        # the overwrite instead of scoping it.
+        self.assertIn("this run already wrote the recorded value for ipv4.dns", report)
+
     def test_a_blank_device_check_on_the_rollback_path_is_reported(self):
         # The same read that now refuses on the uninstall path, on the other one.
         # It ends as `restored=True, ok=False`: the values are back and the
@@ -2180,16 +2327,31 @@ class EmergencyRollbackTests(UninstallFixture):
         self.resolvectl_fails()
         self.result = self.run_uninstall()
         self.assertFalse(self.result.ok)
+        message = self.result.error or ""
         self.assertIn(
             DEVICE,
-            self.result.error or "",
+            message,
             "the failure does not name the device the record holds, so an operator cannot tell a "
             "renamed interface from a missing one",
         )
         self.assertIn(
             "rename",
-            (self.result.error or "").lower(),
+            message.lower(),
             "the failure does not say that a renamed interface is the likely cause",
+        )
+        # And it has to name CAUSES, not enumerate the device as one of them. The
+        # sentence it replaced read "Two things make that so: ens33 is the name
+        # the backup recorded, and the interface has been renamed or removed" --
+        # in which the first "thing" is the subject restated, not a reason.
+        self.assertNotIn(
+            "Two things make that so",
+            message,
+            "the sentence that was supposed to name the causes names the device as one of them",
+        )
+        self.assertIn(
+            "may have been renamed or removed",
+            message,
+            "the message has to say the two things that can make a recorded name unresolvable",
         )
 
     def resolve_property_read_fails(self, prop=IPV4_IGNORE):

@@ -3545,12 +3545,23 @@ def manual_recovery_report(
             # After the block and its notes, never inside them: the block has to
             # stay a run of command lines, because the one thing an operator does
             # with it is select it and paste it.
+            #
+            # The second half is scoped to the properties just named, and that
+            # scoping is the whole point of the paragraph. A partial write set --
+            # the first modify landed and the second did not -- made this sentence
+            # claim about all four properties that the profile holds what every
+            # modify line says, three lines below a reason saying one of those
+            # writes failed. That is Finding A's shape with the polarity flipped:
+            # a claim about the machine on the strength of a write that did not
+            # happen. The properties this run did not write are still what the
+            # table shows, and the report says so rather than leaving it implied.
             lines.append("")
             lines.append(
                 "this run already wrote the recorded value for "
                 + ", ".join(written)
                 + ", so the table above is what the connection held BEFORE it did and the modify "
-                "lines above are what the profile holds now"
+                "lines above are what the profile holds now for those properties; the others are "
+                "still what the table above shows"
             )
         lines.append("")
         lines.append("then check that the device picked them up:")
@@ -3805,10 +3816,16 @@ def _ownership(root: Path, run: CommandRunner) -> Ownership:
             ours.append(prop)
             continue
         if verdict == RECORDED:
-            notes.append(
-                f"{prop} of {uuid} already holds the value {BACKUP_PATH} recorded, so it is left "
-                "as it is"
-            )
+            # Only for a property this installation SET. For one it never touched
+            # -- the IPv6 address list -- "already holds the recorded value" is a
+            # tautology about something no change of ours could have altered, and
+            # a refactor must not add a line to every normal uninstall's output
+            # without a reason. The note is about this installation's changes.
+            if prop in dict(NM_MUTATIONS):
+                notes.append(
+                    f"{prop} of {uuid} already holds the value {BACKUP_PATH} recorded, so it is "
+                    "left as it is"
+                )
             continue
         set_by_us = dict(NM_MUTATIONS).get(prop)
         refusals.append(
@@ -3878,14 +3895,14 @@ def _device_follows_the_backup(run: CommandRunner, ownership: Ownership) -> None
     if not forwarding.strip():
         raise InstallRefused(
             f"resolvectl was asked what {ownership.device} is using for DNS and printed nothing at "
-            f"all. A link that exists is always printed as `Link N ({ownership.device}):` even when "
-            f"it has no resolvers, so this is a read that did not happen. Two things make that so: "
-            f"{ownership.device} is the name {BACKUP_PATH} recorded, and the interface has been "
-            f"renamed or removed since the install -- if it was renamed, `resolvectl dns "
-            f"<its new name>` will answer and the value in {BACKUP_PATH} is still the one to put "
-            f"back. Either way nothing has confirmed that the connection picked the values that "
-            f"were just put back, so the units this package installs are still running and the hook "
-            f"is still installed"
+            f"all. A link that exists is always printed as `Link N (<dev>):` even when it has no "
+            f"resolvers, so this is a read that did not happen, and the only two reasons are that "
+            f"{ownership.device} -- the name {BACKUP_PATH} recorded -- may have been renamed or "
+            f"removed since the install, or that resolvectl itself failed. If the interface was "
+            f"renamed, `resolvectl dns <its new name>` will answer and the values in {BACKUP_PATH} "
+            f"are still the ones to put back. Either way nothing has confirmed that the connection "
+            f"picked the values that were just put back, so the units this package installs are "
+            f"still running and the hook is still installed"
         )
     recorded = _as_current(IPV4_DNS, ownership.original[IPV4_DNS]["raw"])
     if LOCAL_DNS in forwarding.split() and LOCAL_DNS not in recorded:
@@ -4014,7 +4031,9 @@ def _purge_state(root: Path) -> None:
         ) from error
 
 
-def _restore_unfinished(ownership: Ownership, error: str, notes: List[str]) -> UninstallResult:
+def _restore_unfinished(
+    ownership: Ownership, error: str, notes: List[str], written: Sequence[str] = ()
+) -> UninstallResult:
     """The result of an uninstall that started and could not finish.
 
     ``refusals`` is empty on purpose. A refusal means nothing was changed and the
@@ -4023,6 +4042,11 @@ def _restore_unfinished(ownership: Ownership, error: str, notes: List[str]) -> U
     the exit status has to be a different one. Everything below the restoration is
     left alone: the units keep running, the hook stays installed, and the state
     directory stays exactly where the record of it is.
+
+    ``written`` names the properties whose recorded value REACHED the profile, and
+    it is passed on for the same reason the rollback passes it: this report is
+    built from an observation taken before those writes, so without them its table
+    reads as the current state of a machine it has already changed.
     """
     return UninstallResult(
         ok=False,
@@ -4045,6 +4069,7 @@ def _restore_unfinished(ownership: Ownership, error: str, notes: List[str]) -> U
                 "removing the package now would take away a resolver this machine is still "
                 "pointing at; the commands above are what finishes the job"
             ),
+            written=list(written),
         ),
         left_running=[],
         purged=False,
@@ -4121,7 +4146,11 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
     # 1. the timers, which are the only units that write anything.
     left = _stop_units(run, PROJECT_TIMERS, notes)
     # 2. the profile, newest change first, and then the reactivation, which is
-    #    what makes the restored values live.
+    #    what makes the restored values live. What reached the profile is tracked
+    #    per write rather than taken from the list of intended ones, because a
+    #    second modify failing must leave the report saying one value is back and
+    #    two are not.
+    written: List[str] = []
     for prop, value in ownership.restores:
         try:
             _checked(
@@ -4130,7 +4159,8 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
                 f"putting {prop} back to {value!r} on {ownership.uuid}",
             )
         except InstallRefused as error:
-            return _restore_unfinished(ownership, str(error), notes)
+            return _restore_unfinished(ownership, str(error), notes, written)
+        written.append(prop)
     try:
         _checked(
             run,
@@ -4138,13 +4168,13 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
             f"reactivating {ownership.uuid} to apply what was put back",
         )
     except InstallRefused as error:
-        return _restore_unfinished(ownership, str(error), notes)
+        return _restore_unfinished(ownership, str(error), notes, written)
     #    and the read that proves the device took them. Fatal, and the reason the
     #    units below are not stopped when it fails.
     try:
         _device_follows_the_backup(run, ownership)
     except InstallRefused as error:
-        return _restore_unfinished(ownership, str(error), notes)
+        return _restore_unfinished(ownership, str(error), notes, written)
     # 3. the two units, and only the ones whose state could be read.
     left += _stop_units(run, (ROUTER_UNIT, RESOLVER_UNIT), notes)
     # 4. the one file under /etc this package installed.
