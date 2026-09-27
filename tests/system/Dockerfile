@@ -75,6 +75,19 @@ RUN mkdir -p /etc/systemd/resolved \
 COPY tests/system/entrypoint.sh /usr/local/lib/mosdns-test-entrypoint
 RUN chmod 0755 /usr/local/lib/mosdns-test-entrypoint
 
+# The two scripts that PRODUCE the `ss` lines the installer's fixtures are copied
+# from. They are in the image rather than copied in at run time so that what the
+# fixtures claim was captured can be re-captured on a machine that did not exist
+# when they were written, and so that a fixture's provenance is a command in this
+# repository rather than a claim in a comment:
+#
+#   shared_listener.py 18081 127.0.0.1   # a socket two processes hold, one line
+#   port_check_against_real_ss.py 18081 /path/to/mosdns_installer.py
+#
+# Neither is a test and neither runs on its own; the second refuses to claim
+# anything if the machine did not produce a shared-listener line.
+COPY tests/system/shared_listener.py tests/system/port_check_against_real_ss.py /usr/local/lib/
+
 # The installer's preflight reads /etc/os-release and dpkg --print-architecture.
 # Both must be real in the image, and the release line must match the base, or a
 # test would pass here and fail on the machine it is meant to model.
