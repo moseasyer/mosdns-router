@@ -1620,6 +1620,15 @@ DISPATCHER_SCRIPT = "/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-b
 # instead of restoring a guess.
 BACKUP_SCHEMA_VERSION = 1
 
+# How much of a failing command's own output a refusal quotes, and in which
+# direction: the last `FAILURE_DETAIL_LINES` non-blank lines, truncated to
+# `FAILURE_DETAIL_CHARACTERS` from the left so the end of the explanation -- the
+# part that says why the tool gave up -- always survives. Bounded because the
+# text is read by a person on a machine that has just lost its resolver, in a
+# `prerm` output, and a pasted log is not a message.
+FAILURE_DETAIL_LINES = 4
+FAILURE_DETAIL_CHARACTERS = 600
+
 # The fields a SECOND install of this package refreshes, and -- by naming the
 # complement rather than the list -- the fields it must carry forward untouched.
 #
@@ -2251,8 +2260,59 @@ def _answer(runner: CommandRunner, args: Sequence[str]) -> Optional[str]:
     return _text(runner, args) or None
 
 
+def _quoted(text: Optional[str]) -> str:
+    """A bounded ``; it said: ...`` for text a command already returned.
+
+    The same bound and the same direction as :func:`_failure_detail`, factored out
+    because the capture does not raise -- it reads a non-zero status off a
+    `Completed` -- and would otherwise be the one place in this module where a
+    tool's explanation is dropped on the floor.
+    """
+    if not isinstance(text, str):
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    omitted = len(lines) - FAILURE_DETAIL_LINES
+    kept = lines[-FAILURE_DETAIL_LINES:]
+    if omitted > 0:
+        kept = [f"{omitted} earlier line(s) omitted"] + kept
+    detail = " | ".join(kept)
+    if len(detail) > FAILURE_DETAIL_CHARACTERS:
+        detail = "..." + detail[-FAILURE_DETAIL_CHARACTERS:]
+    return f"; it said: {detail}"
+
+
+def _failure_detail(error: BaseException) -> str:
+    """What a failing command printed, trimmed to something a person can read.
+
+    Standard error first and standard output second, because a refusal is
+    conventionally written to standard error and a tool that wrote its reason
+    somewhere else has still said it. `getattr` rather than an `isinstance` check
+    because the boundary is an injected runner: a fake may raise
+    `CalledProcessError`, which carries both streams, and anything else -- a
+    `TypeError` from a string argument, an `OSError` from a binary that is not
+    there -- carries neither. This function runs inside the handler that is trying
+    to explain the failure, so raising here would replace a message with a
+    traceback.
+
+    The last few lines rather than the first, because the line that says why a
+    tool gave up is at the end of what it printed; the count of omitted lines is
+    stated rather than hidden, so a reader can tell a truncated quote from a
+    complete one. The bounding itself is `_quoted`'s, which the capture shares.
+    """
+    for name in ("stderr", "stdout"):
+        text = getattr(error, name, None)
+        if not isinstance(text, str):
+            continue
+        quoted = _quoted(text)
+        if quoted:
+            return quoted
+    return ""
+
+
 def _checked(runner: CommandRunner, args: Sequence[str], what: str) -> None:
-    """Run a command that has to succeed, and name the step if it did not.
+    """Run a command that has to succeed, and name the step AND what it said if it did not.
 
     The broad `except` is forced and not lazy: the module's one process boundary is
     the only place allowed to name `subprocess`, because naming it here would be a
@@ -2260,11 +2320,23 @@ def _checked(runner: CommandRunner, args: Sequence[str], what: str) -> None:
     program runs as root, so a scan weakened to accommodate it is a scan that no
     longer holds. Every failure of the injected boundary means the same thing to
     this step anyway: the command did not do what it was asked to do.
+
+    The reason is quoted because the exception's own text does not carry it.
+    `CalledProcessError.__str__` is `Command '[...]' returned non-zero exit
+    status N`, so the most likely install-time failure in the field reaches the
+    operator as a sentence about this program's step and a number, with the tool's
+    own explanation -- the only part that says what to do next -- discarded. The
+    quote is bounded (see :func:`_quoted`) because this text ends up in a `prerm`
+    output on a machine that may have no DNS, where a thousand-line log is not a
+    message.
     """
     try:
         runner.run(list(args), check=True)
     except Exception as error:  # noqa: BLE001 - see above
-        raise InstallRefused(f"{what} failed: {error}") from error
+        detail = _failure_detail(error)
+        raise InstallRefused(
+            f"{what} failed: {error}" + (f"; {detail}" if detail else "")
+        ) from error
 
 
 def capture_command(interface: str) -> List[str]:
@@ -2339,6 +2411,7 @@ def _capture_dhcp(runner: CommandRunner, device: str) -> None:
         )
     raise InstallRefused(
         f"the DHCP capture failed with status {completed.returncode}; nothing has been changed"
+        + _quoted(getattr(completed, "stderr", None) or getattr(completed, "stdout", None))
     )
 
 
@@ -2999,12 +3072,17 @@ def _reconnect(runner: CommandRunner, transaction: Transaction, connection: Conn
     recorded values sitting unused on disk. Reactivating is what makes the restore
     take effect, and it is idempotent, so a rollback reaches the same state whether
     the reconnection succeeded or failed.
+
+    The undo is registered BEFORE the attempt, which is the one place in the
+    transaction where that order is load-bearing rather than tidy. `nmcli
+    connection up` takes a connection DOWN on its way up, so a run in which it
+    fails may well have left the machine with no uplink -- and an undo registered
+    afterwards is not on the stack when the rollback runs, so exit 3 says "every
+    change this run made has been rolled back and nothing else is different about
+    this machine" about a machine whose connection this run deactivated. The price
+    is that a reactivation which fails twice is a rollback FAILURE (exit 4) rather
+    than a clean refusal, which is the truth about that machine.
     """
-    _checked(
-        runner,
-        ("nmcli", "connection", "up", connection.uuid),
-        f"reactivating {connection.uuid}",
-    )
     transaction.apply_reactivating(
         f"reactivating {connection.uuid}",
         lambda: _checked(
@@ -3012,6 +3090,11 @@ def _reconnect(runner: CommandRunner, transaction: Transaction, connection: Conn
             ("nmcli", "connection", "up", connection.uuid),
             f"reactivating {connection.uuid} again to apply what was put back",
         ),
+    )
+    _checked(
+        runner,
+        ("nmcli", "connection", "up", connection.uuid),
+        f"reactivating {connection.uuid}",
     )
 
 

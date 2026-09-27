@@ -358,14 +358,21 @@ class FakeRunner:
     argument array, so a case that needs the first to succeed and the second to
     fail cannot say so by naming a command; it says how many times the command may
     succeed first, which is a fact about the machine rather than about the array.
+
+    ``fail_first`` is the same problem the other way round, and it is the shape
+    the reactivation's own undo needs: that undo is registered BEFORE the attempt,
+    so the rollback runs the same command again, and a case about "the first
+    ``connection up`` failed" wants the second one to succeed. ``fail`` would fail
+    both, which is a different machine and has its own test.
     """
 
-    def __init__(self, outputs=None, returncodes=None, stderr="", fail=(), fail_after=None, child_environment=None, record=None):
+    def __init__(self, outputs=None, returncodes=None, stderr="", fail=(), fail_after=None, fail_first=(), child_environment=None, record=None):
         self.outputs = {tuple(key): value for key, value in (outputs or {}).items()}
         self.returncodes = {tuple(key): value for key, value in (returncodes or {}).items()}
         self.stderr = stderr
         self.fail = {tuple(command) for command in fail}
         self.fail_after = {tuple(key): value for key, value in (fail_after or {}).items()}
+        self.fail_first = {tuple(command) for command in fail_first}
         self.succeeded = {}
         self.child_environment = child_environment
         self.record = record
@@ -384,14 +391,28 @@ class FakeRunner:
         if self.child_environment is not None:
             self.child_environment(command)
         if command in self.fail:
-            raise subprocess.CalledProcessError(1, list(command), "", "injected failure")
+            raise subprocess.CalledProcessError(
+                1, list(command), "", self.stderr or "injected failure"
+            )
+        if command in self.fail_first and not self.succeeded.get(command, 0):
+            self.succeeded[command] = self.succeeded.get(command, 0) + 1
+            raise subprocess.CalledProcessError(
+                1, list(command), "", self.stderr or "injected failure"
+            )
         allowed = self.fail_after.get(command)
         if allowed is not None and self.succeeded.get(command, 0) >= allowed:
-            raise subprocess.CalledProcessError(1, list(command), "", "injected failure")
+            raise subprocess.CalledProcessError(
+                1, list(command), "", self.stderr or "injected failure"
+            )
         self.succeeded[command] = self.succeeded.get(command, 0) + 1
         code = self.returncodes.get(command, 0)
         if code != 0 and check:
-            raise subprocess.CalledProcessError(code, list(command), "", self.stderr)
+            # The prepared answer goes on BOTH sides, because a tool that reports
+            # a refusal on standard output is a real thing and the module's
+            # message quotes standard output when standard error is empty.
+            raise subprocess.CalledProcessError(
+                code, list(command), self.answer(command), self.stderr
+            )
         return subprocess.CompletedProcess(
             args=list(command), returncode=code, stdout=self.answer(command), stderr=self.stderr
         )
@@ -555,6 +576,11 @@ class TransactionFixture(unittest.TestCase):
         MODIFY + (UUID, "ipv4.dns", LOCAL_DNS),
     )
     REACTIVATING_STEP = CONNECTION_UP + (UUID,)
+    # The one step whose undo is registered BEFORE the attempt rather than after
+    # it, and the only place `expected_rollback` therefore has to treat a FAILING
+    # command as one whose undo is already on the stack. Every other step
+    # registers its undo because it succeeded.
+    UNDO_REGISTERED_FIRST = (CONNECTION_UP + (UUID,),)
     # In APPLICATION order, like STEPS, because expected_rollback reverses each
     # group: newest first within a group. So the unit group's rollback is
     # stop-router, stop-resolver, disable-router, disable-resolver -- the stops
@@ -615,7 +641,15 @@ class TransactionFixture(unittest.TestCase):
         done = [
             command
             for command in self.STEPS
-            if command in self.commands and self.commands.index(command) < reached
+            if command in self.commands
+            and (
+                self.commands.index(command) < reached
+                # A step whose undo went on the stack BEFORE the attempt is undone
+                # even when the attempt failed, because the machine may already be
+                # in the state the undo is about. `_reconnect` is that step, and
+                # this is the one place the rule differs.
+                or (command == failing and command in self.UNDO_REGISTERED_FIRST)
+            )
         ]
         tail = []
         for group in (self.PROFILE_STEPS, (self.REACTIVATING_STEP,), self.UNIT_STEPS):
@@ -629,8 +663,10 @@ class TransactionFixture(unittest.TestCase):
         returncodes=None,
         fail=(),
         fail_after=None,
+        fail_first=(),
         child_environment=None,
         already_installed=False,
+        stderr="",
     ):
         """A runner answering exactly what an installable machine answers.
 
@@ -691,8 +727,10 @@ class TransactionFixture(unittest.TestCase):
         runner = FakeRunner(
             outputs=answers,
             returncodes=codes,
+            stderr=stderr,
             fail=fail or self.failing,
             fail_after=fail_after,
+            fail_first=fail_first,
             child_environment=child_environment or self.record_child,
             record=lambda command: self.events.append(("run", command)),
         )
@@ -754,6 +792,30 @@ class TransactionFixture(unittest.TestCase):
         self.assertEqual(result.rollback_error, None)
         self.assertTrue(result.ok)
         return result
+
+    def install_cli(self, runner=None):
+        """``main`` with the injected probe, which ``main`` does not take.
+
+        The probe is a seam of the functions and not of ``main``, so the one way to
+        run the command as a person runs it is to put the fixture's probe back for
+        the length of the call. The substitution is in memory and restored in a
+        ``finally``, so a case that fails leaves the module as it found it.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        import contextlib
+
+        original = installer.install
+
+        def install(root, run, clock=None, probe=None, **kwargs):
+            return original(root, run, clock=clock or self.clock, probe=probe or self.probe_for(), **kwargs)
+
+        installer.install = install
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status = installer.main(["install"], runner or self.good_runner(), root=self.root)
+        finally:
+            installer.install = original
+        return status, out.getvalue(), err.getvalue()
 
     def preflight_commands(self):
         """Preflight's own read-only commands, as a literal.
@@ -2119,8 +2181,88 @@ class ReinstallTests(TransactionFixture):
         self.assertFalse(result.ok, "the rollback reported success on a device still on the loopback")
 
 
+class FailureMessageTests(TransactionFixture):
+    """What a failing command says, as opposed to what it exits with.
+
+    `subprocess.CalledProcessError`'s own `str()` is
+    ``Command '[...]' returned non-zero exit status N``, which names the array and
+    the number and nothing else. The reason is on standard error, and the most
+    likely install-time failure in the field is a tool explaining itself there --
+    `update-lists --refresh-ranges` refusing because the origin is unreachable and
+    no cache envelope is seeded reaches the operator as
+    "publishing the Cloudflare prefix list ... failed: Command '[...]' returned
+    non-zero exit status 3", which says what this program was doing and gives the
+    operator nothing to act on.
+
+    The detail is BOUNDED, because the alternative to a bounded message is a
+    thousand-line log pasted into a `prerm` output an operator has to read on a
+    machine with no DNS.
+    """
+
+    REFUSAL = (
+        "mosdns-cdnctl: refusing to publish the prefix list: the origin is unreachable and no "
+        "cache envelope is seeded (origin https://example.invalid/list.txt)"
+    )
+
+    def test_a_failing_command_says_what_it_printed(self):
+        result = self.run_install(
+            fail=[PUBLISH_PREFIXES],
+            stderr=self.REFUSAL + "\n",
+        )
+        self.assertFalse(result.ok)
+        self.assertIn(self.REFUSAL, result.error or "", "the command's own words were dropped")
+
+    def test_the_operator_sees_it_and_not_only_the_transaction(self):
+        # `main` prints `result.error` to standard error, and `prerm` reads THAT.
+        # A detail that reached the result but not the process's output would help
+        # a test and not a person.
+        self.setUp()
+        status, _out, err = self.install_cli(
+            runner=self.good_runner(fail=[PUBLISH_PREFIXES], stderr=self.REFUSAL + "\n")
+        )
+        self.assertEqual(status, installer.EXIT_INSTALL_FAILED, err)
+        self.assertIn(self.REFUSAL, err)
+
+    def test_a_command_that_only_printed_on_standard_output_still_says_something(self):
+        # Some tools report a refusal on stdout. Bounded output is the fallback,
+        # and it is a fallback rather than a silence because a message that names
+        # nothing is what this whole item is about.
+        result = self.run_install(
+            outputs={PUBLISH_PREFIXES: "refusing: no envelope and no network\n"},
+            returncodes={PUBLISH_PREFIXES: 3},
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("refusing: no envelope and no network", result.error or "")
+
+    def test_the_detail_is_bounded(self):
+        noise = "\n".join(f"line {index} of a very long explanation" for index in range(200))
+        result = self.run_install(fail=[PUBLISH_PREFIXES], stderr=noise + "\n")
+        message = result.error or ""
+        self.assertIn("line 199 of a very long explanation", message, "the LAST line is the one that says why")
+        self.assertNotIn("line 0 of a very long explanation", message, "an unbounded paste is not a message")
+        self.assertLess(len(message), 2000, f"the message grew to {len(message)} characters")
+
+    def test_a_failure_with_nothing_to_say_still_names_the_step(self):
+        result = self.run_install(fail=[("systemctl", "start", ROUTER_UNIT)])
+        self.assertFalse(result.ok)
+        self.assertIn("starting " + ROUTER_UNIT, result.error or "")
+
+
 class FailureInjectionTests(TransactionFixture):
     """A failure after each mutation, and what the rollback put back."""
+
+    def run_install_failing_at(self, failing, **kwargs):
+        """Run the install with ``failing`` failing, in the way that command fails.
+
+        The reactivation is the one step whose undo is registered BEFORE the
+        attempt, so the rollback runs the same argument array again. `fail_first`
+        is the honest way to fail it -- the first `connection up` fails, the retry
+        succeeds -- and `fail` would fail both, which is a different machine and
+        has its own test.
+        """
+        if failing in self.UNDO_REGISTERED_FIRST:
+            return self.run_install(fail_first=[failing], **kwargs)
+        return self.run_install(fail=[failing], **kwargs)
 
     def injection_points(self):
         """Every command after which something can go wrong, in order.
@@ -2146,7 +2288,7 @@ class FailureInjectionTests(TransactionFixture):
         for failing in self.injection_points():
             with self.subTest(failing=failing):
                 self.setUp()
-                result = self.run_install(fail=[failing])
+                result = self.run_install_failing_at(failing)
                 self.assertFalse(result.ok, f"a failure at {failing!r} was not a failure")
                 self.assertIsNone(
                     result.rollback_error, f"the rollback of a failure at {failing!r} did not complete"
@@ -2161,13 +2303,75 @@ class FailureInjectionTests(TransactionFixture):
         for failing in self.injection_points():
             with self.subTest(failing=failing):
                 self.setUp()
-                self.run_install(fail=[failing])
+                self.run_install_failing_at(failing)
                 reached = self.commands.index(failing)
                 self.assertEqual(
                     self.commands[reached + 1 :],
                     self.expected_rollback(failing),
                     f"a failure at {failing!r} was not followed by exactly its own rollback",
                 )
+
+    def test_a_failed_reactivation_is_still_reactivated_by_the_rollback(self):
+        # The one mutation whose undo has to be on the stack BEFORE the attempt.
+        # `nmcli connection up` takes a connection DOWN on its way up, so a run in
+        # which it fails may have left the machine's connection deactivated -- and
+        # the exit-3 message says every change this run made has been rolled back
+        # and nothing else is different about this machine. Before the fix the undo
+        # was registered after the attempt, so it was not on the stack at all, the
+        # retry never ran, and that sentence was false on exactly the machine it
+        # was written for.
+        self.setUp()
+        result = self.run_install(fail_first=[CONNECTION_UP + (UUID,)])
+        self.assertFalse(result.ok)
+        reactivations = [
+            index for index, command in enumerate(self.commands) if command == CONNECTION_UP + (UUID,)
+        ]
+        self.assertEqual(
+            len(reactivations), 2,
+            f"the reactivation was attempted {len(reactivations)} time(s); a connection that was "
+            "taken down and not brought back up is a machine with no uplink",
+        )
+        self.assertEqual(
+            self.commands[reactivations[0] + 1 :],
+            self.expected_rollback(CONNECTION_UP + (UUID,)),
+            "a failed reactivation was not followed by the profile restore and then the retry",
+        )
+        self.assertIsNone(result.rollback_error, "the rollback of a failed reactivation did not finish")
+
+    def test_a_reactivation_that_fails_every_time_is_a_rollback_failure_not_a_clean_refusal(self):
+        # The other machine: the attempt fails and so does the retry, so the
+        # reactivation is genuinely still applied. The exit status has to say so --
+        # exit 3 claims the machine is as it was found, and this one is not.
+        self.setUp()
+        result = self.run_install(fail=[CONNECTION_UP + (UUID,)])
+        self.assertFalse(result.ok)
+        self.assertIsNotNone(
+            result.rollback_error,
+            "a reactivation that failed both times was reported as a clean refusal, so exit 3 "
+            "would claim the machine is as it was found",
+        )
+        self.assertIn("reactivating", result.rollback_error)
+        self.assertIn(
+            "never reactivated",
+            result.recovery or "",
+            f"the recovery message does not tell the operator the connection was not brought back "
+            f"up: {result.recovery!r}",
+        )
+        self.assertIn(f"nmcli connection up {UUID}", result.recovery or "")
+        for unit in (RESOLVER_UNIT, ROUTER_UNIT):
+            with self.subTest(unit=unit):
+                self.assertIn(("systemctl", "stop", unit), self.commands)
+        self.assertIn(MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM), self.commands)
+
+    def test_the_exit_four_status_is_what_a_failed_reactivation_gets(self):
+        # The status, because "the rollback did not finish" and "the rollback
+        # finished" are two different machines and one status for both would tell
+        # a script to simply repeat an install on a machine with no uplink.
+        self.setUp()
+        status, _out, err = self.install_cli(runner=self.good_runner(fail=[CONNECTION_UP + (UUID,)]))
+        self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
+        self.assertIn("these changes are still applied", err)
+
 
     def test_a_failure_stops_the_services_it_started_and_leaves_the_rest_running(self):
         for failing in self.injection_points():
@@ -2421,7 +2625,11 @@ class RollbackFailureTests(TransactionFixture):
         self.assertFalse(self.rooted(MANAGED_BY).exists())
 
     def test_a_rollback_that_worked_and_one_that_did_not_are_different_statuses(self):
-        worked = self.run_install(fail=[CONNECTION_UP + (UUID,)])
+        # `fail_first` for the reactivation, not `fail`: its undo is the SAME
+        # argument array and is on the stack before the attempt, so failing every
+        # call is a different machine -- one whose reactivation could not be
+        # undone either -- and is the subject of the case above.
+        worked = self.run_install(fail_first=[CONNECTION_UP + (UUID,)])
         self.assertIsNone(worked.rollback_error, "a completed rollback reported a failure")
         self.assertTrue(worked.error)
         self.setUp()
@@ -2733,7 +2941,11 @@ class CliTransactionTests(TransactionFixture):
         self.assertIn("nothing", err.lower(), "a refusal has to say it changed nothing")
 
     def test_a_failed_install_that_rolled_back_exits_three(self):
-        status, out, err = self.install_cli(self.good_runner(fail=[CONNECTION_UP + (UUID,)]))
+        # `fail_first`, not `fail`: the reactivation's undo is the same argument
+        # array and is on the stack before the attempt, so a run in which BOTH
+        # calls fail is a machine with an undone reactivation -- which is exit 4,
+        # and is what the case in FailureInjectionTests is about.
+        status, out, err = self.install_cli(self.good_runner(fail_first=[CONNECTION_UP + (UUID,)]))
         self.assertEqual(status, installer.EXIT_INSTALL_FAILED, err)
         self.assertIn("rolled back", err.lower(), "the operator has to be told the machine is as it was")
         self.assertNotIn("still applied", err.lower())
