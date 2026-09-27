@@ -3383,55 +3383,70 @@ def _render_command(args: Sequence[str]) -> str:
     return " ".join(words)
 
 
-def _changed_after_the_install(prop: str, current: str, original: dict) -> bool:
-    """Whether ``current`` is a value this package never put there.
+# The four verdicts one property's current value can have. They are named rather
+# than derived, because "could not be read" is a QUESTION ABOUT THIS PROGRAM and
+# every other verdict is a question about the machine, and the two must never be
+# confused: this module's whole argument is that a value it did not read is not
+# evidence of anything, and a report that calls one "changed" has made a claim
+# about a machine on the strength of a failed read.
+#
+# One classifier and three consumers. The three are the refusal reasons, the
+# report's "now" column and the report's command block, and they were three
+# functions in the round before this one -- two of which were written the same day
+# and disagreed about the unreadable case, which is how a report came to say
+# "changed after the install" about a value nobody read. :func:`_classify` is the
+# single answer and the three read it.
+OURS = "ours"
+RECORDED = "recorded"
+SOMEONE_ELSE = "somebody_else"
+UNREADABLE = "unreadable"
 
-    Three-way, exactly as :func:`_ownership` asks the same question, and for the
-    same reason: the report must not tell an operator to overwrite a value
-    somebody else put there.
 
-    The middle case is the one a two-way rule gets wrong, and on this machine it
-    is the common one. After a successful install ``ipv4.ignore-auto-dns`` holds
-    ``yes`` and the backup recorded ``no``, so "the value found is not the
-    recorded value" is true of the property most in need of the recorded value --
-    leaving it at ``yes`` leaves the machine ignoring its own DHCP lease. So the
-    question is not whether the two differ but whether the value found is one this
-    installation set, and the answer for the three properties it set is yes.
+def _classify(prop: str, current: Optional[str], recorded: str) -> str:
+    """What one property's current value is, as one of the four verdicts.
 
-    A `None` here means the property could not be read at all, and it is not a
-    value anybody put there, so the caller hands over the recorded value. The
-    report is the manual recovery for a machine in trouble; "put this back to what
-    the record says" is the right instruction when the record is all there is.
+    The order of the questions is the order of the trust: what this program can
+    say about its own reading, then what the machine is using, then what the
+    record says.
+
+    ``UNREADABLE`` has two shapes and both are the same fact. ``None`` is a call
+    that raised. A BLANK answer is a call that ran and printed nothing, and for a
+    ``yes``/no`` that is the second unreadable shape rather than a value: `nmcli
+    -g` prints nothing at all for a connection it cannot find, and a `yes`/`no`
+    has no empty value. For an ADDRESS LIST the blank is the opposite -- the empty
+    list, a real answer, a link with no manual DNS -- and it goes on to the other
+    questions. That asymmetry is measured and it is the one the two functions this
+    replaces got wrong differently.
+
+    ``SOMEONE_ELSE`` is strict equality against both the value this installation
+    set and the recorded original, which means a list that CONTAINS what this
+    install set and one more address is somebody else's: a user who added a
+    resolver did not leave a leftover.
     """
     if current is None:
-        return False
+        return UNREADABLE
+    if not current and prop in IGNORED_AUTOMATICALLY:
+        return UNREADABLE
     found = _as_current(prop, current)
-    if found == _as_current(prop, original[prop]["raw"]):
-        return False
     ours = dict(NM_MUTATIONS).get(prop)
-    return ours is None or found != _as_current(prop, ours)
+    if ours is not None and found == _as_current(prop, ours):
+        return OURS
+    if found == _as_current(prop, recorded):
+        return RECORDED
+    return SOMEONE_ELSE
 
 
-def _shown_now(prop: str, found: Optional[str]) -> str:
+def _shown_now(prop: str, current: Optional[str], recorded: str) -> str:
     """How a report shows what one property holds at this moment.
 
-    The same distinction :func:`_ownership` makes, for the same reason and with
-    the same asymmetry behind it: `_text` returns `None` only when the call
-    raises, so a `nmcli -g` that exits non-zero having printed nothing comes back
-    as the empty string. For an ADDRESS LIST that is a real value -- a link with no
-    manual DNS -- and reads as ``(unset)``. For a `yes`/`no` it is not a value the
-    property can hold at all, and reading it as "unset" would put a fact about
-    this program in a column whose whole job is to hold a fact about the machine.
-
-    The report is what a person acts on, and a column that says `(unset)` when it
-    means "I could not look" is a column that misleads in the direction that
-    matters: it looks like a machine this run examined.
+    One question, and :func:`_classify` answers it: the row is unreadable or it
+    is not. A column that says ``(unset)`` when it means "I could not look" is a
+    column that misleads in the direction that matters, because it looks like a
+    machine this run examined.
     """
-    if found is None:
+    if _classify(prop, current, recorded) == UNREADABLE:
         return COULD_NOT_BE_READ
-    if not found and prop in IGNORED_AUTOMATICALLY:
-        return COULD_NOT_BE_READ
-    return found or UNSET
+    return current or UNSET
 
 
 def manual_recovery_report(
@@ -3441,6 +3456,7 @@ def manual_recovery_report(
     reasons: Sequence[str],
     device: str = "",
     summary: Optional[str] = None,
+    written: Sequence[str] = (),
 ) -> str:
     """The report a person acts on, and the only thing a refusal really produces.
 
@@ -3455,13 +3471,25 @@ def manual_recovery_report(
     is worse than none: an operator who runs three of four believes the connection
     is back.
 
-    And a property whose current value is one this package never put there gets a
-    LEAVE line instead of a modify. The reasons above this block exist to say
-    that this program will not write over such a value, and a block twelve lines
-    below handing over the command that writes over it makes the whole report a
-    thing nobody can act on. The two value sets are both in hand here, so the
-    distinction costs nothing -- see :func:`_changed_after_the_install` for the
-    three-way comparison and for the case a two-way rule gets wrong.
+    And a property this program did not write, whose current value is one this
+    package never put there, gets a LEAVE line instead of a modify. The reasons
+    above this block exist to say that this program will not write over such a
+    value, and a block twelve lines below handing over the command that writes
+    over it makes the whole report a thing nobody can act on. Two values are never
+    left alone: a value this program could not READ, which is a fact about the
+    program and not about the machine (:func:`_classify`), and a property
+    ``written`` names, because this run put the recorded value there and the value
+    in the table no longer exists.
+
+    ``written`` is a parameter and not an inference because a report cannot know
+    what a profile holds after an UNCONDITIONAL overwrite. The emergency rollback
+    writes every recorded value whatever it found -- that is the killed-install
+    case, and gating it would refuse the machine the command exists for -- and then
+    hands this function the observation it took BEFORE those writes. A report built
+    from that without being told what was written would name a value that has been
+    overwritten and claim a refusal that did not happen. So the caller says which
+    properties it wrote, the table is labelled as the state before that, and the
+    overwrite is stated rather than hidden.
     """
     lines = [f"MANUAL RECOVERY REPORT for connection {uuid}" if uuid else "MANUAL RECOVERY REPORT", ""]
     if reasons:
@@ -3470,20 +3498,22 @@ def manual_recovery_report(
         lines.append("")
     quoted = False
     if original:
-        lines.append(f"what {BACKUP_PATH} recorded, and what the connection holds now:")
+        when = "held before this run wrote to it" if written else "holds now"
+        lines.append(f"what {BACKUP_PATH} recorded, and what the connection {when}:")
         for prop in RECORDED_PROPERTIES:
             entry = original.get(prop)
             if not isinstance(entry, dict):
-                recorded = NOTHING_RECORDED
+                recorded_raw = NOTHING_RECORDED
             else:
                 raw = str(entry.get("raw", ""))
-                recorded = raw if raw else UNSET
+                recorded_raw = raw if raw else UNSET
             if observed:
                 lines.append(
-                    f"  {prop:<20}    recorded {recorded}    now {_shown_now(prop, observed.get(prop))}"
+                    f"  {prop:<20}    recorded {recorded_raw}    now "
+                    f"{_shown_now(prop, observed.get(prop), original[prop]['raw'])}"
                 )
             else:
-                lines.append(f"  {prop:<20}    recorded {recorded}")
+                lines.append(f"  {prop:<20}    recorded {recorded_raw}")
         lines.append("")
     if uuid and original:
         lines.append(
@@ -3493,7 +3523,7 @@ def manual_recovery_report(
         )
         for prop in RECORDED_PROPERTIES:
             current = observed.get(prop) if observed else None
-            if _changed_after_the_install(prop, current, original):
+            if prop not in written and _classify(prop, current, original[prop]["raw"]) == SOMEONE_ELSE:
                 lines.append(
                     f"  leave {prop} at {current or UNSET} -- changed after the install, not the "
                     f"recorded value, and overwriting somebody else's change is what this program "
@@ -3505,12 +3535,24 @@ def manual_recovery_report(
             quoted = quoted or "''" in rendered
             lines.append(f"  {rendered}")
         lines.append(f"  {_render_command(('nmcli', 'connection', 'up', uuid))}")
-        lines.append("")
         if quoted:
+            lines.append("")
             lines.append(
                 "an empty value is written as '', which asks NetworkManager to clear that property "
                 "rather than to set it to something"
             )
+        if written:
+            # After the block and its notes, never inside them: the block has to
+            # stay a run of command lines, because the one thing an operator does
+            # with it is select it and paste it.
+            lines.append("")
+            lines.append(
+                "this run already wrote the recorded value for "
+                + ", ".join(written)
+                + ", so the table above is what the connection held BEFORE it did and the modify "
+                "lines above are what the profile holds now"
+            )
+        lines.append("")
         lines.append("then check that the device picked them up:")
         for prop in (IPV4_DNS, IPV6_IGNORE_AUTO_DNS, IPV4_IGNORE_AUTO_DNS):
             lines.append(
@@ -3737,53 +3779,50 @@ def _ownership(root: Path, run: CommandRunner) -> Ownership:
     for prop in RECORDED_PROPERTIES:
         answer = _text(run, ("nmcli", "-g", prop, "connection", "show", uuid))
         observed[prop] = answer
-        if answer is None:
+        recorded_raw = original[prop]["raw"]
+        # One classifier, and this is consumer one of three. The verdict is
+        # UNREADABLE for both unreadable shapes -- a call that raised and a call
+        # that printed nothing -- because this program has no account of this
+        # property either way and the report is told the same thing, which is the
+        # whole of Finding A: one definition, so the refusal reason and the
+        # report's row and the report's command block cannot disagree.
+        verdict = _classify(prop, answer, recorded_raw)
+        if verdict == UNREADABLE:
             refusals.append(
-                f"{prop} of connection {uuid} could not be read at all (`nmcli -g {prop} connection "
-                f"show {uuid}` did not run), so this program cannot say whether the machine still "
-                "holds what this installation set"
-            )
-            continue
-        current = _as_current(prop, answer)
-        recorded = _as_current(prop, original[prop]["raw"])
-        if prop in IGNORED_AUTOMATICALLY and not answer:
-            # A `yes`/`no` property has no empty value, and `nmcli -g` prints
-            # nothing at all for a connection it cannot find. So a blank here is a
-            # read that produced nothing -- the connection is gone, or nmcli
-            # failed -- and it is not a value this program can compare or write.
-            # The address lists are the opposite case and are handled below: an
-            # empty list is a connection with no manual DNS, which is one of the
-            # states a restore has to cope with.
-            refusals.append(
-                f"{prop} of connection {uuid} could not be read: it came back empty, which is not a "
-                f"value it can hold, and `nmcli -g {prop} connection show {uuid}` prints nothing at "
-                "all for a connection it cannot find -- so this program will not write to a "
-                "connection it cannot see"
-            )
-            continue
-        if prop in dict(NM_MUTATIONS):
-            if current == _as_current(prop, dict(NM_MUTATIONS)[prop]):
-                ours.append(prop)
-                continue
-            if current == recorded:
-                notes.append(
-                    f"{prop} of {uuid} already holds the value {BACKUP_PATH} recorded, so it is "
-                    "left as it is"
+                f"{prop} of connection {uuid} could not be read: it came back "
+                + (
+                    "empty, which is not a value it can hold, and `nmcli -g "
+                    f"{prop} connection show {uuid}` prints nothing at all for a connection it "
+                    "cannot find"
+                    if answer is not None
+                    else f"nothing at all (`nmcli -g {prop} connection show {uuid}` did not run)"
                 )
-                continue
-            refusals.append(
-                f"{prop} of connection {uuid} is {answer!r}, which is neither the value this "
-                f"installation set ({dict(NM_MUTATIONS)[prop]!r}) nor the value {BACKUP_PATH} "
-                f"recorded ({original[prop]['raw']!r}), so somebody changed this connection after "
-                "the install and this program will not overwrite their change"
+                + ", so this program cannot say whether the machine still holds what this "
+                "installation set and will not write to a connection it cannot see"
             )
             continue
-        if current != recorded:
-            refusals.append(
-                f"{prop} of connection {uuid} is {answer!r}, but this installation never changed "
-                f"it and {BACKUP_PATH} recorded {original[prop]['raw']!r}, so it was changed by "
+        if verdict == OURS:
+            ours.append(prop)
+            continue
+        if verdict == RECORDED:
+            notes.append(
+                f"{prop} of {uuid} already holds the value {BACKUP_PATH} recorded, so it is left "
+                "as it is"
+            )
+            continue
+        set_by_us = dict(NM_MUTATIONS).get(prop)
+        refusals.append(
+            f"{prop} of connection {uuid} is {answer!r}, which is neither the value this "
+            f"installation set ({set_by_us!r}) nor the value {BACKUP_PATH} recorded "
+            f"({recorded_raw!r})"
+            + (
+                ", so somebody changed this connection after the install and this program will "
+                "not overwrite their change"
+                if set_by_us is not None
+                else ", and this installation never changed this property, so it was changed by "
                 "something other than this package and this program will not write over it"
             )
+        )
     restores = _as_restored(original, ours)
     if not restores and not refusals:
         notes.append(
@@ -3840,9 +3879,13 @@ def _device_follows_the_backup(run: CommandRunner, ownership: Ownership) -> None
         raise InstallRefused(
             f"resolvectl was asked what {ownership.device} is using for DNS and printed nothing at "
             f"all. A link that exists is always printed as `Link N ({ownership.device}):` even when "
-            f"it has no resolvers, so this is a read that did not happen -- a device that is gone, "
-            "or a resolvectl that failed -- and nothing has confirmed that the connection picked the "
-            "values that were just put back"
+            f"it has no resolvers, so this is a read that did not happen. Two things make that so: "
+            f"{ownership.device} is the name {BACKUP_PATH} recorded, and the interface has been "
+            f"renamed or removed since the install -- if it was renamed, `resolvectl dns "
+            f"<its new name>` will answer and the value in {BACKUP_PATH} is still the one to put "
+            f"back. Either way nothing has confirmed that the connection picked the values that "
+            f"were just put back, so the units this package installs are still running and the hook "
+            f"is still installed"
         )
     recorded = _as_current(IPV4_DNS, ownership.original[IPV4_DNS]["raw"])
     if LOCAL_DNS in forwarding.split() and LOCAL_DNS not in recorded:
@@ -4247,13 +4290,22 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
     device = str(connection["device"])
     original = document["original"]
     observed = _read_current_properties(run, uuid)
-    unread = [prop for prop, value in observed.items() if _shown_now(prop, value) == COULD_NOT_BE_READ]
+    unread = [
+        prop
+        for prop, value in observed.items()
+        if _classify(prop, value, original[prop]["raw"]) == UNREADABLE
+    ]
     notes = [
         f"{prop} of {uuid} is {COULD_NOT_BE_READ} in this report, so it cannot say what that "
         "property held; the values in the backup were written back regardless"
         for prop in unread
     ]
     ownership = Ownership(uuid, device, original, observed, _as_restored(original), [], [])
+    # What REACHED the profile, appended as each write succeeds rather than taken
+    # from what was intended. A first-modify failure means the second and third
+    # were never written, so a hand-edited one of those has survived this run and
+    # the report's leave line for it is the truth.
+    written: List[str] = []
     for prop, value in ownership.restores:
         try:
             _checked(
@@ -4262,7 +4314,8 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
                 f"putting {prop} back to {value!r} on {uuid}",
             )
         except InstallRefused as error:
-            return _rollback_stopped(ownership, str(error), False, None, notes)
+            return _rollback_stopped(ownership, str(error), False, None, notes, written)
+        written.append(prop)
     try:
         _checked(
             run,
@@ -4270,11 +4323,11 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
             f"reactivating {uuid} to apply what was put back",
         )
     except InstallRefused as error:
-        return _rollback_stopped(ownership, str(error), True, None, notes)
+        return _rollback_stopped(ownership, str(error), True, None, notes, written)
     try:
         _device_follows_the_backup(run, ownership)
     except InstallRefused as error:
-        return _rollback_stopped(ownership, str(error), True, None, notes)
+        return _rollback_stopped(ownership, str(error), True, None, notes, written)
     resolves = ask(RESOLVED_STUB_ADDRESS, DNS_PORT).resolves
     # The read failures collected before the first write stay on the notes: they
     # are still true of this run, and a report that lost them is a report that
@@ -4308,6 +4361,7 @@ def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackRe
                     f"the values in {BACKUP_PATH} are on connection {uuid} and it has been "
                     "reactivated; what is left is the resolver that connection is now using"
                 ),
+                written=written,
             ),
             resolves=False,
         )
@@ -4324,12 +4378,17 @@ def _rollback_stopped(
     restored: bool,
     resolves: Optional[bool],
     notes: Optional[List[str]] = None,
+    written: Optional[Sequence[str]] = None,
 ) -> RollbackResult:
     """A rollback that put some of the recorded values back and then stopped.
 
     ``notes`` carries the read failures collected before the first write, because
     a report that cannot name the property it could not read is a report that
-    looks like a report about a machine this run never looked at.
+    looks like a report about a machine this run never looked at. ``written``
+    names the properties that REACHED the profile, and the report needs it for the
+    same reason it needs ``observed``: without it the report would tell an operator
+    to leave a value at a number this run has already replaced, and claim a refusal
+    that did not happen.
     """
     return RollbackResult(
         ok=False,
@@ -4349,6 +4408,7 @@ def _rollback_stopped(
                 f"{BACKUP_PATH} records what connection {ownership.uuid} was set to, and the "
                 "commands above are what puts the rest of it back"
             ),
+            written=list(written or ()),
         ),
         resolves=resolves,
     )

@@ -547,6 +547,18 @@ class UninstallFixture(unittest.TestCase):
         self.assertNotEqual(self.result.refusals, [], "a refusal with nothing named in it")
         return self.result
 
+    def refuse_with(self, **kwargs):
+        """Run the uninstall expecting a refusal, and assert it changed nothing.
+
+        Both halves, every time: a refusal that changed something is a bug, and a
+        test that only reads the exit status would not notice.
+        """
+        before = self.snapshot()
+        self.result = self.run_uninstall(**kwargs)
+        self.assertNothingChanged(f"a refusal changed the machine: {self.result.refusals}")
+        self.assertNothingTouched(before, f"a refusal wrote to the filesystem: {self.result.refusals}")
+        return self.refused()
+
     # -- the sequence -----------------------------------------------------
 
     def property_reads(self):
@@ -565,6 +577,253 @@ class UninstallFixture(unittest.TestCase):
             + [("systemctl", "stop", unit) for unit in STOPPED_UNITS]
             + [DAEMON_RELOAD]
         )
+
+
+class UnreadableValueTests(UninstallFixture):
+    """A value this program could not read is UNREADABLE, not SOMEONE_ELSE.
+
+    The two consumers of that question -- the refusal reasons and the report's
+    command block -- were written in the same round and did not agree about it.
+    `_shown_now` read a blank `yes`/`no` as "could not be read"; the command
+    block's `_changed_after_the_install` knew only `None`. So on the refusal path
+    one property got three accounts of itself in one report:
+
+      * the refusal said "could not be read: it came back empty",
+      * the table's row said `now (could not be read)`,
+      * and the block said `leave ipv4.ignore-auto-dns at (unset) -- changed after
+        the install, ... this program refused to do`.
+
+    The last is the false one. "Changed after the install" is a claim about the
+    MACHINE, and it is asserted about a value nobody read.
+    """
+
+    def test_a_blank_read_on_the_refusal_path_makes_no_claim_about_the_machine(self):
+        self.property_value(IPV4_IGNORE, "")
+        before = self.snapshot()
+        self.result = self.run_uninstall()
+        self.assertNothingChanged("a refusal over an unreadable property")
+        self.assertNothingTouched(before, "a refusal over an unreadable property")
+        self.refused()
+        report = self.result.manual_recovery or ""
+        self.assertNotIn(
+            f"leave {IPV4_IGNORE}",
+            report,
+            "the report claims somebody changed a property this program could not read",
+        )
+        self.assertNotIn(
+            "changed after the install",
+            report,
+            "the report asserts a change after the install about a value it could not read",
+        )
+
+    def test_the_report_does_not_contradict_its_own_refusal_reason(self):
+        self.property_value(IPV4_IGNORE, "")
+        result = self.refuse_with()
+        report = result.manual_recovery or ""
+        reasons = " ".join(result.refusals)
+        self.assertIn("could not be read", reasons, "the refusal reason has to say what happened")
+        self.assertIn(
+            f"{IPV4_IGNORE}    recorded {RECORDED_RAW[IPV4_IGNORE]}    now {COULD_NOT_BE_READ}",
+            report,
+            "the row has to agree with the refusal reason about the same property",
+        )
+
+    def test_an_unreadable_property_is_handed_the_recorded_value_not_a_leave(self):
+        # The instruction for a value nobody read is "put it back to what the
+        # record says", not "leave it". It is a guess in neither direction: the
+        # refusal above it says the read failed, and the record is the only
+        # account of the machine there is.
+        self.property_value(IPV4_IGNORE, "")
+        report = self.refuse_with().manual_recovery or ""
+        self.assertIn(
+            f"nmcli connection modify {UUID} {IPV4_IGNORE} {RECORDED_RAW[IPV4_IGNORE]}",
+            report,
+            "an unreadable property has no value to leave, so the record is what the operator needs",
+        )
+
+
+class ValueSpaceTests(unittest.TestCase):
+    """The whole value space, one table, all three consumers read from it.
+
+    The two control tests that shipped in round 1 pinned the two ENDS: a machine
+    nobody touched, and a value somebody deliberately changed. The unreadable
+    middle is what went wrong, and a table over all four verdicts is what stops the
+    next middle from being invented.
+
+    Each row is `(property, value nmcli printed, our value, recorded value,
+    verdict, the row's "now" text, whether the block leaves it)`. Every row feeds
+    all three consumers: :func:`mosdns_installer._classify` for the verdict, the
+    table's row for the "now" column, and the command block for the leave-or-write
+    decision. A value one consumer classifies and another does not fails here.
+    """
+
+    # (prop, what nmcli printed, the value this install sets, the recorded value,
+    #  verdict, the row's "now" text, whether the block leaves it)
+    ROWS = (
+        # -- a yes/no holding what this installation set: the commonest row on an
+        #    installed machine, and the one a two-way rule got wrong.
+        (IPV4_IGNORE, "yes", "yes", "no", "ours", "yes", False),
+        (IPV6_IGNORE, "yes", "yes", "no", "ours", "yes", False),
+        # -- a yes/no already back where the record says.
+        (IPV4_IGNORE, "no", "yes", "no", "recorded", "no", False),
+        (IPV6_IGNORE, "no", "yes", "no", "recorded", "no", False),
+        # -- a yes/no somebody set by hand.
+        (IPV4_IGNORE, "maybe", "yes", "no", "somebody_else", "maybe", True),
+        # -- a yes/no this program could not read. BOTH unreadable shapes: the
+        #    call raised, and the call ran and printed nothing.
+        (IPV4_IGNORE, None, "yes", "no", "unreadable", COULD_NOT_BE_READ, False),
+        (IPV4_IGNORE, "", "yes", "no", "unreadable", COULD_NOT_BE_READ, False),
+        (IPV6_IGNORE, "", "yes", "no", "unreadable", COULD_NOT_BE_READ, False),
+        # -- an address list holding what this installation set.
+        (IPV4_DNS, LOCAL_DNS, LOCAL_DNS, DHCP_UPSTREAM, "ours", LOCAL_DNS, False),
+        # -- an address list already back, with an empty recorded list. This is
+        #    the row that separates "the list is empty" from "the read produced
+        #    nothing": the first is a value and the second is not.
+        (IPV6_DNS, "", None, "", "recorded", UNSET, False),
+        # -- an address list somebody set by hand.
+        (IPV4_DNS, "192.0.2.99", LOCAL_DNS, DHCP_UPSTREAM, "somebody_else", "192.0.2.99", True),
+        (IPV6_DNS, "2001:db8::1", None, "", "somebody_else", "2001:db8::1", True),
+        # -- the same property, a list this install never set and cannot be read
+        #    from. The third value of a property is what the two ends of the table
+        #    do not reach.
+        (IPV6_DNS, None, None, "", "unreadable", COULD_NOT_BE_READ, False),
+        # -- a list that CONTAINS what this install set and one more address,
+        #    which is a user adding a resolver and not a leftover.
+        (IPV4_DNS, f"{LOCAL_DNS},203.0.113.9", LOCAL_DNS, DHCP_UPSTREAM, "somebody_else",
+         f"{LOCAL_DNS},203.0.113.9", True),
+        # -- an address list the call raised on. A blank one is a real value --
+        #    the empty list -- and here the recorded list is NOT empty, so the
+        #    empty one is somebody's edit rather than a leftover. That is the row
+        #    that separates "the list is empty" from "the read produced nothing",
+        #    and both from "the list is empty because this install never had one"
+        #    (the ipv6 row above).
+        (IPV4_DNS, None, LOCAL_DNS, DHCP_UPSTREAM, "unreadable", COULD_NOT_BE_READ, False),
+        (IPV4_DNS, "", LOCAL_DNS, DHCP_UPSTREAM, "somebody_else", UNSET, True),
+    )
+
+    def original_for(self, recorded):
+        """The backup's ``original`` with one property's recorded value replaced.
+
+        Built from the row's own recorded value, so a row is a complete statement
+        about one value rather than half a statement about the default fixture.
+        """
+        recorded_for = {
+            IPV4_IGNORE: "no",
+            IPV6_IGNORE: "no",
+            IPV4_DNS: DHCP_UPSTREAM,
+            IPV6_DNS: "",
+        }
+        recorded_for[recorded[0]] = recorded[3]
+        return {
+            prop: {
+                "raw": value,
+                "value": value if prop in (IPV4_IGNORE, IPV6_IGNORE) else [
+                    token for token in value.split(",") if token
+                ],
+            }
+            for prop, value in recorded_for.items()
+        }
+
+    def test_the_three_consumers_agree_about_every_value(self):
+        for row in self.ROWS:
+            prop, printed, _ours, _recorded, verdict, shown, _leaves = row
+            with self.subTest(prop=prop, printed=printed, recorded=row[3]):
+                original = self.original_for(row)
+                classified = installer._classify(prop, printed, original[prop]["raw"])
+                self.assertEqual(
+                    classified,
+                    verdict,
+                    f"{prop} printed {printed!r} against a recorded {original[prop]['raw']!r} was "
+                    f"classified as {classified!r}",
+                )
+                self.assertEqual(
+                    installer._shown_now(prop, printed, original[prop]["raw"]),
+                    shown,
+                    f"{prop} printed {printed!r} is shown as something other than {shown!r}",
+                )
+
+    def test_the_report_row_and_the_command_block_come_from_the_same_rows(self):
+        for row in self.ROWS:
+            prop, printed, _ours, _recorded, _verdict, shown, leaves = row
+            with self.subTest(prop=prop, printed=printed, recorded=row[3]):
+                original = self.original_for(row)
+                observed = {
+                    other: ("" if other in (IPV4_DNS, IPV6_DNS) else "yes")
+                    for other in RECORDED_PROPERTIES
+                }
+                observed[prop] = printed
+                report = installer.manual_recovery_report(
+                    UUID, original, observed, ["a test drove this report"]
+                )
+                rows = [line for line in report.splitlines() if line.strip().startswith(prop)]
+                self.assertEqual(len(rows), 1, f"the report has {len(rows)} rows about {prop}: {rows}")
+                self.assertTrue(
+                    rows[0].endswith(shown),
+                    f"the row for {prop} printed {printed!r} ends {rows[0]!r}, not with {shown!r}",
+                )
+                self.assertEqual(
+                    f"leave {prop} " in report,
+                    leaves,
+                    f"the block's decision for {prop} printed {printed!r} is the wrong one",
+                )
+
+    def test_the_table_covers_every_verdict_and_both_unreadable_shapes(self):
+        verdicts = {row[4] for row in self.ROWS}
+        self.assertEqual(
+            verdicts,
+            {"ours", "recorded", "somebody_else", "unreadable"},
+            f"the value-space table does not exercise every verdict: {sorted(verdicts)}",
+        )
+        yes_no = (IPV4_IGNORE, IPV6_IGNORE)
+        unreadable_yes_no = {
+            row[1] for row in self.ROWS if row[0] in yes_no and row[4] == "unreadable"
+        }
+        self.assertEqual(
+            unreadable_yes_no,
+            {None, ""},
+            "the table has to cover BOTH shapes of an unreadable value, because a blank answer "
+            "and a call that raised are the two the drift was about",
+        )
+        # The same pair, for an address list, where the two shapes mean DIFFERENT
+        # things: a raised call is unreadable and a blank answer is the empty list.
+        blank_lists = {
+            row[1]: row[4]
+            for row in self.ROWS
+            if row[0] in (IPV4_DNS, IPV6_DNS) and row[1] in (None, "")
+        }
+        self.assertEqual(
+            blank_lists.get(None),
+            "unreadable",
+            "a list whose call raised is unreadable",
+        )
+        self.assertIn(
+            blank_lists.get(""),
+            ("recorded", "somebody_else"),
+            "a blank list is a value -- an empty one -- and never a failed read",
+        )
+
+    def test_the_table_is_still_a_whole_value_space(self):
+        # A table that can be cut for brevity is a table that stops being the
+        # space. The two shapes that drifted are named here rather than left to
+        # the row count, because a count can be met by adding duplicates.
+        self.assertGreaterEqual(
+            len(self.ROWS),
+            12,
+            "the value-space table has shrunk below the whole space it enumerates",
+        )
+        self.assertEqual(
+            len({(row[0], row[1], row[3]) for row in self.ROWS}),
+            len(self.ROWS),
+            "the table has duplicate rows, so it is shorter than it looks",
+        )
+        for prop in (IPV4_IGNORE, IPV6_IGNORE, IPV4_DNS, IPV6_DNS):
+            with self.subTest(prop=prop):
+                self.assertGreaterEqual(
+                    len([row for row in self.ROWS if row[0] == prop]),
+                    3,
+                    f"{prop} is in the table with fewer than three values, so the space it spans "
+                    "is not the space",
+                )
 
 
 class ModuleSurfaceTests(unittest.TestCase):
@@ -613,15 +872,6 @@ class ModuleSurfaceTests(unittest.TestCase):
 
 class OwnershipRefusalTests(UninstallFixture):
     """Nothing is restored that this installation cannot prove it owns."""
-
-    def refuse_with(self, **kwargs):
-        before = self.snapshot()
-        self.result = self.run_uninstall(**kwargs)
-        self.assertNothingChanged(
-            f"a refusal changed the machine: {self.result.refusals}",
-        )
-        self.assertNothingTouched(before, f"a refusal wrote to the filesystem: {self.result.refusals}")
-        return self.refused()
 
     def test_it_refuses_when_the_marker_is_absent(self):
         self.remove_marker()
@@ -1795,6 +2045,151 @@ class EmergencyRollbackTests(UninstallFixture):
             COULD_NOT_BE_READ,
             " ".join(self.result.notes),
             "the operator has to be told which property the report cannot speak for",
+        )
+
+    def test_the_report_of_a_write_that_did_not_finish_never_names_a_written_value(self):
+        # `_rollback_stopped` is one of the two report paths on this verb, and it
+        # hands the PRE-WRITE observation to the report while the run has already
+        # written to the profile. A leave line there names a value that no longer
+        # exists and claims a refusal that did not happen.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        self.result = self.run_rollback(
+            runner=self.good_runner(fail=[CONNECTION_UP + (UUID,)])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        self.assertIn(
+            MODIFY[0], report, "the report of a failed rollback has no command block at all"
+        )
+        self.assertNotIn(
+            f"leave {IPV4_DNS}",
+            report,
+            "the report tells an operator to leave a value at 192.0.2.99 that this run has already "
+            "overwritten with the recorded 192.0.2.53",
+        )
+        self.assertIn(
+            f"nmcli connection modify {UUID} {IPV4_DNS} {DHCP_UPSTREAM}",
+            report,
+            "a property this run wrote is the recorded value now, so the report says so",
+        )
+        self.assertIn(
+            "already wrote",
+            report,
+            "the report has to say which properties it changed, or the table reads as the state of "
+            "a machine nobody touched",
+        )
+
+    def test_the_report_of_a_chain_that_does_not_resolve_never_names_a_written_value(self):
+        # The other report path, and the one an operator is most likely to be
+        # looking at: the restore worked and the machine still cannot resolve.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        self.result = self.run_rollback(probe=self.probe_for(stub=SERVFAIL))
+        self.assertFalse(self.result.ok)
+        self.assertTrue(self.result.restored)
+        report = self.result.manual_recovery or ""
+        self.assertNotIn(
+            f"leave {IPV4_DNS}",
+            report,
+            "this run put ipv4.dns back and the report claims it refused to",
+        )
+        self.assertIn("already wrote", report)
+
+    def test_the_command_block_is_a_contiguous_run_of_command_lines(self):
+        # The one thing an operator does with the block is select it and paste it,
+        # so prose inside it is a defect -- and the "already wrote" paragraph is
+        # prose. The first version of it landed between the modify lines and the
+        # note about `''`, which put two paragraphs inside the block.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        self.result = self.run_rollback(probe=self.probe_for(stub=SERVFAIL))
+        report = self.result.manual_recovery or ""
+        after = report.split("  nmcli connection modify", 1)[1]
+        block = "  nmcli connection modify" + after.split("\n\n")[0]
+        for line in block.splitlines():
+            self.assertTrue(
+                line.strip().startswith("nmcli "),
+                f"the command block has a line in it that is not a command: {line!r}",
+            )
+        self.assertIn("already wrote", report)
+        self.assertNotIn("already wrote", block, "the overwrite note is inside the block an operator pastes")
+
+    def test_a_property_this_run_did_not_write_still_gets_its_leave_line(self):
+        # The other half: the rollback never writes `ipv6.dns`, so a hand-edited
+        # one survives it and the report's leave line is the truth.
+        self.property_value(IPV6_DNS, "2001:db8::1")
+        self.result = self.run_rollback(
+            runner=self.good_runner(fail=[CONNECTION_UP + (UUID,)])
+        )
+        report = self.result.manual_recovery or ""
+        self.assertIn(f"leave {IPV6_DNS} at 2001:db8::1", report)
+
+    def test_a_write_that_never_happened_is_not_claimed_as_written(self):
+        # The write set is what REACHED the profile, not what was intended. The
+        # rollback writes `ipv4.dns` first, so failing that one means a
+        # hand-edited `ipv4.dns` survived this run entirely -- and the report's
+        # leave line for it is the truth, which is the case a set of intended
+        # writes would get wrong.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        self.result = self.run_rollback(
+            runner=self.good_runner(fail=[MODIFY + (UUID, IPV4_DNS, DHCP_UPSTREAM)])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        self.assertIn(
+            f"leave {IPV4_DNS} at 192.0.2.99",
+            report,
+            "the report claims a refusal over a property whose write never ran",
+        )
+        self.assertNotIn("already wrote", report, "and it claims a write that did not happen")
+
+    def test_a_write_that_failed_after_an_earlier_one_claimed_exactly_that_one(self):
+        # The partial case, and the one that needs the set to be tracked rather
+        # than reconstructed: the first write reached the profile and the second
+        # did not, so the report may claim the first and must not claim the second.
+        self.property_value(IPV4_DNS, "192.0.2.99")
+        self.result = self.run_rollback(
+            runner=self.good_runner(fail=[MODIFY + (UUID, IPV6_IGNORE, "no")])
+        )
+        self.assertFalse(self.result.ok)
+        report = self.result.manual_recovery or ""
+        self.assertIn("already wrote the recorded value for ipv4.dns,", report)
+        self.assertNotIn("ipv6.ignore-auto-dns,", report.split("already wrote the recorded value for")[1])
+        self.assertNotIn(f"leave {IPV4_DNS}", report, "the first write happened, so nothing to leave")
+
+    def test_a_blank_device_check_on_the_rollback_path_is_reported(self):
+        # The same read that now refuses on the uninstall path, on the other one.
+        # It ends as `restored=True, ok=False`: the values are back and the
+        # machine's DNS is not accounted for, which is the machine a caller has to
+        # be told about rather than the machine a rollback can claim.
+        self.resolvectl_fails()
+        self.result = self.run_rollback()
+        self.assertFalse(self.result.ok, "a device check that failed was reported as a good rollback")
+        self.assertTrue(self.result.restored, "the values were put back and the result says otherwise")
+        self.assertIsNone(self.result.resolves, "the machine was never asked whether it resolves")
+        self.assertIn("resolvectl", self.result.error or "")
+        self.assertIn(
+            ("nmcli", "connection", "up", UUID),
+            self.commands,
+            "the reactivation is what the report's commands are for, so it has to have run",
+        )
+
+    def test_a_stale_recorded_device_is_named_so_the_operator_recognises_it(self):
+        # A new way for a healthy uninstall to refuse: the interface was renamed
+        # since the install, so the recorded device is not the device. Fail-closed
+        # and recoverable, and the only thing that makes it recoverable is the
+        # operator recognising which name the record holds.
+        self.resolvectl_fails()
+        self.result = self.run_uninstall()
+        self.assertFalse(self.result.ok)
+        self.assertIn(
+            DEVICE,
+            self.result.error or "",
+            "the failure does not name the device the record holds, so an operator cannot tell a "
+            "renamed interface from a missing one",
+        )
+        self.assertIn(
+            "rename",
+            (self.result.error or "").lower(),
+            "the failure does not say that a renamed interface is the likely cause",
         )
 
     def resolve_property_read_fails(self, prop=IPV4_IGNORE):
