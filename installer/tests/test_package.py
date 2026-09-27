@@ -1,0 +1,2211 @@
+"""Hold the Debian package to the machine it is allowed to make.
+
+A package is the one artifact in this project that can change a machine without
+asking a question, and nothing about what it would do is visible in the code that
+does it: three compiled binaries, eight unit files, six configuration documents,
+a maintainer script, a dispatcher hook, three manual pages and a tmpfiles entry
+are all opaque files a reviewer has to trust because they are shipped rather than
+read. So this module builds the staging root exactly the way
+``scripts/build-deb.sh`` does and asks the questions a text review of those files
+would ask, in the only form that can be answered automatically:
+
+* is every file the units' ``ExecStart`` lines name actually installed;
+* is every file installed something the plan decided on;
+* is every mode the mode table says, in either direction;
+* does nothing anywhere name a resolver this project refuses to use.
+
+Each of the four ways a package is wrong has a control in ``ControlTests`` that
+mutates a copy of the staged tree and asserts the question changes its answer,
+because a check that accepts a missing file, a loose mode or a forbidden address
+is not a check.
+
+The build runs once per process and its result is shared, because it compiles
+three programs and a suite that rebuilt them per assertion would be unrunnable.
+The shared build is a staging root and nothing else: no maintainer script is ever
+executed, no service is started, no port is bound, and nothing outside a
+temporary directory is written. That is the whole of the boundary this project
+works under, and a test that crossed it would be testing the development machine
+wearing a test's name.
+"""
+
+import atexit
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+BUILD_SCRIPT = REPO / "scripts" / "build-deb.sh"
+PACKAGING = REPO / "packaging"
+MANIFEST = PACKAGING / "mosdns-router.install"
+CONTROL = PACKAGING / "debian" / "control"
+CONFFILES = PACKAGING / "debian" / "conffiles"
+POSTINST = PACKAGING / "debian" / "postinst"
+PRERM = PACKAGING / "debian" / "prerm"
+POSTRM = PACKAGING / "debian" / "postrm"
+SOURCE_DIGEST = PACKAGING / "debian" / "dnscrypt-proxy.sha256"
+
+sys.path.insert(0, str(REPO))
+from installer.tests.test_units import (  # noqa: E402
+    SHIPPED_UNITS,
+    non_loopback,
+    parse_unit,
+    toml_listen_addresses,
+    yaml_listen_addresses,
+)
+
+# --- the installed layout ----------------------------------------------------
+#
+# Every path here is a path this project decided on. The three binaries and the
+# installer script are the paths the units and mosdns-cdnctl name; the rest are
+# the installer's own constants. A path that appears in only one of those is a
+# disagreement between two parts of the same package, and that is a bug rather
+# than a choice this module gets to make.
+
+BINARY_DIRECTORY = "/usr/lib/mosdns-router"
+ROUTER_BINARY = BINARY_DIRECTORY + "/mosdns-router"
+CDNCTL_BINARY = BINARY_DIRECTORY + "/mosdns-cdnctl"
+DNSCRYPT_BINARY = BINARY_DIRECTORY + "/dnscrypt-proxy"
+INSTALLER_SCRIPT = BINARY_DIRECTORY + "/mosdns_installer.py"
+# The bridge is imported rather than executed, so it is a directory of modules
+# rather than a program, and it has to sit on the Python path of every process
+# that runs `python3 -m mosdns_dhcp_bridge.cli`.
+BRIDGE_PACKAGE = BINARY_DIRECTORY + "/mosdns_dhcp_bridge"
+BRIDGE_MODULES = ("__init__.py", "cli.py", "collect.py", "publish.py")
+DISPATCHER_SCRIPT = "/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge"
+UNIT_DIRECTORY = "/usr/lib/systemd/system"
+TMPFILES_PATH = "/usr/lib/tmpfiles.d/mosdns-router.conf"
+DOC_DIRECTORY = "/usr/share/doc/mosdns-router"
+BUILD_MANIFEST = DOC_DIRECTORY + "/BUILD-MANIFEST"
+DATA_DIRECTORY = "/usr/share/mosdns-router"
+CONFIG_DIRECTORY = "/etc/mosdns"
+MAN_ROOT = "/usr/share/man"
+DEBIAN = "/DEBIAN"
+
+# The six documents an operator edits, and the two generated ones among them. All
+# six are conffiles, so an upgrade asks before replacing any of them.
+EDITABLE_DOCUMENTS = (
+    CONFIG_DIRECTORY + "/mosdns.yaml",
+    CONFIG_DIRECTORY + "/dnscrypt-proxy.toml",
+    CONFIG_DIRECTORY + "/policy.yaml",
+    CONFIG_DIRECTORY + "/force-ech-domains.txt",
+    CONFIG_DIRECTORY + "/cloudflare.txt",
+    CONFIG_DIRECTORY + "/cloudfront-domains.yaml",
+)
+ROUTING_DOCUMENTS = (
+    CONFIG_DIRECTORY + "/mosdns.yaml",
+    CONFIG_DIRECTORY + "/dnscrypt-proxy.toml",
+)
+
+# The three compiled programs. Their bytes are pinned by digest in the build
+# manifest and they are deliberately NOT content-scanned: mosdns-cdnctl embeds
+# the very list of Chinese public resolvers it REFUSES to render, so a substring
+# scan of that binary finds exactly the values the project exists to keep out of
+# a routing document, and calling that a failure would be a check satisfiable
+# only by deleting the refusal.
+COMPILED = (ROUTER_BINARY, CDNCTL_BINARY, DNSCRYPT_BINARY)
+
+# The China domain list, shipped as a reviewed snapshot for the install to place
+# and verify, and the lock that describes it. They are shipped under /usr/share
+# and copied by postinst, because /var/lib holds generated state and a package
+# that ships state there is a package whose upgrade overwrites the operator's
+# data.
+CHINA_LIST = DATA_DIRECTORY + "/cn-domains.txt"
+SOURCE_LOCK = DATA_DIRECTORY + "/source-lock.json"
+PUBLISHED_LIST = "/var/lib/mosdns/lists/cn-domains.txt"
+PUBLISHED_LOCK = "/var/lib/mosdns/lists/source-lock.json"
+
+# The four directories the package provisions. The mode is 2770 and the reason
+# is load-bearing: with an extended ACL present the mode's group field IS the
+# group-class mask, so 2750 would cap the group at r-x and no service identity
+# could create, replace or lock a state file. The first three survive a reboot
+# and are in the package; the fourth is on a tmpfs and belongs to tmpfiles.d.
+STATE_DIRECTORIES = (
+    "/var/lib/mosdns",
+    "/var/lib/mosdns/runtime",
+    "/var/lib/mosdns/lists",
+    "/run/mosdns",
+)
+PACKAGED_STATE_DIRECTORIES = STATE_DIRECTORIES[:3]
+
+# The whole mode table. A mode here is the ONLY mode the file may have, so a file
+# made too permissive and a file made too restrictive both fail.
+MODES = {
+    ROUTER_BINARY: 0o755,
+    CDNCTL_BINARY: 0o755,
+    DNSCRYPT_BINARY: 0o755,
+    INSTALLER_SCRIPT: 0o755,
+    DISPATCHER_SCRIPT: 0o755,
+    TMPFILES_PATH: 0o644,
+    BUILD_MANIFEST: 0o644,
+    DOC_DIRECTORY + "/copyright": 0o644,
+    CHINA_LIST: 0o644,
+    SOURCE_LOCK: 0o644,
+    **{document: 0o644 for document in EDITABLE_DOCUMENTS},
+    **{BRIDGE_PACKAGE + "/" + module: 0o644 for module in BRIDGE_MODULES},
+    **{UNIT_DIRECTORY + "/" + name: 0o644 for name in SHIPPED_UNITS},
+    MAN_ROOT + "/man1/mosdns-cdnctl.1.gz": 0o644,
+    MAN_ROOT + "/man8/mosdns-router.8.gz": 0o644,
+    MAN_ROOT + "/man8/dnscrypt-proxy.8.gz": 0o644,
+}
+
+# The prefixes the package may write to at all. Whether this set is right is the
+# whole of "the package installs nothing it should not", so it is a table here
+# rather than a judgement inside the build script.
+ALLOWED_PREFIXES = (
+    BINARY_DIRECTORY + "/",
+    UNIT_DIRECTORY + "/",
+    CONFIG_DIRECTORY + "/",
+    "/etc/NetworkManager/dispatcher.d/no-wait.d/",
+    "/usr/lib/tmpfiles.d/",
+    DOC_DIRECTORY + "/",
+    DATA_DIRECTORY + "/",
+    MAN_ROOT + "/",
+    "/var/lib/mosdns/",
+)
+
+# The paths the build generates rather than copies. A staged path is either a
+# manifest destination or one of these, and both lists are here so that a path
+# appearing in neither is a failure rather than a surprise.
+GENERATED = set(ROUTING_DOCUMENTS) | {
+    BUILD_MANIFEST,
+    DEBIAN + "/control",
+    DEBIAN + "/conffiles",
+    DEBIAN + "/postinst",
+    DEBIAN + "/prerm",
+    DEBIAN + "/postrm",
+    DEBIAN + "/md5sums",
+    DEBIAN + "/shlibs",
+}
+
+# Everything forbidden, in two tables, because there are two questions and they do
+# not have the same answer everywhere.
+#
+# A resolver ADDRESS is refused EVERYWHERE, the China domain list included. An
+# address in a document is an upstream somebody would be asked, and the domestic
+# branch of the routing document reaches exactly one set of upstreams: the addresses
+# the DHCP lease published. Everything else this package names is either loopback or
+# a pinned bootstrap resolver.
+FORBIDDEN_ADDRESSES = (
+    "114.114.114.114",
+    "114.114.115.115",
+    "119.29.29.29",
+    "182.118.125.13",
+    "223.5.5.5",
+    "223.6.6.6",
+    "180.76.76.76",
+    "117.50.11.11",
+    "1.12.12.12",
+    "120.53.53.53",
+    "168.95.1.1",
+    "202.96.128.86",
+)
+# A resolver ENDPOINT, a provider's brand, or a tool that moves this machine onto
+# somebody else's resolver. Refused in every document EXCEPT the one file that is a
+# list of the names to be resolved inside the network the user is not leaving: that
+# file's content is a set of NAMES this project routes domestically, so naming the
+# provider those names belong to is what the file is FOR, and pointing a query at
+# that provider's public resolver is what the address table above refuses.
+FORBIDDEN_PROVIDERS = (
+    # The domestic public resolvers, by endpoint and by name.
+    "dns.alidns.com",
+    "doh.360.cn",
+    "dot.pub",
+    "doh.pub",
+    "alidns",
+    "dnspod",
+    "114dns",
+    # A DoH or an ODoH endpoint: a resolver doing DNS over HTTPS on this machine's
+    # behalf, where the whole foreign branch is a plain DNSCrypt-over-TCP hop to a
+    # loopback socket.
+    "cloudflare-dns.com",
+    "dns.google",
+    "dns.quad9.net",
+    "dns.adguard.com",
+    "doh.opendns.com",
+    "doh.mullvad.net",
+    "dns.nextdns.io",
+    # A local certificate authority, a browser policy file, a TLS-intercepting
+    # middlebox and a container runtime: the ways a machine is put on somebody
+    # else's resolver without a resolver address ever appearing in a configuration.
+    "ClearDNS",
+    "cleardns",
+    "update-ca-certificates",
+    "p11-kit",
+    "mkcert",
+    "mitmproxy",
+    "sslh",
+    "tls.intercept",
+    "sni_proxy",
+    "haproxy",
+    "network.trr",
+    "policies.json",
+    "/etc/docker",
+    "docker-ce",
+    "wpad",
+)
+
+# The one file the provider scan skips, and why it is not a hole: its bytes are
+# pinned by digest against a lock the package also ships, and every line of it is
+# checked to be one of the four rule forms the gateway can read, which is what
+# keeps it a list of names rather than anything else.
+ROUTE_SCAN_EXEMPT = (CHINA_LIST,)
+
+# The metadata that was decided, read back out of packaging/debian/control.
+CONTROL_FIELDS = {
+    "Package": "mosdns-router",
+    "Version": "0.1.0",
+    "Section": "net",
+    "Priority": "optional",
+}
+# The SET the package is built for, which the repository's control file declares, and
+# the ONE a built package carries. dpkg rejects a space-separated Architecture field,
+# so the two cannot be the same string: a package labelled `amd64 arm64` is a parse
+# error, and a binary labelled with a name it does not have is worse.
+BUILT_ARCHITECTURES = "amd64 arm64"
+CONTROL_DEPENDS = (
+    "python3",
+    "systemd",
+    "network-manager",
+    "systemd-resolved",
+    "libc6",
+)
+
+# The source the packaged resolver is built from, and the digest that archive has
+# to carry before anything at all is built from it.
+DNSCRYPT_VERSION = "2.1.18"
+DNSCRYPT_ARCHIVE = "dnscrypt-proxy-" + DNSCRYPT_VERSION + ".tar.gz"
+DNSCRYPT_SOURCE_URL = (
+    "https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/2.1.18.tar.gz"
+)
+
+
+# --- the Debian control file ------------------------------------------------
+
+
+def control_fields(text):
+    """Return a Debian control stanza as a mapping with lowercased field names.
+
+    The three rules that matter, and each of them is a case this repository's own
+    files get wrong for a reader that does not have them:
+
+    * a continuation line begins with a space or a tab, and it continues the field
+      above it -- a Description that wraps is one field, and a reader that took only
+      its first line would compare against a truncated sentence;
+    * a BLANK line ends the stanza. This is why an inserted control field may not be
+      followed by one: two stanzas where there should be one, and dpkg reports the
+      second as a package with no Package field;
+    * any other line that is not a field ends the field being read as well.
+      `dpkg-deb --info` prints a size header above the stanza, and a reader that did
+      not end the previous field there reads the indented ` Package:` line as a
+      continuation of the header -- and then reports a package with no Package field
+      at all, which is a property of the reader and not of the package.
+    """
+    fields = {}
+    name = None
+    for line in text.splitlines():
+        if not line.strip():
+            name = None
+            continue
+        if line[:1] in (" ", "\t"):
+            if name is not None:
+                fields[name] += " " + line.strip()
+            continue
+        if ":" not in line:
+            name = None
+            continue
+        name, _, value = line.partition(":")
+        name = name.strip().lower()
+        fields[name] = value.strip()
+    return fields
+
+
+def dependency_names(fields):
+    """The Depends field as a list of package names, without their constraints."""
+    parts = []
+    for clause in fields.get("depends", "").split(","):
+        clause = clause.strip()
+        if clause:
+            parts.append(clause.split("(")[0].split("[")[0].split("|")[0].strip())
+    return parts
+
+
+def _built_architecture():
+    """The architecture the shared staging root was built for.
+
+    Read out of the staged control rather than out of `dpkg --print-architecture`, so
+    a build for one architecture cannot pass a test that expects the other: the two
+    are equal in every run that matters and differ in a cross-build.
+    """
+    return control_fields(
+        (Path(_SHARED.get("root", "")) / "DEBIAN" / "control").read_text()
+        if _SHARED.get("root")
+        else ""
+    ).get("architecture", "")
+
+
+# --- a staged tree -----------------------------------------------------------
+
+
+def staged_inventory(root):
+    """Every path under ``root`` as ``(absolute, kind, mode, size)``.
+
+    Reducing the staging root to a list of tuples is what lets every question in
+    this module be asked of the real build and of a mutated copy by the same code.
+    """
+    entries = []
+    for path in sorted(Path(root).rglob("*")):
+        absolute = "/" + str(path.relative_to(root))
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            kind = "symlink"
+        elif stat.S_ISDIR(info.st_mode):
+            kind = "directory"
+        elif stat.S_ISREG(info.st_mode):
+            kind = "file"
+        else:
+            kind = "other"
+        entries.append((absolute, kind, stat.S_IMODE(info.st_mode), info.st_size))
+    return entries
+
+
+def inventory_get(inventory, path):
+    for entry in inventory:
+        if entry[0] == path:
+            return entry
+    return None
+
+
+def content_findings(root, inventory, needles, exempt=()):
+    """Every ``(path, needle)`` in the staged text files that names a needle.
+
+    A file that is not valid UTF-8, and is not one of the compiled binaries, is a
+    finding in its own right: a package whose contents cannot be read is a package
+    nobody reviewed, and skipping one silently is how a forbidden value gets in as
+    an unreadable blob.
+    """
+    findings = []
+    for path, kind, _mode, _size in inventory:
+        if kind != "file" or path in COMPILED or path in exempt:
+            continue
+        raw = (Path(root) / path.lstrip("/")).read_bytes()
+        if path.endswith(".gz"):
+            # A manual page ships compressed, as a Debian package's does, and a scan
+            # that reported every page as unreadable would be a scan that never read
+            # one -- which is exactly where a needle in a page would hide.
+            try:
+                raw = gzip.decompress(raw)
+            except (OSError, EOFError):
+                findings.append((path, "<not readable gzip>"))
+                continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            findings.append((path, "<not utf-8 text>"))
+            continue
+        for needle in needles:
+            if needle in text:
+                findings.append((path, needle))
+    return findings
+
+
+def mode_findings(inventory, modes):
+    """Every path whose mode is not the mode the table says, in either direction."""
+    findings = []
+    for path, kind, mode, _size in inventory:
+        if path in modes and kind == "file" and mode != modes[path]:
+            findings.append(f"{path} is {oct(mode)}, want {oct(modes[path])}")
+    present = {entry[0] for entry in inventory}
+    for path, want in sorted(modes.items()):
+        if path not in present:
+            findings.append(f"{path} is not installed at all, want mode {oct(want)}")
+    return findings
+
+
+def shell_alternatives(text):
+    """The `case` labels a maintainer script branches on, in the order it lists them.
+
+    A dpkg maintainer script is handed one argument and has to answer for every value
+    dpkg can pass, so the set of labels is the set of situations the script was
+    written for -- and a script that forgot one would take a path it was never
+    reviewed for. Read rather than grepped, because the labels are usually written on
+    one `|`-separated line and a per-label regex would only ever see the first.
+    """
+    alternatives = []
+    pattern = re.compile(r"^[A-Za-z][A-Za-z0-9-]*(\s*\|\s*[A-Za-z][A-Za-z0-9-]*)*\)$")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not pattern.match(stripped):
+            continue
+        for label in stripped.rstrip(")").split("|"):
+            label = label.strip()
+            if label and not label.startswith('"$'):
+                alternatives.append(label)
+    return alternatives
+
+
+def shell_code(text):
+    """A shell script's COMMANDS, with its comments removed.
+
+    A script that explains in a comment that it never runs `dpkg -i` would otherwise
+    be caught by the check that says it never runs `dpkg -i`, and the only way to
+    satisfy both would be to delete the explanation. A `#` inside a quoted string is
+    not a comment, which is why this is a blunt instrument and is used only on the
+    one script in this repository that the tests own.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def function_body(source, name):
+    """One top-level function of a Python module, as text.
+
+    Used to scope an assertion to a path rather than to the whole module, because
+    the module legitimately does the thing the assertion forbids somewhere else: an
+    install that enabled a unit and rolled back has to disable it again, and that is
+    not the plain uninstall this project refuses to give a disable step.
+    """
+    pattern = re.compile(rf"^def {re.escape(name)}\(", re.MULTILINE)
+    start = pattern.search(source)
+    if start is None:
+        raise AssertionError(f"{name} is not a top-level function of the module")
+    rest = source[start.end():]
+    end = re.search(r"^(?:def |class |[A-Za-z_][A-Za-z0-9_]* =)", rest, re.MULTILINE)
+    return rest[: end.start()] if end is not None else rest
+
+
+def recorded_digest():
+    """The pinned source digest as ``(digest, file name)``, comments ignored.
+
+    The file is in ``sha256sum`` format so that ``sha256sum -c`` can check it
+    directly, which means it can carry comments saying where the archive comes
+    from, and a reader that did not skip them would read a sentence as a digest.
+    """
+    lines = [
+        line for line in SOURCE_DIGEST.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if len(lines) != 1:
+        raise AssertionError(f"{SOURCE_DIGEST.name} has {len(lines)} digest lines, want exactly one")
+    return lines[0].split()
+
+
+def manifest_entries(text):
+    """``packaging/mosdns-router.install`` as ``(source, destination)`` pairs.
+
+    A source of ``-`` is an empty directory, which is how the three state
+    directories are shipped: they have to exist before ``postinst`` provisions
+    them, and they have to hold nothing.
+    """
+    entries = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if len(fields) != 2:
+            raise AssertionError(f"{stripped!r} is not a `source destination` line")
+        entries.append((fields[0], fields[1]))
+    return entries
+
+
+# The four rule forms MOSDNS v5.3.4's domain_set reader accepts, and the only four
+# this project's own converter can publish. A line that is not one of them is a line
+# the gateway would read as something else, so the list is checked against the same
+# four rather than against a guess at a domain syntax.
+DOMAIN_SET_RULE_KINDS = ("domain", "full", "keyword", "regexp")
+# An IPv4 literal in any of its spellings. A list of NAMES is what routes a query
+# inside the network the user is not leaving; a list of ADDRESSES would be a
+# configuration, and this project refuses to ship one.
+IPV4_LITERAL = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def china_list_findings(text):
+    """Every line of the published China list the gateway could not read as a rule.
+
+    Read the way `internal/rules` reads it before it publishes: truncate at the
+    first `#`, ignore a blank remainder, require one space-free section, and require
+    the part before the first `:` to be a supported kind with a value behind it.
+    """
+    findings = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        expression = raw.split("#", 1)[0].strip()
+        if not expression:
+            continue
+        if any(character.isspace() for character in expression):
+            findings.append(f"line {number}: {expression!r} is not one space-free section")
+            continue
+        kind, separator, value = expression.partition(":")
+        if not separator or kind not in DOMAIN_SET_RULE_KINDS or not value:
+            findings.append(f"line {number}: {expression!r} is not a supported rule")
+            continue
+        if IPV4_LITERAL.search(value):
+            findings.append(f"line {number}: {expression!r} carries an address, not a name")
+    return findings
+
+
+def is_ancestor_of_any(path, paths):
+    """Whether ``path`` is a strict parent directory of anything in ``paths``.
+
+    A package has to create `/etc` to install `/etc/mosdns/policy.yaml`, and a
+    manifest that listed every parent of every file would be a list of `/` and `/usr`
+    rather than of this package. So a directory in the staged tree that is on the way
+    to a listed or generated path is derived rather than extra, and a directory that
+    is on the way to nothing is exactly what the two other checks are for.
+    """
+    prefix = path if path.endswith("/") else path + "/"
+    return any(other.startswith(prefix) for other in paths)
+
+
+def unit_exec_paths(root, unit_names=SHIPPED_UNITS):
+    """The absolute executable of every ExecStart in the staged unit directory.
+
+    Read back out of the unit files rather than out of a table, because the
+    failure this catches is a unit naming a path the package does not install, and
+    a table could only agree with itself.
+    """
+    found = {}
+    for name in unit_names:
+        text = (Path(root) / (UNIT_DIRECTORY + "/" + name).lstrip("/")).read_text()
+        for key, value in parse_unit(text, name).get("Service", []):
+            if key != "ExecStart":
+                continue
+            executable = value.split()[0]
+            if not executable.startswith("/"):
+                raise AssertionError(
+                    f"{name}: ExecStart={value!r} names no absolute path, so nothing can decide "
+                    "where the file goes"
+                )
+            found.setdefault(executable, []).append(name)
+    return found
+
+
+def unit_documentation(root, name):
+    """The manual page a staged unit documents itself with."""
+    text = (Path(root) / (UNIT_DIRECTORY + "/" + name).lstrip("/")).read_text()
+    pages = [
+        value for key, value in parse_unit(text, name).get("Unit", []) if key == "Documentation"
+    ]
+    if len(pages) != 1:
+        raise AssertionError(f"{name} names {len(pages)} manual pages, want exactly one")
+    return pages[0]
+
+
+# --- the tmpfiles.d entry ----------------------------------------------------
+
+
+def tmpfiles_lines(text):
+    """The entry's directives as ``(type, path, fields)``, comments and blanks gone."""
+    entries = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        entries.append((fields[0], fields[1] if len(fields) > 1 else "", fields[2:]))
+    return entries
+
+
+def tmpfiles_findings(text):
+    """Every way the tmpfiles entry can fail to recreate the same directory.
+
+    The properties are read rather than assumed because ``/run`` is a tmpfs: the
+    group, the setgid bit and the default ACL postinst sets are all gone after a
+    reboot, so this entry is the only thing that puts them back, and an entry that
+    names the directory without the group is a directory the bridge cannot write.
+    """
+    findings = []
+    entries = tmpfiles_lines(text)
+    creating = [
+        entry for entry in entries
+        if entry[1] == "/run/mosdns" and entry[0] in ("d", "D", "z", "Z")
+    ]
+    if not creating:
+        findings.append("/run/mosdns is never created on a boot")
+    for kind, _path, fields in creating:
+        if fields[:3] != ["2770", "root", "mosdns"]:
+            findings.append(
+                f"the /run/mosdns line is {' '.join([kind] + fields)}, want 2770 root mosdns"
+            )
+    acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
+    if not acls:
+        findings.append("/run/mosdns is created with no ACL at all")
+    for _kind, _path, fields in acls:
+        spec = " ".join(fields)
+        if "g::rwx" not in spec:
+            findings.append(f"the /run/mosdns ACL is {spec!r}, with no group rwx")
+        if not re.search(r"(^|[\s,])d(?:efault)?:g::rwx($|[\s,])", spec):
+            findings.append(
+                f"the /run/mosdns ACL is {spec!r} and carries no DEFAULT group entry, so a file "
+                "one identity creates is not group-writable for the other"
+            )
+    reaped = {entry[1] for entry in entries if entry[0] in ("r", "R")}
+    for directory in ("/run/mosdns", "/var/lib/mosdns/runtime", "/etc/mosdns"):
+        for suffix in ("*.tmp", ".*.tmp", "*.bak", ".*.bak"):
+            if directory + "/" + suffix not in reaped:
+                findings.append(
+                    f"{directory}/{suffix} is never reaped. The dotted form is the one that does "
+                    "the work: every publisher in this project names its temporary files with a "
+                    "leading dot, and a * does not match one -- measured on the system-level test "
+                    "machine, where the undotted pattern alone reaped nothing this project "
+                    "produces"
+                )
+    for kind, path, _fields in entries:
+        if kind in ("r", "R") and not path.startswith(
+            ("/var/lib/mosdns/", "/etc/mosdns/", "/run/mosdns/")
+        ):
+            findings.append(
+                f"the entry reaps {path}, which is not a directory this package writes"
+            )
+    return findings
+
+
+# --- the provisioning order --------------------------------------------------
+
+
+def provisioning_steps(text):
+    """What ``postinst`` provisions, in the order it does it.
+
+    Returned as ``(what, path)`` pairs where ``what`` is one of ``group``,
+    ``user``, ``directory`` or ``default-acl``. The order is load-bearing and this
+    is the only thing that can see it: the mode has to be written before the ACL,
+    because ``install -d -m 2770`` sets the group-class mask, and a setfacl that
+    ran first would be narrowed by it. That is how a directory ends up passing
+    every default-ACL check while neither service identity can write it.
+    """
+    variables = shell_assignments(text)
+    steps = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        # One expansion, and it is a single command: `expand_shell` returns a
+        # string, and iterating a string one character at a time matches nothing.
+        command = expand_shell(line, variables)
+        if re.search(r"\b(addgroup|groupadd)\b", command) and re.search(r"\bmosdns\b", command):
+            steps.append(("group", "mosdns"))
+        if re.search(r"\b(adduser|useradd)\b", command) and re.search(r"\bmosdns\b", command):
+            steps.append(("user", "mosdns"))
+        if re.search(r"\binstall\s+-d\b", command):
+            for directory in STATE_DIRECTORIES:
+                if re.search(r"(^|[\s/'\"])" + re.escape(directory) + r"([\s'\"]|$)", command):
+                    steps.append(("directory", directory))
+        if "setfacl" in command:
+            # The same lookaround as the create above, and for the same reason:
+            # `/var/lib/mosdns` is a PREFIX of `/var/lib/mosdns/runtime`, so a plain
+            # substring test says the setfacl of the runtime directory also applies to
+            # the state directory, and the order this reader reports is then a story
+            # about four directories that are really two.
+            for directory in STATE_DIRECTORIES:
+                if re.search(
+                    r"(?<![\w/.-])" + re.escape(directory) + r"(?![\w/.-])", command,
+                ):
+                    steps.append(("default-acl", directory))
+    return steps
+
+
+def shell_assignments(text):
+    """The `NAME=literal` assignments at the top of a shell script.
+
+    A maintainer script names its paths in variables rather than repeating them, so a
+    reader that only looks for literals would find neither the group nor the
+    directories -- and would report a correct script as provisioning nothing.
+    """
+    variables = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.strip())
+        if match is None:
+            continue
+        value = match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        variables[match.group(1)] = value
+    return variables
+
+
+def expand_shell(line, variables):
+    """One shell line with its `$NAME` references replaced by their assigned values."""
+    def replace(match):
+        name = match.group(1)
+        return variables[name] if name in variables else match.group(0)
+
+    return re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", replace, line)
+
+
+def order_findings(text):
+    """Every way the provisioning in ``text`` can be wrong: the order AND the commands.
+
+    The order alone is not enough to read, because the order is a property of two
+    commands and either command can be right about its place in the script and
+    wrong about what it says. ``-m 2750`` is the mode this plan itself first named
+    and it is the one that leaves a directory neither service identity can write,
+    so the exact mode is read here and not merely the fact that a mode is set.
+    """
+    findings = []
+    steps = provisioning_steps(text)
+    for path in STATE_DIRECTORIES:
+        if ("directory", path) not in steps:
+            findings.append(f"{path} is never created")
+        if ("default-acl", path) not in steps:
+            findings.append(f"{path} is created with no default ACL for the service group")
+        created = next((i for i, s in enumerate(steps) if s == ("directory", path)), None)
+        acl = next((i for i, s in enumerate(steps) if s == ("default-acl", path)), None)
+        if created is not None and acl is not None and acl < created:
+            findings.append(
+                f"the default ACL on {path} is set before its mode, so install's chmod narrows "
+                "the mask the ACL created"
+            )
+        # Not `\b` around the path: a `/` is not a word character, so there is no
+        # boundary between the space in front of a path and the path itself, and a
+        # `\b` there never matches. The lookarounds are what say "this argument, and
+        # not the longer path that starts with it".
+        expected = r"install\s+-d[^\n]*-o\s+root[^\n]*-g\s+mosdns[^\n]*-m\s+2770[^\n]*" + \
+            r"(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])"
+        if not re.search(expected, text):
+            findings.append(
+                f"{path} is not created with `install -d -o root -g mosdns -m 2770`; the mode is "
+                "2770 and not 2750, because 2750 caps the group at r-x and a default ACL cannot "
+                "restore what the mask removed"
+            )
+        if not re.search(
+            r"setfacl\s+-d\s+-m\s+g::rwx[^\n]*(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])",
+            text,
+        ):
+            findings.append(
+                f"{path} is not given `setfacl -d -m g::rwx`, the default ACL the two service "
+                "identities share"
+            )
+    group = next((i for i, s in enumerate(steps) if s == ("group", "mosdns")), None)
+    if group is None:
+        findings.append("the shared service group is never created")
+    for kind in ("directory", "user"):
+        first = next((i for i, s in enumerate(steps) if s == (kind, "mosdns")), None)
+        if group is not None and first is not None and first < group:
+            findings.append(f"the {kind} mosdns is created before the group it belongs to")
+    for path in STATE_DIRECTORIES:
+        created = next((i for i, s in enumerate(steps) if s == ("directory", path)), None)
+        if group is not None and created is not None and created < group:
+            findings.append(f"{path} is created before the group it is owned by")
+    return findings
+
+
+# --- the production render ---------------------------------------------------
+
+# The render has to be for the INSTALLED layout: the policy path both documents
+# carry is the one the command is given, so the shipped pair must name
+# /etc/mosdns/policy.yaml rather than a build directory. A private view of the
+# filesystem is what makes that path resolve without one byte being written to
+# this host's /etc, and the build script and this test do it for the same reason.
+RENDER_IN_PRIVATE_ROOT = r"""
+set -eu
+stage='%(stage)s'
+mkdir -p "$stage/etc/mosdns"
+cp '%(policy)s' "$stage/etc/mosdns/policy.yaml"
+if ! command -v bwrap >/dev/null 2>&1; then
+	echo "bwrap (the bubblewrap package) is required to render for the installed layout:" >&2
+	echo "it is what makes /etc/mosdns/policy.yaml resolve inside the render without" >&2
+	echo "anything being written to this host's /etc" >&2
+	exit 1
+fi
+exec bwrap --ro-bind / / --bind "$stage/etc" /etc --chdir / \
+	'%(cdnctl)s' render --policy /etc/mosdns/policy.yaml --out /etc/mosdns
+"""
+
+
+def render_for_installed_layout(stage, policy, cdnctl):
+    """Render the installed documents into ``stage`` and return the exit status."""
+    script = RENDER_IN_PRIVATE_ROOT % {"stage": stage, "policy": policy, "cdnctl": cdnctl}
+    # The renderer's own report is captured rather than printed: it is four lines of
+    # `rendered-…-sha256:` per call, and a test run that scrolls it is a test run
+    # whose failures are hard to find.
+    return subprocess.run(
+        ["sh", "-c", script], check=False, capture_output=True, text=True,
+    ).returncode
+
+
+# --- the shared build --------------------------------------------------------
+
+_SHARED = {}
+
+
+def scratch_directory(prefix):
+    """A temporary directory that is REMOVED when this process ends.
+
+    Every copy this module makes holds three compiled programs, so leaving them behind
+    fills a small /tmp -- this one is a 1.7 GB tmpfs -- and a test that quietly eats
+    the machine's scratch space is a test that breaks the next thing that wants it.
+    The location is $TMPDIR, or MOSDNS_PACKAGE_TEST_TMPDIR for a host whose scratch
+    is somewhere else.
+    """
+    directory = tempfile.mkdtemp(
+        prefix=prefix, dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+    )
+    atexit.register(shutil.rmtree, directory, True)
+    return directory
+
+
+def shared_staging():
+    """The staging root, built once per process by the real build script.
+
+    A build that fails is a failure and not a skip: the plan ruled that a package
+    which cannot be built is a real problem, and a test that skipped would make
+    the whole of this module's subject optional.
+    """
+    if "root" in _SHARED:
+        return _SHARED["root"]
+    directory = scratch_directory("mosdns-package-test.")
+    _SHARED["directory"] = directory
+    _SHARED["root"] = os.path.join(directory, "staging")
+    result = subprocess.run(
+        ["sh", str(BUILD_SCRIPT), "--stage", _SHARED["root"]],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _SHARED["status"] = result.returncode
+    _SHARED["output"] = (result.stdout + result.stderr).strip()
+    return _SHARED["root"]
+
+
+def build_problem():
+    """Why the shared staging root is unusable, or ``None`` when it is fine."""
+    if "status" not in _SHARED:
+        shared_staging()
+    if _SHARED["status"] != 0:
+        return f"scripts/build-deb.sh --stage exited {_SHARED['status']}:\n{_SHARED['output']}"
+    return None
+
+
+class _Staged(unittest.TestCase):
+    """The staging root the real build produces, asked a question per test."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = shared_staging()
+        problem = build_problem()
+        if problem is not None:
+            raise AssertionError(problem)
+        cls.inventory = staged_inventory(cls.root)
+
+    def read(self, absolute):
+        return (Path(self.root) / absolute.lstrip("/")).read_text(encoding="utf-8")
+
+    def read_bytes(self, absolute):
+        return (Path(self.root) / absolute.lstrip("/")).read_bytes()
+
+    def entry(self, absolute):
+        return inventory_get(self.inventory, absolute)
+
+    def assertInstalledFile(self, absolute, mode=None):
+        entry = self.entry(absolute)
+        self.assertIsNotNone(entry, f"{absolute} is not installed at all")
+        self.assertEqual(entry[1], "file", f"{absolute} is a {entry[1]}, not a regular file")
+        self.assertGreater(entry[3], 0, f"{absolute} is empty")
+        if mode is not None:
+            self.assertEqual(entry[2], mode, f"{absolute} is {oct(entry[2])}, want {oct(mode)}")
+        return entry
+
+
+# --- the payload -------------------------------------------------------------
+
+
+class PayloadTests(_Staged):
+    """What the package puts on a machine, and at what mode."""
+
+    def test_every_path_the_units_exec_is_installed_at_that_path(self):
+        """A unit naming a path the package does not install is a failed unit."""
+        wanted = unit_exec_paths(self.root)
+        self.assertTrue(wanted, "no ExecStart path was read out of the shipped units")
+        for executable, units in sorted(wanted.items()):
+            with self.subTest(executable=executable):
+                self.assertIsNotNone(
+                    self.entry(executable),
+                    f"{', '.join(units)} runs {executable}, which the package does not install",
+                )
+                self.assertInstalledFile(executable, 0o755)
+
+    def test_the_three_binaries_are_exactly_the_three_this_project_ships(self):
+        executables = {
+            path for path, kind, _mode, _size in self.inventory
+            if kind == "file" and path.startswith(BINARY_DIRECTORY + "/")
+        }
+        for binary in COMPILED + (INSTALLER_SCRIPT,):
+            with self.subTest(binary=binary):
+                self.assertIn(binary, executables)
+        for path in sorted(executables - set(COMPILED) - {INSTALLER_SCRIPT}):
+            if path.startswith(BRIDGE_PACKAGE + "/"):
+                self.assertTrue(path.endswith(".py"), f"{path} is not an importable module")
+                continue
+            self.fail(f"{path} is in the binary directory and nothing decided on it")
+
+    def test_the_package_installs_nothing_outside_the_prefixes_it_may_write(self):
+        """The whole of "installs nothing it should not" is this list, read as it
+        is: a path the package may write, or a directory on the way to one."""
+        allowed = {
+            path for path, _kind, _mode, _size in self.inventory
+            if path.startswith(ALLOWED_PREFIXES) or path in GENERATED
+        }
+        for path, kind, _mode, _size in self.inventory:
+            if path.startswith(DEBIAN):
+                continue  # metadata, not payload: dpkg never unpacks it
+            if path in allowed or is_ancestor_of_any(path, allowed):
+                continue
+            self.fail(
+                f"{path} is a {kind} outside every prefix the package may write, and it is "
+                "not a directory on the way to one that is"
+            )
+
+    def test_the_file_list_manifest_and_the_staged_tree_are_the_same_set(self):
+        """The manifest is the package's own list of itself, so it has to be true in
+        both directions: a listed path that is not there, and a staged file that is
+        neither listed, generated, nor on the way to something that is."""
+        listed = {destination for _source, destination in manifest_entries(MANIFEST.read_text())}
+        known = listed | GENERATED
+        staged = {
+            path for path, _kind, _mode, _size in self.inventory if not path.startswith(DEBIAN)
+        }
+        for path in sorted(staged - known):
+            if is_ancestor_of_any(path, known):
+                continue
+            self.fail(f"{path} is in the package but in neither the manifest nor the generated set")
+        for path in sorted(listed - staged):
+            self.fail(f"the manifest lists {path}, which the package does not contain")
+
+    def test_the_manifest_names_every_source_that_exists_in_this_repository(self):
+        for source, destination in manifest_entries(MANIFEST.read_text()):
+            if source == "-":
+                self.assertTrue(
+                    destination.startswith("/"),
+                    f"{destination!r} is a directory entry and must be an installed path",
+                )
+                continue
+            with self.subTest(source=source):
+                self.assertTrue(
+                    (REPO / source).exists(), f"the manifest names {source}, which does not exist"
+                )
+                self.assertTrue(destination.startswith("/"), f"{destination!r} is not installed under /")
+
+    def test_no_state_file_is_shipped_under_var_lib(self):
+        """`/var/lib` holds generated state, and a package that ships state there
+        is a package whose upgrade overwrites the operator's data."""
+        for path, kind, _mode, _size in self.inventory:
+            if path.startswith("/var/lib") and kind != "directory":
+                self.fail(f"{path} is a {kind} under /var/lib: a shipped state file")
+        for directory in PACKAGED_STATE_DIRECTORIES:
+            with self.subTest(directory=directory):
+                self.assertIsNotNone(
+                    self.entry(directory), f"{directory} is not shipped as an empty directory"
+                )
+                self.assertEqual(self.entry(directory)[1], "directory")
+
+    def test_nothing_is_shipped_under_run(self):
+        """`/run` is a tmpfs, so a file shipped there is gone at the next reboot
+        and the package would be relying on a boot-time side effect."""
+        for path, _kind, _mode, _size in self.inventory:
+            self.assertFalse(path.startswith("/run"), f"{path} is shipped under /run")
+
+    def test_nothing_shipped_is_group_or_world_writable(self):
+        for path, kind, mode, _size in self.inventory:
+            if kind != "file":
+                continue
+            self.assertEqual(
+                mode & 0o022, 0,
+                f"{path} is {oct(mode)}: a file under /etc, /usr or the binary directory has no "
+                "business being group- or world-writable",
+            )
+
+    def test_every_file_is_installed_with_the_mode_its_identity_needs(self):
+        findings = mode_findings(self.inventory, MODES)
+        self.assertEqual(
+            findings, [],
+            "a shipped file has the wrong mode, or is absent:\n" + "\n".join(findings),
+        )
+
+    def test_every_unit_file_is_installed_and_keeps_its_trailing_newline(self):
+        for name in SHIPPED_UNITS:
+            with self.subTest(unit=name):
+                self.assertInstalledFile(UNIT_DIRECTORY + "/" + name, 0o644)
+                self.assertTrue(
+                    self.read(UNIT_DIRECTORY + "/" + name).endswith("\n"),
+                    f"{name} does not end with a newline, so the last directive is not one",
+                )
+
+
+# --- the shipped documents ---------------------------------------------------
+
+
+class ShippedDocumentTests(_Staged):
+    """The documents, and the claim that they are what this project reviewed."""
+
+    def test_the_two_routing_documents_are_a_fresh_production_render(self):
+        """Byte equality against a render run now, from the policy the package
+        installs, for the installed layout.
+
+        A document that differs in a comment is a document the project can no
+        longer explain, and comparing a rendering of the shipped policy against
+        itself would prove only that the build is deterministic.
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-render-check.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            status = render_for_installed_layout(
+                scratch,
+                # The policy the package INSTALLS and the control tool the package
+                # INSTALLS: a render from different inputs is a different render.
+                Path(self.root) / CONFIG_DIRECTORY.lstrip("/") / "policy.yaml",
+                Path(self.root) / CDNCTL_BINARY.lstrip("/"),
+            )
+            self.assertEqual(status, 0, f"a production render exited {status}")
+            for document in ROUTING_DOCUMENTS:
+                with self.subTest(document=document):
+                    fresh = Path(scratch) / "etc" / "mosdns" / Path(document).name
+                    self.assertTrue(fresh.is_file(), f"the render published no {fresh.name}")
+                    self.assertEqual(
+                        self.read(document),
+                        fresh.read_text(encoding="utf-8"),
+                        f"{document} is not a fresh production render",
+                    )
+
+    def test_the_shipped_documents_are_the_ones_this_repository_reviewed(self):
+        for document, committed in (
+            (CONFIG_DIRECTORY + "/mosdns.yaml", "configs/mosdns.yaml"),
+            (CONFIG_DIRECTORY + "/dnscrypt-proxy.toml", "configs/dnscrypt-proxy.toml"),
+            (CONFIG_DIRECTORY + "/policy.yaml", "configs/policy.yaml"),
+            (CHINA_LIST, "configs/cn-domains.txt"),
+            (SOURCE_LOCK, "configs/source-lock.json"),
+        ):
+            with self.subTest(document=document):
+                self.assertEqual(
+                    self.read_bytes(document),
+                    (REPO / committed).read_bytes(),
+                    f"{document} is not {committed}",
+                )
+
+    def test_every_conffile_is_a_conffile_and_nothing_else_under_etc_is(self):
+        listed = [
+            line.strip() for line in CONFFILES.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertEqual(sorted(listed), sorted(EDITABLE_DOCUMENTS))
+        shipped = {
+            path for path, kind, _mode, _size in self.inventory
+            if kind == "file" and path.startswith("/etc/")
+        }
+        self.assertEqual(
+            sorted(shipped - set(EDITABLE_DOCUMENTS)),
+            [DISPATCHER_SCRIPT],
+            "the only file under /etc that is not a conffile is the dispatcher hook, which the "
+            "installer removes on uninstall rather than leaving for dpkg to prompt about",
+        )
+        staged = self.read(DEBIAN + "/conffiles")
+        self.assertEqual(
+            sorted(line.strip() for line in staged.splitlines() if line.strip()),
+            sorted(EDITABLE_DOCUMENTS),
+            "the conffiles the package actually carries are not the ones the repository declares",
+        )
+        # dpkg reads DEBIAN/conffiles literally, one file name per line, so a comment
+        # in the shipped list is a file named `#` that every install would try to own.
+        self.assertNotIn(
+            "#", staged,
+            "the shipped conffiles list carries a comment, which dpkg reads as a file name",
+        )
+
+    def test_the_forced_ech_list_ships_with_at_least_one_comment_line(self):
+        """A zero-byte list is refused by design, so the shipped file carries a `#`
+        line: a file of comments is how this project ships "forcing off"."""
+        text = self.read(CONFIG_DIRECTORY + "/force-ech-domains.txt")
+        entries = [line.split("#", 1)[0].strip() for line in text.splitlines()]
+        self.assertEqual(
+            [entry for entry in entries if entry], [],
+            f"the shipped forced-ECH list forces ECH for {[e for e in entries if e]}",
+        )
+        self.assertTrue(text.endswith("\n"), "the shipped forced-ECH list has no trailing newline")
+        self.assertIn(
+            "#", text,
+            "the shipped forced-ECH list carries no comment line, and a zero-byte list is refused",
+        )
+        self.assertGreater(len(text), 0)
+
+    def test_the_user_candidate_and_profile_files_ship_empty_but_documented(self):
+        """The candidate list is empty because there is nothing to measure, and the
+        profile document declares an empty profile list because a per-hostname
+        address has to be written down by an operator before it can be published.
+        Neither file is zero bytes, and both say in comments what they are."""
+        candidates = self.read(CONFIG_DIRECTORY + "/cloudflare.txt")
+        entries = [
+            line.split("#", 1)[0].strip()
+            for line in candidates.splitlines()
+            if not line.strip().startswith("#")
+        ]
+        self.assertEqual(
+            [entry for entry in entries if entry], [],
+            "the shipped candidate list names a candidate this project never chose",
+        )
+        profiles = self.read(CONFIG_DIRECTORY + "/cloudfront-domains.yaml")
+        self.assertEqual(
+            [line for line in profiles.splitlines() if line.strip() and not line.lstrip().startswith("#")],
+            ["schema_version: 1", "profiles: []"],
+            "the shipped profile document is not the empty document and nothing else",
+        )
+        for document, text in (
+            (CONFIG_DIRECTORY + "/cloudflare.txt", candidates),
+            (CONFIG_DIRECTORY + "/cloudfront-domains.yaml", profiles),
+        ):
+            with self.subTest(document=document):
+                self.assertIn("#", text, f"{document} is undocumented")
+                self.assertGreater(len(text), 0, f"{document} is zero bytes")
+
+    def test_the_profile_document_is_the_empty_document_the_parser_accepts(self):
+        """A document with no profiles in it is not an error, but an UNDECODABLE
+        one is: the parser refuses a file it cannot read, and the nightly
+        measurement would have nothing to work with. Its documented limit: this
+        checks the document's shape, because the parser is Go and the package test
+        suite is Python; `cmd/mosdns-cdnctl` holds the parser's own cases."""
+        text = self.read(CONFIG_DIRECTORY + "/cloudfront-domains.yaml")
+        keys = [
+            line.split(":", 1)[0].strip()
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            keys, ["schema_version", "profiles"],
+            f"the profile document declares {keys}, want the two keys the parser reads",
+        )
+        self.assertRegex(text, r"(?m)^schema_version:\s*1\s*$")
+        self.assertRegex(text, r"(?m)^profiles:\s*\[\s*\]\s*$")
+
+    def test_every_listener_the_shipped_documents_name_is_loopback(self):
+        for document, addresses in (
+            (CONFIG_DIRECTORY + "/mosdns.yaml",
+             yaml_listen_addresses(self.read(CONFIG_DIRECTORY + "/mosdns.yaml"))),
+            (CONFIG_DIRECTORY + "/dnscrypt-proxy.toml",
+             toml_listen_addresses(self.read(CONFIG_DIRECTORY + "/dnscrypt-proxy.toml"))),
+        ):
+            with self.subTest(document=document):
+                self.assertTrue(addresses, f"{document} names no listener at all")
+                for address in addresses:
+                    self.assertEqual(
+                        non_loopback(address), [],
+                        f"{document} listens on {address}, which is not loopback",
+                    )
+        self.assertIn("127.0.0.1:53", self.read(CONFIG_DIRECTORY + "/mosdns.yaml"))
+        self.assertIn("127.0.0.1:15353", self.read(CONFIG_DIRECTORY + "/dnscrypt-proxy.toml"))
+
+    def test_the_resolver_document_turns_off_what_the_plan_forbids(self):
+        text = self.read(CONFIG_DIRECTORY + "/dnscrypt-proxy.toml")
+        for key, value in (
+            ("doh_servers", "false"),
+            ("odoh_servers", "false"),
+            ("cache", "false"),
+            ("ignore_system_dns", "true"),
+        ):
+            with self.subTest(key=key):
+                self.assertRegex(text, rf"(?m)^{key} = {value}$")
+
+    def test_the_china_list_is_a_list_of_names_and_never_of_addresses(self):
+        """It is pinned by digest, and every line of it is one of the four rule
+        forms a domain_set file may carry, so neither a hand edit nor a re-pin can
+        turn it into a set of resolvers."""
+        shipped = self.read_bytes(CHINA_LIST)
+        self.assertEqual(
+            hashlib.sha256(shipped).hexdigest(),
+            json.loads(self.read(SOURCE_LOCK))["list_sha256"],
+            "the shipped China list does not match the list_sha256 in the shipped source lock",
+        )
+        findings = china_list_findings(shipped.decode("utf-8"))
+        self.assertEqual(
+            findings[:5], [],
+            f"{len(findings)} line(s) of {CHINA_LIST} are not a rule the gateway can read:\n"
+            + "\n".join(f"  {finding}" for finding in findings[:5]),
+        )
+
+
+# --- what must not be in the package ----------------------------------------
+
+
+class ForbiddenContentTests(_Staged):
+    """Nothing in the package can put this machine on a resolver it refuses."""
+
+    def test_no_forbidden_resolver_address_appears_anywhere_in_the_package(self):
+        findings = content_findings(self.root, self.inventory, FORBIDDEN_ADDRESSES)
+        self.assertEqual(
+            findings, [],
+            "a domestic public resolver or a DoH endpoint is named in the package:\n"
+            + "\n".join(f"  {path}: {needle}" for path, needle in findings),
+        )
+
+    def test_no_forbidden_provider_or_tool_appears_in_any_shipped_document(self):
+        findings = content_findings(
+            self.root, self.inventory, FORBIDDEN_PROVIDERS, exempt=ROUTE_SCAN_EXEMPT,
+        )
+        self.assertEqual(
+            findings, [],
+            "the package names a resolver provider, an endpoint or a tool this project "
+            "refuses to configure:\n"
+            + "\n".join(f"  {path}: {needle}" for path, needle in findings),
+        )
+
+    def test_the_provider_scan_exempts_exactly_the_one_file_that_may_name_them(self):
+        """An exemption is a hole in the gate, so the hole is one named file, it is
+        asserted to be one file, and that file is pinned by digest and checked line
+        by line rather than merely trusted."""
+        self.assertEqual(ROUTE_SCAN_EXEMPT, (CHINA_LIST,))
+        self.assertNotIn(
+            CHINA_LIST, COMPILED,
+            "the China list is a text file and must not be exempt twice over",
+        )
+        self.assertTrue((REPO / "configs" / "cn-domains.txt").is_file())
+
+    def test_the_compiled_programs_are_exempt_from_the_content_scan_for_a_reason(self):
+        """The exemption is a claim, so it is asserted rather than assumed: the
+        router's own control tool embeds the resolvers it refuses."""
+        for path in COMPILED:
+            with self.subTest(path=path):
+                self.assertInstalledFile(path, 0o755)
+        self.assertIn(
+            "COMPILED", (REPO / "installer" / "tests" / "test_package.py").read_text(),
+        )
+        source = (REPO / "internal" / "mosdnsconfig" / "render.go").read_text()
+        self.assertIn(
+            "114.114.114.114", source,
+            "the compiled control tool is exempt from the address scan because it embeds the "
+            "domestic resolvers it refuses; if that refusal moved, this exemption is wrong",
+        )
+
+
+# --- the maintainer scripts --------------------------------------------------
+
+
+class MaintainerScriptTests(_Staged):
+    """postinst, prerm and postrm, and the order their obligations run in."""
+
+    def test_the_control_file_is_the_metadata_that_was_decided(self):
+        fields = control_fields(self.read(DEBIAN + "/control"))
+        for name, want in CONTROL_FIELDS.items():
+            with self.subTest(field=name):
+                self.assertEqual(fields.get(name.lower()), want)
+        self.assertGreater(int(fields.get("installed-size", "0")), 0)
+        for name in ("maintainer", "description"):
+            with self.subTest(field=name):
+                self.assertTrue(fields.get(name), f"the control file has no {name}")
+        self.assertEqual(
+            fields.get("architecture"), _built_architecture(),
+            "the built package's Architecture is not the architecture it was built for",
+        )
+        self.assertIn(fields.get("architecture"), BUILT_ARCHITECTURES.split())
+        self.assertEqual(
+            control_fields(CONTROL.read_text()).get("architecture"), BUILT_ARCHITECTURES,
+            "the repository's control file no longer declares the set of architectures this "
+            "package is built for",
+        )
+        depends = dependency_names(fields)
+        for name in CONTROL_DEPENDS:
+            with self.subTest(depends=name):
+                self.assertIn(name, depends)
+        self.assertRegex(fields.get("depends", ""), r"python3 \(>=\s*3\.10\)")
+        for field in ("recommends", "suggests", "enhances", "breaks", "replaces", "pre-depends"):
+            self.assertNotIn(
+                field, fields,
+                f"the package declares {field}, which nothing in this plan decided on",
+            )
+
+    def test_the_acl_dependency_is_declared_because_postinst_cannot_work_without_it(self):
+        """`setfacl` is the provisioning this plan makes load-bearing, so a machine
+        without the `acl` package cannot install this one. Recorded amendment: the
+        plan's dependency list predates the ruling that postinst, and only postinst,
+        provisions the state directories' mode and default ACL."""
+        fields = control_fields(self.read(DEBIAN + "/control"))
+        self.assertIn("acl", dependency_names(fields))
+        self.assertIn("setfacl", POSTINST.read_text())
+
+    def test_postinst_provisions_the_state_directories_in_the_load_bearing_order(self):
+        """Mode first, then the ACL, for each directory. The reverse leaves a
+        default ACL of `other::r-x` and a directory neither service identity can
+        write, which every default-ACL check passes."""
+        findings = order_findings(POSTINST.read_text())
+        self.assertEqual(
+            findings, [],
+            "postinst does not provision the state directories correctly:\n"
+            + "\n".join(f"  {finding}" for finding in findings),
+        )
+        # And the pairs themselves, adjacent and in that order, one directory at a
+        # time. `order_findings` is the reader that decides; this reads the same fact
+        # directly, so a bug in the reader cannot quietly pass this whole test.
+        steps = provisioning_steps(POSTINST.read_text())
+        for directory in STATE_DIRECTORIES:
+            with self.subTest(directory=directory):
+                created = steps.index(("directory", directory))
+                self.assertEqual(
+                    steps[created + 1], ("default-acl", directory),
+                    f"{directory} is not followed immediately by its own default ACL",
+                )
+
+    def test_postinst_places_the_pinned_list_and_never_re_pins_it(self):
+        """Re-pinning at install time is how an operator's reviewed pin becomes
+        something nobody reviewed."""
+        text = POSTINST.read_text()
+        for forbidden in ("--pin-remote", "pin-remote", "update-lists"):
+            with self.subTest(token=forbidden):
+                self.assertNotIn(
+                    forbidden, text,
+                    f"postinst contains {forbidden!r}, so an install or an upgrade would "
+                    "re-pin the reviewed list",
+                )
+        self.assertIn(PUBLISHED_LIST, text)
+        self.assertIn(PUBLISHED_LOCK, text)
+        self.assertIn("list_sha256", text)
+        self.assertIn("sha256sum", text)
+        for source, destination in (
+            (CHINA_LIST, PUBLISHED_LIST),
+            (SOURCE_LOCK, PUBLISHED_LOCK),
+        ):
+            with self.subTest(path=destination):
+                self.assertIn(source, text, f"postinst never places {source} at {destination}")
+
+    def test_postinst_provisions_before_it_runs_the_install_transaction(self):
+        """`postinst` provisions, then the transaction enables and starts; that
+        order is the entire reason the provisioning is in this script, because a
+        ReadWritePaths entry naming an absent directory fails its unit at start."""
+        text = POSTINST.read_text()
+        # The call, not the assignment of the path to a variable: the path is named
+        # once so there is one answer to "which installer does this run", and looking
+        # for the path itself finds the assignment and proves nothing about order.
+        self.assertIn(f"INSTALLER={INSTALLER_SCRIPT}", text)
+        self.assertIn('"$INSTALLER" install', text)
+        self.assertLess(
+            text.index("setfacl -d -m g::rwx /run/mosdns"),
+            text.index('"$INSTALLER" install'),
+            "postinst runs the install transaction before the state directories are provisioned",
+        )
+
+    def test_postinst_enables_the_timers_nothing_else_enables(self):
+        text = POSTINST.read_text()
+        for timer in (
+            "mosdns-cdn-optimizer.timer",
+            "mosdns-cdn-health.timer",
+            "mosdns-list-check.timer",
+        ):
+            with self.subTest(timer=timer):
+                self.assertIn(timer, text, f"{timer} is enabled by nothing")
+        self.assertIn("daemon-reload", text)
+
+    def test_prerm_disables_what_the_uninstall_deliberately_does_not(self):
+        """Task 5's handoff: a plain uninstall with no package removal must not
+        disable a unit the operator still has installed, so the disable is here,
+        where the files are known to be going."""
+        text = PRERM.read_text()
+        self.assertIn("disable", text)
+        for unit in ("mosdns-router.service", "dnscrypt-proxy.service"):
+            with self.subTest(unit=unit):
+                self.assertIn(unit, text)
+        for timer in (
+            "mosdns-cdn-optimizer.timer",
+            "mosdns-cdn-health.timer",
+            "mosdns-list-check.timer",
+        ):
+            with self.subTest(timer=timer):
+                self.assertIn(timer, text)
+        self.assertIn("uninstall", text)
+        installer = (REPO / "installer" / "mosdns_installer.py").read_text()
+        # Scoped to the uninstall path and not to the module: `_enable` DOES carry a
+        # `systemctl disable`, as the undo of an enable it registered, and that is
+        # correct -- an install that enabled a unit and then rolled back has to put
+        # that unit back the way it found it. What must not exist is a disable in the
+        # verb that restores a machine with no package removal behind it.
+        for function in ("uninstall", "_stop_units", "_restore_unfinished", "_purge_state"):
+            with self.subTest(function=function):
+                self.assertNotIn(
+                    '"disable"', function_body(installer, function),
+                    f"{function} gained a disable step: a plain uninstall with no package removal "
+                    "would disable a unit the operator still has installed",
+                )
+
+    def test_postrm_purges_only_when_purge_was_asked_for(self):
+        """The data goes on `dpkg --purge` and not on `dpkg --remove`, and the
+        ordering the installer's own `--purge` guarantees is already established
+        because prerm has run the restore and failed loudly if it did not.
+
+        Recorded deviation, and the reason it is a deviation: the plan asked for
+        `postrm purge` to call the installer's `uninstall --purge`, and dpkg removes
+        this package's files between `prerm remove` and `postrm purge`, so there is
+        no installer here to call. The assertion below therefore holds the
+        behaviour the plan was after -- purge on request, never on a plain removal,
+        and never through a symlink -- rather than the spelling that cannot run.
+        """
+        text = POSTRM.read_text()
+        self.assertIn("purge", text)
+        self.assertIn("/var/lib/mosdns", text)
+        self.assertIn("rm -rf /var/lib/mosdns", text)
+        self.assertIn("-L /var/lib/mosdns", text, "the purge would follow a symbolic link")
+        alternatives = shell_alternatives(text)
+        for verb in ("remove", "upgrade", "abort-install", "abort-upgrade", "disappear", "purge"):
+            with self.subTest(verb=verb):
+                self.assertIn(
+                    verb, alternatives,
+                    f"postrm does not consider the {verb} case, so a removal may take a path it "
+                    "was not written for",
+                )
+        # The purge case must be the one that removes the data, and the remove case
+        # must not be: a plain removal that deleted the state directory would delete
+        # the recorded backup of what this machine's DNS was set to.
+        purge_case = text.split("purge)", 1)[1].split(";;", 1)[0]
+        remove_case = text.split("disappear)", 1)[1].split(";;", 1)[0]
+        self.assertIn("rm -rf /var/lib/mosdns", purge_case)
+        self.assertNotIn("rm -rf", remove_case)
+
+    def test_the_operator_has_a_purge_verb_that_does_both_halves_in_one_place(self):
+        """The half postrm cannot do is still available, and it is the installer's
+        own verb rather than a second implementation of the restore here."""
+        self.assertIn("uninstall --purge", POSTRM.read_text())
+        installer = (REPO / "installer" / "mosdns_installer.py").read_text()
+        self.assertRegex(installer, r"def uninstall\([^)]*purge: bool = False")
+        self.assertRegex(installer, r'arguments == \["uninstall"\]|arguments\[:1\] == \["uninstall"\]')
+
+    def test_no_maintainer_script_installs_anything(self):
+        for name, text in (
+            ("postinst", POSTINST.read_text()),
+            ("prerm", PRERM.read_text()),
+            ("postrm", POSTRM.read_text()),
+        ):
+            with self.subTest(script=name):
+                for forbidden in ("apt-get", "dpkg -i", "apt install", "debconf-set-selections"):
+                    self.assertNotIn(forbidden, text)
+                self.assertIn("set -e", text, f"{name} does not stop at its first failure")
+
+    def test_the_maintainer_scripts_the_package_carries_are_the_repository_ones(self):
+        for script, path in (
+            ("postinst", POSTINST),
+            ("prerm", PRERM),
+            ("postrm", POSTRM),
+        ):
+            with self.subTest(script=script):
+                self.assertEqual(
+                    self.read(DEBIAN + "/" + script), path.read_text(),
+                    f"DEBIAN/{script} is not the {path.name} this repository holds",
+                )
+
+
+# --- the tmpfiles entry ------------------------------------------------------
+
+
+class TmpfilesTests(_Staged):
+    """`/run/mosdns` is the one provisioned directory postinst cannot keep."""
+
+    def test_the_tmpfiles_entry_recreates_run_mosdns_with_the_same_properties(self):
+        findings = tmpfiles_findings(self.read(TMPFILES_PATH))
+        self.assertEqual(
+            findings, [],
+            "the tmpfiles entry does not recreate the provisioned directory:\n"
+            + "\n".join(f"  {finding}" for finding in findings),
+        )
+
+        """Measured, not guessed: `parse_acl` splits the specification on commas, and
+        a space-separated one is IGNORED with a diagnostic on stderr while the rest
+        of the entry is applied -- so the directory is created with no ACL at all and
+        every test that reads the text passes."""
+        entries = tmpfiles_lines(self.read(TMPFILES_PATH))
+        for _kind, path, fields in entries:
+            if path != "/run/mosdns" or not _kind.startswith("a"):
+                continue
+            spec = " ".join(fields)
+            with self.subTest(spec=spec):
+                self.assertNotRegex(
+                    spec, r"g::rwx\s+d:",
+                    "the ACL separates its entries with a space, which systemd does not parse",
+                )
+                self.assertIn(
+                    "g::rwx,d:g::rwx", spec,
+                    "the ACL needs a COMMA between the access and the default group entry",
+                )
+
+    def test_the_tmpfiles_entry_names_run_mosdns_with_the_provisioned_mode(self):
+        """Asserted separately from the findings above, because the obligation the
+        plan states is a mode, a group and a default ACL rather than a directory."""
+        entries = tmpfiles_lines(self.read(TMPFILES_PATH))
+        creating = [
+            entry for entry in entries
+            if entry[1] == "/run/mosdns" and entry[0] in ("d", "D", "z", "Z")
+        ]
+        self.assertTrue(creating, f"{TMPFILES_PATH} never names /run/mosdns")
+        for kind, _path, fields in creating:
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    fields[:3], ["2770", "root", "mosdns"],
+                    f"the /run/mosdns line is {' '.join([kind] + fields)}, want 2770 root mosdns",
+                )
+        acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
+        self.assertTrue(acls, f"{TMPFILES_PATH} sets no ACL on /run/mosdns")
+        for _kind, _path, fields in acls:
+            with self.subTest(spec=" ".join(fields)):
+                self.assertIn("g::rwx", " ".join(fields))
+
+
+# --- the hook, the installer and the manual pages ----------------------------
+
+
+class InstalledProgramsTests(_Staged):
+    """The three things the host runs that are not a systemd unit."""
+
+    def test_the_dispatcher_hook_is_a_no_wait_hook_with_the_exact_invocation(self):
+        self.assertInstalledFile(DISPATCHER_SCRIPT, 0o755)
+        text = self.read(DISPATCHER_SCRIPT)
+        self.assertTrue(text.startswith("#!"), "the hook has no interpreter line")
+        commands = [line for line in text.splitlines() if line.startswith("Exec=")]
+        self.assertEqual(
+            len(commands), 1,
+            "the hook has to declare exactly one Exec line, so a test can see what it runs",
+        )
+        command = commands[0]
+        self.assertIn("python3", command)
+        self.assertIn("-m mosdns_dhcp_bridge.cli", command)
+        self.assertIn("--state-file /run/mosdns/dhcp-upstreams.json", command)
+        self.assertIn("--lock-file /run/mosdns/dhcp-bridge.lock", command)
+        self.assertIn("PYTHONPATH=" + BINARY_DIRECTORY, command)
+        self.assertNotRegex(
+            command, r"(^|\s)mosdns-dhcp-bridge(\s|$)",
+            "the hook names a bare program, which resolves through $PATH in whatever environment "
+            "NetworkManager happens to have",
+        )
+        self.assertRegex(
+            text, r'(?m)^exec \$Exec "\$@"$',
+            "the hook does not pass the dispatcher's own interface and action as separate "
+            "arguments, so a name with a space in it would become two",
+        )
+        self.assertIn(
+            "no-wait.d", DISPATCHER_SCRIPT,
+            "the installed path is the blocking one",
+        )
+
+    def test_the_bridge_is_installed_where_the_hook_can_import_it(self):
+        for module in BRIDGE_MODULES:
+            with self.subTest(module=module):
+                self.assertInstalledFile(BRIDGE_PACKAGE + "/" + module, 0o644)
+        module = self.read(BRIDGE_PACKAGE + "/__init__.py")
+        self.assertIn(
+            "__all__", module,
+            "the installed package directory has no __init__ re-exporting anything, so "
+            "`-m mosdns_dhcp_bridge.cli` would run a module that is not a package member",
+        )
+
+    def test_the_installed_installer_script_is_a_program_that_runs_the_verbs(self):
+        """mosdns-cdnctl execs this path, so it needs an interpreter line, the
+        executable bit, and an entry point that turns a verb into an exit status."""
+        self.assertInstalledFile(INSTALLER_SCRIPT, 0o755)
+        text = self.read(INSTALLER_SCRIPT)
+        self.assertTrue(text.startswith("#!"), "mosdns-cdnctl execs this path, so it needs a #!")
+        self.assertIn('if __name__ == "__main__":', text)
+        self.assertRegex(text, r"sys\.exit\(main\(sys\.argv\[1:\]\)\)")
+        for verb in ("preflight", "install", "uninstall", "emergency-rollback"):
+            with self.subTest(verb=verb):
+                self.assertIn(verb, text)
+
+    def test_every_unit_documents_itself_with_a_page_the_package_ships(self):
+        for name in SHIPPED_UNITS:
+            with self.subTest(unit=name):
+                reference = unit_documentation(self.root, name)
+                self.assertTrue(
+                    reference.startswith("man:"), f"{name} documents itself as {reference!r}"
+                )
+                page = reference[len("man:"):]
+                manual, _, section = page.partition("(")
+                section = section.rstrip(")")
+                installed = f"{MAN_ROOT}/man{section}/{manual}.{section}.gz"
+                self.assertInstalledFile(installed, 0o644)
+                body = gzip.decompress(self.read_bytes(installed)).decode("utf-8")
+                # roff escapes a hyphen as a backslash-hyphen, and a page that spells
+                # a name that way names the same page, so the escapes come out and the
+                # case is folded before the name is compared.
+                plain = body.replace("\\", "").lower()
+                self.assertRegex(
+                    plain, rf"(?m)^\.th\s+{re.escape(manual.lower())}\s+{re.escape(section)}\b",
+                    f"{installed} does not open with a .TH line naming {manual}({section})",
+                )
+
+    def test_the_three_named_manual_pages_are_the_three_this_package_documents(self):
+        installed = sorted(
+            path[len(MAN_ROOT) + 1:]
+            for path, kind, _mode, _size in self.inventory
+            if kind == "file" and path.startswith(MAN_ROOT + "/")
+        )
+        self.assertEqual(
+            installed,
+            ["man1/mosdns-cdnctl.1.gz", "man8/dnscrypt-proxy.8.gz", "man8/mosdns-router.8.gz"],
+        )
+
+
+# --- the build itself --------------------------------------------------------
+
+
+class BuildTests(_Staged):
+    """The script that produced all of it, and what it recorded about itself."""
+
+    def test_the_build_manifest_records_the_toolchain_the_sources_and_the_binaries(self):
+        text = self.read(BUILD_MANIFEST)
+        self.assertIn("go1.25.8", text, "the manifest does not name the Go release")
+        for name in ("go.mod", "go.sum"):
+            with self.subTest(module=name):
+                self.assertIn(name, text)
+        self.assertIn("dnscrypt-proxy", text)
+        self.assertIn(DNSCRYPT_VERSION, text)
+        self.assertIn(DNSCRYPT_SOURCE_URL, text)
+        digest = recorded_digest()[0]
+        self.assertIn(digest, text, "the manifest does not record the verified source digest")
+        for binary in COMPILED:
+            with self.subTest(binary=binary):
+                actual = hashlib.sha256(self.read_bytes(binary)).hexdigest()
+                self.assertIn(
+                    actual, text,
+                    f"{binary} is installed at {actual[:16]}… and the manifest does not record "
+                    "that digest",
+                )
+
+    def test_the_manifest_records_the_module_digests_that_were_built(self):
+        text = self.read(BUILD_MANIFEST)
+        for committed in ("go.mod", "go.sum"):
+            with self.subTest(module=committed):
+                digest = hashlib.sha256((REPO / committed).read_bytes()).hexdigest()
+                self.assertIn(
+                    digest, text,
+                    f"the manifest does not record the {committed} digest that was built against",
+                )
+
+    def test_the_recorded_source_digest_is_a_digest_of_the_named_archive(self):
+        fields = recorded_digest()
+        self.assertEqual(
+            len(fields), 2, f"{SOURCE_DIGEST.name} is not a digest and a file name"
+        )
+        self.assertRegex(fields[0], r"^[0-9a-f]{64}$", f"{fields[0]!r} is not a SHA-256")
+        self.assertEqual(fields[1], DNSCRYPT_ARCHIVE)
+        self.assertIn(
+            DNSCRYPT_SOURCE_URL, SOURCE_DIGEST.read_text(),
+            "the recorded digest does not say where the archive comes from",
+        )
+
+    def test_the_verification_steps_run_a_build_this_machine_can_execute(self):
+        """A cross build ships the TARGET's binaries, and the render and the
+        resolver's `-check` are steps the BUILD MACHINE runs -- so they must run the
+        host's own build of the same pinned sources, or `make package --arch arm64`
+        fails on an amd64 host with "Exec format error", which is a fact about the
+        host and not about the package. Read as two properties rather than one: the
+        shipped path is the target's, and the path the build RUNS is the host's."""
+        # `assertTrue` and not `assertRegex`: a failing regex assertion prints the
+        # whole script, and a reviewer reading four hundred lines of build script to
+        # find out which one line was wrong is not being helped.
+        script = shell_code(BUILD_SCRIPT.read_text())
+        for needle, why in (
+            ('GOARCH="$3"', "the Go build takes no architecture argument"),
+            ('build_go_binary ./cmd/mosdns-router "$BUILD/$PACKAGE.router" "$ARCH"',
+             "the shipped router is not built for the architecture being packaged"),
+            ("GOHOSTARCH", "the build never asks what it is running on"),
+            ("verifier_dir=$BUILD/verifier-$HOST_ARCH",
+             "the programs the build runs are not in a directory named for the host's architecture"),
+            ('"$verifier_dir/mosdns-cdnctl" render',
+             "the render does not run the host's build of the control tool"),
+            ('"$verifier_dir/dnscrypt-proxy" -check',
+             "the resolver's -check does not run the host's build of the resolver"),
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, script, why)
+        self.assertNotIn(
+            '"$STAGE/usr/lib/mosdns-router/mosdns-cdnctl" render', script,
+            "the render runs the SHIPPED control tool, which a cross build cannot execute",
+        )
+
+    def test_the_build_script_refuses_to_build_an_unverified_source_tree(self):
+        script = shell_code(BUILD_SCRIPT.read_text())
+        self.assertIn("sha256sum", script)
+        self.assertIn("dnscrypt-proxy.sha256", script)
+        self.assertIn("CGO_ENABLED=0", script)
+        self.assertIn("dpkg-deb", script)
+        self.assertIn("--root-owner-group", script)
+        self.assertIn("--build", script)
+        self.assertIn("render", script, "the shipped documents are not rendered by the build")
+        # `assertIn` on a whole script, so the failures that would dump four hundred
+        # lines are the two below, which are short and say what is missing.
+        self.assertNotIn("dpkg -i", script, "the build script must not install what it builds")
+        self.assertNotIn("apt-get", script)
+        self.assertTrue(
+            "--build" in script and "--root-owner-group" in script,
+            "the build does not hand dpkg-deb a staging root and a --root-owner-group",
+        )
+
+    def test_the_build_script_installs_nothing_on_the_host(self):
+        # The comments, not the commands: a script whose header says "there is no
+        # dpkg -i here" must not be caught by the check that says there is no dpkg -i
+        # here, or the only way to satisfy both is to delete the explanation.
+        script = shell_code(BUILD_SCRIPT.read_text())
+        for forbidden in ("systemctl", "nmcli", "service ", "update-rc.d", "invoke-rc.d"):
+            with self.subTest(token=forbidden):
+                self.assertNotIn(
+                    forbidden, script,
+                    f"the build script contains {forbidden!r}: building a package must not touch "
+                    "the host it is built on",
+                )
+
+    def test_the_package_would_be_readable_by_dpkg(self):
+        """The staging root is a package: the control file names this package, and
+        every payload file is in the digest file dpkg verifies on unpack."""
+        md5sums = self.read(DEBIAN + "/md5sums")
+        listed = {}
+        for line in md5sums.splitlines():
+            digest, _, path = line.partition("  ")
+            listed["/" + path.lstrip("./")] = digest
+        payload = sorted(
+            path for path, kind, _mode, _size in self.inventory
+            if kind == "file" and not path.startswith(DEBIAN)
+        )
+        self.assertEqual(sorted(listed), payload, "md5sums and the payload are different sets")
+        for path, digest in listed.items():
+            with self.subTest(path=path):
+                self.assertEqual(hashlib.md5(self.read_bytes(path)).hexdigest(), digest)
+
+
+# --- the artifact ------------------------------------------------------------
+
+
+class BuiltPackageTests(_Staged):
+    """The .deb the staging root is built into, read with dpkg's own tools.
+
+    The staging root is the only thing under test, and this class is what shows that
+    the artifact follows it: it builds the package from the very tree every other
+    test asserted, then asks dpkg what it made. A staging root dpkg would refuse, or
+    a package whose payload differs from the tree, is a package nobody has looked at.
+
+    The metadata is read out of the package's own CONTROL member, with
+    ``dpkg-deb -e``, rather than out of ``dpkg-deb --info``. That is not a
+    preference: ``--info`` prints a human-readable report whose control-file listing
+    sits above the stanza in the same indented shape a continuation line has, so a
+    stanza parser reads the real ``Package:`` line as a continuation of the size
+    header and reports a package with no Package field. The report is still asserted,
+    for the two things only it can say -- that the maintainer scripts are in the
+    control member and that they are executable.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.deb = os.path.join(
+            _SHARED["directory"], f"mosdns-router_0.1.0_{_built_architecture()}.deb"
+        )
+        built = subprocess.run(
+            ["dpkg-deb", "--root-owner-group", "--build", cls.root, cls.deb],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        if built.returncode != 0:
+            raise AssertionError(
+                f"dpkg-deb --build exited {built.returncode}: {built.stdout}{built.stderr}"
+            )
+        cls.scratch = scratch_directory("mosdns-package-control-archive.")
+        cls.extracted = os.path.join(cls.scratch, "control")
+        extracted = subprocess.run(
+            ["dpkg-deb", "-e", cls.deb, cls.extracted],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+
+    def dpkg(self, *arguments):
+        """One dpkg-deb call, in the C locale.
+
+        LC_ALL=C because dpkg-deb translates its own output, and a test that greps an
+        English label fails on a host whose locale is not English -- for the wrong
+        reason, which is the worst kind of gate failure.
+        """
+        return subprocess.run(
+            ["dpkg-deb", *arguments],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+
+    def control_file(self):
+        return (Path(self.extracted) / "control").read_text(encoding="utf-8")
+
+    def test_dpkg_reads_the_metadata_the_test_expects(self):
+        fields = control_fields(self.control_file())
+        for name, want in CONTROL_FIELDS.items():
+            with self.subTest(field=name):
+                self.assertEqual(fields.get(name.lower()), want)
+        self.assertEqual(
+            fields.get("architecture"), _built_architecture(),
+            "the package's Architecture is not the architecture it was built for",
+        )
+        self.assertGreater(int(fields.get("installed-size", "0")), 0)
+        self.assertTrue(fields.get("maintainer"))
+        self.assertTrue(fields.get("description"))
+
+    def test_the_artifact_is_the_control_file_the_test_asserted(self):
+        """Byte equality, not a field-by-field reading: the package must carry the
+        metadata this repository holds, and a field-by-field reading cannot see a
+        field nobody asked about."""
+        self.assertEqual(
+            self.control_file(),
+            (Path(self.root) / "DEBIAN" / "control").read_text(encoding="utf-8"),
+            "the control member of the .deb is not the staged DEBIAN/control",
+        )
+
+    def test_the_conffiles_the_package_declares_are_the_ones_it_carries(self):
+        listed = [
+            line.strip()
+            for line in (Path(self.extracted) / "conffiles").read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(sorted(listed), sorted(EDITABLE_DOCUMENTS))
+        self.assertNotIn("#", "".join(listed))
+
+    def test_dpkg_prints_the_maintainer_scripts_as_executable(self):
+        """dpkg runs these, and a control file that is not executable is a package
+        whose install does nothing on some dpkg versions. The `*` is dpkg's own
+        marker for an executable control file, and it is absent from the changelog
+        line, so the comparison below is what gives the three assertions meaning."""
+        stdout = self.dpkg("--info", self.deb).stdout
+        for script in ("postinst", "prerm", "postrm"):
+            with self.subTest(script=script):
+                self.assertRegex(stdout, rf"\*\s+{script}\b")
+        self.assertRegex(stdout, r"lines\s+changelog\b")
+        for script in ("postinst", "prerm", "postrm"):
+            with self.subTest(script=script):
+                self.assertEqual(
+                    inventory_get(self.inventory, DEBIAN + "/" + script)[2], 0o755,
+                    f"the staged {script} is not executable, so dpkg would refuse to run it",
+                )
+
+    def test_the_package_contents_are_the_staged_tree(self):
+        """The payload member only: DEBIAN lives in the control member, which
+        dpkg-deb --contents does not print and the test above reads directly."""
+        result = self.dpkg("--contents", self.deb)
+        inside = set()
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 5)
+            if len(fields) < 6 or not fields[5].startswith("."):
+                continue
+            if not fields[0].startswith("-"):
+                continue  # a directory, and the staging-root test knows what those are
+            inside.add("/" + fields[5].lstrip("./"))
+        staged = {
+            path for path, kind, _mode, _size in self.inventory
+            if kind == "file" and not path.startswith(DEBIAN)
+        }
+        self.assertEqual(sorted(inside - staged), [], "the package holds a file the tree does not")
+        self.assertEqual(sorted(staged - inside), [], "the tree holds a file the package does not")
+
+
+# --- the controls ------------------------------------------------------------
+
+
+class ControlTests(unittest.TestCase):
+    """Each check above, asked about a tree that is wrong on purpose.
+
+    A gate that cannot fail is not a gate, and this suite is the gate that decides
+    whether a package may put a machine on somebody else's resolver. So each of
+    the ways this package can be wrong is manufactured here and the corresponding
+    check is asserted to notice: a missing executable, a missing file, a loose
+    mode, a planted resolver address, a planted middlebox, an unreadable blob, a
+    shipped state file, a reversed provisioning order, a mode this plan itself
+    first named, a tmpfiles entry with no default ACL, and a routing document that
+    is not the render.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        source = shared_staging()
+        problem = build_problem()
+        if problem is not None:
+            raise AssertionError(problem)
+        cls.original = source
+        cls.copies = {}
+
+    def copy(self, mutate):
+        """A private copy of the staged tree with ``mutate`` applied to it."""
+        target = os.path.join(scratch_directory("mosdns-package-control."), "staging")
+        shutil.copytree(self.original, target, symlinks=True)
+        mutate(Path(target))
+        return target, staged_inventory(target)
+
+    # -- the four ways a package is wrong -----------------------------------
+
+    def test_a_missing_executable_is_reported_by_the_exec_path_check(self):
+        wanted = unit_exec_paths(self.original)
+        self.assertIn(ROUTER_BINARY, wanted)
+        _root, inventory = self.copy(
+            lambda stage: os.remove(stage / ROUTER_BINARY.lstrip("/"))
+        )
+        missing = [
+            path for path in wanted if inventory_get(inventory, path) is None
+        ]
+        self.assertEqual(
+            missing, [ROUTER_BINARY],
+            "a binary a unit's ExecStart names is absent and nothing noticed",
+        )
+
+    def test_a_missing_file_is_reported_by_the_mode_table(self):
+        _root, inventory = self.copy(
+            lambda stage: os.remove(stage / TMPFILES_PATH.lstrip("/"))
+        )
+        findings = mode_findings(inventory, MODES)
+        self.assertIn(
+            f"{TMPFILES_PATH} is not installed at all, want mode 0o644", findings,
+            "an absent file passes the mode table",
+        )
+
+    def test_a_loose_mode_is_reported_by_the_mode_table(self):
+        _root, inventory = self.copy(
+            lambda stage: os.chmod(stage / DISPATCHER_SCRIPT.lstrip("/"), 0o777)
+        )
+        findings = mode_findings(inventory, MODES)
+        self.assertIn(
+            f"{DISPATCHER_SCRIPT} is {oct(0o777)}, want {oct(0o755)}", findings,
+            "a world-writable dispatcher hook passes the mode table",
+        )
+
+    def test_a_tight_mode_is_reported_by_the_mode_table(self):
+        _root, inventory = self.copy(
+            lambda stage: os.chmod(stage / ROUTER_BINARY.lstrip("/"), 0o700)
+        )
+        findings = mode_findings(inventory, MODES)
+        self.assertIn(
+            f"{ROUTER_BINARY} is {oct(0o700)}, want {oct(0o755)}", findings,
+            "a mode nobody can read as another user passes the mode table",
+        )
+
+    # -- the two ways a package can put a machine on the wrong resolver ------
+
+    def test_a_planted_resolver_address_is_reported(self):
+        path = CONFIG_DIRECTORY + "/mosdns.yaml"
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-planted.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            planted = Path(scratch) / path.lstrip("/")
+            planted.parent.mkdir(parents=True)
+            planted.write_text("listen: 223.5.5.5:53\n", encoding="utf-8")
+            findings = content_findings(
+                scratch, [(path, "file", 0o644, 21)], FORBIDDEN_ADDRESSES,
+            )
+            self.assertEqual(
+                findings, [("/etc/mosdns/mosdns.yaml", "223.5.5.5")],
+                "a domestic public resolver in a shipped document is not reported",
+            )
+
+    def test_a_planted_middlebox_is_reported(self):
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-planted.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            planted = Path(scratch) / DISPATCHER_SCRIPT.lstrip("/")
+            planted.parent.mkdir(parents=True)
+            planted.write_text("#!/bin/sh\nexec mitmproxy -p 53\n", encoding="utf-8")
+            findings = content_findings(
+                scratch, [(DISPATCHER_SCRIPT, "file", 0o755, 30)], FORBIDDEN_PROVIDERS,
+            )
+            self.assertEqual(
+                findings, [(DISPATCHER_SCRIPT, "mitmproxy")],
+                "a TLS-intercepting middlebox in the dispatcher hook is not reported",
+            )
+
+    def test_a_planted_doh_endpoint_is_reported(self):
+        path = CONFIG_DIRECTORY + "/dnscrypt-proxy.toml"
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-planted.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            planted = Path(scratch) / path.lstrip("/")
+            planted.parent.mkdir(parents=True)
+            planted.write_text("server_names = ['cloudflare-dns.com']\n", encoding="utf-8")
+            findings = content_findings(scratch, [(path, "file", 0o644, 34)], FORBIDDEN_PROVIDERS)
+            self.assertEqual(findings, [(path, "cloudflare-dns.com")])
+
+    def test_an_unreadable_blob_is_reported_rather_than_skipped(self):
+        # A path that is NOT one of the compiled binaries, because those are exempt
+        # from the content scan and an exempt path would report nothing.
+        path = DATA_DIRECTORY + "/unexpected.bin"
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-planted.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            planted = Path(scratch) / path.lstrip("/")
+            planted.parent.mkdir(parents=True)
+            planted.write_bytes(b"\xff\xfe\x00\x01")
+            findings = content_findings(scratch, [(path, "file", 0o755, 4)], FORBIDDEN_ADDRESSES)
+            self.assertEqual(findings, [(path, "<not utf-8 text>")])
+
+    def test_a_compressed_document_is_decompressed_and_scanned(self):
+        """A needle hidden in a manual page is a needle this project would ship."""
+        path = MAN_ROOT + "/man8/mosdns-router.8.gz"
+        body = b".TH MOSDNS-ROUTER 8\n.br\nlisten 223.5.5.5\n"
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-planted.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            planted = Path(scratch) / path.lstrip("/")
+            planted.parent.mkdir(parents=True)
+            planted.write_bytes(gzip.compress(body))
+            findings = content_findings(
+                scratch, [(path, "file", 0o644, len(body))], FORBIDDEN_ADDRESSES,
+            )
+            self.assertEqual(
+                findings, [(path, "223.5.5.5")],
+                "a resolver address compressed into a manual page is not reported",
+            )
+
+    # -- the ways the package's own promises can be broken ------------------
+
+    def test_a_shipped_state_file_is_reported(self):
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-planted.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            runtime = Path(scratch) / "var" / "lib" / "mosdns" / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "ech-state.json").write_text("{}\n", encoding="utf-8")
+            shipped = [
+                path for path, kind, _mode, _size in staged_inventory(scratch)
+                if path.startswith("/var/lib") and kind != "directory"
+            ]
+            self.assertEqual(shipped, ["/var/lib/mosdns/runtime/ech-state.json"])
+
+    def test_a_reversed_provisioning_order_is_reported(self):
+        good = POSTINST.read_text()
+        self.assertEqual(order_findings(good), [], "the shipped postinst does not pass its own check")
+        broken = "\n".join(_swap_a_directory_pair(good))
+        self.assertNotEqual(broken, good, "the mutation changed nothing, so the control is empty")
+        findings = order_findings(broken)
+        self.assertTrue(
+            any("narrows" in finding for finding in findings),
+            f"reversing the mode and the ACL of one directory is not reported: {findings}",
+        )
+
+    def test_the_mode_this_plan_first_named_is_reported(self):
+        """2750 caps the group at r-x on the directory, so a service identity
+        cannot create a state file in it at all. Measured, not assumed."""
+        broken = POSTINST.read_text().replace("-m 2770", "-m 2750")
+        self.assertNotIn("-m 2770", broken, "the mutation changed nothing")
+        findings = order_findings(broken)
+        self.assertTrue(
+            any("-m 2770" in finding for finding in findings),
+            f"provisioning the state directories at 2750 is not reported: {findings}",
+        )
+
+    def test_a_directory_created_without_its_group_is_reported(self):
+        broken = POSTINST.read_text().replace("-g mosdns", "-g root")
+        self.assertNotIn("-g mosdns", broken, "the mutation changed nothing")
+        findings = order_findings(broken)
+        self.assertTrue(
+            any("-g mosdns" in finding for finding in findings),
+            f"provisioning the state directories without the service group is not reported: {findings}",
+        )
+
+    def test_a_tmpfiles_entry_with_no_default_acl_is_reported(self):
+        good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
+        self.assertEqual(tmpfiles_findings(good), [], "the shipped entry does not pass its own check")
+        broken = re.sub(r"\bd:g::rwx\b", "g::rwx", good)
+        self.assertNotEqual(broken, good, "the mutation changed nothing")
+        findings = tmpfiles_findings(broken)
+        self.assertTrue(
+            any("DEFAULT group entry" in finding for finding in findings),
+            f"a /run/mosdns ACL with no default entry is not reported: {findings}",
+        )
+
+    def test_a_space_separated_acl_is_reported(self):
+        """The control for the comma. Replacing it with a space is a one-character
+        edit that systemd answers with a diagnostic on stderr and then IGNORES, so
+        the entry still "works", the directory is still created, and it carries no ACL
+        at all. `tmpfiles_findings` cannot see the separator -- the specification is
+        one opaque string to it -- so what this control proves is that the text the
+        textual assertion reads is the text that would change."""
+        good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
+        self.assertEqual(
+            tmpfiles_findings(good), [], "the shipped entry does not pass its own check"
+        )
+        broken = good.replace("g::rwx,d:g::rwx", "g::rwx d:g::rwx")
+        self.assertNotEqual(broken, good, "the mutation changed nothing")
+        self.assertIn("g::rwx d:g::rwx", broken)
+        self.assertNotIn("g::rwx,d:g::rwx", broken)
+
+    def test_a_tmpfiles_entry_that_reaps_too_much_is_reported(self):
+        good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
+        broken = good + "r /etc/ssl/*.tmp\n"
+        findings = tmpfiles_findings(broken)
+        self.assertTrue(
+            any("/etc/ssl" in finding for finding in findings),
+            f"reaping a directory this package does not write is not reported: {findings}",
+        )
+
+    def test_a_routing_document_that_is_not_the_render_is_reported(self):
+        """One byte in a comment is enough, which is the point: a shipped document
+        nobody can regenerate is a document the project can no longer explain."""
+        def edit(stage):
+            document = stage / CONFIG_DIRECTORY.lstrip("/") / "mosdns.yaml"
+            document.write_text(document.read_text() + "# a hand edit\n")
+
+        mutated, inventory = self.copy(edit)
+        self.assertIsNotNone(inventory_get(inventory, CONFIG_DIRECTORY + "/mosdns.yaml"))
+        committed = (REPO / "configs" / "mosdns.yaml").read_text()
+        edited = (Path(mutated) / CONFIG_DIRECTORY.lstrip("/") / "mosdns.yaml").read_text()
+        self.assertNotEqual(edited, committed, "the mutation changed nothing")
+        with tempfile.TemporaryDirectory(
+            prefix="mosdns-render-control.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+        ) as scratch:
+            status = render_for_installed_layout(
+                scratch,
+                Path(mutated) / CONFIG_DIRECTORY.lstrip("/") / "policy.yaml",
+                Path(mutated) / CDNCTL_BINARY.lstrip("/"),
+            )
+            self.assertEqual(status, 0)
+            fresh = (Path(scratch) / "etc" / "mosdns" / "mosdns.yaml").read_text()
+            self.assertNotEqual(
+                edited, fresh,
+                "a shipped routing document with an extra comment byte is still a fresh render",
+            )
+
+    def test_the_provider_scan_exemption_cannot_silently_grow(self):
+        """The exemption is a hole in the gate, so it is one named file and this
+        test reads the table rather than trusting it."""
+        self.assertEqual(
+            ROUTE_SCAN_EXEMPT, (CHINA_LIST,),
+            "a second file is exempt from the provider scan, and nobody decided on it",
+        )
+        self.assertEqual(
+            (REPO / "configs" / "cn-domains.txt").is_file(), True,
+            "the one exempt file's reviewed source has to exist",
+        )
+
+    def test_a_manifest_entry_that_is_not_shipped_is_reported(self):
+        listed = {destination for _s, destination in manifest_entries(MANIFEST.read_text())}
+        self.assertIn(TMPFILES_PATH, listed)
+        _root, inventory = self.copy(
+            lambda stage: os.remove(stage / TMPFILES_PATH.lstrip("/"))
+        )
+        shipped = {path for path, _kind, _mode, _size in inventory if not path.startswith(DEBIAN)}
+        self.assertEqual(
+            sorted(listed - shipped - GENERATED), [TMPFILES_PATH],
+            "the manifest lists a file the package does not contain, and nothing noticed",
+        )
+
+
+def _swap_a_directory_pair(text):
+    """Swap the create and the setfacl of the first provisioned directory.
+
+    The two whole commands are swapped rather than their arguments, because what
+    this mutation has to demonstrate is that the ORDER is read: the commands
+    themselves stay exactly the ones the shipped script runs.
+    """
+    lines = text.splitlines()
+    create = next(
+        index for index, line in enumerate(lines)
+        if "install -d" in line and STATE_DIRECTORIES[0] in line
+    )
+    acl = next(
+        index for index, line in enumerate(lines)
+        if "setfacl" in line and STATE_DIRECTORIES[0] in line
+    )
+    lines[create], lines[acl] = lines[acl], lines[create]
+    return lines
+
+
+if __name__ == "__main__":
+    unittest.main()

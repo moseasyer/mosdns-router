@@ -5,6 +5,22 @@ GO ?= go
 # can see is a change nobody notices. Its suite therefore runs with the Go one.
 PYTHON ?= python3
 BRIDGE_TESTS := bridge/tests
+# The installer suite is the other half of the Python in this package: it is what
+# holds the units, the preflight, the transaction, the uninstall AND the package's
+# own content to the machine they are allowed to make. `test-python` discovers the
+# bridge suite only, so it needs its own target or none of it runs in the gate.
+INSTALLER_TESTS := installer/tests
+
+# The package build. It compiles three programs and writes a .deb, and it is part
+# of `verify` because a package that cannot be built is a real problem rather than
+# something to skip: the ledger's ruling is explicit about that. It needs the
+# pinned dnscrypt-proxy source archive, which is NOT committed, and the build fails
+# loudly and says how to seed it when it is absent.
+#
+# Nothing in it installs anything on the machine that runs it, and the entry-point
+# regression below asserts that as well.
+DNSCRYPT_ARCHIVE ?= build/dnscrypt-proxy-2.1.18.tar.gz
+PACKAGE_SCRIPT := scripts/build-deb.sh
 
 # Every entry point refuses to run on a different Go release: the module pins
 # go 1.25.8, the reproducible build metadata assumes exactly that compiler, and
@@ -29,7 +45,8 @@ endif
 
 METADATA_LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) -X $(BUILDINFO_PKG).Revision=$(REVISION) -X $(BUILDINFO_PKG).BuildTime=$(BUILD_TIME)
 
-.PHONY: check-go test test-integration test-python test-make-entrypoints build cross-build verify verify-build-info
+.PHONY: check-go test test-integration test-python test-installer test-make-entrypoints \
+	build cross-build verify verify-build-info package
 
 # The guard is the only place that decides whether this host's Go is acceptable.
 check-go:
@@ -105,6 +122,21 @@ test-integration: check-go
 test-python:
 	@$(PYTHON) -m unittest discover -s $(BRIDGE_TESTS)
 
+# A separate, non-recursive target, for the same reason and one more: the installer
+# suite is the only thing that holds the eight unit files, the preflight, the
+# transaction, the uninstall and the PACKAGE CONTENT to what this project decided,
+# and `test-python` discovers the bridge suite only. A gate that stopped depending
+# on this target would keep passing while the rules a package is built under stopped
+# being enforced -- which is the failure this target was added to prevent, and the
+# same one that put the bridge suite's fixture outside the gate.
+#
+# The suite builds the staging root itself, by running the real build script, so
+# `make verify` builds a package. That is the point: the package is the artifact
+# whose content matters, and a content test that read a checked-in expectation
+# instead of the build would be testing the expectation.
+test-installer:
+	@$(PYTHON) -m unittest discover -s $(INSTALLER_TESTS)
+
 # This is a separate, non-recursive target: the regression harness inspects the
 # real Makefile with `make -n` and never invokes `make test` recursively.
 test-make-entrypoints:
@@ -126,5 +158,17 @@ cross-build: check-go
 verify-build-info: build
 	@$(GO) run -mod=readonly ./internal/buildinfo/cmd/check build/mosdns-router
 
-verify: test test-integration verify-build-info
+# The Debian package. It installs nothing here: no dpkg -i, no apt, no systemctl, no
+# nmcli, and no maintainer script is executed, so running it cannot change the
+# machine it runs on. `scripts/build-deb.sh` builds the staging root, renders the
+# two routing documents through the control tool the package itself installs, and
+# writes build/mosdns-router_0.1.0_<arch>.deb from it.
+#
+# GO and the archive location are passed through rather than read out of the
+# environment, so `make -n package` prints the same command a run would use -- and
+# so the entry-point regression can read what this target plans.
+package:
+	@GO='$(GO)' MOSDNS_DNSCRYPT_ARCHIVE='$(DNSCRYPT_ARCHIVE)' sh $(PACKAGE_SCRIPT)
+
+verify: test test-integration test-installer verify-build-info package
 	@$(GO) vet -mod=readonly ./...

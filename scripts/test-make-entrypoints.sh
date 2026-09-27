@@ -218,6 +218,48 @@ for target in test test-python verify; do
 	fi
 done
 
+# 6b. The installer suite runs from the acceptance gate. `test-python` discovers
+#     bridge/tests only, so without a target of its own NOTHING holds the eight unit
+#     files, the preflight, the transaction, the uninstall or the package's content
+#     to what this project decided -- and a gate that stops enforcing the rules a
+#     package is built under keeps passing. The target has to name the installer
+#     suite, and `verify` has to depend on the TARGET rather than repeating its
+#     recipe, so the two cannot drift apart while the recipe still works.
+for target in test-installer verify; do
+	status=0
+	make --no-print-directory -n "$target" GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+	if [ "$status" -ne 0 ]; then
+		fail "dry run of $target exited $status"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+		continue
+	fi
+	if ! grep -q 'unittest discover -s installer/tests' "$work/dryrun"; then
+		fail "$target does not run the python installer suite"
+		sed 's/^/    /' "$work/dryrun" >&2 || true
+	fi
+done
+
+# 6c. `package` is part of the gate, and it installs nothing. A package that cannot
+#     be built is a real problem rather than something to skip, so the build belongs
+#     in the acceptance gate -- and a build that installed what it built would put
+#     the machine running the gate on a resolver, which is the one thing this
+#     project's whole boundary is about. So `verify` reaches the target, the target
+#     runs the build script, and the planned commands install nothing.
+status=0
+make --no-print-directory -n verify GO="$work/go-wrong-version" >"$work/dryrun" 2>&1 || status=$?
+if [ "$status" -ne 0 ]; then
+	fail "dry run of verify exited $status"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+elif ! grep -q 'scripts/build-deb.sh' "$work/dryrun"; then
+	fail "verify does not build the package, so the artifact whose content this project decides is not in the gate"
+	sed 's/^/    /' "$work/dryrun" >&2 || true
+fi
+for forbidden in 'dpkg -i' 'apt-get' 'systemctl ' 'nmcli '; do
+	if grep -q -- "$forbidden" "$work/dryrun"; then
+		fail "the acceptance gate plans a command that would change this machine: $forbidden"
+	fi
+done
+
 # 7. The acceptance gate runs the end-to-end suite. tests/integration is the only
 #    place the routing and the response-rewrite promises are checked at all -- a
 #    document-level test cannot see where a query was sent, and cannot see what a
