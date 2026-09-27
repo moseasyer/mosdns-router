@@ -158,6 +158,11 @@ RESOLVED_UNIT = "systemd-resolved.service"
 # this machine cannot deliver: strict ECH on a forced domain.
 MINIMUM_ECH_FIREFOX = 129
 FIREFOX_VERSION = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+# The v4-mapped IPv6 spelling, anchored: `::ffff:` is the whole of the prefix and
+# what follows has to be a dotted quad. Not a prefix test on the IPv6 side -- that
+# is the bug this exists to be the opposite of -- because `::ffff:10.0.0.1` and
+# `::ffff:127.0.0.1` are both mapped, and only one of them is loopback.
+IPV4_MAPPED = re.compile(r"::ffff:((?:[0-9]{1,3}\.){3}[0-9]{1,3})\Z")
 
 # The connection types that carry a machine's DNS. A VPN or a bridge with no
 # device is neither the primary uplink this install rewrites nor a source of the
@@ -678,12 +683,25 @@ def _is_loopback(address: str) -> bool:
 
     Two spellings of the same question: `127.0.0.1` and `[::1]`. Anything that is
     not loopback is not resolved's stub, whatever the owning process is.
+
+    The IPv6 answer is an equality and not a prefix, because `::1` is the whole of
+    IPv6 loopback -- `::2` and up are reserved, not loopback. A prefix test says
+    `yes` to `::10.0.0.1` and to `::1abc`, and the direction it is wrong in is the
+    permissive one: the address exists so that a listener on something routable is
+    refused, so a test that admits a global address waves through the case the
+    address was added to catch.
+
+    A v4-mapped address is the IPv4 address in the other spelling, so it is asked
+    the same question: `::ffff:127.0.0.1` is the loopback address and is exempt,
+    and `::ffff:10.0.0.1` is a global address and is not, which falls out of
+    unwrapping it rather than out of a rule of its own.
     """
     bare = address.strip("[]")
-    if bare.startswith("::1") or bare == "::1":
+    if bare == "::1":
         return True
-    if bare.startswith("::ffff:127."):
-        return True
+    mapped = IPV4_MAPPED.match(bare)
+    if mapped is not None:
+        bare = mapped.group(1)
     parts = bare.split(".")
     return len(parts) == 4 and parts[0] == "127" and all(part.isdigit() for part in parts)
 

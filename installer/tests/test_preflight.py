@@ -219,6 +219,16 @@ SHARED_LISTENER_LINE = (
     "tcp LISTEN 0      5          127.0.0.1:18081 0.0.0.0:*"
     ' users:(("python3",pid=110,fd=3),("python3",pid=108,fd=3))\n'
 )
+# The same demonstration on the IPv6 loopback, captured the same way. It pins two
+# spellings rather than one behaviour: `ss` BRACKETS an IPv6 local address
+# (`[::1]:15399`), and the peer column of an IPv6 socket is `[::]:*` rather than
+# `0.0.0.0:*`. The brackets are why an address is stripped before it is compared,
+# and a fixture written without them would be describing a line `ss` does not
+# print -- which is the same class of mistake as the two-line shared socket above.
+SHARED_IPV6_LISTENER_LINE = (
+    "tcp LISTEN 0      5              [::1]:15399    [::]:*"
+    ' users:(("python3",pid=136,fd=3),("python3",pid=134,fd=3))\n'
+)
 # The pids those lines name, and the two this package's own units would use.
 RESOLVED_PID = "39"
 ROUTER_PID = "41"
@@ -1013,6 +1023,52 @@ class PortTests(PreflightFixture):
                     problems = " ".join(self.answered(answers).problems())
                     self.assertIn("53", problems, f"{why}, but the socket was accepted")
 
+    def test_the_stub_exemption_is_loopback_and_not_merely_an_ipv6_prefix(self):
+        # The exemption is "resolved on a loopback address", and the IPv6 half of
+        # that question is an equality. `::1` is the whole of IPv6 loopback: `::2`
+        # and up are reserved, and a global address beginning `::1` is a global
+        # address. A prefix test answers "yes" to `::10.0.0.1` and `::1abc`, and
+        # the direction it is wrong in is the permissive one -- this is the check
+        # that refuses a listener on something routable, so a prefix that admits a
+        # global address waves through the case the address exists to catch.
+        #
+        # The 4-in-6 rows are here for the same reason and in both directions: a
+        # v4-mapped loopback is the same loopback in the other spelling and is
+        # exempt, and a v4-mapped *global* address is not, which falls out of the
+        # same equality rather than out of a special case.
+        for address, accepted in (
+            ("127.0.0.1", True),
+            ("127.0.0.53", True),
+            ("[::1]", True),
+            ("[::ffff:127.0.0.1]", True),
+            ("[::10.0.0.1]", False),
+            ("[::ffff:10.0.0.1]", False),
+            ("[::2]", False),
+            ("[2001:db8::1]", False),
+            ("[fe80::1]", False),
+        ):
+            with self.subTest(address=address, accepted=accepted):
+                self.setUp()
+                peer = "[::]:*" if ":" in address else "0.0.0.0:*"
+                line = self.shared_line(
+                    "tcp",
+                    "LISTEN",
+                    f"{address}:53",
+                    4096,
+                    [("systemd-resolve", RESOLVED_PID, 15)],
+                    peer=peer,
+                )
+                if accepted:
+                    self.assertPasses(
+                        self.good_runner({SS_LISTENERS: line}),
+                        f"resolved on {address}, which is loopback, was refused",
+                    )
+                else:
+                    problems = " ".join(self.answered({SS_LISTENERS: line}).problems())
+                    self.assertIn(
+                        "53", problems, f"resolved on {address} is not the stub this install keeps"
+                    )
+
     def test_a_socket_with_no_process_column_is_refused_on_a_shared_address(self):
         # `ss` prints no process column for a socket this user may not read, and
         # that is what an unprivileged run sees for every other user's process.
@@ -1141,6 +1197,40 @@ class PortTests(PreflightFixture):
             queue[2], "53", "the captured Send-Q line does not carry 53 in the queue column"
         )
         self.assertEqual(queue[3], "127.0.0.1:8080", "and the socket is not on port 53")
+
+    def test_the_captured_shared_lines_carry_two_owners_on_one_line(self):
+        # The evidence for the every-owner rule, asserted rather than left to a
+        # reader's counting. What matters is that the claim "one socket, two
+        # holders" is expressed the way `ss` expresses it: a single `users:` field
+        # naming two processes, on a single line. A capture that put them on two
+        # lines would be describing two sockets, and it is the difference between
+        # the case the rule exists for and the case that was already refused.
+        for name, captured, local, peer in (
+            ("IPv4", SHARED_LISTENER_LINE, "127.0.0.1:18081", "0.0.0.0:*"),
+            ("IPv6", SHARED_IPV6_LISTENER_LINE, "[::1]:15399", "[::]:*"),
+        ):
+            with self.subTest(family=name):
+                self.setUp()
+                lines = captured.splitlines()
+                self.assertEqual(
+                    len(lines), 1, f"{name}: a socket with two holders is ONE line to `ss`"
+                )
+                fields = lines[0].split()
+                self.assertEqual(len(fields), 7, f"{name}: the captured line's field count")
+                self.assertEqual(
+                    fields[4], local, f"{name}: the local address is not where this comment says"
+                )
+                self.assertEqual(fields[5], peer, f"{name}: and neither is the peer column")
+                owners = re.findall(r'\("([^"]+)",pid=(\d+)', fields[6])
+                self.assertEqual(
+                    len(owners),
+                    2,
+                    f"{name}: the process field names both holders, and this capture names "
+                    f"{len(owners)}",
+                )
+                self.assertNotEqual(
+                    owners[0], owners[1], f"{name}: and they are two processes, not one twice"
+                )
 
     def test_says_that_a_port_check_is_a_moment_and_not_a_reservation(self):
         # Between this check and the bind, anything may take the port, and the
