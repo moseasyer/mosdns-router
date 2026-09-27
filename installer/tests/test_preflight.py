@@ -1503,6 +1503,64 @@ class ControlLockTests(PreflightFixture):
             fingerprint(self.root), before, "preflight replaced a lock path it was refusing"
         )
 
+    def test_reports_a_dangling_symlink_at_the_lock_path(self):
+        # A link to nothing is not a lock, and it is not the absence of one either.
+        # The control operations open this path, and open follows a symbolic link,
+        # so a link at this path is a redirect the install must not walk: it is
+        # reported by kind, which is more use to an operator than "could not be
+        # stat'd".
+        path = self.rooted(CONTROL_LOCK)
+        path.symlink_to(self.rooted("/gone/elsewhere.lock"))
+        before = fingerprint(self.root)
+        problems = " ".join(self.preflight().problems())
+        self.assertIn(CONTROL_LOCK, problems, "a dangling symlink at the lock path was passed")
+        self.assertRegex(
+            problems,
+            r"(?i)(symbolic link|symlink)",
+            "a symlink at the lock path has to be named as one: open follows it, so the "
+            "refusal has to say the path is a redirect",
+        )
+        self.assertEqual(fingerprint(self.root), before, "preflight removed the link it was refusing")
+
+    def test_reports_a_lock_path_under_something_that_is_not_a_directory(self):
+        # The lookup itself fails with ENOTDIR, which `Path.exists()` turns into
+        # "no lock here". A file at the runtime directory is something the operator
+        # did, and the install is not free to proceed past it.
+        self._replace_runtime_directory_with_a_file()
+        before = fingerprint(self.root)
+        problems = " ".join(self.preflight().problems())
+        self.assertIn(
+            CONTROL_LOCK, problems, "a lock path under a file was reported as no lock at all"
+        )
+        self.assertEqual(fingerprint(self.root), before)
+
+    @unittest.skipIf(os.geteuid() == 0, "root may search a 0600 directory, so this case cannot be built here")
+    def test_reports_a_lock_path_whose_parent_cannot_be_searched(self):
+        # A parent this user cannot search is unreadable, not empty. Preflight runs
+        # as root in production, where this cannot happen -- which is exactly why
+        # the answer has to be a refusal rather than an exception or a pass: the
+        # same code path runs wherever it is invoked from.
+        parent = self.rooted(CONTROL_LOCK).parent
+        parent.chmod(0o600)
+        self.addCleanup(parent.chmod, 0o700)
+        before = fingerprint(self.root)
+        problems = " ".join(self.preflight().problems())
+        self.assertIn(
+            CONTROL_LOCK, problems, "an unsearchable parent was reported as no lock at all"
+        )
+        self.assertEqual(fingerprint(self.root), before)
+
+    def _replace_runtime_directory_with_a_file(self):
+        """Turn the runtime directory into a regular file, lock path and all."""
+        parent = self.rooted(CONTROL_LOCK).parent
+        lock = self.rooted(CONTROL_LOCK)
+        if lock.is_symlink() or lock.exists():
+            lock.unlink()
+        subprocess.run(["setfacl", "-b", "-k", str(parent)], check=True)
+        parent.rmdir()
+        parent.write_text("not a directory", encoding="utf-8")
+        parent.chmod(0o644)
+
     def test_a_missing_lock_is_not_a_problem(self):
         # The lock is created on first acquire by whichever of the two identities
         # wins the race, so its absence on a fresh machine is the normal state.

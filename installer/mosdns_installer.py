@@ -1189,6 +1189,38 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
             )
 
 
+def _path_state(path: Path) -> str:
+    """Whether a path is absent, and what is there if it is not.
+
+    ``Path.exists()`` cannot answer this question, and its two failures are the
+    two that matter here. It follows a symbolic link, so a dangling link reads as
+    absent; and it swallows ``OSError``, so a path whose parent is not a directory
+    or whose parent this user may not search reads as absent too. All three are
+    "there is something at this path and this program cannot see what", and this
+    check is the one place where "absent" is the answer that lets an install
+    proceed to create a file.
+
+    The link is not followed: a symbolic link at the control lock's path is a
+    redirect the control operations would follow when they open it, and naming it
+    is more use to an operator than "could not be stat'd".
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    except NotADirectoryError:
+        return "under something that is not a directory"
+    except OSError as error:
+        return f"unreadable ({error.strerror or error})"
+    if stat.S_ISLNK(info.st_mode):
+        return "a symbolic link"
+    if stat.S_ISDIR(info.st_mode):
+        return "a directory"
+    if stat.S_ISREG(info.st_mode):
+        return "a regular file"
+    return "neither a regular file nor a directory"
+
+
 def check_control_lock(root: Path, run: CommandRunner, report: Preflight) -> None:
     """Report a control lock that already exists and is not this package's.
 
@@ -1199,9 +1231,22 @@ def check_control_lock(root: Path, run: CommandRunner, report: Preflight) -> Non
     world-writable lock is a lock any local user can take, and a lock in another
     group's hands is a lock this package's own control operations would contend
     with. Re-creating it would be a repair, and postinst owns repairs.
+
+    Presence is asked with lstat rather than with ``Path.exists()``, so a path
+    that exists and cannot be read is a refusal and not the normal state.
     """
     path = root / CONTROL_LOCK.lstrip("/")
-    if not path.exists():
+    state = _path_state(path)
+    if state == "absent":
+        return
+    if state != "a regular file":
+        report.refuse(
+            f"{CONTROL_LOCK} is {state}, not a regular file: the control operations open this "
+            "path, and open follows a symbolic link, so whatever is here would be written "
+            "through or refused -- either way the install cannot treat the lock as free. It is "
+            "reported rather than replaced, because replacing it is a change to something this "
+            "package did not create"
+        )
         return
     stat_fields = _stat_of(root, run, CONTROL_LOCK)
     if stat_fields is None:
