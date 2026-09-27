@@ -1801,11 +1801,20 @@ class ArgumentArrayDisciplineTests(unittest.TestCase):
     things this module argues *about*, and an argument that cannot tell the
     argument from the code is an argument that has to be dropped.
 
-    It is a needle scan over code, so it is a floor and not a proof: a call
-    reached through ``getattr`` would pass it. That is stated rather than papered
-    over, because the layer that does not have the hole is one level down --
-    whatever such a call produced would have to reach :class:`CommandRunner` as a
-    command, and the runner this suite injects refuses a string outright.
+    Three scans, because one list of needles was not enough. The needle list
+    rules out the ways this module has talked about reaching a shell. A named
+    list of process-creating attributes rules out the ones it had not named,
+    across `os` and `pty` -- `os` is imported at module scope, so `os.fork` and
+    `os.posix_spawn` are one attribute away and were invisible to the needles.
+    And an allowlist of `os` attributes says positively which ones this program
+    is allowed to touch, so the next attribute somebody reaches for is a test
+    failure rather than a review question.
+
+    All three are needle-shaped and so are a floor, not a proof: a call reached
+    through ``getattr`` would pass them. That is stated rather than papered over,
+    because the layer that does not have the hole is one level down -- whatever
+    such a call produced would have to reach :class:`CommandRunner` as a command,
+    and the runner this suite injects refuses a string outright.
     """
 
     FORBIDDEN = {
@@ -1821,6 +1830,43 @@ class ArgumentArrayDisciplineTests(unittest.TestCase):
         "exec(": "exec evaluates a string as code",
         "`": "a backtick is a shell command substitution",
     }
+
+    # `os` is imported at module scope for `readlink` and `lstat`, which is why
+    # the earlier FORBIDDEN list could not simply refuse the module: a whole-module
+    # refusal would have forbidden the two reads the program is made of. An
+    # allowlist of attributes is the other half of that decision. It is short
+    # because the module reads files and nothing else -- no environment, no
+    # process, no signals, no paths beyond the ones it is handed.
+    OS_ALLOWED = {"readlink", "lstat", "stat"}
+    # Every attribute of `os` and `pty` that starts a process, named rather than
+    # inferred. The needle list above missed all of them: `os` is imported at
+    # module scope, so `os.posix_spawn`, `os.fork` and `pty.spawn` would have
+    # passed every scan in this class, and each of them starts something the
+    # injected runner never sees.
+    PROCESS_SPAWNERS = (
+        "system",
+        "popen",
+        "spawn",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+        "posix_spawn",
+        "posix_spawnp",
+        "fork",
+        "forkpty",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "execl",
+        "execlp",
+    )
+    SPAWNING_MODULES = ("os", "pty", "ptyprocess", "multiprocessing", "commands")
 
     @staticmethod
     def process_boundary():
@@ -1881,6 +1927,69 @@ class ArgumentArrayDisciplineTests(unittest.TestCase):
             "a reference to subprocess outside the runner is a second process boundary, "
             "however it is spelled",
         )
+
+    @classmethod
+    def spawners_used(cls, code):
+        """The process-creating attribute uses in a block of code.
+
+        Whitespace between the module and the dot is allowed, because ``os\n
+        .fork()`` parses and a scan that only matched ``os.fork`` would miss it.
+        """
+        return {
+            f"{module}.{name}"
+            for module in cls.SPAWNING_MODULES
+            for name in cls.PROCESS_SPAWNERS
+            if re.search(rf"\b{module}\s*\.\s*{name}\b", code)
+        }
+
+    def test_the_module_uses_no_process_creating_attribute(self):
+        # The hole the earlier needle list left. `os` is imported at module scope,
+        # so every process-creating attribute of it was one attribute away from a
+        # second process boundary that the injected runner cannot see -- and this
+        # program runs as root on somebody's machine, where the difference between
+        # a read and a spawn is the difference between a report and an incident.
+        self.assertEqual(
+            self.spawners_used(CODE),
+            set(),
+            f"mosdns_installer.py uses {sorted(self.spawners_used(CODE))}, which start processes "
+            "the injected runner would never see",
+        )
+
+    def test_every_os_attribute_the_module_uses_is_one_it_is_allowed(self):
+        # An allowlist rather than a needle list, because the module legitimately
+        # uses `os` for two reads and a needle list could only answer "no" by
+        # forbidding the module. `stat` is here for the same reason: it is the
+        # module's `stat`, and the attributes it uses are `S_ISDIR` and friends
+        # rather than anything that starts a process.
+        used = set(re.findall(r"\bos\.(\w+)", CODE))
+        self.assertTrue(used, "the module uses os, so this allowlist is doing work")
+        self.assertEqual(
+            used - self.OS_ALLOWED,
+            set(),
+            f"mosdns_installer.py uses os attributes outside the allowlist: "
+            f"{sorted(used - self.OS_ALLOWED)}. Add a name to OS_ALLOWED only if it cannot "
+            "start a process, change the environment, or write",
+        )
+
+    def test_the_spawn_scan_fires_on_a_spawn_and_stays_quiet_on_the_reads(self):
+        # The scan's own test, so a guard that cannot fail is not a comment. Each
+        # control is run through the same helper the real assertion uses, so what
+        # is shown to fire is exactly what fires on the module.
+        for spawner in ("os.posix_spawn", "os.fork", "pty.spawn", "os.execv", "os.system"):
+            with self.subTest(spawner=spawner):
+                code = f"import os\n{spawner}('ls', ['ls'])\n"
+                self.assertEqual(
+                    self.spawners_used(code),
+                    {spawner},
+                    f"the scan does not see {spawner!r}, so it cannot be shown to fire on it",
+                )
+        for read in ("os.readlink(path)", "os.lstat(path)", "os.getcwd()", "stat.S_ISREG(mode)"):
+            with self.subTest(read=read):
+                self.assertEqual(
+                    self.spawners_used(read),
+                    set(),
+                    f"the control case {read!r} is not clean, so a passing scan would prove nothing",
+                )
 
     def test_every_subprocess_use_passes_no_shell_and_no_string_command(self):
         for match in re.finditer(r"subprocess\.\w+\(([^)]*)\)", CODE):
