@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Check that this machine can have this router installed on it, and then do it.
 
 The module has two halves and the line between them is the one that matters on a
@@ -4656,3 +4657,20 @@ def main(
         return _run_emergency_rollback(root, run or RealCommandRunner(), probe)
     sys.stderr.write(f"{_usage()}\n")
     return EXIT_USAGE
+
+
+# The process entry point, and the reason this file is shipped as an executable
+# program rather than imported by something else.
+#
+# Two callers exec this exact path and both need it to be a program: the package's
+# postinst and prerm run it, and `mosdns-cdnctl emergency-rollback` executes
+# `/usr/lib/mosdns-router/mosdns_installer.py` with an argument array. A module with
+# no `__main__` guard is neither of those things -- exec'ing it starts a Python
+# process that defines everything and exits 0, so a postinst that called it would
+# report a successful installation of a machine on which nothing had been installed.
+#
+# It holds nothing but the translation of a verb into an exit status, which is the
+# whole of what an entry point is allowed to decide. `main` itself raises nothing,
+# and every status it returns is its own.
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
