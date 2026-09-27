@@ -639,10 +639,14 @@ still reads `rwx` — a directory that passes every default-ACL check and that
 neither service identity can write.
 
 `postinst` therefore provisions with `install -d -o root -g mosdns -m 2770`
-followed by `setfacl -d -m g::rwx`, in that order: the mode last, so a default ACL
-that `install` has not disturbed survives it, and the mask a default ACL implies
-is not left narrower than the group needs. The `tmpfiles.d` entry provisions
-`/run/mosdns` the same way, since it is the same directory on a different boot.
+followed by `setfacl -d -m g::rwx`, in that order — the mode first, then the ACL.
+The order is load-bearing and the reverse is wrong: `install -d -m 2770` writes the
+mode with no ACL present, so it leaves no mask behind, and the `setfacl` that follows
+creates the default ACL with the mask its own entries imply. Running them the other
+way round leaves `default:other::r-x`, because `install`'s `chmod` sets the mask a
+previously created ACL had narrowed. Measured in the test container, both ways. The
+`tmpfiles.d` entry provisions `/run/mosdns` the same way, since it is the same
+directory on a different boot.
 
 `/run/mosdns` is the one directory on that list that `postinst` cannot keep: `/run`
 is a tmpfs, so the group, the setgid bit and the default ACL are all gone after a

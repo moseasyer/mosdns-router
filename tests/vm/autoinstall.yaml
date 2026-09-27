@@ -1,0 +1,57 @@
+#cloud-config
+# Unattended install for the system-level test machine.
+#
+# Ubuntu DESKTOP specifically, not server: the target of this project is a
+# desktop user's machine, and the one thing server lacks is the Firefox the ECH
+# checks are written against. Installing server and adding a desktop later would
+# test a machine nobody ships.
+#
+# The desktop ENVIRONMENT is never started: this machine is driven over SSH from
+# the command line, and a GDM session on the console would be an unattended
+# graphical login nobody ever uses.
+autoinstall:
+  version: 1
+  locale: en_US
+  keyboard:
+    layout: us
+  refresh-installer:
+    update: false
+  identity:
+    hostname: mosdns-test
+    username: mosdns
+    # Not a real secret. This machine is disposable, reachable only through
+    # user-mode NAT, and is destroyed after a test run. A real credential here
+    # would be a real credential in a git object.
+    password: "$6$rounds=4096$QE1mZ0YQ$oL4T0Xk9bqUq0J0m0m0m0m0m0m0m0m0m0m0m0m"
+  # The whole point is a real NetworkManager-managed wired connection with a
+  # real DHCP lease, because that is what the installer's transaction rewrites.
+  # A DHCP lease also gives the machine a real upstream resolver, which is the
+  # case where "the DHCP DNS changed" must be handled.
+  network:
+    version: 2
+    ethernets:
+      uplink:
+        dhcp4: true
+  storage:
+    layout:
+      name: direct
+  packages:
+    - acl
+    - iproute2
+    - openssh-server
+    - qemu-guest-agent
+  # The GNOME desktop is installed, but not started. gdm is masked rather than
+  # disabled so `apt install ubuntu-desktop` in a later test cannot silently
+  # un-mask it and change the machine under us.
+  late-commands:
+    - systemctl mask graphical.target
+    - systemctl mask gdm.service
+    - systemctl set-default multi-user.target
+    - systemctl enable --now ssh
+  ssh:
+    install-server: true
+    allow-pw: true
+    # The host side reaches this through user-mode NAT on a forwarded port, so
+    # the key is placed by the harness rather than baked in here.
+    authorized-keys: []
+  shutdown: reboot

@@ -32,6 +32,7 @@ RUN apt-get update \
       systemd-sysv \
       systemd-resolved \
       network-manager \
+      udev \
       dbus \
       iproute2 \
       acl \
@@ -59,6 +60,13 @@ RUN mkdir -p /etc/systemd/system \
 # however, must exist or those units cannot start.
 RUN systemd-sysusers \
  && systemd-tmpfiles --create --boot --prefix=/run --prefix=/run/lock
+
+# NetworkManager decides which devices it manages from udev's view of them, and
+# with no udev daemon every device in the container stays "unmanaged" forever --
+# so the installer's NetworkManager transaction, whose entire subject is a
+# managed connection, cannot be modelled at all. udev is therefore not optional
+# here; it is the thing that makes the device look like a device to NM.
+RUN systemctl --root=/ enable systemd-udevd.service 2>/dev/null || true
 
 # A resolver that is this project's own, never the host's. The stub listener is
 # what the installer's preflight requires, and the install then REPLACES the
