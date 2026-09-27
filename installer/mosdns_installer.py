@@ -2449,6 +2449,37 @@ def _original_property(runner: CommandRunner, uuid: str, prop: str) -> str:
     this module cannot read as `yes` or `no` is refused rather than stored, because
     a restore writes back a value it recorded and a value it could not parse is
     one it would write back as nonsense.
+
+    THE ASYMMETRY, which is the module's one and it is deliberate.
+
+    This is the module's SECOND statement of "a blank `yes`/`no` is not a value",
+    and the other one is the shared classifier `_classify`, which
+    :func:`_ownership` and :func:`manual_recovery_report` use. They are not
+    interchangeable, and pretending they were is what let an earlier round ship two
+    functions that disagreed about a blank read and then print both answers about
+    the same property twelve lines apart in one report.
+
+    The two answer DIFFERENT questions, which is why there are two:
+
+      * `_classify` answers WHOSE value is this -- is it what we set, what was
+        recorded, what somebody else changed, or is it unreadable -- and it must
+        keep working for a value that is legitimately blank. An `ipv6.dns` nobody
+        has set is a real value, and a report that called it unreadable would print
+        a row about a machine that is fine. So it reads blank as a value, compares
+        it, and only says UNREADABLE when a read produced nothing at all.
+
+      * THIS function answers MAY I RECORD THIS -- and a blank ignore-auto-dns is
+        not something to record, because `nmcli` prints nothing for an unset
+        boolean and "unset" and "NetworkManager could not be read" are the same
+        empty string. A restore that wrote the empty string back would write a
+        malformed value onto a live connection.
+
+    So the two are not duplicates to be collapsed and one is not a bug in the
+    other. The shape is the same because the VALUE SPACE is the same; the verdict
+    differs because the question does. The rule both sides point at, and the
+    reason this comment exists rather than a refactor: any change to one that is
+    not also a change to the other has to be a change to the QUESTION, not to the
+    answer.
     """
     answer = _text(runner, ("nmcli", "-g", prop, "connection", "show", uuid))
     if answer is None:
@@ -3653,6 +3684,15 @@ def _classify(prop: str, current: Optional[str], recorded: str) -> str:
     list, a real answer, a link with no manual DNS -- and it goes on to the other
     questions. That asymmetry is measured and it is the one the two functions this
     replaces got wrong differently.
+
+    THE OTHER STATEMENT OF "A BLANK `yes`/`no` IS NOT A VALUE" is in
+    :func:`_original_property`, on the install side, and the comment there says
+    what is said here and why the two are not one function: this one answers
+    WHOSE value is this and must keep treating a blank ADDRESS LIST as a real
+    value, and that one answers MAY I RECORD THIS and must refuse a blank
+    `yes`/`no` because nmcli prints nothing for an unset boolean. Same value
+    space, different questions, and the asymmetry is the design rather than a
+    leftover.
 
     ``SOMEONE_ELSE`` is strict equality against both the value this installation
     set and the recorded original, which means a list that CONTAINS what this

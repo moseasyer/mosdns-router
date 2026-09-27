@@ -63,6 +63,10 @@ packaging/config/cloudflare.txt                 /etc/mosdns/cloudflare.txt
 packaging/config/cloudfront-domains.yaml        /etc/mosdns/cloudfront-domains.yaml
 
 # --- the NetworkManager hook --------------------------------------------------
+# The ONLY file outside /var/lib/mosdns that this package installs and owns outright.
+# The uninstaller removes it, and `postrm purge` removes it again for a removal whose
+# uninstaller could not run; the conffiles under /etc/mosdns are dpkg's, which is why
+# the two of them are the whole of what "under /etc" means for this package.
 packaging/networkmanager/10-mosdns-dhcp-bridge  /etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge
 
 # --- the tmpfiles entry, the documentation and the pinned reference data -----

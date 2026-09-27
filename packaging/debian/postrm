@@ -43,9 +43,10 @@ purge)
 		echo "postrm: package's to remove. It has been left alone." >&2
 	elif [ -d /var/lib/mosdns ]; then
 		rm -rf /var/lib/mosdns
-		echo "postrm: /var/lib/mosdns and everything in it has been removed, and nothing" >&2
-		echo "postrm: else under /etc was touched: dpkg owns the conffiles and it has" >&2
-		echo "postrm: already asked about the ones that had changed." >&2
+		echo "postrm: /var/lib/mosdns and everything in it has been removed. The only" >&2
+		echo "postrm: other file under /etc this package installs is its NetworkManager" >&2
+		echo "postrm: dispatcher hook, which is removed below. The conffiles are dpkg's" >&2
+		echo "postrm: and it has already asked about the ones that had changed." >&2
 	fi
 	# The installer is gone, so it cannot remove the one file under /etc this
 	# package installed. A removal whose uninstaller could not read the machine

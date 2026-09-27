@@ -1204,6 +1204,22 @@ def unit_documentation(root, name):
 
 # --- the tmpfiles.d entry ----------------------------------------------------
 
+# The two staged-file shapes that neither `*.tmp` nor `.*.tmp` matches, and the
+# producer that makes them. `internal/candidate` is the odd one out among this
+# project's publishers: it calls `os.CreateTemp(directory, filepath.Base(path)+".*")`
+# where the other three call `os.CreateTemp(dir, "."+base+".*.tmp")` -- so its
+# staged file is `cloudflare-prefixes.txt.1234567`, with no leading dot and no
+# suffix at all. A `*` matches the digits; the problem is that neither existing
+# pattern names this directory, and the digits-only shape matches nothing else.
+#
+# These are reap lines and a reap line is a delete, so the two are named exactly
+# rather than as a glob over the whole lists directory: a pattern loose enough to
+# catch them would also catch the published files themselves.
+STAGED_WITHOUT_A_SUFFIX = (
+    "/var/lib/mosdns/lists/cloudflare-prefixes.txt.*",
+    "/var/lib/mosdns/lists/cloudflare-ips.json.*",
+)
+
 
 def tmpfiles_lines(text):
     """The entry's directives as ``(type, path, fields)``, comments and blanks gone."""
@@ -1273,6 +1289,16 @@ def tmpfiles_findings(text):
                     "machine, where the undotted pattern alone reaped nothing this project "
                     "produces"
                 )
+    for pattern in STAGED_WITHOUT_A_SUFFIX:
+        if pattern not in reaped:
+            findings.append(
+                f"{pattern} is never reaped. internal/candidate is a FOURTH producer and the only "
+                "one whose staged file has neither a leading dot nor a .tmp suffix: "
+                "os.CreateTemp(directory, filepath.Base(path)+\".*\") leaves "
+                "cloudflare-prefixes.txt.1234567 and cloudflare-ips.json.1234567 in "
+                "/var/lib/mosdns/lists, so neither *.tmp nor .*.tmp matches them and a publication "
+                "that dies between the staging and the rename leaves a file nothing manages"
+            )
     for kind, path, _fields in entries:
         if kind in ("r", "R") and not path.startswith(
             ("/var/lib/mosdns/", "/etc/mosdns/", "/run/mosdns/")
@@ -2578,6 +2604,23 @@ class TmpfilesTests(_Staged):
             + "\n".join(f"  {finding}" for finding in findings),
         )
 
+    def test_the_tmpfiles_entry_reaps_the_fourth_producer_staged_files(self):
+        """`internal/candidate` stages where no existing pattern reaches.
+
+        It is the one publisher in this project that does not name its temporary
+        file with a leading dot and a `.tmp` suffix -- `os.CreateTemp(dir,
+        filepath.Base(path)+".*")` -- so what it leaves in
+        `/var/lib/mosdns/lists` is `cloudflare-prefixes.txt.1234567`. A
+        publication that dies between the staging and the rename therefore leaves
+        a file that neither `*.tmp` nor `.*.tmp` matches, in the one directory this
+        entry did not reap at all.
+        """
+        findings = tmpfiles_findings(self.read(TMPFILES_PATH))
+        self.assertEqual(
+            findings, [],
+            "the tmpfiles entry cannot do its job:\n" + "\n".join(f"  {f}" for f in findings),
+        )
+
     def test_the_tmpfiles_acl_is_comma_separated(self):
         """Measured, not guessed: `parse_acl` splits the specification on commas, and
         a space-separated one is IGNORED with a diagnostic on stderr while the rest
@@ -2700,6 +2743,36 @@ class InstalledProgramsTests(_Staged):
                     plain, rf"(?m)^\.th\s+{re.escape(manual.lower())}\s+{re.escape(section)}\b",
                     f"{installed} does not open with a .TH line naming {manual}({section})",
                 )
+
+    def test_the_man_page_says_the_service_accounts_outlive_a_purge(self):
+        """A purge removes three service accounts and two groups unless it says so.
+
+        Either `postrm purge` removes the ones it created, guarded -- or the manual
+        page says they are still there. The second is what ships, and the reason is
+        a collision this package cannot see: the upstream `dnscrypt-proxy` package
+        creates a user and a group of the same name, so a `deluser`/`delgroup` from
+        here would remove an identity another installed package still needs. What
+        cannot ship is silence, because an operator who purges and then finds three
+        accounts they did not ask for has learned that from the machine.
+        """
+        page = gzip.decompress(self.read_bytes(MAN_ROOT + "/man8/mosdns-router.8.gz")).decode()
+        self.assertIn(".SH ACCOUNTS AND REMOVAL", page)
+        for account in ("mosdns", "mosdns-cdn", "dnscrypt-proxy"):
+            with self.subTest(account=account):
+                self.assertIn(account, page)
+        # Named as outliving the package, and removable by hand rather than by
+        # this package -- the two halves that make the sentence useful.
+        self.assertIn("outlive the package", page)
+        self.assertIn("deluser", page)
+        # And the reason, because "they are still there" without a why is the note
+        # an operator has to take on trust.
+        self.assertIn("upstream", page)
+        self.assertNotIn(
+            "deluser", "\n".join(
+                line for line in executed_lines(POSTRM.read_text())
+            ),
+            "postrm purges the service accounts, so the manual page would be wrong",
+        )
 
     def test_the_three_named_manual_pages_are_the_three_this_package_documents(self):
         installed = sorted(
@@ -3492,6 +3565,25 @@ class ControlTests(unittest.TestCase):
         self.assertIn(
             'install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"', broken
         )
+
+    def test_a_missing_staged_file_pattern_is_reported(self):
+        """The control for the fourth producer's two reap lines.
+
+        Deleted rather than loosened, because a reap line is a delete and the two
+        published files in that directory are the very names the pattern is built
+        from. The control also proves the check is about the lists directory and
+        not about the entry in general: the three directories that were already
+        reaped still pass with one of these two gone.
+        """
+        good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
+        for pattern in STAGED_WITHOUT_A_SUFFIX:
+            with self.subTest(pattern=pattern):
+                self.assertEqual(tmpfiles_findings(good), [])
+                self.assertMethodFails(
+                    TmpfilesTests,
+                    "test_the_tmpfiles_entry_reaps_the_fourth_producer_staged_files",
+                    staged={TMPFILES_PATH: good.replace(f"r {pattern}\n", "")},
+                )
 
     def test_one_sentence_for_both_of_the_installers_refusals_is_reported(self):
         """The control for prerm's two arms.

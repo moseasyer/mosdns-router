@@ -35,6 +35,7 @@ state directory" is a claim about the whole tree rather than about two paths a
 test remembered to check.
 """
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -276,6 +277,21 @@ def purges(path):
     """
     state = STATE_DIRECTORY.lstrip("/")
     return path == state or path.startswith(state + "/")
+
+
+def function_source(name):
+    """One function's own text out of the module, comments and docstring included.
+
+    Read with `ast` rather than by scanning for the name, so a docstring that
+    happens to mention another function's name cannot make the reader believe the
+    function under test says something it does not. And the DOCSTRING is kept,
+    because that is the text this assertion is about.
+    """
+    tree = ast.parse(SOURCE)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return ast.get_source_segment(SOURCE, node) or ""
+    raise AssertionError(f"{MODULE} has no function named {name}")
 
 
 def snapshot(root):
@@ -812,6 +828,36 @@ class ValueSpaceTests(unittest.TestCase):
                     leaves,
                     f"the block's decision for {prop} printed {printed!r} is the wrong one",
                 )
+
+    def test_the_two_statements_about_a_blank_value_point_at_each_other(self):
+        """The module's one classifier and its one second statement, said once each.
+
+        The ledger has carried this as a deferred minor for two rounds: the module
+        has three ways of asking whether a blank `yes`/`no` is a value, and a
+        reviewer has to read both docstrings to learn that the difference is
+        deliberate. The fix is not a refactor -- merging them would be wrong, and
+        the two docstrings now say why -- it is that each one says it, and this
+        holds them to it in both directions so neither can be edited into silence.
+        """
+        classify = function_source("_classify")
+        record = function_source("_original_property")
+        for name, body in (("_classify", classify), ("_original_property", record)):
+            with self.subTest(function=name):
+                self.assertIn(
+                    "_original_property" if name == "_classify" else "_classify",
+                    body,
+                    f"{name} does not name the other statement, so the asymmetry is stated in one "
+                    "place only",
+                )
+                self.assertIn(
+                    "question", body.lower(),
+                    f"{name} states an asymmetry without saying the two answer different questions, "
+                    "which is the only reason for having two",
+                )
+                # And it must say WHY each side differs, not merely that they do:
+                # a comment that says "these differ" without saying how is the note
+                # this minor was filed about.
+                self.assertIn("nmcli", body.lower())
 
     def test_the_table_covers_every_verdict_and_both_unreadable_shapes(self):
         verdicts = {row[4] for row in self.ROWS}

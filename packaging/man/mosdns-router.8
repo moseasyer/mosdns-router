@@ -89,6 +89,42 @@ entry, because
 .B /run
 is a tmpfs and the group, the setgid bit and the default ACL do not survive a
 reboot.
+.SH ACCOUNTS AND REMOVAL
+A purge removes
+.BR /var/lib/mosdns ,
+the ownership marker, and the NetworkManager dispatcher hook under
+.IR /etc/NetworkManager/dispatcher.d/no-wait.d/ .
+It does
+.B not
+remove the three service accounts
+.RB ( mosdns ,
+.BR mosdns-cdn ,
+.BR dnscrypt-proxy )
+or the two groups
+.RB ( mosdns ,
+.BR dnscrypt-proxy ),
+which outlive the package. That is a decision rather than an omission: a system
+account may be shared, and the upstream
+.B dnscrypt-proxy
+package creates a group and a user of the same name, so a
+.B deluser
+or
+.B delgroup
+run from this package's
+.B postrm
+would remove an identity another installed package still needs. Remove them by
+hand with
+.B deluser
+and
+.B delgroup
+if you are certain nothing else on the machine uses them.
+.PP
+The recorded NetworkManager settings are the one thing a removal cannot recreate.
+A plain
+.B dpkg \-\-remove
+leaves them in place for exactly that reason: a machine with no marker is a
+machine a later install will treat as somebody else's. Put them back first with
+.BR "mosdns\-cdnctl emergency\-rollback" (1).
 .SH OPTIONS
 The router takes one subcommand and one flag, and this package's unit uses both:
 .B start
