@@ -2277,6 +2277,188 @@ class ReinstallTests(TransactionFixture):
         self.assertFalse(result.ok, "the rollback reported success on a device still on the loopback")
 
 
+class RecordWithoutMarkerTests(TransactionFixture):
+    """A record and NO marker: the state the carry-forward must be gated on.
+
+    `ReinstallTests` reaches its state by installing twice, which leaves a marker,
+    and the carry-forward is gated on that marker. The marker is a claim about the
+    INSTALL -- it is written last, after the health check and the verification --
+    and it is absent in exactly one state that matters more than the upgrade: a
+    machine whose install got as far as recording, changed the connection, and
+    then failed with a rollback that did not finish. That machine has a RECORD
+    saying what it had, NO marker, and a connection still handing resolved the
+    loopback address, because the restore is one of the undos that failed.
+
+    The routine retry from there is `dpkg --configure mosdns-router`, which dpkg
+    offers on its own after a failed configure. It re-reads the connection --
+    which holds `yes`/`yes`/`127.0.0.1`, this package's own values -- and, on the
+    version before the fix, wrote them over the record and succeeded. The next
+    removal then restored the loopback, stopped both units and printed `ok=True`.
+    That is the Critical from `final-review-findings.md` reached by the ordinary
+    retry path, and gating on the marker is what let it through.
+
+    The state is produced HONESTLY here -- by a real install whose rollback fails
+    -- rather than by deleting the marker, because the marker being absent is
+    supposed to be a fact about the ORDER and a test that arranges it by hand
+    cannot tell whether the order still produces it.
+    """
+
+    # The two commands that fail. The first is the ROLLBACK's own restore of
+    # `ipv4.dns`, which is a different argument array from the install's
+    # `ipv4.dns 127.0.0.1` -- the forward write succeeds, the restore does not,
+    # and the profile is left pointing at the loopback. The second is the
+    # reactivation, so the device never picks the recorded values up either.
+    UNRESTORABLE = (MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM), CONNECTION_UP + (UUID,))
+
+    def failed_rollback(self):
+        """Get this machine into record-without-marker and the connection on the loopback."""
+        result = self.run_install(fail=list(self.UNRESTORABLE))
+        self.assertFalse(result.ok, "an install with two failing undos reported success")
+        self.assertIsNotNone(
+            result.rollback_error,
+            "the install was supposed to fail its ROLLBACK, and a clean refusal would leave the "
+            "connection restored and the case testing nothing",
+        )
+        self.assertTrue(
+            self.rooted(BACKUP_PATH).exists(),
+            "a failed rollback removed the record of what the machine had, which is the whole "
+            "thing the next install would have to keep",
+        )
+        self.assertFalse(
+            self.rooted(MANAGED_BY).exists(),
+            "this case is about a machine with a record and NO marker, and the install left a "
+            "marker behind",
+        )
+        return self.recorded()
+
+    def later_clock(self):
+        import datetime
+
+        return datetime.datetime(2026, 10, 4, 11, 5, tzinfo=datetime.timezone.utc)
+
+    def recorded(self):
+        return json.loads(self.rooted(BACKUP_PATH).read_text(encoding="utf-8"))
+
+    def retry(self, **kwargs):
+        """The routine retry: a second install on a machine now reading `ALREADY_OURS`."""
+        kwargs.setdefault("clock", self.later_clock)
+        kwargs.setdefault("outputs", {PACKAGE_VERSION_COMMAND: "1.5.0\n"})
+        return self.run_install(already_installed=True, **kwargs)
+
+    def test_a_reinstall_keeps_the_record_of_a_machine_that_has_no_marker(self):
+        before = self.failed_rollback()
+        self.assertEqual(
+            before["original"]["ipv4.dns"]["raw"],
+            DHCP_UPSTREAM,
+            "the record this case builds its argument from does not hold the machine's own resolver",
+        )
+        result = self.retry()
+        self.assertTrue(result.ok, f"the routine retry failed: {result.error}")
+        after = self.recorded()
+        self.assertEqual(
+            after["original"],
+            before["original"],
+            "the retry rewrote the record of what the machine had, from the values this package "
+            "itself had just set",
+        )
+        for prop in ("ipv4.ignore-auto-dns", "ipv6.ignore-auto-dns", "ipv4.dns"):
+            with self.subTest(prop=prop):
+                self.assertNotIn(
+                    LOCAL_DNS,
+                    str(after["original"][prop]["value"]),
+                    f"the loopback is in the record of the machine's own {prop}, so the next "
+                    "removal would put it back and stop the resolver",
+                )
+        # And the volatile half moved, so this is a carry-forward and not a refusal:
+        # a refusal would be a different (also correct) answer, and the two must not
+        # be able to stand in for each other in a test.
+        self.assertNotEqual(after["created_at"], before["created_at"])
+        self.assertNotEqual(after["package_version"], before["package_version"])
+
+    def test_the_uninstall_after_that_retry_restores_the_machine_and_the_device_check_refuses(self):
+        before = self.failed_rollback()
+        self.assertTrue(self.retry().ok)
+
+        self.events = []
+        result = installer.uninstall(
+            self.root, self.good_runner(already_installed=True), probe=self.probe_for()
+        )
+        restored = [command[4:] for command in self.commands if command[:3] == MODIFY]
+        self.assertEqual(
+            sorted(restored),
+            sorted(
+                (
+                    (prop, before["original"][prop]["raw"] or "''")
+                    for prop in ("ipv4.dns", "ipv4.ignore-auto-dns", "ipv6.ignore-auto-dns")
+                )
+            ),
+            "the uninstall did not put the machine's OWN recorded values back",
+        )
+        # The fake device still reports the loopback this run took away from it, so
+        # the check that guards the machine's resolver has to REFUSE and the units
+        # have to still be running. On the version before the fix the record held
+        # the loopback, so the check passed and both units were stopped on a
+        # machine whose DNS pointed at a process that had gone.
+        self.assertFalse(result.ok, "the device check did not refuse a machine still on the loopback")
+        self.assertIn(LOCAL_DNS, (result.error or "") + (result.manual_recovery or ""))
+        for unit in (ROUTER_UNIT, RESOLVER_UNIT):
+            with self.subTest(unit=unit):
+                self.assertNotIn(
+                    ("systemctl", "stop", unit),
+                    self.commands,
+                    f"{unit} was stopped while the device was still using {LOCAL_DNS}",
+                )
+
+    def test_the_uninstall_refuses_a_record_without_a_marker_before_the_retry(self):
+        # The same machine one step earlier, and it is a separate assertion because
+        # it is a different fact: with no marker there is no claim, so the restore
+        # is refused outright and nothing at all is written. The retry is what makes
+        # the case above reachable, and a reader who only saw the case above would
+        # not know this one had to give way.
+        self.failed_rollback()
+        self.events = []
+        result = installer.uninstall(
+            self.root, self.good_runner(already_installed=True), probe=self.probe_for()
+        )
+        self.assertFalse(result.ok, "a machine with a record and no marker reported a clean removal")
+        self.assertFalse(
+            [command for command in self.commands if command[:3] == MODIFY],
+            "a refused uninstall wrote to the connection anyway",
+        )
+        self.assertIn(MANAGED_BY, " ".join(result.refusals))
+
+    def test_a_reinstall_refuses_a_record_it_can_read_the_file_of_but_not_the_fields(self):
+        # Present but damaged is not absent. A record whose file is there and whose
+        # contents are not usable is a machine whose original is UNKNOWN, and writing
+        # a fresh document would replace an unknown with this package's own values --
+        # so it refuses, and it says which part of the record is missing rather
+        # than only that the record is not usable.
+        before = self.failed_rollback()
+        damaged = self.recorded()
+        del damaged["original"]["ipv4.dns"]
+        self.rooted(BACKUP_PATH).write_text(
+            json.dumps(damaged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        result = self.retry()
+        self.assertFalse(result.ok, "a re-install over a damaged record reported success")
+        self.assertIn(
+            "ipv4.dns",
+            result.error or "",
+            f"the refusal does not name what is missing from the record: {result.error!r}",
+        )
+        self.assertEqual(
+            self.recorded()["original"],
+            damaged["original"],
+            "the refused re-install overwrote a record it had just said it could not read",
+        )
+        self.assertNotEqual(
+            self.recorded()["original"],
+            before["original"],
+            "the damaged record is the one under test, and this says the test did not set it up",
+        )
+        self.assertNothingChanged("a re-install refused over a damaged record")
+
+
 class FailureMessageTests(TransactionFixture):
     """What a failing command says, as opposed to what it exits with.
 

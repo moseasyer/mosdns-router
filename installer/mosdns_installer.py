@@ -2793,12 +2793,15 @@ def _carried_forward(root: Path, document: dict) -> dict:
     exists to prevent -- the next removal would then take the machine's resolver
     with it while reporting that everything was fine.
 
-    Two things it will not do, and both are refusals rather than guesses:
+    Two things it will not do, and both are refusals rather than guesses. The
+    third case -- a first install, with nothing to carry forward -- is not one of
+    them and must never become one:
 
-      * **Carry a record it cannot read.** If the marker claims this machine and
-        the record is absent or unreadable, the only values available are this
-        package's own, and writing them would manufacture a record rather than
-        keep one.
+      * **Carry a record it cannot read.** The record is the only thing that knows
+        what the machine's DNS was, so a record that is absent with the marker
+        claiming this machine, or a record that is present and unusable, both
+        leave the only values available being this package's own -- and writing
+        those would manufacture a record rather than keep one.
       * **Keep a record that is about a different connection.** The record is
         what `uninstall` and `emergency-rollback` restore from, and they restore
         the one connection it names. A re-install working on a second connection
@@ -2808,21 +2811,80 @@ def _carried_forward(root: Path, document: dict) -> dict:
     The reader is `_read_backup`, the same one the uninstall uses and the same
     standard of what a usable record is -- so a document carried forward here is
     one an uninstall would act on rather than one that merely parsed.
+
+    THE GATE IS THE RECORD, not the marker, and getting that backwards is the
+    whole of the second version of this bug.
+
+    An earlier version asked `_installation_is_ours` -- the MARKER -- whether to
+    carry anything forward, and that is the wrong question by one state. The
+    marker is a claim about the INSTALL: it is written last, after the health
+    check and the verification, so it is absent on every machine whose install did
+    not run to completion -- and the machine that matters most here is exactly
+    that one. An install that changed the connection and then failed with a
+    rollback that did not finish leaves a RECORD of the machine's original DNS,
+    NO marker, and a connection still handing resolved the loopback address. The
+    routine repair for that is `dpkg --configure mosdns-router`, which dpkg itself
+    offers after a failed configure: it re-reads the connection -- which now holds
+    `yes`/`yes`/`127.0.0.1`, this package's own values -- wrote them over the
+    record, and SUCCEEDED. The next removal then restored the loopback, stopped
+    both units and reported `ok=True`.
+
+    So the record is what knows the machine's original, and the marker is a claim
+    about the install that is missing precisely where the record matters most. A
+    record is a fact about the MACHINE; a marker is a fact about a RUN. This
+    function is about the machine, and it is gated on the record.
+
+    What that leaves, and all three are refusals or a first install rather than a
+    guess:
+
+      * **A record that is present and not usable.** The machine's original is
+        unknown, and the values this run would write down are this package's own.
+        It refuses, and it names which field of the record is missing, because
+        "the backup is not usable" is not something an operator can act on and
+        "the record has no `ipv4.dns`" is.
+      * **No record at all, with the marker claiming this machine.** The marker
+        says the DNS is ours and the record of what it was is gone, so the only
+        values left to write are ours. Same refusal, same reason, reached from the
+        other side -- and `_never_applied` treats the mirror image of it
+        (no marker, no record) as provably-never-applied, which is the complement
+        of this arm rather than a contradiction of it.
+      * **A first install.** No record, no claim, nothing to keep, so the fresh
+        document is written. This is the ordinary case and it must not be refused.
+
+    THE COST, stated rather than discovered later: a release that changes the
+    schema cannot re-install over a machine an older release installed, because
+    `_read_backup` refuses a version it does not know and this arm then refuses
+    the install. The operator's route is the refusal's own advice. The alternative
+    is writing a fresh document over the only record of the machine's original
+    DNS, which is the outcome this function exists to prevent, so the refusal is
+    the right side of that trade.
     """
-    if not _installation_is_ours(root):
-        return document
     recorded, refusals = _read_backup(root)
     if recorded is None:
-        raise InstallRefused(
+        # Three states and the difference between them is the whole of the gate.
+        # `_path_state` rather than "did the file open" because a record that is
+        # ABSENT and a record that is present-but-damaged are different machines:
+        # the first is a first install (or a refused one), and the second is a
+        # machine whose original this program can no longer say.
+        if _path_state(root / BACKUP_PATH.lstrip("/")) == "absent" and not _installation_is_ours(root):
+            return document
+        claim = (
             f"{MANAGED_BY} says this machine is already running this package's DNS, and "
-            f"{BACKUP_PATH} is not a record this program can read ("
+            if _installation_is_ours(root)
+            else ""
+        )
+        raise InstallRefused(
+            f"{claim}{BACKUP_PATH} is not a record this program can read, and it is the only "
+            "thing that knows what this machine's DNS was set to before this package touched it ("
             + "; ".join(refusals)
             + "), so this install cannot record what the machine had: the values it would "
             f"write down are the ones this package itself set -- {_set_values_now(document)} -- and "
             "recording those would destroy the record of the machine's real settings rather than "
-            "keep it. Nothing has been changed. The record has to be restored by hand, or this "
-            "package removed with `dpkg --force-remove-reinstreq` once the connection is back on "
-            "the machine's own resolvers"
+            "keep it. Nothing on this machine's DNS configuration has been changed; the DHCP lease "
+            "this run published under /run/mosdns before it got here is this package's own state "
+            f"and says nothing about the connection. Restore the record, or remove this package "
+            f"with `dpkg --force-remove-reinstreq` once the connection is back on the machine's own "
+            "resolvers"
         )
     recorded_uuid = str(recorded["connection"]["uuid"])
     fresh_uuid = str(document["connection"]["uuid"])
@@ -2831,7 +2893,9 @@ def _carried_forward(root: Path, document: dict) -> dict:
             f"{BACKUP_PATH} records what connection {recorded_uuid} was set to, and this install "
             f"is working on connection {fresh_uuid}; one record cannot describe two connections, "
             "and replacing the first would leave it pointed at the loopback address with nothing to "
-            "put back. Nothing has been changed. Remove this package (which restores "
+            "put back. Nothing on this machine's DNS configuration has been changed; the DHCP lease "
+            "this run published under /run/mosdns before it got here is this package's own state "
+            "and says nothing about the connection. Remove this package (which restores "
             f"{recorded_uuid} through the record that is already there) and install it again to "
             f"work on {fresh_uuid}"
         )
