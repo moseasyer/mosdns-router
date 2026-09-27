@@ -1,0 +1,162 @@
+.\" Manual page for mosdns-cdnctl, the control tool this package installs.
+.TH MOSDNS\-CDNCTL 1 "2026-09-27" "mosdns-router 0.1.0" "User Commands"
+.SH NAME
+mosdns\-cdnctl \- render, measure, prove and publish this router's configuration
+.SH SYNOPSIS
+.B mosdns\-cdnctl
+.I render
+.RB [ \-\-policy\ \fIPATH\fR ]
+.RB [ \-\-out\ \fIDIR\fR ]
+.br
+.B mosdns\-cdnctl
+.I validate
+.B \-\-policy
+.I PATH
+.RB [ \-\-documents\ \fIDIR\fR ]
+.br
+.B mosdns\-cdnctl
+.I update\-lists
+.RB ( \-\-check | \-\-pin\-remote\ \fIHEAD\fR | \-\-refresh\-ranges )
+.br
+.B mosdns\-cdnctl
+.I test
+.RB [ \-\-apply ]
+.br
+.B mosdns\-cdnctl
+.I health\-check
+.br
+.B mosdns\-cdnctl
+.I pin
+.I ADDRESS
+.br
+.B mosdns\-cdnctl
+.I unpin
+.br
+.B mosdns\-cdnctl
+.I emergency\-rollback
+.SH DESCRIPTION
+.BR mosdns\-cdnctl (1)
+is this project's control tool. It is what turns a policy into the two documents
+the gateway runs, what measures and publishes the CDN address in service, and what
+proves that address is still good. Three of its five jobs are started by timers
+rather than by a person, and one of them is root\-only by design.
+.SS render
+Loads a policy, renders both generated documents through the same renderers this
+repository reviewed, and publishes them as a pair: the routing document first and
+the resolver document second, each staged, flushed and renamed into place, with
+the previous one kept until the pair is complete. A policy that cannot be loaded
+or cannot be validated is reported as one error and nothing is published.
+.PP
+The policy path it is given is the path both published documents NAME, so rendering
+a policy somewhere other than
+.I /etc/mosdns/policy.yaml
+produces documents that refer to that other path. That is what the
+.B \-\-policy
+and
+.B \-\-out
+flags are for, and it is why this package builds its own copy through a private
+view of the filesystem rather than substituting a path into the result.
+.SS validate
+Reports whether the installed documents are what the policy describes, and writes
+nothing. The policy itself is valid \(em that is what the caller established \(em
+so the command still exits zero; what it adds is the disagreement between a policy
+nobody applied and a document the router is running. A directory with no document
+in it is an installation that has not rendered yet and is not reported as stale.
+.SS update\-lists
+Three mutually exclusive modes, and each is a mode rather than a flag on the others:
+.TP
+.B \-\-check
+Reports whether the pinned source has moved, and reports the published ranges read
+from disk without requesting them. Takes no lock, writes nothing, and cannot
+publish a missing prefix list. Scheduled daily by
+.BR mosdns\-list\-check.timer (5).
+.TP
+.B \-\-pin\-remote\ \fIHEAD\fR
+Re\-pins the China domain list to the source's default branch and publishes the
+list and the lock that describes it. An operator runs this by hand after reading
+what the daily check reported; nothing applies a change automatically, because an
+accepted change is a change nobody reviewed.
+.TP
+.B \-\-refresh\-ranges
+Fetches the published ranges and publishes their prefix list. Measures nothing and
+spends no bandwidth budget, which is what makes it the mode an installation runs
+before the router starts: the response rewriter refuses to CONSTRUCT without a
+published prefix list, so
+.B systemctl start mosdns\-router
+on a machine that has never run it binds nothing on port 53. An installation runs
+this with no origin named, so a valid cached range document republishes with no
+network at all.
+.SS test, pin, unpin
+The measurement. One invocation of
+.B test \-\-apply
+is the whole nightly: the measurement phases and the final identity proof, so the
+address that is published was proved against what was just measured rather than
+against a report written two hours ago.
+.B pin
+and
+.B unpin
+stop the optimizer for one address.
+.SS health\-check
+Takes the address in service out of service if it is failing. It proves the
+published winner and every published per\-hostname mapping against their own
+identity profiles, records the verdict, and moves the selector to the fallback
+when the winner has failed the policy's threshold. It spends no bandwidth budget
+and cannot: the prober it is given offers no transfer. Scheduled every two minutes
+by
+.BR mosdns\-cdn\-health.timer (5).
+.SS emergency\-rollback
+ROOT ONLY, and the one verb here that changes a machine's DNS. It restores only
+the last valid backup the installer recorded, verifies through the system resolver
+that the machine can resolve, and leaves the binaries and the configuration
+installed for diagnosis. It does not consult the preflight, so it works on a
+machine whose preflight refuses \(em which is the machine whose install died. It
+runs the installed installer with an argument array and no shell, so nothing an
+operator controls can be reinterpreted on the way there.
+.SH SHARED STATE
+The optimizer, the health check and an operator's own command share one control
+lock and one set of state files under
+.IR /var/lib/mosdns/runtime .
+Whichever process wins the race creates a file at mode 0640 inside a group\-writable
+setgid directory, so the other identity can read it, rename over it and take the
+lock without any additional privilege. "The other one got there first" is exit
+status 4, and it is a different answer from a failure: the two timer units excuse
+4 and fail on everything else.
+.SH FILES
+.TP
+.I /etc/mosdns/policy.yaml
+The policy. Edit this.
+.TP
+.I /etc/mosdns/mosdns.yaml
+The generated routing document.
+.TP
+.I /etc/mosdns/dnscrypt\-proxy.toml
+The generated resolver document. Custom stamps are edited HERE, and they need a
+dnscrypt\-proxy restart to take effect.
+.TP
+.I /var/lib/mosdns/runtime/control.lock
+The shared control lock, mode 0640, created on first acquire.
+.TP
+.I /var/lib/mosdns/lists/cn\-domains.txt
+The pinned China domain list, published by
+.B update\-lists
+and verified against
+.IR source\-lock.json .
+.SH EXIT STATUS
+.TP
+.B 0
+The verb did what was asked.
+.TP
+.B 1
+A usage error, or a report the command wrote to standard output.
+.TP
+.B 3
+The command produced no report at all, or refused to publish.
+.TP
+.B 4
+The shared control lock was held by another process, or a state could not be
+published.
+.SH SEE ALSO
+.BR mosdns\-router (8),
+.BR dnscrypt\-proxy (8),
+.BR systemd.unit (5),
+.BR tmpfiles.d (5)

@@ -1,0 +1,33 @@
+# mosdns-router user candidate list.
+#
+# Addresses and prefixes the nightly optimizer measures IN ADDITION to the ones
+# Cloudflare publishes. One entry per line: one public IPv4 address, or one public
+# IPv4 prefix. A line whose first non-space character is # is a comment, a blank
+# line is nothing, and a # anywhere on a line ends the entry, so an address may
+# carry a trailing comment. Everything else is REFUSED rather than skipped: this
+# is the only channel you control, and a line this release cannot read is a line
+# whose intent would be silently dropped.
+#
+# The shipped file names nothing, and it says so in comments rather than being zero
+# bytes so that it is a document about itself instead of an empty one. A file that
+# is not there at all is equally acceptable: the optimizer then measures only the
+# published ranges.
+#
+# A prefix a /24 or narrower names every address in it, one candidate each. A wider
+# prefix contributes the first host address of every block it covers, because
+# expanding one address by address would hand the prober millions of them. Either
+# way the list as a whole is bounded at 512 candidates, so one line cannot make a
+# nightly run unbounded.
+#
+# This list cannot introduce a resolver. Every entry is a CANDIDATE ADDRESS the
+# optimizer would forward a query to, never an upstream this project ships: the
+# shipped routing document's two upstreams are the addresses DHCP published and the
+# loopback resolver, and nothing here changes either of them. What a name in this
+# list does is make the measurement run try an address of yours, so an address
+# that does not answer will simply not win.
+#
+# Changes take effect on the next optimizer run. To measure now:
+#
+#   sudo mosdns-cdnctl test --apply
+#
+# See mosdns-cdnctl(1) and mosdns-router(8).

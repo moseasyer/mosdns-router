@@ -1,0 +1,52 @@
+#!/bin/sh
+# The NetworkManager dispatcher hook, and the one thing in this package that
+# NetworkManager runs.
+#
+# WHY no-wait.d AND NOT dispatcher.d: this hook reads NetworkManager's own state
+# with nmcli and rewrites one runtime file. A blocking hook holds the DHCP event
+# open for the length of that call, and a DHCP event is a moment where the machine
+# is mid-transition. no-wait.d is the directory for a hook that must not.
+#
+# WHY THE INVOCATION IS PINNED RATHER THAN A SCRIPT ON $PATH: NetworkManager runs
+# dispatcher scripts with a minimal environment, and a bare program name would
+# resolve through whatever PATH that environment happens to carry, or not at all.
+# The module invocation and the absolute interpreter are what make this hook behave
+# the same on every machine, and they are the one line the package-content test
+# reads to prove the installed hook runs that invocation rather than a name it has
+# to find.
+#
+# WHY PYTHONPATH IS SET RATHER THAN THE MODULE INSTALLED INTO site-packages: this
+# package owns /etc/mosdns, /var/lib/mosdns and 127.0.0.1:53. It does not own the
+# machine's Python path. The one package it needs is named here, so nothing an
+# operator installs site-wide can shadow the bridge.
+#
+# The two paths are the ones the installer uses too, and that is what makes a
+# capture and the first `up` event after it ONE DHCP generation rather than two:
+# the publisher refuses a state whose resolvers moved, because nothing moved.
+#
+# The hook exits with the bridge's own status and NetworkManager reads nothing but
+# that status: 0 published or already current, 2 a command line or environment this
+# cannot act on, 3 another bridge holds the lock, 4 a state that could not be
+# published or a lease that could not be read. 4 leaves the previous generation
+# standing, so one failed read is never an emptied router.
+set -eu
+
+# One line, and a literal, on purpose: the package-content test reads it to check
+# what the INSTALLED hook runs, and a value that is a constant in this file is
+# exactly as safe to word-split as any other word-split command line -- there is
+# nothing in it for an operator to put there. Only the dispatcher's own arguments,
+# which are an interface name and an action, are quoted, and they are passed
+# separately so a name with a space in it cannot become two arguments.
+Exec="env PYTHONPATH=/usr/lib/mosdns-router /usr/bin/python3 -m mosdns_dhcp_bridge.cli --state-file /run/mosdns/dhcp-upstreams.json --lock-file /run/mosdns/dhcp-bridge.lock"
+
+if [ ! -x /usr/bin/python3 ]; then
+	echo "mosdns-dhcp-bridge: /usr/bin/python3 is missing, so no DHCP generation can be published" >&2
+	exit 4
+fi
+if [ ! -d /usr/lib/mosdns-router/mosdns_dhcp_bridge ]; then
+	echo "mosdns-dhcp-bridge: /usr/lib/mosdns-router/mosdns_dhcp_bridge is not in the installed package" >&2
+	exit 4
+fi
+
+# shellcheck disable=SC2086 # the word list is the literal above, by design
+exec $Exec "$@"

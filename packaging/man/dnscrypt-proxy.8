@@ -1,0 +1,114 @@
+.\" Manual page for the packaged dnscrypt-proxy as this package installs and configures it.
+.TH DNSCRYPT\-PROXY 8 "2026-09-27" "mosdns-router 0.1.0" "System Administration"
+.SH NAME
+dnscrypt\-proxy \- the foreign resolver, on loopback only
+.SH SYNOPSIS
+.B dnscrypt\-proxy
+.B \-config
+.I /etc/mosdns/dnscrypt-proxy.toml
+.SH DESCRIPTION
+This is the page for
+.BR dnscrypt\-proxy (8)
+as THIS PACKAGE builds, configures and runs it: dnscrypt\-proxy 2.1.18, compiled
+from a checksummed source archive with cgo disabled, installed at
+.IR /usr/lib/mosdns\-router/dnscrypt\-proxy ,
+configured by
+.IR /etc/mosdns/dnscrypt\-proxy.toml ,
+and started by
+.BR dnscrypt\-proxy.service (5).
+The program's own documentation is in the configuration file's comments and in its
+upstream release notes; what is written here is the configuration this package
+ships and the properties of the unit that runs it.
+.SH THE SHIPPED CONFIGURATION
+.TP
+.B listen_addresses
+.BR 127.0.0.1:15353 ,
+and nothing else. Never port 53, so this resolver is neither reachable from
+off\-host nor mistakable for the system resolver. dnscrypt\-proxy registers a UDP
+and a TCP listener for every listen address, so nothing here narrows it to one
+transport; the router's foreign forward uses TCP.
+.TP
+.B ignore_system_dns
+.BR true .
+The host resolver list is what a DHCP lease published, and this router does not
+control it, so a foreign query must never be answered by the network the user is
+leaving. The bootstrap resolvers below resolve DNSCrypt provider names and never
+receive an ordinary user query.
+.TP
+.B cache
+.BR false .
+The foreign cache belongs to the router, which is the only component that knows
+when an answer has been superseded; a second cache here would answer from a copy
+nothing can invalidate, and a query log would write the user's names to disk.
+.TP
+.B doh_servers , odoh_servers
+Both
+.BR false ,
+so no stamp may name a DoH or an ODoH endpoint: the program would drop such a stamp
+and keep serving with fewer resolvers than the file lists, without saying so.
+.TP
+.B require_dnssec , require_nolog
+Both
+.BR true ,
+so a resolver that cannot promise DNSSEC and no\-log is refused rather than used.
+.TP
+.B netprobe_address
+.BR 9.9.9.9:443 .
+A reachability probe over TCP 443, so a captive portal or a blackholed network is
+reported before the router claims to resolve anything. It is pinned rather than
+defaulted to the first bootstrap resolver, which would probe plain DNS on port 53
+where a portal happily answers.
+.TP
+.B [static.*]
+The stamps. Each is complete: it carries the 32\-byte Ed25519 provider public key
+the resolver's certificate is signed with, so the address and the key it has to
+prove cannot be separated. Nothing in the file is a bare resolver IP, because an
+unauthenticated address is exactly what an on\-path party substitutes.
+.SH CHANGING IT
+The resolver document is GENERATED:
+.BR "mosdns\-cdnctl render" (1)
+rewrites it from the policy, so a custom stamp set is an edit that a render will
+overwrite. Two honest ways to have a different provider: keep a copy of the
+document and restore it after a render, or change the renderer. Editing it in
+place and then rendering is a configuration nobody can explain.
+.PP
+Any change needs a restart, because the unit reads the file once at start:
+.PP
+.RS
+.nf
+sudo systemctl restart dnscrypt\-proxy
+.fi
+.RE
+.PP
+Check the document before restarting it. The program validates a document and exits
+without binding a socket, which makes it the one command that can tell an operator
+their edit parses before the router loses its foreign branch:
+.PP
+.RS
+.nf
+/usr/lib/mosdns\-router/dnscrypt\-proxy \-check \-config /etc/mosdns/dnscrypt\-proxy.toml
+.fi
+.RE
+.SH THE UNIT
+It runs as
+.BR dnscrypt\-proxy ,
+which shares no state with either mosdns identity and so has its own group and its
+own umask. It binds an unprivileged port and runs no privileged operation, so its
+capability bounding set is emptied rather than inherited. Its address\-family list
+includes
+.BR AF_NETLINK ,
+and that is not a detail: dnscrypt\-proxy 2.1.18 enumerates the host's interfaces in
+its network\-change monitor, Go's
+.I net.Interfaces
+opens a netlink socket, and without the family the fingerprint loses every
+interface and a change of network is missed silently.
+.PP
+.B network.target
+is an ordering edge and nothing else. This resolver must start on a machine whose
+network is not up, because it resolves provider names through pinned bootstrap
+resolvers rather than through the system resolver.
+.SH SEE ALSO
+.BR "mosdns\-cdnctl" (1),
+.BR mosdns\-router (8),
+.BR systemd.unit (5),
+.BR tmpfiles.d (5)

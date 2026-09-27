@@ -1,0 +1,105 @@
+.\" Manual page for the mosdns-router DNS router as this package installs it.
+.TH MOSDNS\-ROUTER 8 "2026-09-27" "mosdns-router 0.1.0" "System Administration"
+.SH NAME
+mosdns\-router \- the machine's DNS router, on loopback only
+.SH SYNOPSIS
+.B mosdns\-router
+.B start
+.B \-c
+.I /etc/mosdns/mosdns.yaml
+.SH DESCRIPTION
+.BR mosdns\-router (8)
+is the resolver this package makes a machine's own. It binds
+.B 127.0.0.1:53
+on UDP and TCP and nothing else, and it is started by
+.BR mosdns\-router.service (5).
+The routing document it reads is
+.IR /etc/mosdns/mosdns.yaml ,
+and that document is GENERATED: it is the output of
+.BR "mosdns\-cdnctl render" (1)
+for the policy in
+.IR /etc/mosdns/policy.yaml .
+A hand edit to it is an edit the next render overwrites, and the file says in its
+own header that it is generated and by what.
+.SS The two branches
+There are two and there is no third. A name the pinned China list matches goes to
+the DNS servers the DHCP lease published, and every other name goes to the loopback
+DNSCrypt resolver over TCP. There is no fallback between them: a foreign query
+that cannot be answered fails, and is never re\-asked inside the network the user
+is leaving.
+.SS What is rewritten
+Only what comes back from the foreign branch, and only that:
+.B cdn_rewrite
+runs before the cache, so a rewritten answer is never itself stored, and a cached
+answer is rewritten on the way out to every client rather than stored rewritten.
+It replaces an address only for a response every one of whose addresses is inside
+a published range, and only while the published selection's proof window is open.
+Nothing in the domestic branch is rewritten: those answers come from the network
+the user is not leaving, and nothing here has proved anything about them.
+.SH FILES
+.TP
+.I /etc/mosdns/mosdns.yaml
+The routing document. Generated; a conffile, so an upgrade asks before replacing
+it. Regenerate it with
+.BR "mosdns\-cdnctl render" (1).
+.TP
+.I /etc/mosdns/policy.yaml
+The policy both generated documents are rendered from. Edit this, not the
+documents. Validate it with
+.BR "mosdns\-cdnctl validate" (1).
+.TP
+.I /etc/mosdns/force\-ech\-domains.txt
+Domains to force ECH for. Ships with no entries, and carries a comment line
+rather than being zero bytes because a zero\-byte list is refused.
+.TP
+.I /etc/mosdns/cloudflare.txt
+Addresses and prefixes to measure in addition to the published ones. Ships empty.
+.TP
+.I /etc/mosdns/cloudfront\-domains.yaml
+Per\-hostname CloudFront candidate profiles. Ships with an empty profile list.
+.TP
+.I /var/lib/mosdns/runtime/ech\-state.json
+The ECH state the response rewriter publishes. Generated; the router's only write.
+.TP
+.I /run/mosdns/dhcp\-upstreams.json
+The DHCP generation the router follows, published by the NetworkManager dispatcher
+hook. Its absence is not an error: the router keeps the generation it has and
+starts green.
+.SH STATE DIRECTORIES
+The state directories are
+.BR /var/lib/mosdns ,
+.BR /var/lib/mosdns/runtime ,
+.B /var/lib/mosdns/lists
+and
+.BR /run/mosdns ,
+each
+.BR root:mosdns " 2770"
+with a default ACL granting the group
+.BR rwx .
+One group serves two service users, because a default ACL grants by group and
+per\-service groups would let only one of them replace the other's files.
+.B /var/lib/mosdns
+is provisioned by the package's
+.B postinst
+and
+.B /run/mosdns
+by the package's
+.BR tmpfiles.d (5)
+entry, because
+.B /run
+is a tmpfs and the group, the setgid bit and the default ACL do not survive a
+reboot.
+.SH OPTIONS
+The router takes one subcommand and one flag, and this package's unit uses both:
+.B start
+and
+.BR \-c .
+.SH EXIT STATUS
+The router is a long\-running server and does not have a useful exit status of its
+own; a unit that has failed says why in the journal.
+.SH SEE ALSO
+.BR "mosdns\-cdnctl" (1),
+.BR dnscrypt\-proxy (8),
+.BR systemd.unit (5),
+.BR resolv.conf (5),
+.BR tmpfiles.d (5)

@@ -1,0 +1,59 @@
+# mosdns-router CloudFront candidate profiles.
+#
+# A CloudFront address means nothing without a hostname: the whole reason this
+# project can publish one address per hostname rather than one address for the
+# whole CDN is a profile that says which hostname an address is allowed to serve.
+# This document is where you write those down.
+#
+# The shape is two keys and nothing else; an unknown key is refused, because a
+# profile is an instruction to publish an address for a hostname and a field this
+# build ignored would be an instruction silently dropped.
+#
+#   schema_version   1. The only version this release reads.
+#   profiles         the list. Empty is valid and is what ships.
+#
+# Each entry needs at least a hostname, which is mandatory because it is the key
+# of the per-hostname mapping: a profile that left it out would be refused rather
+# than defaulted, because two profiles would then be free to share one implicit
+# mapping and a winner proved for one hostname could be published for another. Two
+# profiles may not name the same hostname in any spelling, because the selector
+# publishes one address per hostname.
+#
+# Every other field is optional and is filled in from the URL when it is omitted:
+#
+#   hostname          the name this profile may ever be used for. Required.
+#   url               the request to make; its host must be the hostname. Defaults
+#                     to https://<hostname>/.
+#   method            GET or HEAD. Defaults to GET.
+#   port              the TCP port to connect to; it must be the port the URL
+#                     resolves to. Defaults to 443.
+#   ip                the CloudFront address to measure for this hostname.
+#                     Required: without it there is no candidate.
+#   expected_status   the statuses that mean the request was answered. Anything
+#                     else, a redirect included, is a failure. Defaults to [200].
+#   required_headers  headers a response must carry, by canonical name, with the
+#                     value it must have.
+#   body_sha256       the digest the body must have, or empty when the body is not
+#                     identity. It must be a lowercase SHA-256.
+#
+# Nothing here is fetched from AWS. The published AWS ranges document has no
+# consumer in this release, and a per-hostname address comes from what you wrote
+# down rather than from a range list that would say nothing about which name an
+# address serves.
+#
+# An example, commented out because an example in a live list is a candidate
+# nobody chose:
+#
+#   profiles:
+#     - hostname: example-cdn-host.example
+#       ip: 203.0.113.10
+#       method: HEAD
+#       expected_status: [200, 204]
+#
+# Changes take effect on the next optimizer run. To measure now:
+#
+#   sudo mosdns-cdnctl test --apply
+#
+# See mosdns-cdnctl(1) and mosdns-router(8).
+schema_version: 1
+profiles: []

@@ -1,0 +1,31 @@
+# mosdns-router forced-ECH domain list.
+#
+# One domain per line. A line whose first non-space character is # is a comment, a
+# blank line is nothing, and everything after a # on a line ends the entry. A
+# domain on this list has ECH forced for it even when the router cannot tell
+# whether the name is censored, which is the whole point: a name you know is
+# censored should not have to be recognised before it is protected.
+#
+# The shipped file is empty OF ENTRIES ON PURPOSE, and it carries this comment
+# rather than being zero bytes, because a zero-byte list is REFUSED by the
+# response rewriter. A file of nothing but comments is how this project ships
+# "forcing off": the router starts with an empty list and one warning, and an
+# operator adds a name here and restarts mosdns-router to have it forced.
+#
+# Two things to know before you add a name:
+#
+#   * forcing ECH costs a DNS lookup, and that is deliberate. The rewriter answers
+#     an A or AAAA query for a listed name itself, with an empty NOERROR, and asks
+#     nobody. A censored name must not be leaked by looking it up.
+#   * the policy's ech.failure_policy decides what happens when a forced name
+#     cannot be protected. The shipped policy says "strict", which fails the name
+#     closed. Set it to "fallback" if you would rather have a working lookup than
+#     a protected one, and say so in your own notes, because the two are not
+#     equivalent and only you know which one you want.
+#
+# After editing, check the policy and restart the router so the list is reloaded:
+#
+#   sudo mosdns-cdnctl validate --policy /etc/mosdns/policy.yaml
+#   sudo systemctl restart mosdns-router
+#
+# See mosdns-router(8) and the force-ech-domains stanza of /etc/mosdns/policy.yaml.
