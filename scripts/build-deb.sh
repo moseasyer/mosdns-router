@@ -22,7 +22,12 @@ REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPO"
 
 PACKAGE=mosdns-router
-VERSION=0.1.0
+# The .deb's version, and therefore the one in the control file and the file name.
+# Distinct from the build IDENTITY below on purpose: the two are different facts, and
+# the first version of this script called both `VERSION`, so a `VERSION=` the Makefile
+# passed in was silently ignored and the shipped binary's version was whatever this
+# line said rather than the revision the Makefile had computed.
+PACKAGE_VERSION=0.1.0
 BUILD=build
 STAGE=
 STAGE_ONLY=
@@ -33,6 +38,12 @@ ARCH=$(dpkg --print-architecture)
 # checked BEFORE the archive is opened, so a tree nobody pinned is never built, and
 # an archive that is absent is a loud failure with the command to fetch it rather
 # than a package that silently lacks a resolver.
+#
+# The archive is NOT committed, and the build has other prerequisites that are not
+# either -- Go 1.25.8 exactly, and bwrap, because the render below has to be for the
+# installed layout. The Makefile's `package` target carries the same list with the
+# seed command in it, so a contributor meets it before the gate fails rather than
+# after.
 DNSCRYPT_VERSION=2.1.18
 DNSCRYPT_ARCHIVE=dnscrypt-proxy-$DNSCRYPT_VERSION.tar.gz
 DNSCRYPT_SOURCE_URL=https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/$DNSCRYPT_VERSION.tar.gz
@@ -44,6 +55,19 @@ DNSCRYPT_DIR=build/dnscrypt-proxy
 # exactly this one and a different patch of the same minor cannot build it.
 GO_REQUIRED_VERSION=1.25.8
 GO=${GO:-go}
+
+# The build identity the shipped binaries carry, derived the same three ways the
+# Makefile derives it, because a package built outside `make` must report the same
+# identity as one built inside it -- and because the first version of this script
+# passed NO metadata at all, so the router in the .deb answered a version question
+# with dev/unknown/unknown while the Makefile's own verify-build-info was checking a
+# DIFFERENT binary. The Makefile passes its three values in, so `make build` and
+# `make package` agree by construction rather than by two copies of one expression.
+BUILDINFO_PKG=mosdns-router/internal/buildinfo
+VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
+REVISION=${REVISION:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}
+BUILD_TIME=${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+METADATA_LDFLAGS="-X $BUILDINFO_PKG.Version=$VERSION -X $BUILDINFO_PKG.Revision=$REVISION -X $BUILDINFO_PKG.BuildTime=$BUILD_TIME"
 
 # A private view of the filesystem, and why the build needs one. The two shipped
 # documents are the output of `mosdns-cdnctl render`, and the render stamps the
@@ -141,7 +165,7 @@ build_go_binary() {
 	# is what makes the digest in the build manifest mean anything: the same source
 	# at the same release produces the same bytes on any machine.
 	CGO_ENABLED=0 GOOS=linux GOARCH="$3" "$GO" build -mod=readonly -trimpath \
-		-ldflags "-s -w" -o "$2" "$1"
+		-ldflags "-s -w $METADATA_LDFLAGS" -o "$2" "$1"
 }
 
 mkdir -p "$BUILD"
@@ -181,6 +205,15 @@ fi
 # a mismatch exits non-zero out of `set -e`.
 recorded_digest=$(grep -v '^[[:space:]]*#' "$DNSCRYPT_PIN" | grep -v '^[[:space:]]*$' | cut -d' ' -f1)
 [ -n "$recorded_digest" ] || die "$DNSCRYPT_PIN records no digest"
+# The tag's commit is recorded beside the archive's digest, and it is not a
+# checksum: a digest proves the archive is the same bytes every time and says nothing
+# about whether those bytes are what the tag points at today. With both recorded, a
+# future divergence is attributable to a RE-TAG -- which moves this SHA -- rather than
+# to a transport change, which would not.
+recorded_commit=$(sed -n 's/^tag-commit:[[:space:]]*\([0-9a-f]\{40\}\).*/\1/p' "$DNSCRYPT_PIN")
+[ -n "$recorded_commit" ] ||
+	die "$DNSCRYPT_PIN records no tag commit, so a re-tag upstream and a corrupted
+     download would be indistinguishable and the pin would absorb the first silently"
 ( cd "$(dirname -- "$archive")" && sha256sum -c "$REPO/$DNSCRYPT_PIN" ) ||
 	die "$archive does not match the digest recorded in $DNSCRYPT_PIN, and an unverified
      source tree is never built. The pin is the upstream tag's tarball digest; if
@@ -383,7 +416,12 @@ fi
 	echo "==========================="
 	echo
 	echo "package:          $PACKAGE"
+	echo "package version:  $PACKAGE_VERSION"
+	echo "build identity:"
 	echo "version:          $VERSION"
+	echo "revision:         $REVISION"
+	echo "build time:       $BUILD_TIME"
+	echo "buildinfo pkg:    $BUILDINFO_PKG"
 	echo "architecture:     $ARCH"
 	echo "build script:     scripts/build-deb.sh"
 	echo
@@ -404,6 +442,7 @@ fi
 	echo "source:           $DNSCRYPT_SOURCE_URL"
 	echo "archive:          $DNSCRYPT_ARCHIVE"
 	echo "archive sha256:   $recorded_digest"
+	echo "tag commit:       $recorded_commit"
 	echo "go.mod sha256:    $(sha256sum "$DNSCRYPT_DIR/go.mod" | cut -d' ' -f1)"
 	echo "go.sum sha256:    $(sha256sum "$DNSCRYPT_DIR/go.sum" | cut -d' ' -f1)"
 	echo "modules.txt sha256: $(sha256sum "$DNSCRYPT_DIR/vendor/modules.txt" | cut -d' ' -f1)"
@@ -453,10 +492,6 @@ chmod 644 "$STAGE/DEBIAN/conffiles"
 for script in postinst prerm postrm; do
 	place "packaging/debian/$script" "/DEBIAN/$script" 755
 done
-# The redundant path the plan's file map names, as a link to the one script rather
-# than a second copy of it: two copies of a maintainer script is two chances to fix
-# one of them.
-ln -sf debian/postinst packaging/mosdns-router.postinst
 
 # Two fields are computed rather than copied, and both of them are fields dpkg
 # REJECTS if they are the repository's own text:
@@ -500,7 +535,7 @@ fi
 # whose file owners are the build user's uid is a package that installs files
 # nobody can read.
 mkdir -p "$BUILD"
-out=$BUILD/${PACKAGE}_${VERSION}_${ARCH}.deb
+out=$BUILD/${PACKAGE}_${PACKAGE_VERSION}_${ARCH}.deb
 rm -f "$out"
 dpkg-deb --root-owner-group --build "$STAGE" "$out"
 echo "build-deb.sh: wrote $out ($(wc -c <"$out") bytes)"

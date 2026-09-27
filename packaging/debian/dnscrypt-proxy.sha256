@@ -14,4 +14,14 @@
 #
 # `sha256sum -c packaging/debian/dnscrypt-proxy.sha256` from the repository root
 # checks a copy already placed in build/.
+#
+# The tag's COMMIT is recorded as well as the archive's digest, and it is not a
+# checksum: it is `git ls-remote https://github.com/DNSCrypt/dnscrypt-proxy
+# refs/tags/2.1.18` from the same fetch. A digest proves the archive is the same
+# bytes every time and says nothing about whether those bytes are what the tag
+# points at today, so a future divergence is attributable to a RE-TAG (which moves
+# this SHA) rather than to a transport change (which would not) -- and a re-tag is a
+# change somebody has to look at, not one a pin silently absorbs. Neither number is a
+# signature; see the task report's NOT VERIFIED list.
+tag-commit: 30c0a9e91c12a15c081ac90546dd657c4ab98fbc
 9b810d862ba07c383cc0b8f9f7f1f2ca8f74a02f849d818c4c4d37cc21a7dfa6  dnscrypt-proxy-2.1.18.tar.gz
