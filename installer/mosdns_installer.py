@@ -1630,6 +1630,36 @@ RECORDED_PROPERTIES = IGNORED_AUTOMATICALLY + ADDRESS_LISTS
 # at all.
 PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--refresh-ranges")
 
+# The operator's force-ECH list, and the one entry in it that would make this
+# install's own health check meaningless.
+#
+# The rewriter's strict short circuit is the FIRST thing its Exec does: for a name
+# on this list, with the policy's failure policy fail-closed, an A or AAAA query is
+# answered by the router itself with a NOERROR carrying no records and no SOA, and
+# nothing is asked downstream. The probe above is an A query, so an operator with
+# the probe's name on this list would get a NOERROR out of the router with no
+# upstream ever consulted -- and the wait, the barrier and the router half of the
+# verification would all be satisfied by a local answer.
+#
+# That short circuit is load-bearing ECH behaviour and it is correct: forcing ECH
+# for a censored name must not cost a DNS lookup, which is the entire point of the
+# feature. This install does not weaken it and cannot. What it can do is refuse to
+# run while its own probe would be answered that way, because a barrier that
+# cannot be lied to is the only kind worth having, and the refusal names the file,
+# the entry and the remedy.
+FORCE_ECH_DOMAINS = "/etc/mosdns/force-ech-domains.txt"
+# The policy's ECH failure policy value the plugin maps to its fail-closed
+# behaviour. `failurePolicyOf` in the plugin returns FailClosed for anything that
+# is not "fallback", and `internal/config`'s default is "strict", so both the
+# default and a typo land on the short circuit.
+ECH_FALLBACK = "fallback"
+# A list line that starts with this, after trimming, is prose rather than an
+# entry -- the same rule internal/statewatch's trimmed-lines reader uses, and the
+# same reason: a `#` anywhere else is a malformed entry rather than a comment,
+# because a list that guessed which lines were annotated would be guessing about a
+# censorship-resistance setting.
+FORCE_ECH_COMMENT = "#"
+
 # The two units this transaction owns, in the order it enables them. The router
 # is enabled as well as started: a machine whose NetworkManager points DNS at the
 # loopback and whose router is not enabled comes back from a reboot with no
@@ -1649,32 +1679,57 @@ NOT_ENABLED = ("disabled", "not-found")
 UNIT_ACTIVE = "active"
 UNIT_ENABLED = "enabled"
 
-# The name the probes ask for, and the measurement that chose it.
+# The name the probes ask for, and the RFC plus the measurement that chose it.
 #
-# It has to be under a TLD RFC 6761 reserves, so no public name is needed and no
-# lookup can leak. It must NOT be `.invalid`: measured against real
-# systemd-resolved 24.04 with an unreachable upstream configured, a question for a
-# name under `.invalid` is answered IMMEDIATELY with a bare NXDOMAIN carrying no
-# records at all -- 28 bytes, which is a header and the question and nothing else
-# -- while a question for a name under `.test` is forwarded and comes back as
-# silence. So a dead chain synthesises a definitive denial for `.invalid`, and any
-# check that accepts a denial passes a machine that cannot resolve anything. That
-# is not a theoretical worry about a predicate: it is the predicate the first
-# version of this check had.
+# The barrier's real dependency is a fact about the machine the install runs on:
+# that the operator's resolver FORWARDS this name rather than answering it without
+# asking anybody. No assertion in this file can observe that, so the choice below
+# is made from what can be -- what the RFC tells a conforming caching resolver to
+# do with each candidate -- and the measurement on 24.04 says whether the resolver
+# this project ships agrees.
 #
-# `.test` is forwarded, so a dead chain is silent, which the wait already reads as
-# a failure. It is also reserved, so a chain that works answers NXDOMAIN (nothing
-# delegates `.test`) and the barrier accepts it -- which is the other half, because
-# a check that rejected every healthy machine would be a check that makes the
-# install impossible. No component of this project short-circuits a reserved TLD,
-# so mosdns-router and dnscrypt-proxy forward it like any other name.
+# RFC 6761 gives every special-use TLD a "caching servers" category, and the three
+# candidates are recommended in three DIFFERENT directions. That partition is the
+# whole of the choice:
 #
-# UNVERIFIED, and it is the one thing this choice rests on: whether a systemd
-# resolved on 22.04 or 26.04 forwards `.test` the way 24.04 does. A resolved that
-# synthesised `.test` too would pass a dead chain again. Closing that needs a
-# per-release measurement, and the failure is a check that accepts a machine that
-# cannot resolve -- so the residual is recorded rather than designed away.
-INSTALL_PROBE_NAME = "install-probe.test"
+#   * `.invalid` (§6.4 category 4) -- caching servers SHOULD generate immediate
+#     NXDOMAIN responses. systemd-resolved 24.04 does exactly that: with an
+#     unreachable upstream configured, a question is answered in microseconds with
+#     a bare NXDOMAIN carrying no records at all (28 bytes: a header and the
+#     question). So `.invalid` is CONFORMING and deterministically blind -- a dead
+#     chain states a confident denial, and any check that accepts a denial passes
+#     a machine that cannot resolve anything. Disqualifying, and not a judgement
+#     call.
+#   * `.test` (§6.2 category 4) -- caching servers SHOULD generate immediate
+#     negative responses. resolved forwarding it is a measured DEVIATION from a
+#     SHOULD, so a resolver that followed the RFC would put the blind spot back.
+#     Better than `.invalid` and still resting on a resolver behaving against the
+#     RFC's recommendation.
+#   * `.example` (§6.5 category 4) -- caching servers SHOULD NOT recognise these
+#     names as special and SHOULD resolve them normally. resolved forwards it, and
+#     that is the RECOMMENDED behaviour, so a conforming caching server cannot
+#     answer it locally. Measured on 24.04 with an unreachable upstream: forwarded,
+#     and therefore silent, which the wait already reads as a failure.
+#
+# `.test` was the choice in the previous round, on the evidence that `.test` is
+# forwarded and `.invalid` is not. That evidence did not separate them, and this
+# comment is the correction: the RFC does, and it is on the side of `.example`.
+#
+# WHAT THIS COSTS, stated rather than glossed: a question for this name is
+# forwarded, so 1-3 of them per install reach the operator's own recursive resolver
+# and the public root, where the root has no delegation for `.example` and answers
+# NXDOMAIN. Under `.invalid` nothing left the machine. The name is meaningless to
+# the public root either way -- nothing delegates any of the three -- so what
+# changed is a handful of queries to the operator's own resolver, not a disclosure
+# of anything about the machine.
+#
+# UNVERIFIED, and it is the one thing this rests on beyond the RFC: whether a
+# systemd-resolved on 22.04 or 26.04 forwards a `.example` question the way 24.04
+# does. A resolved that synthesised `.example` as well would pass a dead chain
+# again. Closing that needs a per-release measurement; the failure is a check that
+# accepts a machine that cannot resolve, so the residual is recorded rather than
+# designed away.
+INSTALL_PROBE_NAME = "install-probe.example"
 PROBE_TIMEOUT_SECONDS = 2.0
 # How long a unit gets to start answering. It fails the install rather than
 # hanging, because a resolver that is not up is exactly the state this
@@ -1757,6 +1812,11 @@ class AppliedStep(NamedTuple):
 
     description: str
     undo: Callable[[], None]
+    # The unit this step changed, or None for a step that is not a unit's. Carried
+    # rather than recovered from the description, because the recovery message has
+    # to print a command an operator can run and `systemctl stop <unit>` with an
+    # unsubstituted placeholder is not one.
+    unit: Optional[str] = None
 
 
 class RollbackFailure(NamedTuple):
@@ -1770,6 +1830,7 @@ class RollbackFailure(NamedTuple):
     group: str
     description: str
     error: str
+    unit: Optional[str] = None
 
 
 class Transaction:
@@ -1823,9 +1884,9 @@ class Transaction:
         """Record the reactivation, whose undo runs after every profile restore."""
         self._groups[self.REACTIVATING].append(AppliedStep(description, undo))
 
-    def apply_unit(self, description: str, undo) -> None:
+    def apply_unit(self, description: str, undo, unit: Optional[str] = None) -> None:
         """Record a change to a unit, undone after the profile and the reactivation."""
-        self._groups[self.UNITS].append(AppliedStep(description, undo))
+        self._groups[self.UNITS].append(AppliedStep(description, undo, unit))
 
     def note_uncertain_unit(self, unit: str) -> None:
         """Record that ``unit``'s prior state could not be read.
@@ -1844,7 +1905,9 @@ class Transaction:
                 try:
                     step.undo()
                 except Exception as error:  # noqa: BLE001 - see this method's docstring
-                    failures.append(RollbackFailure(group, step.description, str(error)))
+                    failures.append(
+                        RollbackFailure(group, step.description, str(error), step.unit)
+                    )
             self._groups[group] = []
         return failures
 
@@ -2324,6 +2387,123 @@ def _check_dhcp_document(path: Path, document: dict) -> None:
         )
 
 
+def _ech_may_answer_locally(root: Path) -> bool:
+    """Whether the router could answer the probe itself, under the policy as written.
+
+    This mirrors two facts and refuses when they combine:
+
+    * the plugin's `forcesECH` returns false when the policy has ECH turned OFF,
+      whatever the list says -- there is no ECH to force, so there is no short
+      circuit; and
+    * the plugin's `failurePolicyOf` maps every failure policy except "fallback"
+      onto `dnsrewrite.FailClosed`, and `internal/config`'s default is "strict".
+
+    So the risky combination is: ECH not explicitly disabled, and the failure
+    policy not "fallback". A policy with no `ech:` section at all is the risky
+    one, because the config defaults fill both fields in -- reading a silent
+    policy as the safe one would be exactly backwards, because silence is the
+    default configuration.
+
+    An unreadable policy answers True. The plugin would fail to load a policy it
+    cannot parse, and the direction that leaves the check quiet is the direction
+    that could wave a machine through, so the uncertain answer is the one that
+    keeps looking.
+    """
+    body = _ech_section(root)
+    if body is None:
+        return True
+    enabled = re.search(r"^\s+enabled:\s*(\S+)\s*$", body, flags=re.MULTILINE)
+    if enabled is not None and enabled.group(1).strip('"').lower() in ("false", "no", "off"):
+        return False
+    policy = re.search(r"^\s+failure_policy:\s*(\S+)\s*$", body, flags=re.MULTILINE)
+    if policy is not None and policy.group(1).strip('"').lower() == ECH_FALLBACK:
+        return False
+    return True
+
+
+def _ech_section(root: Path) -> Optional[str]:
+    """The policy's ``ech:`` block, or ``None`` when there is not one to read."""
+    try:
+        contents = (root / POLICY_CONFIG.lstrip("/")).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    section = re.search(r"^ech:\s*$(.*?)(?=^\S|\Z)", contents, flags=re.MULTILINE | re.DOTALL)
+    return None if section is None else section.group(1)
+
+
+def _forced_ech_domains(root: Path) -> List[str]:
+    """The names on the operator's force-ECH list, as the plugin's reader sees them.
+
+    Trimmed lines, with a line that starts with a comment marker dropped and
+    everything else kept verbatim -- the same rule
+    `internal/statewatch.NewTrimmedLines` applies, and the same reason: a `#`
+    anywhere but the start is a malformed entry rather than a comment.
+
+    A list that cannot be read is an empty one. The router's own watcher refuses a
+    list it cannot parse and keeps the last good one, which this install cannot
+    see from here; that blind spot belongs to the plugin and is recorded rather
+    than papered over, because guessing "it probably does not list the probe" in
+    order to let an install proceed is the wrong direction to guess in.
+    """
+    try:
+        contents = (root / FORCE_ECH_DOMAINS.lstrip("/")).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    entries = []
+    for line in contents.splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith(FORCE_ECH_COMMENT):
+            continue
+        entries.append(entry)
+    return entries
+
+
+def _forces_ech(entries: Sequence[str], name: str) -> bool:
+    """The plugin's own match: EXACT, case-insensitive, trailing dot trimmed.
+
+    Deliberately exact rather than suffix-based, because that is what
+    `cdn_rewrite.forcesECH` does: it compares each entry to the canonical name with
+    `strings.EqualFold`. A mirror that matched a suffix would refuse installations
+    the plugin would answer downstream like any other name, and one that matched
+    loosely in the other direction would claim a cover it does not have.
+    """
+    bare = name.rstrip(".").lower()
+    return any(entry.strip().rstrip(".").lower() == bare for entry in entries)
+
+
+def _refuse_a_locally_answered_probe(root: Path) -> None:
+    """Refuse the install when the router would answer the health check itself.
+
+    Read before the first mutation, and it costs no command: the policy is a file
+    and the list is a file, so the sequence of argument arrays every order
+    assertion is written against is unchanged by this check existing.
+
+    A refusal, rather than a note, because the alternative is worse than a failed
+    install: proceeding means the wait, the barrier and the verification are all
+    satisfied by a NOERROR the router fabricated, NetworkManager is pointed at the
+    loopback, and the machine loses resolution with every check reporting success.
+    That is the one outcome this whole transaction exists to prevent, and it is
+    reachable through a single line in a file the operator is invited to edit.
+    """
+    if not _ech_may_answer_locally(root):
+        return
+    entry = next(
+        (name for name in _forced_ech_domains(root) if _forces_ech((name,), INSTALL_PROBE_NAME)),
+        None,
+    )
+    if entry is None:
+        return
+    raise InstallRefused(
+        f"{FORCE_ECH_DOMAINS} lists {entry!r}, and the policy asks for strict ECH, so the router "
+        f"answers A queries for that name itself without asking anything upstream. This install "
+        f"checks that {LOCAL_DNS} can actually resolve by asking it for {INSTALL_PROBE_NAME}, and "
+        "a name on that list would be answered locally whatever the upstream is doing, so the "
+        f"check would pass on a machine that cannot resolve anything. Remove the {entry!r} line from "
+        f"{FORCE_ECH_DOMAINS}, or set ech.failure_policy to fallback in {POLICY_CONFIG}, and run the "
+        "install again. Nothing has been changed"
+    )
+
+
 def prepare_backup(root: Path, runner: CommandRunner, connection: Connection, now) -> dict:
     """Read every value the transaction will change, and return the backup document.
 
@@ -2514,6 +2694,7 @@ def _enable(runner: CommandRunner, transaction: Transaction, unit: str, states: 
     transaction.apply_unit(
         f"enabling {unit}",
         lambda unit=unit: _checked(runner, ("systemctl", "disable", unit), f"disabling {unit}"),
+        unit,
     )
 
 
@@ -2546,6 +2727,7 @@ def _start(
     transaction.apply_unit(
         f"starting {unit}",
         lambda unit=unit: _checked(runner, ("systemctl", "stop", unit), f"stopping {unit}"),
+        unit,
     )
 
 
@@ -2732,6 +2914,7 @@ def _run_transaction(
     that a future edit must not move.
     """
     _capture_dhcp(runner, connection.device)
+    _refuse_a_locally_answered_probe(root)
     document = prepare_backup(root, runner, connection, now)
     path = write_backup(root, document)
     validate_backup(root, document)
@@ -2918,9 +3101,14 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
             f"reactivated, so the machine's DNS may not be in use; `nmcli connection up {uuid}`, or "
             "a reboot, is what finishes it"
         )
-    if Transaction.UNITS in groups:
+    stuck = sorted(
+        {failure.unit for failure in failures if failure.group == Transaction.UNITS and failure.unit}
+    )
+    if stuck:
         steps.append(
-            f"a unit this run started is still running, and `systemctl stop <unit>` stops it"
+            "this run started "
+            + " and ".join(stuck)
+            + (" which is still running, and `systemctl stop " + stuck[0] + "` stops it" if len(stuck) == 1 else " which are still running, and `systemctl stop <unit>` stops each of them")
         )
     return InstallResult(
         ok=False,

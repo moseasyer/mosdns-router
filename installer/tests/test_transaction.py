@@ -206,11 +206,25 @@ ANSWER_SHAPES = {
 # expected to answer a name under one of them without any public delegation. The
 # set is restated here because the probe name's being under it is a property
 # this suite holds, not one it reads.
-RESERVED_TLDS = ("test", "example", "invalid", "localhost", "local")
-# The name the transaction probes with, restated from the measurement that chose
-# it: `.invalid` is answered by systemd-resolved without being forwarded, so it
-# cannot tell a working chain from a dead one.
-INSTALL_PROBE_NAME = "install-probe.test"
+SPECIAL_USE_TLDS = ("test", "example", "invalid", "localhost", "local")
+# RFC 6761's "caching servers" category, which is the only one that decides whether a
+# resolver forwards a name or answers it without asking anybody. The partition is
+# from the RFC, restated here so the test asserts the RFC rather than an
+# observation.
+#
+#   §6.2 `.test`     category 4: SHOULD generate immediate negative responses.
+#   §6.4 `.invalid`  category 4: SHOULD generate immediate NXDOMAIN responses.
+#   §6.3 `.localhost` category 4: SHOULD generate an immediate positive response.
+#   §6.5 `.example`  category 4: SHOULD NOT recognise these names as special and
+#                              SHOULD resolve them normally.
+LOCALLY_ANSWERED_TLDS = ("test", "invalid", "localhost", "local")
+FORWARDED_TLD = "example"
+# The name the transaction probes with, restated from the RFC and the measurement
+# that chose it: `.example` is the one special-use TLD whose category 4 tells a
+# caching server to resolve it NORMALLY, so a resolver that follows the RFC cannot
+# answer it locally, and a dead chain is silent rather than confidently wrong.
+INSTALL_PROBE_NAME = "install-probe.example"
+FORCE_ECH = "/etc/mosdns/force-ech-domains.txt"
 
 NMCLI_CONNECTIONS = ("nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active")
 NMCLI_DEVICE_UUID = ("nmcli", "-g", "GENERAL.CON-UUID", "device", "show", DEVICE)
@@ -450,6 +464,25 @@ class TransactionFixture(unittest.TestCase):
             path.mkdir(parents=True, exist_ok=True)
             setfacl(path, "g::rwx")
             path.chmod(int(mode, 8))
+
+    def force_ech(self, *domains):
+        """Write the operator's force-ECH list, comment lines and all."""
+        body = "# domains this router forces ECH for\n"
+        for domain in domains:
+            body += f"{domain}\n"
+        return self.write(FORCE_ECH, body, mode=0o644)
+
+    def policy(self, enabled="true", failure="strict"):
+        return self.write(
+            POLICY_CONFIG,
+            "schema_version: 1\n"
+            "cdn:\n"
+            "  provider: cloudflare\n"
+            "ech:\n"
+            f"  enabled: {enabled}\n"
+            f"  failure_policy: {failure}\n"
+            "  stale_grace: 900\n",
+        )
 
     def dhcp_state(self, upstreams=(DHCP_UPSTREAM,), source="dhcp4", uuid=UUID):
         """The state the capture has already published under the fake root.
@@ -1529,18 +1562,63 @@ class ResolvingChainTests(TransactionFixture):
         self.assertIn(MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM), self.commands)
         self.assertFalse(self.rooted(MANAGED_BY).exists())
 
-    def test_the_probe_name_is_one_a_resolver_forwards(self):
-        # The measured reason the name is not `.invalid`: systemd-resolved
-        # synthesises an immediate bare NXDOMAIN for it instead of forwarding, so
-        # a dead chain looks like a definitive denial. Every label must be under a
-        # TLD RFC 6761 reserves -- so no public name is needed and no lookup can
-        # leak -- and that TLD must not be the measured offender.
+    def test_the_probe_name_is_one_the_rfc_tells_a_resolver_to_forward(self):
+        """The name, and an honest account of what this test can and cannot hold.
+
+        THE REAL DEPENDENCY is a property of the machine the install runs on: that
+        the operator's resolver FORWARDS this name instead of answering it locally.
+        A fake root cannot observe that, a container cannot host the router, and no
+        assertion in this file can stand in for it. Everything below is a PROXY for
+        it, and the proxy is only as good as the observation behind it.
+
+        The observation: on real systemd-resolved 24.04 with an unreachable
+        upstream, `.invalid` is answered with an immediate bare NXDOMAIN and
+        `.example` is forwarded into silence. The RFC explains why those differ,
+        and the difference is the whole of the choice -- RFC 6761 gives every
+        special-use TLD a "caching servers" category, and the three candidates are
+        recommended in three different directions:
+
+          * `.invalid`  (§6.4 category 4): caching servers SHOULD generate immediate
+            NXDOMAIN. resolved does exactly that, so `.invalid` is CONFORMING and
+            deterministically blind -- a dead chain states a confident denial.
+          * `.test`     (§6.2 category 4): caching servers SHOULD generate immediate
+            negative responses. resolved forwarding it is a measured DEVIATION
+            from a SHOULD, so a resolver that follows the RFC would reintroduce the
+            blind spot.
+          * `.example`  (§6.5 category 4): caching servers SHOULD NOT recognise
+            these names as special and SHOULD resolve them normally. resolved
+            forwarding it is the RECOMMENDED behaviour, so the name cannot be
+            answered locally by a conforming caching server.
+
+        So the assertion is the RFC's own partition, not a list of names that
+        happen to work today: the probe's TLD must be one whose category 4 asks
+        for normal resolution. 22.04 and 26.04 are unmeasured and the residual
+        says so.
+        """
         labels = INSTALL_PROBE_NAME.split(".")
-        self.assertNotIn("invalid", labels, "resolved answers .invalid without forwarding it; see the class docstring")
-        self.assertIn(labels[-1], RESERVED_TLDS, "the probe name must be under a reserved TLD, so no public lookup is needed")
+        self.assertEqual(
+            labels[-1],
+            FORWARDED_TLD,
+            "the probe's TLD must be the one RFC 6761 tells a caching server to resolve normally "
+            "(§6.5 category 4); a TLD whose category 4 asks for an immediate local response makes "
+            "a dead chain look like a resolver",
+        )
+        self.assertIn(
+            labels[-1],
+            SPECIAL_USE_TLDS,
+            "the probe name must be under a special-use TLD, so it is meaningless to the public "
+            "root and the 1-3 queries an install sends cannot resolve to anything real",
+        )
+        self.assertNotIn(labels[-1], LOCALLY_ANSWERED_TLDS, "see the RFC partition in this docstring")
         for label in labels[:-1]:
             self.assertTrue(label, "the probe name has an empty label")
             self.assertLessEqual(len(label), 63)
+        self.assertGreaterEqual(
+            len(labels),
+            2,
+            "the force-ECH list's own rule is that an entry needs at least two labels, so a "
+            "one-label probe name could not even be refused by the check that guards this one",
+        )
 
     def test_response_resolves_is_the_question_the_barrier_asks(self):
         query = installer.build_dns_query(INSTALL_PROBE_NAME, 0x0042)
@@ -1590,6 +1668,111 @@ class ResolvingChainTests(TransactionFixture):
         finally:
             server.close()
             thread.join(timeout=5)
+
+
+class LocallyAnsweredProbeTests(TransactionFixture):
+    """A force-ECH entry can make the router answer the probe itself, and nothing else.
+
+    The rewriter's strict short circuit is the first thing its Exec does: for a name
+    on the operator's force-ECH list, with the policy's failure policy fail-closed,
+    an **A** or AAAA query is answered with `emptyAnswer(query)` -- NOERROR, the
+    question echoed, no records, no SOA -- and `next.ExecNext` is never called. The
+    install's probe is an A query, so an operator with the probe's name on that list
+    gets a NOERROR out of the router without one thing being asked downstream: the
+    wait, the barrier and `_verify`'s router probe are all satisfied by a local lie.
+
+    That is load-bearing ECH behaviour and it is correct. This install cannot
+    weaken it, and it does not. What it can do is refuse to run at all when its own
+    probe would be answered that way, which is the only outcome in which "the
+    barrier passed" means "the machine can resolve" -- so that is what it does.
+    """
+
+    def test_the_install_is_refused_when_the_router_would_answer_the_probe_itself(self):
+        self.force_ech("cdn.example.net", INSTALL_PROBE_NAME)
+        result = self.run_install()
+        self.assertFalse(result.ok, "the install proceeded with a probe the router answers itself")
+        message = result.error or ""
+        self.assertIn(FORCE_ECH, message, "the refusal has to name the file that causes it")
+        self.assertIn(INSTALL_PROBE_NAME, message, "and the entry in it")
+        self.assertIn("force", message.lower())
+        self.assertIn("ECH", message, "and say that the entry is a force-ECH entry")
+        self.assertTrue(
+            any(word in message.lower() for word in ("remove", "delete")),
+            "and name the remedy; a refusal that only names the cause leaves the operator guessing",
+        )
+        self.assertIsNone(result.rollback_error, "nothing had been mutated to roll back")
+        self.assertNothingChanged("the machine was changed despite a locally-answered probe")
+        self.assertFalse(self.rooted(BACKUP_PATH).exists())
+        self.assertFalse(self.rooted(MANAGED_BY).exists())
+
+    def test_the_refusal_matches_the_plugins_rule_exactly(self):
+        # cdn_rewrite's forcesECH is an EXACT case-insensitive match on the
+        # canonical name with the trailing dot trimmed -- no suffix, no wildcard --
+        # so a mirror that matched loosely would either refuse installs that are
+        # fine or, worse, think it had covered a name the plugin does not match.
+        for entry, refused in (
+            (INSTALL_PROBE_NAME, True),
+            (INSTALL_PROBE_NAME.upper(), True),
+            (f"  {INSTALL_PROBE_NAME}  ", True),
+            (f"{INSTALL_PROBE_NAME}.", True),
+            # Neither of these is a match for an exact comparison, and treating
+            # either as one would refuse a machine the plugin would answer
+            # downstream like any other name.
+            ("example", False),
+            (f"cdn.{INSTALL_PROBE_NAME}", False),
+            (INSTALL_PROBE_NAME.replace("install-", "x"), False),
+        ):
+            with self.subTest(entry=entry, refused=refused):
+                self.setUp()
+                self.force_ech(entry)
+                result = self.run_install()
+                self.assertEqual(
+                    not result.ok,
+                    refused,
+                    f"an entry of {entry!r} should {'refuse' if refused else 'not refuse'}, and the "
+                    "plugin matches the canonical name exactly and case-insensitively",
+                )
+
+    def test_a_comment_only_list_is_the_normal_case_and_changes_nothing(self):
+        # The shipped list is comments, and a list whose every line is a comment is
+        # the state a fresh installation is in. The check must be quiet there, or
+        # it would refuse every install.
+        self.force_ech()
+        self.install_succeeds()
+
+    def test_an_absent_list_changes_nothing(self):
+        self.install_succeeds()
+
+    def test_a_name_on_the_list_under_fallback_is_not_refused(self):
+        # failure_policy: fallback means the plugin does not short circuit, so
+        # the same list is harmless. A check that ignored the policy would refuse
+        # a machine the plugin answers downstream.
+        self.force_ech(INSTALL_PROBE_NAME)
+        self.policy(failure="fallback")
+        self.install_succeeds()
+
+    def test_a_name_on_the_list_with_ech_disabled_is_not_refused(self):
+        self.force_ech(INSTALL_PROBE_NAME)
+        self.policy(enabled="false")
+        self.install_succeeds()
+
+    def test_a_policy_with_no_ech_section_is_the_risky_default(self):
+        # internal/config's defaults are Enabled true and FailurePolicy strict, and
+        # the plugin's failurePolicyOf maps anything but "fallback" to FailClosed.
+        # So a policy that says nothing is the case the check must catch, not skip.
+        self.force_ech(INSTALL_PROBE_NAME)
+        self.write(POLICY_CONFIG, "schema_version: 1\ncdn:\n  provider: cloudflare\n")
+        result = self.run_install()
+        self.assertFalse(result.ok, "a silent policy was read as the safe one rather than the default")
+
+    def test_the_check_costs_no_command(self):
+        # It reads two files and must not add a command, so the sequence literal is
+        # the one every other order assertion is written against.
+        before = self.full_sequence()
+        self.force_ech(INSTALL_PROBE_NAME)
+        with self.assertRaises(AssertionError):
+            self.install_succeeds()
+        self.assertEqual(self.full_sequence(), before, "the refusal added a command to the sequence")
 
 
 class MarkerTests(TransactionFixture):
@@ -2273,13 +2456,30 @@ class CliTransactionTests(TransactionFixture):
         self.assertIn("still applied", err.lower())
         self.assertIn("127.0.0.1", err, "the operator has to be told the machine may still point at the loopback")
 
-    def test_the_exit_four_message_says_when_a_unit_is_still_running(self):
+    def test_the_exit_four_message_names_the_unit_in_the_command_it_prints(self):
+        # The first version of this case asserted only that the unit appeared
+        # somewhere in stderr, which the failing step's own description satisfies
+        # whether or not the recovery line names anything. So it asserted that
+        # `systemctl stop <unit>` was printed: the unit has to be SUBSTITUTED into
+        # the command, which is the only way that string can appear.
         status, out, err = self.install_cli(
             self.good_runner(fail=[CONNECTION_UP + (UUID,), ("systemctl", "stop", ROUTER_UNIT)])
         )
         self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
-        self.assertIn(ROUTER_UNIT, err, "the operator has to be told which unit is still running")
-        self.assertIn("systemctl stop", err, "and the one command that stops it")
+        self.assertIn(
+            f"systemctl stop {ROUTER_UNIT}",
+            err,
+            "the recovery line has to print the command with the unit's name in it, because "
+            "'systemctl stop <unit>' with an unsubstituted placeholder is not a command an "
+            "operator can run",
+        )
+        self.assertNotIn("<unit>", err, "a placeholder reached the operator")
+        self.assertNotIn(
+            RESOLVER_UNIT,
+            err,
+            "only the unit whose undo failed may be named: the resolver was stopped successfully, "
+            "so naming it would send the operator after a unit that is already down",
+        )
 
     def test_the_exit_three_message_excepts_a_unit_it_could_not_ask_about(self):
         # "Nothing is different about this machine" is a claim, and there is one
