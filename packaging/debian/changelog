@@ -1,0 +1,7 @@
+mosdns-router (0.1.0) unstable; urgency=medium
+
+  * First packaged release: the DNS router, the DNSCrypt foreign resolver, the
+    CDN optimizer and its timers, the DHCP bridge hook, and the transactional
+    installer that points this machine's NetworkManager connection at 127.0.0.1.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 27 Sep 2026 00:00:00 +0000

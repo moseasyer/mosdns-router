@@ -1,0 +1,87 @@
+# The package's file list. Every path the .deb contains, and the one place that
+# says so.
+#
+# `source destination`, whitespace separated, one per line, and both are relative
+# to the repository root and to the installed root respectively. A source of `-` is
+# an empty directory with nothing in it.
+#
+# This is not decoration. installer/tests/test_package.py reads it and compares it
+# with the staged tree in BOTH directions, so a file that is in the package but in
+# neither this list nor the build's own generated set fails, and a line here that
+# the package does not contain fails. That is the whole of "the package installs
+# nothing it should not": the list is the answer, it is a table, and it is read by
+# a test rather than trusted by a reviewer.
+#
+# The modes are NOT here, because a dh-style file list has nowhere to put one. They
+# are a table in the same test, and every mode in it is checked in both
+# directions: a file made too permissive and a file made too restrictive both fail.
+#
+# Not in this list, because the build produces them rather than copying them:
+# /etc/mosdns/mosdns.yaml and /etc/mosdns/dnscrypt-proxy.toml, which are the output
+# of `mosdns-cdnctl render`; /usr/share/doc/mosdns-router/BUILD-MANIFEST; and
+# everything under DEBIAN. The test names that set too.
+
+# --- the three programs, at the exact paths the units' ExecStart lines name ----
+# A unit that names a path the package does not install is a failed unit on a real
+# machine and nothing at all in a repository, so the test reads those lines back out
+# of the unit files and checks each one against this list.
+build/mosdns-router                          /usr/lib/mosdns-router/mosdns-router
+build/mosdns-cdnctl                          /usr/lib/mosdns-router/mosdns-cdnctl
+build/mosdns-router.dnscrypt-proxy          /usr/lib/mosdns-router/dnscrypt-proxy
+
+# The installer, executable, because mosdns-cdnctl's emergency-rollback verb execs
+# exactly this path and this package's postinst and prerm call exactly this path.
+installer/mosdns_installer.py                /usr/lib/mosdns-router/mosdns_installer.py
+
+# --- the bridge, as an importable package ------------------------------------
+# The dispatcher hook runs `python3 -m mosdns_dhcp_bridge.cli`, so the modules have
+# to be importable from wherever the hook's PYTHONPATH points and cannot be a
+# script with a name on $PATH.
+bridge/mosdns_dhcp_bridge/__init__.py        /usr/lib/mosdns-router/mosdns_dhcp_bridge/__init__.py
+bridge/mosdns_dhcp_bridge/cli.py             /usr/lib/mosdns-router/mosdns_dhcp_bridge/cli.py
+bridge/mosdns_dhcp_bridge/collect.py         /usr/lib/mosdns-router/mosdns_dhcp_bridge/collect.py
+bridge/mosdns_dhcp_bridge/publish.py         /usr/lib/mosdns-router/mosdns_dhcp_bridge/publish.py
+
+# --- the units, in the modern merged-/usr unit directory ----------------------
+packaging/systemd/mosdns-router.service          /usr/lib/systemd/system/mosdns-router.service
+packaging/systemd/dnscrypt-proxy.service         /usr/lib/systemd/system/dnscrypt-proxy.service
+packaging/systemd/mosdns-cdn-optimizer.service   /usr/lib/systemd/system/mosdns-cdn-optimizer.service
+packaging/systemd/mosdns-cdn-optimizer.timer     /usr/lib/systemd/system/mosdns-cdn-optimizer.timer
+packaging/systemd/mosdns-cdn-health.service      /usr/lib/systemd/system/mosdns-cdn-health.service
+packaging/systemd/mosdns-cdn-health.timer        /usr/lib/systemd/system/mosdns-cdn-health.timer
+packaging/systemd/mosdns-list-check.service      /usr/lib/systemd/system/mosdns-list-check.service
+packaging/systemd/mosdns-list-check.timer        /usr/lib/systemd/system/mosdns-list-check.timer
+
+# --- the documents an operator edits ------------------------------------------
+# policy.yaml is the committed output of config.Marshal(config.Defaults()) and the
+# three hand-written ones say in their own comments what they are for and what to
+# run after editing them. A zero-byte forced-ECH list is REFUSED by the response
+# rewriter, so that file ships with comments and no entries.
+configs/policy.yaml                            /etc/mosdns/policy.yaml
+packaging/config/force-ech-domains.txt          /etc/mosdns/force-ech-domains.txt
+packaging/config/cloudflare.txt                 /etc/mosdns/cloudflare.txt
+packaging/config/cloudfront-domains.yaml        /etc/mosdns/cloudfront-domains.yaml
+
+# --- the NetworkManager hook --------------------------------------------------
+packaging/networkmanager/10-mosdns-dhcp-bridge  /etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge
+
+# --- the tmpfiles entry, the documentation and the pinned reference data -----
+# /usr/share and not /var/lib: /var/lib holds generated state, and a package that
+# ships state there is a package whose upgrade overwrites the operator's data. The
+# install places the list and verifies its digest against the lock; it never
+# re-pins it.
+packaging/tmpfiles.d/mosdns-router.conf    /usr/lib/tmpfiles.d/mosdns-router.conf
+packaging/copyright                        /usr/share/doc/mosdns-router/copyright
+packaging/man/mosdns-router.8              /usr/share/man/man8/mosdns-router.8.gz
+packaging/man/mosdns-cdnctl.1              /usr/share/man/man1/mosdns-cdnctl.1.gz
+packaging/man/dnscrypt-proxy.8             /usr/share/man/man8/dnscrypt-proxy.8.gz
+configs/cn-domains.txt                    /usr/share/mosdns-router/cn-domains.txt
+configs/source-lock.json                  /usr/share/mosdns-router/source-lock.json
+
+# --- the state directories, empty --------------------------------------------
+# Shipped as directories and nothing else, and created at 2770 root:mosdns with a
+# default ACL by the postinst. A directory with a file in it here would be state
+# this package ships, which is what the test refuses.
+-                                      /var/lib/mosdns
+-                                      /var/lib/mosdns/runtime
+-                                      /var/lib/mosdns/lists

@@ -1,0 +1,162 @@
+#!/bin/sh
+# Provision what the services need, and then let the installer take the machine's
+# DNS over. The order in this file is the whole of its design, and three of its
+# steps are load-bearing in a way that is easy to get backwards.
+#
+# STEP 1 is the accounts. The group comes first, then the two users, and both
+# users have that group as their PRIMARY group rather than each having one of their
+# own. That is not tidiness: the state directories' default ACL grants by group, so
+# per-service groups would give the grant to exactly one identity and leave the
+# other unable to replace the other's files. dnscrypt-proxy is a third identity with
+# a third group, because it shares no state with either of the other two and its
+# umask is 0077 rather than 0007.
+#
+# STEP 2 is the state directories, and the order inside it is measured rather than
+# reasoned about. For each directory: `install -d -o root -g mosdns -m 2770` and
+# THEN `setfacl -d -m g::rwx`. The reverse order is wrong, and the way it is wrong
+# is not obvious: install's chmod sets the group-class MASK, so a setfacl that ran
+# first has its mask narrowed by the chmod that follows, and the directory is left
+# with `default:other::r-x` and an access mask that lets the group list and traverse
+# but not write. Such a directory passes every default-ACL check and no service
+# identity can create a state file in it. The eight commands below are written out
+# one pair at a time rather than hidden in a loop or a function, so that the order
+# is visible here to a reader and to the test that holds it.
+#
+# The mode is 2770 and not the 2750 this plan first wrote. A member of a
+# root:mosdns directory's own group cannot create a file in it at all at 2750 --
+# measured on the system-level test machine -- and can at 2770. There is no third
+# option, because when a directory carries an extended ACL the mode's group field IS
+# the group-class mask, so 2750 caps the group at r-x and no default ACL can
+# restore what the mask removed.
+#
+# /run/mosdns is here as well as in the tmpfiles.d entry, and both is right: this
+# script needs it to exist for the install transaction that follows, and the
+# tmpfiles.d entry is the only thing that brings it back after a reboot, because
+# /run is a tmpfs and the group, the setgid bit and the default ACL are all gone.
+#
+# STEP 3 is the pinned China list. It is placed and its digest is verified against
+# the list_sha256 in the lock that describes it, and it is NEVER re-pinned here. A
+# re-pin at install time is how an operator's reviewed pin becomes something nobody
+# reviewed, and a refusal to install because a reviewed list cannot be verified is a
+# machine that is left exactly as it was.
+#
+# STEP 4 is the install transaction itself, and it is last because everything above
+# is a prerequisite for it: a ReadWritePaths entry naming a directory that is not
+# there fails its unit at start with a mount-namespace error, which on the only
+# resolver this machine has is an outage rather than a failed installation. The
+# transaction rolls itself back on any failure, so a postinst that fails here leaves
+# the machine as it was found and says so.
+set -e
+
+STATE_GROUP=mosdns
+ROUTER_USER=mosdns
+CONTROL_USER=mosdns-cdn
+RESOLVER_USER=dnscrypt-proxy
+INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
+SOURCE_LIST=/usr/share/mosdns-router/cn-domains.txt
+SOURCE_LOCK=/usr/share/mosdns-router/source-lock.json
+PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains.txt
+PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock.json
+
+case "$1" in
+configure | abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+	echo "postinst called with an argument this script does not understand: $*" >&2
+	exit 1
+	;;
+esac
+
+# --- STEP 1: the accounts ----------------------------------------------------
+
+# addgroup/adduser are used rather than groupadd/useradd because they are the
+# Debian interface and they are idempotent: on an upgrade every one of these lines
+# runs again and none of them may fail because the account is already there. The
+# `--system` forms put the accounts below UID 1000 with no home directory and a
+# non-expiring password, which is what a service identity is.
+addgroup --system "$STATE_GROUP"
+adduser --system --no-create-home --home /nonexistent \
+	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
+	--gecos "mosdns DNS router" "$ROUTER_USER"
+adduser --system --no-create-home --home /nonexistent \
+	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
+	--gecos "mosdns CDN optimizer and health check" "$CONTROL_USER"
+# Its own group, not the shared one: it creates no file and shares no state with
+# either of the other identities, and giving it the shared group would hand it
+# write access to the state directories for no reason.
+addgroup --system "$RESOLVER_USER"
+adduser --system --no-create-home --home /nonexistent \
+	--ingroup "$RESOLVER_USER" --shell /usr/sbin/nologin \
+	--gecos "DNSCrypt foreign resolver" "$RESOLVER_USER"
+
+# --- STEP 2: the state directories, mode first and then the ACL -------------
+
+install -d -o root -g mosdns -m 2770 /var/lib/mosdns
+setfacl -d -m g::rwx /var/lib/mosdns
+
+install -d -o root -g mosdns -m 2770 /var/lib/mosdns/runtime
+setfacl -d -m g::rwx /var/lib/mosdns/runtime
+
+install -d -o root -g mosdns -m 2770 /var/lib/mosdns/lists
+setfacl -d -m g::rwx /var/lib/mosdns/lists
+
+install -d -o root -g mosdns -m 2770 /run/mosdns
+setfacl -d -m g::rwx /run/mosdns
+
+# --- STEP 3: the pinned China list, placed and verified ----------------------
+
+# `install` rather than `cp`, so the mode and the group are the published ones and
+# not whatever the caller's umask left behind: 0640 root:mosdns is the mode
+# internal/rules publishes at, and it is the mode that lets the list-check identity
+# read a document the optimizer replaces.
+install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"
+install -o root -g mosdns -m 0640 "$SOURCE_LOCK" "$PUBLISHED_LOCK"
+
+# The digest is compared, not recomputed from a re-pin, and a mismatch is fatal here
+# rather than a warning: a list nobody can verify is a routing document whose
+# domestic branch this project cannot account for. The comparison reads the two
+# files as they are now on disk, so what it verifies is the list the router is
+# ABOUT to read and not the archive the archive claims to contain.
+expected_digest=$(sed -n 's/.*"list_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$PUBLISHED_LOCK")
+if [ -z "$expected_digest" ]; then
+	echo "postinst: $PUBLISHED_LOCK names no list_sha256, so the pinned list cannot be verified" >&2
+	exit 1
+fi
+actual_digest=$(sha256sum "$PUBLISHED_LIST" | cut -d' ' -f1)
+if [ "$actual_digest" != "$expected_digest" ]; then
+	echo "postinst: $PUBLISHED_LIST is $actual_digest and the lock says $expected_digest;" >&2
+	echo "postinst: refusing to install a routing list this project cannot account for." >&2
+	echo "postinst: nothing has been changed on this machine's DNS. The reviewed snapshot" >&2
+	echo "postinst: this package carries is $SOURCE_LIST; compare the two, and read" >&2
+	echo "postinst: mosdns-cdnctl(1) for how an operator re-pins the list deliberately." >&2
+	exit 1
+fi
+
+# --- STEP 4: the install transaction -----------------------------------------
+
+# The three timers are enabled here and nowhere else. Their services are oneshots
+# that must not be enabled: a timer is what starts them, and an enabled oneshot
+# would run a nightly measurement at boot as well. The two daemons are enabled and
+# started by the installer, which is the one thing that knows whether they were
+# already active -- an upgrade on a machine that is already running this router is
+# the normal case, not a conflict.
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+	systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
+		mosdns-list-check.timer
+fi
+
+# The argument array, never a shell string. A path an operator could influence
+# reaching a shell is the one thing this transaction exists to make impossible, and
+# a string here would undo that for the one command in this package that changes the
+# machine's DNS.
+if ! "$INSTALLER" install; then
+	echo "postinst: the install transaction refused this machine, so nothing has been" >&2
+	echo "postinst: changed: see the messages above and /var/lib/mosdns/installer for" >&2
+	echo "postinst: what was recorded. Nothing is enabled and running; to try again" >&2
+	echo "postinst: after fixing what it named:" >&2
+	echo "postinst:   sudo $INSTALLER preflight --check-only" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+
+exit 0

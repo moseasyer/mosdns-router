@@ -1,0 +1,70 @@
+#!/bin/sh
+# Take the machine's DNS back, and stop this package from being started again.
+#
+# TWO things happen here and the order matters.
+#
+# First, the `systemctl disable` that the installer's own uninstall deliberately does
+# NOT do. That is a handoff, not an omission: a plain `mosdns_installer.py
+# uninstall` with no package removal behind it would disable a unit the operator
+# still has installed, and leaving a machine's resolver enabled when the operator
+# asked for the daemon to stop -- but the package to stay -- is not what anyone
+# meant. prerm knows the files are about to go: dpkg is removing this package.
+# Here an unconditional disable of every unit in this package is correct, and it
+# costs one call each.
+#
+# Second, the uninstall transaction, which is the part that changes the machine.
+# It stops the three timers first, because they are the only units that write
+# anything, then puts the recorded NetworkManager values back and reactivates the
+# connection, then reads the device to prove it took them, and only then stops the
+# two daemons. A failure at any step leaves the rest alone and prints a manual
+# recovery report with argument arrays a person can paste.
+#
+# The uninstaller refuses to restore automatically when it cannot prove the
+# connection's current values are the ones this package set: an absent marker, an
+# unknown schema, a missing connection, or a value somebody else has since changed.
+# That refusal is the correct answer, and the report it prints is the deliverable
+# rather than a log line.
+#
+# For a purge, the state directory goes in postrm, and only when the purge was
+# asked for: `dpkg --purge` is the operator saying the data goes too, and a plain
+# `dpkg --remove` must leave /var/lib/mosdns with the backup and the marker in it,
+# because a machine with no marker is a machine a later install will treat as
+# somebody else's.
+set -e
+
+INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
+
+case "$1" in
+remove|deconfigure)
+	# The two daemons and the three timers, and nothing else: a unit that is
+	# already stopped is left stopped, and one that was never enabled is not
+	# touched, so this is cheap on a machine where the transaction refused.
+	if [ -d /run/systemd/system ]; then
+		systemctl disable mosdns-router.service dnscrypt-proxy.service \
+			mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
+			mosdns-list-check.timer
+	fi
+
+	if ! "$INSTALLER" uninstall; then
+		# A refusal or an unfinished restore is a failure of THIS script, and dpkg
+		# has to hear about it: a package half removed while the machine is still
+		# pointed at a resolver it no longer has is the worst state available here.
+		echo "prerm: the uninstall did not finish, so the files are about to be removed" >&2
+		echo "prerm: with this machine's DNS still pointed at 127.0.0.1. See the" >&2
+		echo "prerm: recovery report above, and do not restart the machine until" >&2
+		echo "prerm: this machine can resolve something other than itself." >&2
+		exit 1
+	fi
+	;;
+upgrade|failed-upgrade|abort-install|abort-upgrade)
+	# An upgrade keeps everything enabled and running: the units are about to be
+	# replaced, not removed, and the transaction in postinst is idempotent for a
+	# machine that is already running this router.
+	;;
+*)
+	echo "prerm called with an argument this script does not understand: $*" >&2
+	exit 1
+	;;
+esac
+
+exit 0

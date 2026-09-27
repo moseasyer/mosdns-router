@@ -1,0 +1,35 @@
+Package: mosdns-router
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64 arm64
+Maintainer: mosdns-router maintainers <mosdns-router@localhost>
+Depends: python3 (>= 3.10), systemd, network-manager, systemd-resolved, libc6, acl
+Description: DNS router on loopback, with a DNSCrypt foreign resolver
+ This package installs a DNS router, a DNSCrypt resolver and the control tool
+ that measures and publishes the CDN address the router puts in service, and
+ points this machine's NetworkManager connection at 127.0.0.1 so that all of its
+ resolution goes through them.
+ .
+ The router binds 127.0.0.1:53 and the resolver 127.0.0.1:15353, on UDP and TCP,
+ and nothing else; no listener in this package is reachable from another host. A
+ name on the pinned China domain list is resolved by the addresses the DHCP lease
+ published, and every other name by the loopback resolver. No listener in this
+ package is configured with a public resolver address, no document resolution
+ over HTTPS is configured anywhere, and no certificate authority, browser
+ override or intercepting middlebox is installed.
+ .
+ The installation is a transaction. The installer backs up the active connection,
+ starts the two daemons, waits for a real resolved answer from the machine's own
+ resolver, and only then points NetworkManager at the loopback; anything that
+ fails is rolled back, and an uninstall restores exactly what was recorded and
+ refuses to guess when it cannot prove the change was this package's.
+ .
+ Both generated documents are the output of "mosdns-cdnctl render" for the policy
+ in /etc/mosdns/policy.yaml. Edit the policy and re-render; do not edit the
+ generated pair.
+ .
+ The acl dependency is the acl package, because this package's postinst provisions
+ the state directories' mode and default ACL with setfacl and cannot do it without
+ it; the five dependency names this project first listed were written before that
+ ruling.

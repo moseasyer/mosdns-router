@@ -1,0 +1,19 @@
+# The documents an operator may edit, and the two of them that are GENERATED.
+#
+# All six are conffiles, and all six for the same reason: an upgrade must not
+# replace a file a person changed without dpkg asking. The two generated documents
+# are here rather than left to dpkg's defaults because an operator is EXPECTED to
+# edit one of them -- a custom DNSCrypt stamp set lives in dnscrypt-proxy.toml --
+# and a generated file that dpkg silently overwrote would be a configuration the
+# operator had and then lost.
+#
+# The dispatcher hook under /etc/NetworkManager is deliberately NOT a conffile.
+# It is the one file under /etc this package installs that is not a document, it
+# has no content an operator can edit, and the installer removes it on uninstall
+# rather than leaving it behind for dpkg to prompt about a binary.
+/etc/mosdns/mosdns.yaml
+/etc/mosdns/dnscrypt-proxy.toml
+/etc/mosdns/policy.yaml
+/etc/mosdns/force-ech-domains.txt
+/etc/mosdns/cloudflare.txt
+/etc/mosdns/cloudfront-domains.yaml

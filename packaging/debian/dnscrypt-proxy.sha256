@@ -1,0 +1,17 @@
+# The pinned dnscrypt-proxy source, and the digest it has to carry.
+#
+# dnscrypt-proxy is not a dependency of this package: the binary is built from
+# source into the package, so there is a source tree to pin. scripts/build-deb.sh
+# verifies the line below against the archive it was given BEFORE it extracts
+# anything, and it never builds a tree whose archive does not match, so a swapped
+# archive fails the build rather than producing a resolver this project did not
+# review.
+#
+# The archive is the upstream tag's tarball, unmodified:
+#
+#   curl -L -o build/dnscrypt-proxy-2.1.18.tar.gz \
+#     https://github.com/DNSCrypt/dnscrypt-proxy/archive/refs/tags/2.1.18.tar.gz
+#
+# `sha256sum -c packaging/debian/dnscrypt-proxy.sha256` from the repository root
+# checks a copy already placed in build/.
+9b810d862ba07c383cc0b8f9f7f1f2ca8f74a02f849d818c4c4d37cc21a7dfa6  dnscrypt-proxy-2.1.18.tar.gz

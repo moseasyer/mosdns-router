@@ -1,0 +1,69 @@
+#!/bin/sh
+# Nothing to do for a removal that was not a purge, and the data removal for one.
+#
+# A NOTE ON WHAT THIS SCRIPT CANNOT DO, because the obvious implementation of it is
+# impossible: this plan asked for `postrm purge` to call the installer's
+# `uninstall --purge`, and dpkg removes this package's files BETWEEN `prerm remove`
+# and `postrm purge`. By the time this script runs there is no
+# /usr/lib/mosdns-router/mosdns_installer.py to call, so the verb is not available
+# here and the data removal is done directly instead. What that loses is nothing:
+# the ordering `uninstall --purge` guarantees -- that the state directory goes only
+# after the NetworkManager restore has succeeded -- is already established, because
+# prerm has run the restore and exited non-zero if it did not finish, and dpkg does
+# not reach this script at all in that case. The operator's own purge verb remains
+# available and is the one that does both halves in one place:
+#
+#   sudo /usr/lib/mosdns-router/mosdns_installer.py uninstall --purge
+#
+# What is here is the last-resort half, for a `dpkg --purge` that the operator asked
+# for and that no longer has the installer to ask.
+#
+# The state directory is the operator's data: the recorded NetworkManager values,
+# the ownership marker, the published China list, the published range cache, the
+# selector, the budget and the health document. A `dpkg --remove` leaves all of it,
+# and deliberately: the backup and the marker are what let a later install know this
+# machine is already running this router, and removing them on an ordinary removal
+# would turn a re-install into a second installation. A `dpkg --purge` is the
+# operator saying the data goes too.
+set -e
+
+case "$1" in
+purge)
+	# The same three conditions the installer applies, because a `rm -rf` on a path
+	# an operator may have replaced is the one destructive thing in this package: a
+	# symbolic link is not followed, only a directory is removed, and an absent
+	# directory is not an error.
+	if [ -L /var/lib/mosdns ]; then
+		echo "postrm: /var/lib/mosdns is a symbolic link, so nothing behind it is this" >&2
+		echo "postrm: package's to remove. It has been left alone." >&2
+	elif [ -d /var/lib/mosdns ]; then
+		rm -rf /var/lib/mosdns
+		echo "postrm: /var/lib/mosdns and everything in it has been removed, and nothing" >&2
+		echo "postrm: else under /etc was touched: dpkg owns the conffiles and it has" >&2
+		echo "postrm: already asked about the ones that had changed." >&2
+	fi
+	# The installer is gone, so it cannot remove the one file under /etc this
+	# package installed. A removal whose uninstaller could not read the machine
+	# would have left it, and it is a hook that would run on the next NetworkManager
+	# event and try to publish into a state directory that no longer exists.
+	hook=/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge
+	if [ -e "$hook" ] || [ -L "$hook" ]; then
+		echo "postrm: removing $hook, which is still installed and would run on the next" >&2
+		echo "postrm: NetworkManager event against a state directory that is gone." >&2
+		rm -f "$hook"
+	fi
+	;;
+remove|upgrade|abort-install|abort-upgrade|disappear)
+	# remove and upgrade keep /var/lib/mosdns. abort-* never got far enough to write
+	# anything worth removing. disappear is the case where the files were removed
+	# without dpkg running any of this, and the data is left: an operator who
+	# removed the files by hand can remove the directory by hand too, and guessing
+	# here would delete a recorded backup of a machine whose DNS state is unknown.
+	;;
+*)
+	echo "postrm called with an argument this script does not understand: $*" >&2
+	exit 1
+	;;
+esac
+
+exit 0
