@@ -2590,7 +2590,12 @@ class CliTransactionTests(TransactionFixture):
         self.assertNotIn("except", err.lower(), "no exception is due when every unit state was read")
 
     def test_a_usage_error_runs_nothing_at_all(self):
-        for arguments in ((), ("install", "--force"), ("preflight", "install"), ("uninstall",)):
+        # `uninstall` was one of these cases until Task 5 made it a verb, and the
+        # case that replaced it is one its own test file holds: `uninstall` with
+        # a flag it does not take, and with the flag given twice. A repeated
+        # `--purge` is a usage error rather than a second permission, because
+        # whether the operator's data goes is a decision and not a modifier.
+        for arguments in ((), ("install", "--force"), ("preflight", "install"), ("uninstall", "--force")):
             with self.subTest(arguments=arguments):
                 self.setUp()
                 runner = self.good_runner()

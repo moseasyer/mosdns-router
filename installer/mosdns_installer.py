@@ -52,6 +52,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import stat
 import sys
@@ -60,11 +61,20 @@ from pathlib import Path
 from typing import Callable, List, NamedTuple, Optional, Sequence
 
 __all__ = [
+    "Answer",
     "BACKUP_PATH",
     "BACKUP_SCHEMA_VERSION",
     "CommandRunner",
     "Completed",
     "Connection",
+    "DISPATCHER_SCRIPT",
+    "EXIT_INSTALL_FAILED",
+    "EXIT_OK",
+    "EXIT_OWNERSHIP_REFUSED",
+    "EXIT_REFUSED",
+    "EXIT_RESTORE_INCOMPLETE",
+    "EXIT_ROLLBACK_FAILED",
+    "EXIT_USAGE",
     "Holder",
     "InstallRefused",
     "InstallResult",
@@ -72,8 +82,12 @@ __all__ = [
     "Owner",
     "Preflight",
     "RealCommandRunner",
+    "RollbackFailure",
+    "RollbackResult",
     "SCRUBBED_ENVIRONMENT_NAMES",
+    "STATE_DIRECTORY",
     "Transaction",
+    "UninstallResult",
     "build_dns_query",
     "capture_command",
     "check_architecture",
@@ -86,11 +100,15 @@ __all__ = [
     "check_release",
     "check_resolv_conf",
     "check_state_directories",
+    "emergency_rollback",
     "install",
+    "manual_recovery_report",
     "preflight",
     "prepare_backup",
     "probe_dns",
     "response_is_an_answer",
+    "response_resolves",
+    "uninstall",
     "validate_backup",
     "wait_for_dns",
     "write_backup",
@@ -127,10 +145,15 @@ SUPPORTED_ARCHITECTURES = ("amd64", "arm64")
 # plan's prose asked for "a group-writable setgid directory"; 2770 is that, and
 # no mode reads 2750 while granting the group write, because the group field *is*
 # the mask.
+#
+# The first entry is named on its own because it is the one an operator's data
+# lives in and the one a `purge` removes; every other check here is about the
+# whole set and this one is about a single path.
+STATE_DIRECTORY = "/var/lib/mosdns"
 STATE_DIRECTORIES = (
-    "/var/lib/mosdns",
-    "/var/lib/mosdns/runtime",
-    "/var/lib/mosdns/lists",
+    STATE_DIRECTORY,
+    STATE_DIRECTORY + "/runtime",
+    STATE_DIRECTORY + "/lists",
     "/run/mosdns",
 )
 STATE_OWNER = "root"
@@ -170,13 +193,16 @@ DNS_PORT = 53
 RESOLVER_PORT = 15353
 RESOLVER_UNIT = "dnscrypt-proxy.service"
 ROUTER_UNIT = "mosdns-router.service"
-PROJECT_UNITS = (
-    ROUTER_UNIT,
-    RESOLVER_UNIT,
+# The three timers, named on their own because an uninstall stops them first and
+# on their own: they are the only units that WRITE, so they are the reason a
+# purge can be safe without taking the control lock. One list rather than two,
+# because two lists of the same three names is one more thing to get out of step.
+PROJECT_TIMERS = (
     "mosdns-cdn-optimizer.timer",
     "mosdns-cdn-health.timer",
     "mosdns-list-check.timer",
 )
+PROJECT_UNITS = (ROUTER_UNIT, RESOLVER_UNIT) + PROJECT_TIMERS
 # The unit whose stub listener already holds port 53 on a stock Ubuntu, and the
 # one the install keeps: resolved stays in front and forwards to the router, so
 # its socket is not a conflict to be cleared first. It is named here because the
@@ -1575,6 +1601,18 @@ BACKUP_MODE = 0o600
 BACKUP_MODE_OCTAL = "0600"
 INSTALLER_DIRECTORY_MODE = 0o700
 MARKER_MODE = 0o600
+
+# The one file under /etc this package installs, and the only one an uninstall
+# removes. Everything else under /etc belongs to dpkg's conffile machinery or to
+# the operator, and an operator who has edited /etc/mosdns/policy.yaml has edited
+# a file this program must not delete on the way out.
+#
+# `no-wait.d` is the directory for a hook that must not block a NetworkManager
+# event, which is the right one for the bridge: it reads NetworkManager's state
+# and rewrites one runtime file, and a blocking hook would hold a DHCP event open
+# for the length of an `nmcli` call. The name is this plan's and it is named once
+# so that "which hook did we install" has one answer.
+DISPATCHER_SCRIPT = "/etc/NetworkManager/dispatcher.d/no-wait.d/10-mosdns-dhcp-bridge"
 
 # The schema version of the backup. It is written into the document and checked
 # on the way back in, so a future release that cannot read this shape says so
@@ -3180,6 +3218,989 @@ def connection_of(report: Optional[Preflight]) -> str:
     return report.connection.uuid
 
 
+# ---------------------------------------------------------------------------
+# The uninstall, and the emergency rollback
+# ---------------------------------------------------------------------------
+#
+# Two verbs that put a machine's DNS back, and the difference between them is
+# which record they are allowed to act on:
+#
+#   * `uninstall` acts on a claim. The marker has to be there and the connection
+#     has to hold what the installation set, because this runs on a working
+#     machine and an operator may have changed the connection since. Anything it
+#     cannot prove it owns, it refuses, and the refusal's deliverable is a report
+#     a person can act on.
+#   * `emergency_rollback` acts on a record alone. It exists for the machine
+#     where the install died partway -- killed, or rolled back with a rollback
+#     that did not finish -- and on that machine the marker is precisely what is
+#     MISSING, because Task 4 writes it last. So it reads the backup and nothing
+#     else, which is why the backup is written and read back before the first
+#     mutation rather than after the last one.
+#
+# Neither consults preflight. An uninstall has to work on the machine preflight
+# refuses -- wrongly-moded state directories are the ordinary reason -- and the
+# operator removing the package is exactly the person who needs it to.
+#
+# The order, and it is the order rather than a preference:
+#
+#   1. stop the three timers. They are the only units that write, so nothing is
+#      writing state while the machine is being pointed elsewhere.
+#   2. put the profile back and reactivate the connection, then CHECK that the
+#      device picked the values up.
+#   3. stop the two units this package installs, and only those whose state this
+#      program could read.
+#   4. remove the one file under /etc this package installed.
+#   5. reload systemd.
+#   6. purge the state directory, if asked, and never before.
+#
+# Steps 2 and 3 are the load-bearing pair. The machine's NetworkManager is handing
+# resolved the loopback address until step 2 finishes, so stopping the router
+# first would open a window in which the machine points at 127.0.0.1 with nothing
+# listening on it. And because the restore comes first, the check in step 2 can be
+# FATAL -- if the device is still on the loopback, the units are not stopped, which
+# is why a unit whose state cannot be read may be left running without the
+# operator losing their resolver. That is the same reasoning as the install's
+# barrier, pointed the other way.
+
+# The property comparison's three outcomes, and only the third is a refusal. The
+# first two are the only states this program is entitled to act on.
+#
+# Recorded in a comment rather than as an enum because there is no third
+# enumerator to define: the states are "what we set", "what the backup recorded",
+# and everything else, and the everything-else case is a refusal rather than a
+# value to write.
+NOTHING_RECORDED = "(no record)"
+COULD_NOT_BE_READ = "(could not be read)"
+# An address list that is empty is a real value -- a connection with no manual DNS
+# -- and a report that printed it as nothing would read as a column that failed to
+# be filled in. This is the same fact as the "''" in the command below it, said in
+# the table's own language.
+UNSET = "(unset)"
+
+# A word that needs no quoting in a shell command line. Anything outside it is
+# single-quoted by :func:`_render_command`, which matters for exactly one value
+# this program ever renders: the empty address list, which has to be written as
+# '' or it is a command with a missing argument.
+_COMMAND_WORD = re.compile(r"\A[A-Za-z0-9._:@%+=,/-]+\Z")
+
+
+class UninstallResult(NamedTuple):
+    """What an uninstall did, what it refused, and what a person still owes.
+
+    ``ok`` is a fact about the MACHINE and only about the machine: this machine's
+    DNS is back on the resolvers the backup recorded, and the device took the
+    values. It is False in exactly two situations, and both of them are the ones
+    where removing the package would take a resolver away from a machine that is
+    still using one:
+
+      * ``refusals`` is not empty -- nothing was changed, because ownership could
+        not be proven. The connection is as the operator left it and the
+        deliverable is ``manual_recovery``;
+      * ``error`` is not None -- the restoration began and did not finish, so some
+        of this package's changes are still applied, and the deliverable is again
+        ``manual_recovery``, this time to finish the job.
+
+    Everything AFTER a successful restoration -- a unit that could not be stopped,
+    a hook that could not be unlinked, a systemd cache one removal out of date, a
+    purge that was refused -- is in ``notes`` and does not clear ``ok``. Those are
+    things an operator should be told about and none of them is a reason to tell
+    dpkg that this machine's DNS is not where it should be.
+
+    ``left_running`` names the units this program would not stop because it could
+    not read whether they were running, which is the one case where a successful
+    uninstall leaves a unit of this package's still up.
+
+    ``purged`` is a fact about the filesystem rather than a step that succeeded:
+    the state directory is gone, or it is not.
+    """
+
+    ok: bool
+    notes: List[str]
+    refusals: List[str]
+    error: Optional[str]
+    manual_recovery: Optional[str]
+    left_running: List[str]
+    purged: bool
+
+
+class RollbackResult(NamedTuple):
+    """What an emergency rollback did, and whether the machine can resolve now.
+
+    ``restored`` and ``ok`` are separate because they answer two different
+    questions. ``restored`` is "the recorded values are back on the profile" and
+    ``ok`` is "this machine can resolve". A rollback whose reactivation failed has
+    restored nothing that is live; a rollback whose reactivation worked on a chain
+    that cannot reach a resolver has restored something and has not fixed the
+    machine. Both are worth telling apart, and neither is the other's success.
+
+    ``resolves`` is the answer the rollback actually got, or `None` when it never
+    asked -- an unasked question is not a passing one.
+    """
+
+    ok: bool
+    restored: bool
+    notes: List[str]
+    error: Optional[str]
+    manual_recovery: Optional[str]
+    resolves: Optional[bool]
+
+
+class Ownership(NamedTuple):
+    """What the marker, the backup and the connection say about who owns the DNS.
+
+    ``restores`` is the list of properties to write back, in the order they are
+    written, and it is EMPTY for a connection that already holds the recorded
+    values everywhere. A machine that is already back where the backup says needs
+    no `connection modify` -- and still needs the reactivation, because a profile
+    that is right on disk and a device that has not picked it up are two states.
+    """
+
+    uuid: str
+    device: str
+    original: dict
+    observed: dict
+    restores: List[tuple]
+    refusals: List[str]
+    notes: List[str]
+
+
+def _render_command(args: Sequence[str]) -> str:
+    """One argument array, rendered as a line a person can paste into a root shell.
+
+    The report this produces is a deliverable, and a deliverable an operator
+    cannot run is not one. So the array is rendered, not printed as a Python
+    tuple, and anything that is not a bare word is single-quoted: the empty
+    address list is the case that matters, and `nmcli connection modify UUID
+    ipv6.dns` with no value after it clears a property by accident rather than by
+    the argument the report meant to pass.
+    """
+    words = []
+    for word in args:
+        if word and _COMMAND_WORD.match(word):
+            words.append(word)
+        else:
+            words.append("'" + word.replace("'", "'\\''") + "'")
+    return " ".join(words)
+
+
+def manual_recovery_report(
+    uuid: str,
+    original: Optional[dict],
+    observed: dict,
+    reasons: Sequence[str],
+    device: str = "",
+    summary: Optional[str] = None,
+) -> str:
+    """The report a person acts on, and the only thing a refusal really produces.
+
+    It carries three things and nothing else does: **what this program found**,
+    **what was expected**, and **the commands to run**. A refusal whose only
+    output is a sentence is a refusal that leaves the work to the reader, and the
+    reader is standing in front of a machine that cannot resolve.
+
+    The commands are offered only when the record behind them is one this program
+    read and understood in full. A backup of an unknown schema version may not
+    even hold these four properties in this shape, and a partial set of commands
+    is worse than none: an operator who runs three of four believes the connection
+    is back.
+    """
+    lines = [f"MANUAL RECOVERY REPORT for connection {uuid}" if uuid else "MANUAL RECOVERY REPORT", ""]
+    if reasons:
+        lines.append("why this program stopped where it did:")
+        lines.extend(f"  - {reason}" for reason in reasons)
+        lines.append("")
+    quoted = False
+    if original:
+        lines.append(f"what {BACKUP_PATH} recorded, and what the connection holds now:")
+        for prop in RECORDED_PROPERTIES:
+            entry = original.get(prop)
+            if not isinstance(entry, dict):
+                recorded = NOTHING_RECORDED
+            else:
+                raw = str(entry.get("raw", ""))
+                recorded = raw if raw else UNSET
+            if observed:
+                found = observed.get(prop)
+                lines.append(
+                    f"  {prop:<20}    recorded {recorded}    now "
+                    f"{COULD_NOT_BE_READ if found is None else (found if found else UNSET)}"
+                )
+            else:
+                lines.append(f"  {prop:<20}    recorded {recorded}")
+        lines.append("")
+    if uuid and original:
+        lines.append("to put the connection back by hand, run these as root, in this order:")
+        for prop in RECORDED_PROPERTIES:
+            value = _restore_value(prop, original)
+            rendered = _render_command(("nmcli", "connection", "modify", uuid, prop, value))
+            quoted = quoted or "''" in rendered
+            lines.append(f"  {rendered}")
+        lines.append(f"  {_render_command(('nmcli', 'connection', 'up', uuid))}")
+        lines.append("")
+        if quoted:
+            lines.append(
+                "an empty value is written as '', which asks NetworkManager to clear that property "
+                "rather than to set it to something"
+            )
+        lines.append("then check that the device picked them up:")
+        for prop in (IPV4_DNS, IPV6_IGNORE_AUTO_DNS, IPV4_IGNORE_AUTO_DNS):
+            lines.append(
+                "  " + _render_command(("nmcli", "-g", prop, "connection", "show", uuid))
+            )
+        if device:
+            lines.append("  " + _render_command(("resolvectl", "dns", device)))
+            lines.append(
+                f"  that should name the machine's own resolvers and not {LOCAL_DNS}, which is the "
+                "address this package pointed it at"
+            )
+        lines.append("")
+    elif not uuid:
+        lines.append(
+            f"there is no connection to name, because {BACKUP_PATH} is not a record this program "
+            "can read, and this program will not invent a connection UUID. The commands that put "
+            "a connection back are `nmcli connection modify <uuid> <property> <value>`, once for "
+            "each of "
+            + ", ".join(RECORDED_PROPERTIES)
+            + ", followed by `nmcli connection up <uuid>`; the values are in that file"
+        )
+        lines.append("")
+    lines.append(
+        summary
+        or (
+            f"nothing on this machine has been changed by this run, and {BACKUP_PATH} is the record "
+            "of what the connection was set to before anything was changed"
+        )
+    )
+    return "\n".join(lines)
+
+
+def _as_current(prop: str, text: str):
+    """One property's value in the shape two values are compared in.
+
+    An address list is compared as a list and a `yes`/`no` as a string, so that a
+    release printing `192.0.2.53;192.0.2.54` and a release printing
+    `192.0.2.53,192.0.2.54` are the same value rather than a difference this
+    program would refuse over.
+
+    Nothing here validates an address. A value that is not a list of addresses is
+    simply a value that is neither what this installation set nor what the backup
+    recorded, and a refusal that names it is more use than a refusal that parses
+    it and fails on the parsing.
+    """
+    if prop in ADDRESS_LISTS:
+        return [token for token in re.split(r"[,;\s]+", (text or "").strip()) if token]
+    return text
+
+
+def _read_marker(root: Path) -> List[str]:
+    """The ownership claim, or the reasons there is not one to act on.
+
+    The marker is the second of two independent proofs, not the only one: the
+    connection's own values are the first, and either alone is a reason to stop.
+    Both have to agree, because each can be present without the other -- a marker
+    is left behind by an install whose rollback undid its changes, and correct
+    values are left behind by an install that was killed before it wrote one.
+    """
+    path = root / MANAGED_BY.lstrip("/")
+    state = _path_state(path)
+    if state != "a regular file":
+        return [
+            f"there is no ownership marker at {MANAGED_BY} (there is {state}); a marker says "
+            f"{MANAGED_BY_VALUE!r} and an install writes it only after it has finished, so nothing "
+            "on this machine claims the DNS is this package's"
+        ]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"the ownership marker at {MANAGED_BY} could not be read ({error})"]
+    said = text.strip()
+    if said != MANAGED_BY_VALUE:
+        return [
+            f"the ownership marker at {MANAGED_BY} says {said!r} rather than {MANAGED_BY_VALUE!r}, "
+            "so it is not this package's claim to this machine"
+        ]
+    return []
+
+
+def _read_backup(root: Path) -> tuple:
+    """The record, and the reasons there is not one this program will act on.
+
+    Returns ``(document, refusals)``. The document is `None` whenever anything
+    about it is wrong, INCLUDING a field it did not have: a record that is
+    missing one of the four properties is a record this program cannot offer
+    commands from, because a command block that restores three of four is one an
+    operator will believe is complete.
+
+    The schema version and the project name are checked first and on their own,
+    because those are the two fields a future release has to refuse rather than
+    guess at, and a message that only said "the backup is not usable" would not
+    tell an operator which of the two it was.
+    """
+    path = root / BACKUP_PATH.lstrip("/")
+    state = _path_state(path)
+    if state != "a regular file":
+        return None, [
+            f"there is no backup at {BACKUP_PATH} (there is {state}), and without it there is "
+            "nothing to put the connection back to: this program will not invent a value it did "
+            "not record"
+        ]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return None, [f"{BACKUP_PATH} could not be read ({error})"]
+    try:
+        document = json.loads(text)
+    except ValueError as error:
+        return None, [f"{BACKUP_PATH} is not a JSON document ({error})"]
+    if not isinstance(document, dict):
+        return None, [f"{BACKUP_PATH} is a {type(document).__name__} rather than a record"]
+    if document.get("managed_by") != MANAGED_BY_VALUE:
+        return None, [
+            f"{BACKUP_PATH} names {document.get('managed_by')!r} rather than {MANAGED_BY_VALUE!r}, "
+            "so it is not a record of this project's changes to this machine"
+        ]
+    if document.get("schema_version") != BACKUP_SCHEMA_VERSION:
+        return None, [
+            f"{BACKUP_PATH} is at schema version {document.get('schema_version')!r} and this "
+            f"release reads version {BACKUP_SCHEMA_VERSION}, so this program cannot know what its "
+            "fields mean and will not write any of them"
+        ]
+    refusals = []
+    connection = document.get("connection")
+    if not isinstance(connection, dict):
+        refusals.append(f"{BACKUP_PATH} names no connection at all")
+    else:
+        if not str(connection.get("uuid") or "").strip():
+            refusals.append(
+                f"{BACKUP_PATH} names no connection UUID, and a modify aimed at anything but a "
+                "UUID is a modify aimed at the wrong thing with no error"
+            )
+        if not str(connection.get("device") or "").strip():
+            refusals.append(
+                f"{BACKUP_PATH} names no device, so there is nothing to ask which resolvers the "
+                "machine ended up using"
+            )
+    original = document.get("original")
+    if not isinstance(original, dict):
+        refusals.append(f"{BACKUP_PATH} records no original properties at all")
+    else:
+        for prop in RECORDED_PROPERTIES:
+            entry = original.get(prop)
+            if not isinstance(entry, dict) or not isinstance(entry.get("raw"), str) or "value" not in entry:
+                refusals.append(
+                    f"{BACKUP_PATH} does not record {prop}, or records it without the raw text an "
+                    "operator would read, and a restore can only put back what was written down"
+                )
+                continue
+            value = entry["value"]
+            if prop in ADDRESS_LISTS:
+                shape = "a list of addresses"
+            else:
+                shape = "a yes or a no"
+            readable = (
+                isinstance(value, list) and all(isinstance(item, str) for item in value)
+                if prop in ADDRESS_LISTS
+                else isinstance(value, str)
+            )
+            if not readable:
+                # Checked here rather than at the point of use, because the point
+                # of use is a refusal's own report: a `value` of the wrong shape
+                # has to be a refusal with a sentence in it, not a TypeError from
+                # a function that was rendering a command for a person to run.
+                refusals.append(
+                    f"{BACKUP_PATH} records {prop} as {value!r}, which is not {shape}, so this "
+                    "release cannot put it back and will not guess at what it meant"
+                )
+    if refusals:
+        return None, refusals
+    return document, []
+
+
+def _as_restored(original: dict, ours: Optional[Sequence[str]] = None) -> List[tuple]:
+    """The three properties, newest change first, with the value each goes back to.
+
+    The same order and the same values as the install's own rollback, because
+    there is one story for how this package undoes its profile changes and two
+    would be one more thing to get wrong. The address list this install never
+    changed is not in it: writing it would be writing a value nothing changed.
+
+    ``ours`` restricts the answer to the properties the caller found still holding
+    this installation's value, and restricting it does not disturb the order --
+    which is the reason the order lives here and not in the caller.
+    """
+    return [
+        (prop, _restore_value(prop, original))
+        for prop, _value in reversed(NM_MUTATIONS)
+        if ours is None or prop in ours
+    ]
+
+
+def _ownership(root: Path, run: CommandRunner) -> Ownership:
+    """Everything this program has to establish before it writes to a connection.
+
+    Four independent questions, and any of them being unanswerable is a refusal:
+
+      1. does the marker say this package owns this machine's DNS;
+      2. is there a record this release can read, naming a connection and a device;
+      3. does every property hold the value this installation set, or the value
+         the backup recorded;
+      4. and the two address lists, are they values this program can read at all.
+
+    Question 3 is the plan's own review focus -- an uninstall must not overwrite a
+    connection the user changed after the installation -- and it is asked as a
+    three-way comparison rather than as "is it what we set", because a property
+    that already holds the recorded original is a machine that has been restored
+    already and is not a machine somebody edited.
+    """
+    refusals = _read_marker(root)
+    document, backup_refusals = _read_backup(root)
+    refusals.extend(backup_refusals)
+    if document is None:
+        return Ownership("", "", {}, {}, [], refusals, [])
+    connection = document["connection"]
+    uuid = str(connection["uuid"])
+    device = str(connection["device"])
+    original = document["original"]
+    notes = []
+
+    observed: dict = {}
+    ours: List[str] = []
+    for prop in RECORDED_PROPERTIES:
+        answer = _text(run, ("nmcli", "-g", prop, "connection", "show", uuid))
+        observed[prop] = answer
+        if answer is None:
+            refusals.append(
+                f"{prop} of connection {uuid} could not be read at all (`nmcli -g {prop} connection "
+                f"show {uuid}` did not run), so this program cannot say whether the machine still "
+                "holds what this installation set"
+            )
+            continue
+        current = _as_current(prop, answer)
+        recorded = _as_current(prop, original[prop]["raw"])
+        if prop in IGNORED_AUTOMATICALLY and not answer:
+            # A `yes`/`no` property has no empty value, and `nmcli -g` prints
+            # nothing at all for a connection it cannot find. So a blank here is a
+            # read that produced nothing -- the connection is gone, or nmcli
+            # failed -- and it is not a value this program can compare or write.
+            # The address lists are the opposite case and are handled below: an
+            # empty list is a connection with no manual DNS, which is one of the
+            # states a restore has to cope with.
+            refusals.append(
+                f"{prop} of connection {uuid} could not be read: it came back empty, which is not a "
+                f"value it can hold, and `nmcli -g {prop} connection show {uuid}` prints nothing at "
+                "all for a connection it cannot find -- so this program will not write to a "
+                "connection it cannot see"
+            )
+            continue
+        if prop in dict(NM_MUTATIONS):
+            if current == _as_current(prop, dict(NM_MUTATIONS)[prop]):
+                ours.append(prop)
+                continue
+            if current == recorded:
+                notes.append(
+                    f"{prop} of {uuid} already holds the value {BACKUP_PATH} recorded, so it is "
+                    "left as it is"
+                )
+                continue
+            refusals.append(
+                f"{prop} of connection {uuid} is {answer!r}, which is neither the value this "
+                f"installation set ({dict(NM_MUTATIONS)[prop]!r}) nor the value {BACKUP_PATH} "
+                f"recorded ({original[prop]['raw']!r}), so somebody changed this connection after "
+                "the install and this program will not overwrite their change"
+            )
+            continue
+        if current != recorded:
+            refusals.append(
+                f"{prop} of connection {uuid} is {answer!r}, but this installation never changed "
+                f"it and {BACKUP_PATH} recorded {original[prop]['raw']!r}, so it was changed by "
+                "something other than this package and this program will not write over it"
+            )
+    restores = _as_restored(original, ours)
+    if not restores and not refusals:
+        notes.append(
+            f"every property of {uuid} already holds the value {BACKUP_PATH} recorded, so there is "
+            "nothing to put back and only the reactivation is needed"
+        )
+    try:
+        digest = _config_digest(root)
+    except InstallRefused:
+        digest = ""
+    if digest and digest != document.get("config_sha256"):
+        notes.append(
+            f"{POLICY_CONFIG} no longer has the digest {BACKUP_PATH} recorded, so it has been "
+            "edited since the install; that says nothing about the connection, and the connection "
+            "is what is being restored"
+        )
+    return Ownership(uuid, device, original, observed, restores, refusals, notes)
+
+
+def _device_follows_the_backup(run: CommandRunner, ownership: Ownership) -> None:
+    """Whether the live device took the restored values, which is the step that matters.
+
+    The properties are written to the connection's PROFILE, and a profile reaches
+    the device when the connection is brought up. A `connection modify` and a
+    `connection up` that both succeed are not proof that the second one applied
+    the first, and on this program that is not a cosmetic gap: the router is
+    stopped two steps later, and stopping it on a machine that is still handing
+    resolved the loopback address is the one outcome this whole section exists to
+    prevent.
+
+    A loopback address is only a failure when the backup did not record one. A
+    machine that was already using a local resolver before this package was
+    installed is restored TO the loopback, and calling that a leftover would
+    refuse the correct result.
+    """
+    forwarding = _text(run, ("resolvectl", "dns", ownership.device))
+    if forwarding is None:
+        raise InstallRefused(
+            f"resolvectl could not be asked what {ownership.device} is using for DNS, so nothing "
+            "has confirmed that the connection picked the values that were just put back"
+        )
+    recorded = _as_current(IPV4_DNS, ownership.original[IPV4_DNS]["raw"])
+    if LOCAL_DNS in forwarding.split() and LOCAL_DNS not in recorded:
+        raise InstallRefused(
+            f"resolvectl reports {ownership.device} using {forwarding!r}, which still includes the "
+            f"loopback address {LOCAL_DNS} that this package pointed it at, and {BACKUP_PATH} "
+            f"recorded {ownership.original[IPV4_DNS]['raw']!r}; NetworkManager accepted the change "
+            "and did not apply it, so this program will not go on to stop the resolver that "
+            "address is pointing at"
+        )
+
+
+def _stop_units(run: CommandRunner, units: Sequence[str], notes: List[str]) -> List[str]:
+    """Stop the units this package installs, and name the ones it will not touch.
+
+    A unit whose state could not be read is LEFT RUNNING and named, which is
+    Task 4's rule and it is inherited rather than re-derived: `is-active` on a
+    unit that does not exist prints nothing, so a blank answer and a call that
+    failed are one fact -- this program cannot say -- and stopping a resolver whose
+    state it cannot read is the harm the rule exists to prevent. Leaving one
+    running is smaller, and reversible, and is reported.
+
+    The reads come first and the stops second, for both groups. Reading each unit
+    and stopping it before reading the next would make "which units did this
+    program decide it could not read" depend on where the run stopped.
+
+    A stop that FAILS is reported and the rest of the uninstall goes on. That is
+    the difference between this step and the restoration above it: the machine is
+    already back on its own resolvers, so a resolver of this package's that is
+    still running is a process nobody is using rather than a machine with nowhere
+    to send a query -- and stopping the run at the first failure would leave the
+    hook installed and systemd's copy of the unit files stale, which are two more
+    things wrong for no benefit.
+
+    Every step after the restoration is reported this way rather than raised, and
+    none of them changes `ok`. The exit status is a fact about the MACHINE: not
+    ours, not back, or back. A stale hook, a unit that is still up, and a systemd
+    cache that is one removal out of date are all things an operator should be
+    told about and none of them is a reason to tell dpkg that this machine's DNS
+    is not where it should be.
+    """
+    readable = [unit for unit in units if _text(run, ("systemctl", "is-active", unit))]
+    unreadable = [unit for unit in units if unit not in readable]
+    for unit in readable:
+        try:
+            _checked(run, ("systemctl", "stop", unit), f"stopping {unit}")
+        except InstallRefused as error:
+            notes.append(
+                f"{str(error)}, so {unit} is still running; `systemctl stop {unit}` stops it, and "
+                "nothing on this machine's DNS depends on it any more"
+            )
+    for unit in unreadable:
+        notes.append(
+            f"{unit} could not be asked about, so this program would not stop a unit whose state "
+            f"it could not read and left it as it found it; `systemctl stop {unit}` stops it"
+        )
+    return unreadable
+
+
+def _remove_dispatcher(root: Path, notes: List[str]) -> None:
+    """Remove the one file under /etc this package installed, and only that one.
+
+    A symbolic link is unlinked rather than followed: the link is the package's
+    file and whatever it points at is not. Anything else at that path -- a
+    directory, a socket -- is not a hook and is reported rather than removed,
+    because a path this program did not create is the one thing it must not
+    destroy on its way out.
+
+    Nothing else under /etc is touched. The conffiles are dpkg's business, and an
+    operator who has edited /etc/mosdns/policy.yaml owns it: the package's answer
+    to that is to leave it for `dpkg` to ask about, not to delete it.
+    """
+    path = root / DISPATCHER_SCRIPT.lstrip("/")
+    state = _path_state(path)
+    if state == "absent":
+        return
+    if state not in ("a regular file", "a symbolic link"):
+        notes.append(
+            f"{DISPATCHER_SCRIPT} is {state} rather than a file this package installed, so it was "
+            "left alone"
+        )
+        return
+    try:
+        path.unlink()
+    except OSError as error:
+        notes.append(
+            f"{DISPATCHER_SCRIPT} could not be removed ({error}), so the DHCP bridge is still "
+            "installed and will still run on the next NetworkManager event"
+        )
+        return
+    notes.append(f"removed {DISPATCHER_SCRIPT}, the only file under /etc this package installs")
+
+
+def _purge_state(root: Path) -> None:
+    """Remove the state directory, which is the operator's data, and only on request.
+
+    Three refusals, all in the same direction. A symbolic link is not followed:
+    the tree behind it was not created by this program and is not its to delete.
+    Anything that is not a directory is not a state directory. And an absent
+    directory is not a failure of its own -- it is what a purge finds when
+    something else has already removed it -- so this step says nothing and the
+    caller reports ``purged`` as false, which is the fact.
+
+    `shutil.rmtree` does not follow a symbolic link inside the tree either, so a
+    link an operator dropped into the state directory is unlinked and what it
+    pointed at is untouched. That is the property this step is allowed to have,
+    and it is asserted rather than assumed.
+    """
+    path = root / STATE_DIRECTORY.lstrip("/")
+    if path.is_symlink():
+        raise InstallRefused(
+            f"{STATE_DIRECTORY} is a symbolic link to {os.readlink(path)} rather than a directory "
+            "this package created, so this program will not remove a tree it did not make"
+        )
+    state = _path_state(path)
+    if state == "absent":
+        return
+    if state != "a directory":
+        raise InstallRefused(f"{STATE_DIRECTORY} is {state} rather than a directory to remove")
+    try:
+        shutil.rmtree(path)
+    except OSError as error:
+        raise InstallRefused(
+            f"{STATE_DIRECTORY} could not be removed ({error}); everything above it is already "
+            "back the way it was, and the state directory is the operator's to remove by hand"
+        ) from error
+
+
+def _restore_unfinished(ownership: Ownership, error: str, notes: List[str]) -> UninstallResult:
+    """The result of an uninstall that started and could not finish.
+
+    ``refusals`` is empty on purpose. A refusal means nothing was changed and the
+    caller can say so; this is the other machine, where the values this package
+    set are still on the profile, so the sentence has to be a different one and
+    the exit status has to be a different one. Everything below the restoration is
+    left alone: the units keep running, the hook stays installed, and the state
+    directory stays exactly where the record of it is.
+    """
+    return UninstallResult(
+        ok=False,
+        notes=list(notes),
+        refusals=[],
+        error=(
+            f"the restoration did not finish, so the values this installation set are still on "
+            f"connection {ownership.uuid}: {error}"
+        ),
+        manual_recovery=manual_recovery_report(
+            ownership.uuid,
+            ownership.original,
+            ownership.observed,
+            [error],
+            device=ownership.device,
+            summary=(
+                f"{BACKUP_PATH} still records what connection {ownership.uuid} was set to, and the "
+                "values written before the failure are in place. The units this package installs "
+                f"have NOT been stopped, because the machine may still be using {LOCAL_DNS}, so "
+                "removing the package now would take away a resolver this machine is still "
+                "pointing at; the commands above are what finishes the job"
+            ),
+        ),
+        left_running=[],
+        purged=False,
+    )
+
+
+def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -> UninstallResult:
+    """Put this machine's DNS back the way the backup says it was, and stop.
+
+    ``root`` and ``run`` are the same two seams :func:`preflight` and
+    :func:`install` have. ``probe`` is the third: after the restore the machine's
+    path is through its own resolvers, and whether that path works is a fact the
+    operator is entitled to be told -- so it is asked once, through resolved's
+    stub, with the RESOLVING half of the prober's two answers. A SERVFAIL is not
+    a resolution, and an uninstall that reported one as a working machine would be
+    reporting the one thing an operator removing this package cannot afford to be
+    told wrongly.
+
+    It is a note and not a failure. Whether the operator's own upstream can
+    resolve is not this package's business, and failing the uninstall over it
+    would make `dpkg` complain about a machine whose resolver is somebody else's
+    problem. The restore's OWN check -- did the device pick the values up -- is a
+    failure, and it is fatal, because on that machine stopping the resolver is the
+    one thing that must not happen.
+    """
+    root = Path(root)
+    ask = probe or (lambda address, port: probe_dns(address, port))
+    ownership = _ownership(root, run)
+    notes = list(ownership.notes)
+    if ownership.refusals:
+        return UninstallResult(
+            ok=False,
+            notes=notes,
+            refusals=ownership.refusals,
+            error=(
+                "this program will not change a connection it cannot prove this package set, so "
+                "nothing was changed"
+            ),
+            manual_recovery=manual_recovery_report(
+                ownership.uuid,
+                ownership.original,
+                ownership.observed,
+                ownership.refusals,
+                device=ownership.device,
+                summary=(
+                    f"nothing on this machine has been changed by this run, and {BACKUP_PATH} is "
+                    f"the record of what connection {ownership.uuid} was set to before anything was "
+                    f"changed. The units this package installs are still here and the machine may "
+                    f"still be using {LOCAL_DNS}, so REMOVING THE PACKAGE NOW would take away a "
+                    "resolver this machine is still pointing at; put the connection back with the "
+                    "commands above first, or reboot, and then remove the package"
+                ),
+            ),
+            left_running=[],
+            purged=False,
+        )
+
+    # 1. the timers, which are the only units that write anything.
+    left = _stop_units(run, PROJECT_TIMERS, notes)
+    # 2. the profile, newest change first, and then the reactivation, which is
+    #    what makes the restored values live.
+    for prop, value in ownership.restores:
+        try:
+            _checked(
+                run,
+                ("nmcli", "connection", "modify", ownership.uuid, prop, value),
+                f"putting {prop} back to {value!r} on {ownership.uuid}",
+            )
+        except InstallRefused as error:
+            return _restore_unfinished(ownership, str(error), notes)
+    try:
+        _checked(
+            run,
+            ("nmcli", "connection", "up", ownership.uuid),
+            f"reactivating {ownership.uuid} to apply what was put back",
+        )
+    except InstallRefused as error:
+        return _restore_unfinished(ownership, str(error), notes)
+    #    and the read that proves the device took them. Fatal, and the reason the
+    #    units below are not stopped when it fails.
+    try:
+        _device_follows_the_backup(run, ownership)
+    except InstallRefused as error:
+        return _restore_unfinished(ownership, str(error), notes)
+    # 3. the two units, and only the ones whose state could be read.
+    left += _stop_units(run, (ROUTER_UNIT, RESOLVER_UNIT), notes)
+    # 4. the one file under /etc this package installed.
+    _remove_dispatcher(root, notes)
+    # 5. systemd's cached copy of the unit files this uninstall has just stopped,
+    #    which the package removal that follows is about to make wrong. It is
+    #    harmless while the files are still there, which at `prerm` time they are:
+    #    it is here because a plain `uninstall` with no package removal is also a
+    #    thing an operator does, and a reload is the only step that makes a
+    #    removed unit's cache entry go away. NetworkManager reads its dispatcher
+    #    directory itself, so the hook's removal needs no reload -- this one is
+    #    about the unit files.
+    try:
+        _checked(
+            run,
+            ("systemctl", "daemon-reload"),
+            "reloading systemd (systemctl daemon-reload) so its copy of the unit files is current",
+        )
+    except InstallRefused as error:
+        notes.append(str(error))
+    # 6. the state directory, last, and never before the restoration above.
+    purged = False
+    if purge:
+        try:
+            _purge_state(root)
+        except InstallRefused as error:
+            notes.append(str(error))
+        else:
+            purged = True
+    # The verdict on the machine is LAST, and it is the only sentence in this
+    # whole section that is about whether the machine works rather than about
+    # what this program did to it. An operator who reads the last line of the
+    # output has to be reading that, and a run whose last line is about a
+    # directory is a run whose last line can be mistaken for "all fine".
+    if ask(RESOLVED_STUB_ADDRESS, DNS_PORT).resolves:
+        notes.append(
+            f"connection {ownership.uuid} is back on the machine's own resolvers, and "
+            f"{RESOLVED_STUB_ADDRESS} resolved {INSTALL_PROBE_NAME}, so this machine can resolve"
+        )
+    else:
+        notes.append(
+            f"connection {ownership.uuid} is back on the machine's own resolvers, but a query for "
+            f"{INSTALL_PROBE_NAME} through {RESOLVED_STUB_ADDRESS} did not resolve, so THIS MACHINE "
+            f"CANNOT RESOLVE: that is the resolver it was following before this package was "
+            "installed, it is not something this uninstall did, and nothing above will change it"
+        )
+    return UninstallResult(
+        ok=True,
+        notes=notes,
+        refusals=[],
+        error=None,
+        manual_recovery=None,
+        left_running=left,
+        purged=purged,
+    )
+
+
+def emergency_rollback(root: Path, run: CommandRunner, probe=None) -> RollbackResult:
+    """Put the recorded DNS back on a machine whose install died, and say whether it works.
+
+    The record is the only input. No marker -- a machine whose install was killed
+    has no marker, because Task 4 writes it last, and requiring one would make
+    this command useless for exactly the machine it exists for. No preflight --
+    the machine is broken, and a broken machine is the one that fails preflight.
+    No ownership check -- the connection is expected to hold some mixture of this
+    package's values and the recorded originals, and requiring it to hold exactly
+    the former would refuse the case the command is for.
+
+    It restores ONLY the connection. It does not stop a unit, remove a file,
+    disable anything or reload systemd, and the binaries and the configuration
+    stay installed: an operator who has just watched their DNS die needs to be
+    able to read the logs, and a rollback that tidied up would take the evidence
+    with it.
+
+    The verification asks whether this machine can RESOLVE, through resolved's
+    stub, with the resolving half of the prober's two answers. Not whether
+    something is listening: a SERVFAIL is a confident answer from a chain that
+    reached nobody, and a rollback that called that success would hand the
+    operator a machine with no DNS and a reassuring message. The profile being
+    right is reported separately from the machine working, because on a machine
+    where the upstream is down those are two different facts and only the first
+    is this package's doing.
+    """
+    root = Path(root)
+    ask = probe or (lambda address, port: probe_dns(address, port))
+    document, refusals = _read_backup(root)
+    if document is None:
+        reasons = list(refusals) + [
+            "an emergency rollback restores the last valid backup and there is not one here; it "
+            "will not guess at a value, because a guessed resolver is a machine with no DNS",
+            f"the connection on this machine may still be handing resolved the loopback address "
+            f"{LOCAL_DNS}, and this program will not stop the router that answers it, because "
+            "without a record of the original settings it could not put them back",
+        ]
+        return RollbackResult(
+            ok=False,
+            restored=False,
+            notes=[],
+            error="there is no valid backup to roll back to, so nothing was changed",
+            manual_recovery=manual_recovery_report(
+                "",
+                None,
+                {},
+                reasons,
+                summary=(
+                    f"nothing on this machine has been changed, and {BACKUP_PATH} is where the "
+                    "record of what this connection was set to would be if one had survived"
+                ),
+            ),
+            resolves=None,
+        )
+    connection = document["connection"]
+    uuid = str(connection["uuid"])
+    device = str(connection["device"])
+    original = document["original"]
+    ownership = Ownership(uuid, device, original, {}, _as_restored(original), [], [])
+    for prop, value in ownership.restores:
+        try:
+            _checked(
+                run,
+                ("nmcli", "connection", "modify", uuid, prop, value),
+                f"putting {prop} back to {value!r} on {uuid}",
+            )
+        except InstallRefused as error:
+            return _rollback_stopped(ownership, str(error), False, None)
+    try:
+        _checked(
+            run,
+            ("nmcli", "connection", "up", uuid),
+            f"reactivating {uuid} to apply what was put back",
+        )
+    except InstallRefused as error:
+        return _rollback_stopped(ownership, str(error), True, None)
+    try:
+        _device_follows_the_backup(run, ownership)
+    except InstallRefused as error:
+        return _rollback_stopped(ownership, str(error), True, None)
+    resolves = ask(RESOLVED_STUB_ADDRESS, DNS_PORT).resolves
+    notes = [
+        f"connection {uuid} was put back on the resolvers {BACKUP_PATH} recorded, and the "
+        "binaries and the configuration were left installed for diagnosis"
+    ]
+    if not resolves:
+        return RollbackResult(
+            ok=False,
+            restored=True,
+            notes=notes,
+            error=(
+                f"the recorded values are restored on {uuid} and the connection was reactivated, "
+                f"but a query for {INSTALL_PROBE_NAME} through {RESOLVED_STUB_ADDRESS} did not "
+                f"resolve, so this machine still cannot resolve: check what {device} is using for "
+                "DNS, and whether the resolvers it is using answer"
+            ),
+            manual_recovery=manual_recovery_report(
+                uuid,
+                original,
+                {},
+                [
+                    f"a query for {INSTALL_PROBE_NAME} through {RESOLVED_STUB_ADDRESS} did not "
+                    "resolve after the restore, so the values this backup recorded are in place and "
+                    "the machine still does not work"
+                ],
+                device=device,
+                summary=(
+                    f"the values in {BACKUP_PATH} are on connection {uuid} and it has been "
+                    "reactivated; what is left is the resolver that connection is now using"
+                ),
+            ),
+            resolves=False,
+        )
+    notes.append(
+        f"{RESOLVED_STUB_ADDRESS} resolved {INSTALL_PROBE_NAME}, so this machine can resolve"
+    )
+    return RollbackResult(ok=True, restored=True, notes=notes, error=None, manual_recovery=None, resolves=True)
+
+
+def _rollback_stopped(
+    ownership: Ownership, error: str, restored: bool, resolves: Optional[bool]
+) -> RollbackResult:
+    """A rollback that put some of the recorded values back and then stopped."""
+    return RollbackResult(
+        ok=False,
+        restored=restored,
+        notes=[],
+        error=(
+            f"the rollback did not finish, so the connection is still partly as this package left "
+            f"it: {error}"
+        ),
+        manual_recovery=manual_recovery_report(
+            ownership.uuid,
+            ownership.original,
+            ownership.observed,
+            [error],
+            device=ownership.device,
+            summary=(
+                f"{BACKUP_PATH} records what connection {ownership.uuid} was set to, and the "
+                "commands above are what puts the rest of it back"
+            ),
+        ),
+        resolves=resolves,
+    )
+
+
 # The exit statuses the command boundary uses. They are the CLI's own: 0 is a machine
 # this can install onto, 1 is one it cannot, and 2 is a usage error.
 #
@@ -3190,17 +4211,35 @@ def connection_of(report: Optional[Preflight]) -> str:
 # of what the connection was set to -- so that is a manual recovery, and a script
 # that cannot tell the two apart will report "the install failed" about a machine
 # that has lost its resolver.
+#
+# 5 and 6 are the same two machines reached from the other end, by the verbs that
+# put a machine back rather than take it. 4 is about the INSTALL's own rollback
+# failing while the install was running; 6 is about a restore this program was
+# asked to perform and did not finish. Both mean "still applied", both carry a
+# recovery line, and a caller that has to tell them apart can, because the
+# situations are different: after 4 nobody asked for a restore, and after 6
+# somebody did.
 EXIT_OK = 0
 EXIT_REFUSED = 1
 EXIT_USAGE = 2
 EXIT_INSTALL_FAILED = 3
 EXIT_ROLLBACK_FAILED = 4
+# Nothing was changed, because this program could not prove the DNS on this
+# machine is its own to change. Distinct from 1 because 1 is about a machine's
+# shape and this is about a claim on a machine, and the deliverable is a manual
+# recovery report rather than a list of problems.
+EXIT_OWNERSHIP_REFUSED = 5
+# A restore was attempted and did not finish: some of this package's changes are
+# still applied, and the manual recovery report is what finishes them.
+EXIT_RESTORE_INCOMPLETE = 6
 
 
 def _usage() -> str:
     return (
         "usage: mosdns_installer.py preflight [--check-only]\n"
         "       mosdns_installer.py install\n"
+        "       mosdns_installer.py uninstall [--purge]\n"
+        "       mosdns_installer.py emergency-rollback\n"
     )
 
 
@@ -3222,8 +4261,8 @@ def _run_preflight(root: Path, run: CommandRunner) -> int:
     return EXIT_OK
 
 
-def _run_install(root: Path, run: CommandRunner) -> int:
-    result = install(root, run)
+def _run_install(root: Path, run: CommandRunner, probe) -> int:
+    result = install(root, run, probe=probe)
     for note in result.notes:
         sys.stdout.write(f"note: {note}\n")
     if result.ok:
@@ -3276,8 +4315,62 @@ def _run_install(root: Path, run: CommandRunner) -> int:
     return EXIT_INSTALL_FAILED
 
 
-def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = Path("/")) -> int:
-    """Run ``preflight`` to report, or ``install`` to take the machine's DNS over.
+def _run_uninstall(root: Path, run: CommandRunner, purge: bool, probe) -> int:
+    result = uninstall(root, run, purge=purge, probe=probe)
+    if result.refusals:
+        # Nothing was changed, so the whole of the output is the refusal and the
+        # report. The reasons appear in both because the report has to stand alone
+        # -- it is the thing an operator pastes into a ticket, and a report that
+        # pointed at the lines above it would be useless there -- and the prefixed
+        # lines are what a script greps for.
+        for refusal in result.refusals:
+            sys.stderr.write(f"uninstall: {refusal}\n")
+        sys.stderr.write(f"{result.manual_recovery}\n")
+        return EXIT_OWNERSHIP_REFUSED
+    # What happened to the state directory is printed FIRST, and the notes after
+    # it, so the last line of the output is the verdict on the machine rather than
+    # a note about a directory. The two facts are equally true and only one of
+    # them is what an operator who reads only the last line needs to know.
+    if result.purged:
+        sys.stdout.write(
+            f"uninstall: {STATE_DIRECTORY} and everything in it has been removed, and nothing "
+            f"else under /etc was touched; the backup that was in it said what this connection was "
+            "set to, and it is now gone\n"
+        )
+    else:
+        sys.stdout.write(
+            f"uninstall: {STATE_DIRECTORY} was kept, including {BACKUP_PATH} and the marker, "
+            "because --purge was not asked for; a machine with no marker is a machine a later "
+            "install will treat as somebody else's\n"
+        )
+    for note in result.notes:
+        sys.stdout.write(f"uninstall: {note}\n")
+    if result.error:
+        sys.stderr.write(f"uninstall: {result.error}\n")
+    if not result.ok:
+        sys.stderr.write(f"{result.manual_recovery}\n")
+        return EXIT_RESTORE_INCOMPLETE
+    return EXIT_OK
+
+
+def _run_emergency_rollback(root: Path, run: CommandRunner, probe) -> int:
+    result = emergency_rollback(root, run, probe=probe)
+    for note in result.notes:
+        sys.stdout.write(f"rollback: {note}\n")
+    if not result.ok:
+        sys.stderr.write(f"rollback: {result.error}\n")
+        sys.stderr.write(f"{result.manual_recovery}\n")
+        return EXIT_RESTORE_INCOMPLETE if result.restored else EXIT_OWNERSHIP_REFUSED
+    return EXIT_OK
+
+
+def main(
+    argv: Sequence[str],
+    run: Optional[CommandRunner] = None,
+    root: Path = Path("/"),
+    probe=None,
+) -> int:
+    """Run ``preflight`` to report, or one of the three verbs that change the machine.
 
     Two verbs rather than one verb and a flag, because the difference between
     reporting a problem and changing the machine is the difference this program
@@ -3286,15 +4379,19 @@ def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = 
     changes a machine's DNS and puts it back if anything goes wrong.
 
     ``--check-only`` is accepted for ``preflight`` and is not a flag in disguise: it
-    names the only mode that verb has.
+    names the only mode that verb has. ``--purge`` is the only flag ``uninstall``
+    takes and it is a separate verb's worth of decision -- whether the operator's
+    data goes -- rather than a detail, so a repeated ``--purge`` is a usage error
+    rather than a second permission.
 
-    ``run`` and ``root`` are the same two seams :func:`preflight` and :func:`install`
-    have, and they are named in the other order here: :func:`preflight` takes
-    ``(root, run)`` and this takes ``(argv, run, root)``, so ``root`` is passed along
-    positionally by name rather than by position. A command whose root could not be
-    pointed elsewhere could only be tested against the machine it ran on, and a test
-    here that read the host's NetworkManager, ports and ``/etc/resolv.conf`` would be
-    a test of the host wearing a test's name.
+    ``run``, ``root`` and ``probe`` are the three seams :func:`preflight`,
+    :func:`install`, :func:`uninstall` and :func:`emergency_rollback` have, and they
+    are named here in the other order from :func:`preflight`, which takes
+    ``(root, run)``. A command whose root could not be pointed elsewhere could only
+    be tested against the machine it ran on, and a test here that read the host's
+    NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the host
+    wearing a test's name. ``probe`` is here for the same reason and one more: a
+    DNS query is a real request to a real resolver, and the last two verbs ask one.
     """
     arguments = list(argv)
     if arguments[:1] == ["preflight"]:
@@ -3303,6 +4400,16 @@ def main(argv: Sequence[str], run: Optional[CommandRunner] = None, root: Path = 
             return EXIT_USAGE
         return _run_preflight(root, run or RealCommandRunner())
     if arguments == ["install"]:
-        return _run_install(root, run or RealCommandRunner())
+        return _run_install(root, run or RealCommandRunner(), probe)
+    if arguments[:1] == ["uninstall"]:
+        purge = False
+        for argument in arguments[1:]:
+            if argument != "--purge" or purge:
+                sys.stderr.write(f"{_usage()}\n")
+                return EXIT_USAGE
+            purge = True
+        return _run_uninstall(root, run or RealCommandRunner(), purge, probe)
+    if arguments == ["emergency-rollback"]:
+        return _run_emergency_rollback(root, run or RealCommandRunner(), probe)
     sys.stderr.write(f"{_usage()}\n")
     return EXIT_USAGE
