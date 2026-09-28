@@ -357,10 +357,9 @@ fi
 # A FAILING ENABLE IS REPORTED AND NOT FATAL, and that is a decision rather than an
 # oversight. This step is below the transaction, so reaching it means the machine's
 # DNS was taken over successfully, the daemons are serving, and the marker is
-# written: everything `postinst` is for has happened. Under this script's own `set
-# -e` a failing `enable` would end the script non-zero, and dpkg's answer to a
-# non-zero `postinst configure` is to record the package unpacked-but-UNCONFIGURED --
-# so a machine with a working resolver, a marker and a running transaction would be
+# written: everything `postinst` is for has happened. dpkg's answer to a non-zero
+# `postinst configure` is to record the package unpacked-but-UNCONFIGURED -- so a
+# machine with a working resolver, a marker and a running transaction would be
 # reported as a broken install, `apt` would offer `dpkg --configure`, and that runs
 # the whole transaction again. Reporting a successful install as a failure is the
 # defect `88bc2af` shipped, and it is the same defect wearing the opposite sign.
