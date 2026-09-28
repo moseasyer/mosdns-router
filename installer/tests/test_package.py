@@ -959,6 +959,46 @@ def postinst_transaction_run(status, second_argument=None, systemd_running=True,
     return completed, calls
 
 
+def postinst_status_arms_findings(text=None):
+    """``(arms, findings)`` for `postinst`'s arms on the installer's exit status.
+
+    `numeric_case_arms` reads a `case` and answers `{}` for anything else without
+    saying so, so a script whose status arms had been un-nested into an
+    `if`/`elif`/`else` chain -- the shape `88bc2af` shipped, and a shape a hand edit
+    takes -- left every test that asks for arm 4 to raise `KeyError: '4'`. A
+    `KeyError` is an ERROR in a suite and a FAILURE in nothing: a control aimed at
+    such a test sees a crash, not a verdict, and a crash is not a gate.
+
+    So the reader reports what it could not read, and a shape it does not understand
+    is a FINDING rather than an empty dictionary. The findings are the ones a
+    `case` reader genuinely cannot answer, and nothing else is invented here -- the
+    bodies themselves are read the same way they always were.
+    """
+    text = text if text is not None else POSTINST.read_text()
+    tail = postinst_transaction_tail(text)
+    arms = numeric_case_arms(tail)
+    findings = []
+    if not arms:
+        # Name the shape we can recognise, because "no arms" and "arms of a shape I
+        # cannot read" are different situations and only the first is a `case` bug.
+        if re.search(r'^\s*(?:el)?if\s+\[?\s*"?\$\{?install_status', tail, re.MULTILINE):
+            findings.append(
+                "postinst's status arms are an `if`/`elif` chain on the captured status rather "
+                "than a `case`, and no reader in this suite understands that shape: the arms are "
+                "read as nothing, so a test asking what the arm for a status says would report "
+                "an absent arm rather than the un-nesting that caused it"
+            )
+        else:
+            findings.append(
+                "postinst has no readable arms on the captured install status, so nothing can "
+                "ask what this script says about a status it does not know"
+            )
+    for status in ("1", "3", "4", "5", "6", "*"):
+        if status not in arms and arms:
+            findings.append(f"postinst's status arms have no arm for {status}")
+    return arms, findings
+
+
 def postinst_status_arms(text=None):
     """``{status: body}`` for `postinst`'s arms on the installer's exit status.
 
@@ -970,10 +1010,15 @@ def postinst_status_arms(text=None):
     After the fix the arms live inside the `else` of `if "$INSTALLER" install`,
     which is `prerm`'s shape and the only one in which a successful run cannot
     reach them. `numeric_case_arms` does not care where they are, so neither does
-    this.
+    this -- but it does care WHAT SHAPE they are in, and a shape it cannot read is
+    raised as an `AssertionError` carrying the finding rather than returned as an
+    empty dictionary. `AssertionError` because that is what `assertMethodFails` and
+    every other gate in this suite can act on; an empty dictionary is not.
     """
-    text = text if text is not None else POSTINST.read_text()
-    return numeric_case_arms(postinst_transaction_tail(text))
+    arms, findings = postinst_status_arms_findings(text)
+    if findings:
+        raise AssertionError("; ".join(findings))
+    return arms
 
 
 # A line that OPENS a shell block, and a line that CLOSES one, for the walk in
@@ -1077,6 +1122,48 @@ def capture_closed_early(text):
     lines = text.splitlines(keepends=True)
     return "".join(
         lines[: capture + 1] + [moved] + lines[capture + 1 : closing] + lines[closing + 1 :]
+    )
+
+
+def arms_unnested_into_a_chain(text):
+    """`postinst` with its `case` on the install status turned into an `if`/`elif`/`else`.
+
+    The shape `88bc2af` shipped: the arms sit at the TOP LEVEL, outside the capture's
+    `fi`, each behind its own `-eq` test. Two edits rather than one, because the
+    un-nesting is not a change of punctuation -- a `case` cannot be un-nested while
+    it is still inside the `else`, so the `fi` moves too, which is
+    `capture_closed_early`.
+
+    It exists to demonstrate what a reader that only understands `case` does with a
+    shape it does not understand, and the result parses, so a gate that cannot read
+    it fails for the reason the gate is about rather than on a syntax error.
+    """
+    moved = capture_closed_early(text)
+    tail = postinst_transaction_tail(moved)
+    arms = numeric_case_arms(tail)
+    if not arms:
+        raise AssertionError(
+            "postinst's status arms are not a readable `case`, so there is nothing to un-nest "
+            "into a chain and this would be demonstrating nothing"
+        )
+    out, first = [], True
+    for label, body in arms.items():
+        if label == "*":
+            out.append("else\n" + body + "\n")
+            continue
+        out.append(
+            (f'if [ "$install_status" -eq {label} ]; then\n' if first
+             else f'elif [ "$install_status" -eq {label} ]; then\n') + body + "\n"
+        )
+        first = False
+    out.append("fi\n")
+    lines = tail.splitlines(keepends=True)
+    start = next(
+        index for index, line in enumerate(lines) if line.strip() == 'case "$install_status" in'
+    )
+    end = next(index for index, line in enumerate(lines) if line.strip() == "esac")
+    return moved.replace(
+        tail, "".join(lines[:start]) + "".join(out) + "".join(lines[end + 1:]), 1
     )
 
 
@@ -2986,7 +3073,13 @@ class MaintainerScriptTests(_Staged):
         # paragraph, so a rewrap cannot make this pass. `postinst_transaction_run`
         # below is the real gate; these two assertions are here because they say
         # WHAT each arm has to say, and the run only says WHICH arm was reached.
+        # `postinst_status_arms` RAISES on a shape it cannot read rather than
+        # answering `{}`, so a script that un-nested these arms into an `if`/`elif`
+        # chain fails here with the shape named instead of raising `KeyError` -- see
+        # `ControlTests.test_status_arms_un_nested_into_an_if_chain_are_reported`.
         arms = postinst_status_arms(text)
+        for status in ("3", "4"):
+            self.assertIn(status, arms, f"postinst has no arm for the installer's exit {status}")
         self.assertIn("no resolver", arms["4"].lower())
         self.assertIn("emergency-rollback", arms["4"])
         self.assertIn("do not assume", arms["4"].lower())
@@ -4335,6 +4428,40 @@ class ControlTests(unittest.TestCase):
         # about the SUCCESSFUL run. Asserting the second gate here would be asserting
         # something false -- and it was false, in the first draft of this control.
         self.assertNotEqual(opening, closing)
+
+    def test_status_arms_un_nested_into_an_if_chain_are_reported(self):
+        """The control for the READER, and for the reason it is the reader and not the
+        script that is at issue.
+
+        `postinst_status_arms` reads a `case`, and it used to answer `{}` for
+        anything else without a word -- so a script that un-nested the status arms
+        into an `if`/`elif`/`else` chain, which is the shape `88bc2af` shipped and a
+        shape a hand edit takes, turned every test that asks for an arm into a
+        `KeyError`. A `KeyError` is an ERROR, not a FAILURE: a control aimed at
+        `test_postinst_does_not_promise_the_daemons_are_still_running_behind_a_failed_rollback`
+        saw a crash rather than a verdict, and a crash is not a gate.
+
+        So the mutation here is the one that used to crash the gate, and the
+        assertion is that it is now a FAILURE -- which `assertMethodFails` can only
+        be if the raise is an `AssertionError` carrying the finding.
+        """
+        good = POSTINST.read_text()
+        broken = arms_unnested_into_a_chain(good)
+        self.assertNotEqual(broken, good, "the un-nesting changed nothing, so this is empty")
+        self.assertEqual(
+            shell_parses(broken).returncode, 0,
+            "the un-nested script does not parse, so it is not the shape being demonstrated",
+        )
+        # The reader names the shape rather than answering nothing.
+        arms, findings = postinst_status_arms_findings(broken)
+        self.assertEqual(arms, {}, "the reader read arms out of an if/elif chain")
+        self.assertEqual(len(findings), 1, f"expected one finding and got {findings}")
+        self.assertIn("if`/`elif` chain", findings[0])
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_does_not_promise_the_daemons_are_still_running_behind_a_failed_rollback",
+            postinst=broken,
+        )
 
     def test_a_status_capture_that_never_reads_the_transactions_status_is_reported(self):
         """The second control on the same gate, for a DIFFERENT defect in the same line.
