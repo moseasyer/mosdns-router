@@ -148,13 +148,20 @@ FORBIDDEN_SOURCE_TREE_ROOTS = ("/etc", "/run", "/var", "/sys")
 # escape in five spellings. `extra_args` is the hatch every later task reaches
 # for when something will not start, so the hatch is where the refusal lives.
 #
-# Keyed on the flag's NAME and the value it carries, because pflag accepts both
-# `--flag value` and `--flag=value` for a string flag, and because
+# Keyed on the flag's **canonical** NAME and the value it carries, because pflag
+# accepts both `--flag value` and `--flag=value` for a string flag, and because
 # `run_container` emits its own `--network <net>` before `extra_args` -- so the
 # last occurrence of a repeated flag is the one podman reads. A list of
 # `--flag=value` strings checked with `token == flag or token.startswith(flag +
 # "=")` refuses the equals form only, which is a check on a spelling rather than
 # on a policy.
+#
+# Canonical, because podman has *aliases*: `podman-run(1)` declares
+# `--network=mode, --net` in a single heading and pflag accepts either name, so
+# a table keyed on the name the documentation happens to lead with is a table
+# with a hole in it. The second spelling is in `PODMAN_FLAG_ALIASES` below and is
+# resolved by `canonical_flag_name` before this table is consulted, rather than
+# by a second key here -- see the note at that constant for why.
 FORBIDDEN_CONTAINER_FLAGS = {
     "--privileged": None,
     "--cgroupns": "host",
@@ -165,9 +172,35 @@ FORBIDDEN_CONTAINER_FLAGS = {
     "--userns": "host",
 }
 
-# The flag names alone, for a caller that wants to know which names are policed
-# without repeating the value table.
-FORBIDDEN_CONTAINER_FLAG_NAMES = tuple(sorted(FORBIDDEN_CONTAINER_FLAGS))
+# The other names podman has for a policed flag, as alias -> canonical name.
+#
+# **Keyed the other way round from the policy on purpose.** A second entry here
+# (`"--net": "host"`, beside `"--network": "host"`) would work, and it is the
+# change a reviewer would expect -- but it makes the policy table a mixture of
+# policies and vocabulary, and a later task that adds a policed flag has to know
+# that aliases exist and go and look for them. Keyed as alias -> canonical, the
+# policed table stays a statement of policy, the aliases stay a statement about
+# podman's spelling, and a flag added to the policy needs no second thought. The
+# table is closed against the policy in both directions by the suite, so an
+# entry pointing at a name nothing polices -- an entry that would refuse nothing
+# -- is a test failure rather than a silent no-op.
+#
+# Only *long* names are here. pflag's short form (`-v`, `-p`) and its two value
+# spellings (`--flag` / `--flag=value`) are not aliases: a short form is a
+# different token shape, and the guard reads the flag's name and the value that
+# flag carries, so both value spellings are already covered by construction.
+PODMAN_FLAG_ALIASES = {
+    "--net": "--network",
+}
+
+# The flag names a caller can see are policed: the canonical names and every
+# alias of one. Used, in `ContainerPolicyError`'s message, so the person who has
+# just been refused is told the whole set rather than only the one token they
+# typed -- `extra_args` is the hatch every later task reaches for, so the refusal
+# is the documentation.
+FORBIDDEN_CONTAINER_FLAG_NAMES = tuple(
+    sorted(set(FORBIDDEN_CONTAINER_FLAGS) | set(PODMAN_FLAG_ALIASES))
+)
 
 # Families refused outright, in both spellings, whatever the value. A device is
 # host hardware; a seccomp or apparmor override removes a layer of the boundary
@@ -203,6 +236,26 @@ ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")
 
 class PodmanError(RuntimeError):
     """A Podman command failed, was refused, or could not be built."""
+
+
+def canonical_flag_name(name: str) -> str:
+    """The policed name a flag spelling stands for, or the name unchanged.
+
+    Podman has aliases -- `podman-run(1)` declares `--network=mode, --net` in one
+    heading, and pflag accepts either name in either value spelling. The guard
+    below is keyed on the flag's *name*, so an alias that is not resolved first is
+    a policed flag under a name the table does not contain: `extra_args=["--net",
+    "host"]` lands after the wrapper's own `--network <net>`, `--network` is a
+    `stringArray`, and the target would end up on the bridge *and* on the host
+    network. Resolving here, once, is what makes the policed table a statement
+    about flags rather than about spellings.
+
+    Idempotent, so a caller may normalise defensively without a loop, and total on
+    the names this harness emits: anything podman does not alias -- `--ip`,
+    `--hostname`, a short form, a value -- is returned unchanged, which is what
+    keeps the ordinary `extra_args` of a real scenario passing.
+    """
+    return PODMAN_FLAG_ALIASES.get(name, name)
 
 
 class PodmanTimeout(PodmanError):
@@ -532,6 +585,15 @@ class Podman:
         `--cap-add=ALL` of its own would be caught by this case, and the flag
         set it is allowed to emit is asserted as literals in `ArgumentArrayTest`.
 
+        A flag's *name* is canonicalised before the table is consulted, so an
+        alias pflag accepts reaches the policy it belongs to. `--net` is the one
+        podman documents (`podman-run(1)`: `.SS --network=mode, --net`) and it is
+        the shape of the hazard: it lands after the wrapper's own
+        `--network <net>`, `--network` is a `stringArray`, and the target would end
+        up on the bridge *and* on the host network. `tests/podman/tests/
+        test_podman_flags.py` derives the set of aliases from podman's own
+        documentation, so the next alias is a case failure rather than a review.
+
         It also examines every token rather than skipping each flag's value, and
         that is the safe direction. Skipping a value means trusting that the
         token after `--privileged` is a value; not skipping it means a token
@@ -570,14 +632,27 @@ class Podman:
                         f"to every capability)"
                     )
                 continue
-            if name in FORBIDDEN_CONTAINER_FLAGS:
-                forbidden_value = FORBIDDEN_CONTAINER_FLAGS[name]
+            # Canonicalised before the lookup, so `--net` reaches the `--network`
+            # policy instead of missing it. Both value spellings are already
+            # covered -- `value` is the inline one or the next token -- and this
+            # is the part that covers the *other name* for the same flag.
+            policed = canonical_flag_name(name)
+            if policed in FORBIDDEN_CONTAINER_FLAGS:
+                forbidden_value = FORBIDDEN_CONTAINER_FLAGS[policed]
                 if forbidden_value is None or value == forbidden_value:
+                    alias_note = (
+                        f" {name} is podman's alias for {policed}, so this is the same flag "
+                        f"under the other name pflag accepts -- refusing it here is not a "
+                        f"quirk of this harness."
+                        if policed != name
+                        else ""
+                    )
                     violations.append(
-                        f"{token!r} (a target container may not be given the host it runs on. "
-                        f"The measured flag set is --systemd=always --cgroupns=private with "
-                        f"{', '.join(ALLOWED_CAPABILITIES)}, and no privilege or host-namespace "
-                        f"flag)"
+                        f"{token!r} (a target container may not be given the host it runs on."
+                        f"{alias_note} The measured flag set is --systemd=always "
+                        f"--cgroupns=private with {', '.join(ALLOWED_CAPABILITIES)}, and no "
+                        f"privilege or host-namespace flag. The policed names are "
+                        f"{', '.join(FORBIDDEN_CONTAINER_FLAG_NAMES)})"
                     )
         if violations:
             raise ContainerPolicyError(

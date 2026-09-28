@@ -57,7 +57,9 @@ sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
 
 from podman import (  # noqa: E402
     FORBIDDEN_CONTAINER_FLAG_FAMILIES,
+    FORBIDDEN_CONTAINER_FLAG_NAMES,
     FORBIDDEN_CONTAINER_FLAGS,
+    PODMAN_FLAG_ALIASES,
     ALLOWED_CAPABILITIES as ALLOWED_CAPS,
     CleanupFailed,
     ContainerPolicyError,
@@ -68,6 +70,7 @@ from podman import (  # noqa: E402
     PodmanTimeout,
     RunResources,
     assert_networkmanager_manages_device,
+    canonical_flag_name,
     new_run_id,
     podman_session,
 )
@@ -1397,6 +1400,15 @@ FORBIDDEN_EXTRA_ARGS = (
     (["--privileged", "--device=/dev/kvm"], "--device"),
     (["--cgroupns=host", "--cap-add=ALL", "--pid", "host"], "--pid"),
     (["--network", "host", "--ipc=host", "--uts=host", "--userns", "host"], "--userns"),
+    # `--net`, which `podman-run(1)` lists in its own `.SS --network=mode, --net`
+    # heading and pflag accepts, in both spellings, in any position. These two
+    # rows are about the *alias*, not the spelling: each is placed after a legal
+    # flag, because the property is that an alias arriving after a legal flag is
+    # still policed. A second key in the policed table with the value spelled out
+    # would have covered the equals form and left the space form open -- which is
+    # the defect Fix Round 1 already had to fix once for `--network` itself.
+    (["--ip", "10.89.0.10", "--net=host"], "--net"),
+    (["--hostname", "mosdns-target", "--net", "host"], "--net"),
 )
 
 
@@ -1428,7 +1440,7 @@ class ContainerPolicyTest(PodmanTestCase):
         return str(caught.exception)
 
     def test_every_forbidden_extra_argument_is_refused_in_every_spelling(self):
-        """The sweep: forty-eight cases, one refusal each, each naming its own flag.
+        """The sweep: fifty cases, one refusal each, each naming its own flag.
 
         The count is asserted so the table cannot be quietly shortened -- a
         guard with fewer cases in it than the family has spellings is a guard
@@ -1436,7 +1448,7 @@ class ContainerPolicyTest(PodmanTestCase):
         written in the same shape as the mount sweep: a table of cases, each
         one refusing, so a family added to the policy has to be added here too.
         """
-        self.assertEqual(len(FORBIDDEN_EXTRA_ARGS), 48)
+        self.assertEqual(len(FORBIDDEN_EXTRA_ARGS), 50)
         for extra_args, named in FORBIDDEN_EXTRA_ARGS:
             with self.subTest(extra_args=extra_args):
                 self.assertIn(named, self.refused(extra_args))
@@ -1518,6 +1530,126 @@ class ContainerPolicyTest(PodmanTestCase):
         message = self.refused(["--network", "host"])
         self.assertIn("--network", message)
         self.assertIn("host", message)
+
+    def test_the_documented_alias_of_a_policed_flag_is_policed_too(self):
+        """`--net` is `--network`. A guard keyed on one name does not see it.
+
+        `podman-run(1)` lists the pair in a single heading --
+        `.SS --network=mode, --net` -- and pflag accepts either spelling, so
+        `extra_args=["--net", "host"]` is a host-namespace request that reaches
+        the target through a *name* the policed table did not contain. It lands
+        after the wrapper's own `--network <net>` and `--network` is a
+        `stringArray`, so the target would end up on both the bridge and the
+        host network.
+
+        The alias is held, not the two value spellings: the equals form and the
+        space form are both refused, and each is refused when it arrives *after*
+        a legal flag, which is where `extra_args` puts everything.
+        """
+        for spelling in (["--net=host"], ["--net", "host"]):
+            with self.subTest(spelling=spelling):
+                message = self.refused(["--hostname", "mosdns-target", *spelling])
+                # The token the operator typed is in the message, and so is the
+                # name the policy is written against: a reader who has never seen
+                # the alias has to learn from the refusal that they are the same
+                # flag, or the next thing they try is `--network host`.
+                self.assertIn("--net", message)
+                self.assertIn("--network", message)
+                self.assertIn("alias", message)
+
+    def test_an_alias_of_a_policed_flag_does_not_police_its_value(self):
+        """`--net mosdns-testnet` is a legal flag with a legal value.
+
+        The failure mode of a fix for the alias hole is to blacklist the *name*,
+        which would refuse the alias in every position and so break the first
+        thing a later scenario does -- put a target on a network by its alias.
+        The property is that the value is judged, not the spelling of the name,
+        so this holds the legal case as firmly as the refused one.
+        """
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+            extra_args=["--net", "mosdns-testnet"],
+        )
+        self.assertIn("mosdns-testnet", fake.only())
+
+    def test_a_flag_name_is_canonicalised_before_the_policed_lookup(self):
+        """The normalisation is one function, and it is idempotent.
+
+        Deriving the policed names from one declaration is what keeps the alias
+        table from becoming a second list that drifts: a policed name is written
+        once, and every spelling that reaches it goes through this function. The
+        second property is that canonicalising an already-canonical name is a
+        no-op, so a caller may normalise defensively without a loop.
+        """
+        self.assertEqual(canonical_flag_name("--net"), "--network")
+        self.assertEqual(canonical_flag_name("--network"), "--network")
+        # Idempotent on the canonical names, which are the policed ones; an
+        # alias's whole job is to *change* the name, so demanding otherwise of
+        # `--net` would be demanding the bug.
+        for name in FORBIDDEN_CONTAINER_FLAGS:
+            self.assertEqual(canonical_flag_name(name), name)
+        # And the derived name set is the policed names plus the aliases, so
+        # nothing else is advertised as policed and no alias is left out of the
+        # set a refusal prints.
+        self.assertEqual(
+            set(FORBIDDEN_CONTAINER_FLAG_NAMES),
+            set(FORBIDDEN_CONTAINER_FLAGS) | set(PODMAN_FLAG_ALIASES),
+        )
+        # An unpoliced flag is untouched, which is what keeps the ordinary
+        # extra arguments of `test_an_ordinary_extra_argument_is_still_allowed`
+        # passing rather than making the normalisation a closed door.
+        for name in ("--ip", "--hostname", "--dns", "--env", "--add-host", "--tmpfs"):
+            self.assertEqual(canonical_flag_name(name), name)
+
+    def test_the_alias_table_cannot_name_a_flag_nothing_policies(self):
+        """An alias pointing at an unpoliced name is a silent no-op.
+
+        The alias table is keyed alias -> canonical name, and the policed table is
+        keyed canonical name -> refused value. Nothing in the types stops a
+        contributor adding `{"--ns": "--namespace"}` when both names are
+        policed *in their own right* in some later Podman, which would make the
+        entry a spelling of a policy while the two tables disagree. So the table
+        is closed against the policed set in both directions, and it is
+        `FORBIDDEN_CONTAINER_FLAG_NAMES` -- the derivation the refusal message
+        prints -- that is held to it.
+        """
+        policed = set(FORBIDDEN_CONTAINER_FLAGS)
+        self.assertTrue(policed, "the policed set cannot be empty")
+        for alias, canonical in PODMAN_FLAG_ALIASES.items():
+            with self.subTest(alias=alias):
+                self.assertIn(
+                    canonical,
+                    policed,
+                    f"{alias!r} canonicalises to {canonical!r}, which no policy governs, so "
+                    f"the entry refuses nothing",
+                )
+                # And it is not a *second* key for a name already policed: a
+                # policed name reached through two table rows is the shape that
+                # made the count of policed spellings meaningless in Fix Round 1.
+                self.assertNotIn(alias, policed)
+        # The printed set is the policed names and their aliases, and nothing
+        # else -- so what a refusal tells the reader to avoid is exactly what
+        # the lookup consults.
+        self.assertEqual(
+            set(FORBIDDEN_CONTAINER_FLAG_NAMES),
+            policed | set(PODMAN_FLAG_ALIASES),
+        )
+
+    def test_the_refusal_names_the_whole_policed_set(self):
+        """`FORBIDDEN_CONTAINER_FLAG_NAMES` is used, not decoration.
+
+        It was declared as "the names alone, for a caller that wants to know
+        which names are policed" and no caller wanted to know. The caller that
+        wants to know is the person who has just been refused, in a harness where
+        `extra_args` is the hatch every later task reaches for -- so the refusal
+        prints the set, and a case holds that it is the set and not a summary.
+        """
+        message = self.refused(["--net", "host"])
+        for name in FORBIDDEN_CONTAINER_FLAG_NAMES:
+            self.assertIn(name, message)
 
     def test_every_violation_in_one_array_is_named(self):
         """The scan does not return on the first thing it finds.
