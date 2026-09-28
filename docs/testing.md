@@ -60,6 +60,7 @@ tests/podman/images/target.Containerfile        the target: systemd, NetworkMana
 tests/podman/images/target-entrypoint.sh        its PID 1: the resolver, then systemd
 tests/podman/images/target-nm-setup.sh          the NetworkManager sequence and its boot check
 tests/podman/images/target-nm-setup.service     the unit that runs it once, at boot
+tests/podman/images/10-mosdns-target.conf        declares eth0 managed, on every release
 tests/podman/images/mock-router.Containerfile   dnsmasq, serving DHCP and DNS
 tests/podman/images/mock-cdn.Containerfile      the CDN server, built from this module
 tests/podman/images.lock.json                   the three digests, and how each was read
@@ -146,36 +147,83 @@ give, and no snapshot at all is indistinguishable from no change.
 
 ## The measured fact the whole plan turns on, on all three releases
 
-**`GENERAL.NM-MANAGED` is `yes` on 24.04 and 26.04, and cannot be made `yes` on
-22.04.** Measured in this session, on the images this repository builds, on a
-netavark bridge network, with the flag set the wrapper emits:
+**A target's `eth0` is managed on 22.04, 24.04 and 26.04, on a netavark bridge
+network, out of the locked images in this repository.** Measured by building
+`target.Containerfile` at each locked digest and running it with the flag set the
+wrapper emits:
 
-| release | NetworkManager | on a bridge, no setup | the three steps | device type |
-|---|---|---|---|---|
-| 22.04 | 1.36.6 | `no` | **still `no`** | `ethernet` |
-| 24.04 | 1.46.0 | `yes` | `yes` | `ethernet` |
-| 26.04 | 1.54.3 | `yes` | `yes` | `ethernet` |
+| release | nmcli | `GENERAL.NM-MANAGED` | `GENERAL.TYPE` | `GENERAL.STATE` | active connection | profile | unit | failed units |
+|---|---|---|---|---|---|---|---|---|
+| 22.04 | 1.36.6 | **`yes`** | `ethernet` | `100 (connected (externally))` | `eth0` | `eth0-managed` present | active | 0 |
+| 24.04 | 1.46.0 | **`yes`** | `ethernet` | `100 (connected (externally))` | `eth0` | `eth0-managed` present | active | 0 |
+| 26.04 | 1.54.3 | **`yes`** | `ethernet` | `100 (connected (externally))` | `eth0` | `eth0-managed` present | active | 0 |
 
-The 22.04 result is a version difference, not a container limitation, and it is
-worth knowing precisely because it looks like the plan's premise failing:
+### Two mechanisms, and which one applies
 
-- `nmcli device set eth0 managed yes` is **accepted** — the audit log records
-  `op="device-managed" … result="success"` — and has **no effect**: with or
-  without a connection profile, with or without the restart.
-- The file under `/run/NetworkManager/devices/` is created but gets **no
-  `managed=true` key**. On 24.04 and 26.04 it does get one, which is what the
-  restart re-reads.
-- So NetworkManager 1.36 has no persistent device override, and the sequence the
-  plan's architecture note is built on cannot work on it.
+**1. The declaration, which is the baseline on every release.** NetworkManager
+ships `/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf` containing
 
-A 22.04 target therefore **refuses to boot**, with the observed value, the missing
-profile fact, and its own `nmcli --version` in the message. That is deliberate: a
-target that came up unmanaged would fail every scenario for a reason that has
-nothing to do with the package. The one mechanism that does work on 22.04 — a
-`NetworkManager.conf.d` entry excepting `eth0` from the default
-`unmanaged-devices=*` — is **not** used, because the plan forbids forcing this
-from configuration; see the report for the measurement and the decision that
-belongs to the plan, not to a build.
+```ini
+[keyfile]
+unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma
+```
+
+so every non-radio device is unmanaged unless something says otherwise. The
+target image ships one file,
+`/etc/NetworkManager/conf.d/10-mosdns-target.conf`, which **narrows that list**
+with `except:interface-name:eth0` — NetworkManager's own documented key for "this
+device is handled by NetworkManager even when it would not otherwise be". It works
+on all three releases, and on 22.04 it is the only mechanism that does.
+`[ifupdown] managed=true` was also measured and does **not** work on 22.04.
+
+**2. The sequence, which works only from NetworkManager 1.44.** With a connection
+profile present, measured across five releases:
+
+| release | nmcli | `nmcli device set … managed yes` + restart |
+|---|---|---|
+| 22.04 | 1.36.6 | `no` — accepted, and changes nothing |
+| 23.04 | 1.42.4 | `no` — same |
+| 23.10 | 1.44.2 | `yes` |
+| 24.04 | 1.46.0 | `yes` |
+| 26.04 | 1.54.3 | `yes` |
+
+The boundary is **1.44**, and the two sides are adjacent releases, so nothing is
+excused in between. The target image therefore **runs the sequence only where the
+override exists** and skips it below 1.44, naming the version it found. On 22.04
+the journal says so:
+
+```text
+target-nm-setup: this NetworkManager (nmcli tool, version 1.36.6) has no
+target-nm-setup: persistent device override, so 'nmcli device set eth0 managed
+target-nm-setup: yes' would be accepted and would change nothing, and no restart could
+target-nm-setup: re-read it. Skipping both; the managed state comes from the conf.d
+target-nm-setup: declaration, and the check below is what decides whether it took effect.
+```
+
+The discriminator is **the field, not the file**. On 22.04
+`/run/NetworkManager/devices/<ifindex>` *does* grow a `managed=true` key once the
+device is managed — but that is NetworkManager recording state it already has. With
+the declaration removed, the command is accepted, the restart happens, the field
+stays `no`, and no key appears at all. A check that read the file would have been
+reading a consequence.
+
+### The boot check is what keeps the declaration honest
+
+The declaration is a file, and a file can be written, read, and not take effect. So
+the setup script **asserts** `GENERAL.NM-MANAGED: yes` after the sequence and
+refuses to boot when it is not — with the observed value, the declaration's path,
+and the `nmcli --version` it found. A case runs the script with a declaration that
+is present and *ignored* and requires a non-zero exit, with a control that a
+managed device passes on the observed field alone.
+
+### The active connection is NetworkManager's own
+
+**`eth0`, not `eth0-managed`, on all three releases.** The bridge gave the
+interface its address outside NetworkManager, so NM activated a profile it created
+for itself. `eth0-managed` exists and is the profile the plan's Task 3 modifies,
+but it is *not* the active connection until something activates it. A DHCP
+scenario that reads the active connection before that will report a lease
+belonging to a different profile.
 
 ## Prerequisites
 
@@ -234,12 +282,11 @@ NetworkManager over D-Bus, and before `/sbin/init` there is no bus to connect to
 — measured, with an entrypoint that tried: `Error: Could not create NMClient
 object: Could not connect: No such file or directory`.
 
-**On 22.04 these three do not work, and nothing in the sequence can change that.**
-NetworkManager 1.36 has no persistent device override: step 2 is accepted and has
-no effect, `/run/NetworkManager/devices/` gets no `managed=true` key, and the
-field stays `no`. See the table above — the details matter because a `no` on
-22.04 is a different fact from a `no` on 24.04, and the boot message says which
-version it found.
+**On 22.04 these three do not work**, because NetworkManager 1.36 has no
+persistent device override: step 2 is accepted, the audit log records success, and
+the field stays `no` after the restart. The image therefore **skips them there**
+and gets `yes` from the `conf.d` declaration instead, which is why the table above
+shows 22.04 coming up managed. See "Two mechanisms, and which one applies".
 
 The harness **asserts** `nmcli -g GENERAL.NM-MANAGED device show eth0` is
 `yes` on a running target before the first scenario runs, and refuses with a
