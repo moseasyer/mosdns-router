@@ -983,6 +983,25 @@ class MockCdnContainerfileTest(unittest.TestCase):
         checkout, made by a command whose job is to change nothing.
         """
         self.assertIn("-mod=readonly", read(MOCK_CDN_CONTAINERFILE))
+
+
+def containerfiles(directory: Path | None = None) -> list[Path]:
+    """Every Containerfile in the images directory, sorted.
+
+    **Discovered, not listed.** The first version of the availability check named
+    two of the three files, and its own docstring said "every package the three
+    Containerfiles install" -- so the one it left out was the one carrying
+    `caddy`, which does not exist on 22.04, and the check written to catch exactly
+    that could not see it. A hand-maintained list of the files to check is a
+    fourth thing that can drift from the three that exist, and it drifts silently:
+    a Containerfile added in a later task is checked by nobody.
+
+    Discovered by glob, so a new image joins the set the moment it is written. The
+    control below is what makes that a claim rather than a hope.
+    """
+    return sorted((directory or IMAGES).glob("*.Containerfile"))
+
+
 class ResolverPackageAvailabilityTest(unittest.TestCase):
     """Defect 1, made structural: a package that exists on only some releases.
 
@@ -1022,24 +1041,6 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
 
     def locked_versions(self) -> list[str]:
         return sorted(images.load_lock(LOCK)["images"])
-
-
-def containerfiles(directory: Path | None = None) -> list[Path]:
-    """Every Containerfile in the images directory, sorted.
-
-    **Discovered, not listed.** The first version of the availability check named
-    two of the three files, and its own docstring said "every package the three
-    Containerfiles install" -- so the one it left out was the one carrying
-    `caddy`, which does not exist on 22.04, and the check written to catch exactly
-    that could not see it. A hand-maintained list of the files to check is a
-    fourth thing that can drift from the three that exist, and it drifts silently:
-    a Containerfile added in a later task is checked by nobody.
-
-    Discovered by glob, so a new image joins the set the moment it is written. The
-    control below is what makes that a claim rather than a hope.
-    """
-    return sorted((directory or IMAGES).glob("*.Containerfile"))
-
     def test_it_checks_every_containerfile_in_the_images_directory(self):
         """The set is discovered, and the control shows a new file joins it.
 
@@ -1160,6 +1161,8 @@ def containerfiles(directory: Path | None = None) -> list[Path]:
             f"table covers are {known}, and the resolver integration has to be libnss-resolve -- "
             f"the name that exists on all three releases",
         )
+
+
 class SetupUnitTest(unittest.TestCase):
     """The systemd unit that runs the sequence once, at boot.
 
@@ -2088,6 +2091,66 @@ class ImageDigestVerificationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class ImageHandsOverToSystemdTest(unittest.TestCase):
+    """The image's own boot path: entrypoint, and where the sequence runs.
+
+    These three are about the *image's files* rather than about what the setup
+    script does when it runs, so they do not need the modelled `nmcli` and
+    `systemctl` at all -- and they were here by accident, inheriting the harness
+    below for nothing.
+
+    They were in the wrong class for a second reason that is the one this file's
+    suite-shape guard now refuses: `SetupScriptTestCase` has three subclasses, and
+    a case in a base runs once per subclass. So each of these ran four times, under
+    four different sets of dials, while the base's own docstring said the cases were
+    not inherited. The dials do not reach this far -- the assertions read files and
+    never call `run_setup` -- which is exactly why the duplication was invisible and
+    why the run count alone could not have found it.
+    """
+
+    def test_the_entrypoint_hands_over_to_systemd(self):
+        """`exec` into the init, so it becomes PID 1.
+
+        Without the `exec`, the shell stays PID 1 and systemd is a child, which
+        is the shape that makes `--systemd=always` a no-op: a target whose units
+        systemd "started" are not managed by a PID 1 systemd at all, and
+        `systemctl` answers to the child.
+        """
+        text = read(ENTRYPOINT)
+        self.assertRegex(text, r"exec\s+/sbin/init|exec\s+.*init")
+
+    def test_the_entrypoint_does_not_perform_the_sequence_itself(self):
+        """The sequence runs once, from systemd, and not twice.
+
+        An entrypoint that also ran the three steps would do them before
+        `/sbin/init` exists -- before there is a D-Bus for `nmcli` to talk to.
+        Measured in this session, on the real image, for the entrypoint that
+        tried: `Error: Could not create NMClient object: Could not connect: No such
+        file or directory`, and `GENERAL.NM-MANAGED` stayed `no`.
+
+        The case reads the entrypoint's **instructions**, not its text: the file
+        quotes that error and names all three commands in the comment explaining
+        why it does not run them, and a case that read the prose would fail on
+        the explanation.
+        """
+        instructions = " ".join(shell_statements(ENTRYPOINT))
+        for command in ("nmcli", "systemctl", "device set", "connection add"):
+            with self.subTest(command=command):
+                self.assertNotIn(command, instructions)
+
+    def test_the_setup_is_installed_as_a_unit_the_image_enables(self):
+        """The sequence is part of the image's boot, not of a scenario.
+
+        A sequence a scenario ran would leave the window where the target is
+        unmanaged open to the first scenario, and the plan's whole correction --
+        that the profile must exist *before* the steps -- only holds if the steps
+        run once, at boot, in order.
+        """
+        text = read(TARGET_CONTAINERFILE)
+        self.assertIn("target-nm-setup.service", text)
+        self.assertRegex(text, r"systemctl\s+enable\s+.*target-nm-setup")
+
+
 class SetupScriptTestCase(unittest.TestCase):
     """A real `sh`, a model of `nmcli` and `systemctl`, and a trace to read.
 
@@ -2096,10 +2159,17 @@ class SetupScriptTestCase(unittest.TestCase):
     is the load-bearing measured fact of this plan and a case that only found the
     words in a file would not notice them in the wrong order.
 
-    Three classes use it and they ask different questions of the same script, so
-    the harness is here and the cases are not inherited: an ordering question and a
+    Three classes use it and they ask different questions of the same script, so the
+    harness is here and the cases are not inherited: an ordering question and a
     version-gate question have opposite dials, and inheriting would run each case
-    twice, once under dials that make it vacuous.
+    once per subclass, under dials that make it vacuous.
+
+    **It carries no cases, and that is a rule rather than a habit.** A base that
+    declares a case has it run once per subclass, so three cases in a base with three
+    subclasses run nine times more than they were written -- and this class did
+    exactly that until `test_no_class_in_this_tree_silently_inherits_a_class_that_carries_cases`
+    in `test_suite_shape.py` reported it. The three cases that were here read the
+    image's files and needed no harness; they are `ImageHandsOverToSystemdTest` now.
     """
 
     # -- a model of the two tools -------------------------------------------
@@ -2410,49 +2480,7 @@ exit 64
         ]
         return self._write_variant(statements, "dropped")
 
-    # -- the entrypoint the image runs ----------------------------------------
 
-    def test_the_entrypoint_hands_over_to_systemd(self):
-        """`exec` into the init, so it becomes PID 1.
-
-        Without the `exec`, the shell stays PID 1 and systemd is a child, which
-        is the shape that makes `--systemd=always` a no-op: a target whose units
-        systemd "started" are not managed by a PID 1 systemd at all, and
-        `systemctl` answers to the child.
-        """
-        text = read(ENTRYPOINT)
-        self.assertRegex(text, r"exec\s+/sbin/init|exec\s+.*init")
-
-    def test_the_entrypoint_does_not_perform_the_sequence_itself(self):
-        """The sequence runs once, from systemd, and not twice.
-
-        An entrypoint that also ran the three steps would do them before
-        `/sbin/init` exists -- before there is a D-Bus for `nmcli` to talk to.
-        Measured in this session, on the real image, for the entrypoint that
-        tried: `Error: Could not create NMClient object: Could not connect: No such
-        file or directory`, and `GENERAL.NM-MANAGED` stayed `no`.
-
-        The case reads the entrypoint's **instructions**, not its text: the file
-        quotes that error and names all three commands in the comment explaining
-        why it does not run them, and a case that read the prose would fail on
-        the explanation.
-        """
-        instructions = " ".join(shell_statements(ENTRYPOINT))
-        for command in ("nmcli", "systemctl", "device set", "connection add"):
-            with self.subTest(command=command):
-                self.assertNotIn(command, instructions)
-
-    def test_the_setup_is_installed_as_a_unit_the_image_enables(self):
-        """The sequence is part of the image's boot, not of a scenario.
-
-        A sequence a scenario ran would leave the window where the target is
-        unmanaged open to the first scenario, and the plan's whole correction --
-        that the profile must exist *before* the steps -- only holds if the steps
-        run once, at boot, in order.
-        """
-        text = read(TARGET_CONTAINERFILE)
-        self.assertIn("target-nm-setup.service", text)
-        self.assertRegex(text, r"systemctl\s+enable\s+.*target-nm-setup")
 
     # -- the cases ------------------------------------------------------------
 

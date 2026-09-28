@@ -61,22 +61,41 @@ import sys
 import re
 import unittest
 from pathlib import Path
+from typing import Iterable
 
 TESTS_DIR = Path(__file__).resolve().parent
 
 
-def case_functions(body) -> list[tuple[str, int]]:
-    """Every `test_*` function defined directly in one scope, with its line.
+def case_functions(body, *, nested: bool = False) -> list[tuple[str, int]]:
+    """Every `test_*` function in one scope, with its line.
 
-    "Directly" is the important word: a nested function or a helper class is
-    not a case, and neither is a method of a class nested in a method.
+    **Nesting is followed, and the reason is a live defect.** This used to stop at
+    the immediate scope, and its docstring said a nested function "is not a case" --
+    which is true of what `unittest` collects and irrelevant to what the *source*
+    declares. The difference matters because the guard compares those two things: a
+    `def test_*` orphaned into a module-level function appeared in neither the
+    declared set nor the loaded set, the sets agreed, and the guard passed on a
+    **six-case loss** -- in `test_images.py`, the very file whose fix round had
+    created it. A source that declares a case nothing runs is the defect this whole
+    module exists for, and a detector that cannot see the declaration cannot find it.
+
+    So a `test_*` inside a `test_*`-less function is reported too, carrying the
+    **name of the function it is inside**. That is what makes the report actionable:
+    "containerfiles.test_x" says both what is wrong and where, where a bare name
+    would send a reader looking for a case that does not exist anywhere.
     """
-    return [
-        (node.name, node.lineno)
-        for node in body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test")
-    ]
+    found: list[tuple[str, int]] = []
+    for node in body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name.startswith("test"):
+            found.append((node.name, node.lineno))
+            continue
+        if nested:
+            continue
+        for name, lineno in case_functions(node.body, nested=True):
+            found.append((f"{node.name}.{name}", lineno))
+    return found
 
 
 def duplicate_case_names(source: str, origin: str) -> list[str]:
@@ -106,6 +125,28 @@ def duplicate_case_names(source: str, origin: str) -> list[str]:
                 )
             seen[name] = lineno
     return duplicates
+
+
+def declared_case_ids_in(tree: ast.Module, module_name: str) -> set[str]:
+    """Every case id `tree` declares, in exactly the shape `loaded_case_ids` uses.
+
+    Two shapes of id, and the difference between them is the whole point: a case in
+    a class is `module.Class.case`, and a case in a function is `module.function.case`
+    -- the same three components, so a case `unittest` cannot collect is a **difference**
+    in `declared - loaded` rather than a name in neither set. That is what went wrong:
+    `case_functions` stopped at the immediate scope, so six cases orphaned into a
+    module-level helper were in neither set, the sets agreed, and the equality below
+    passed on the loss. The dot is also what makes the report findable, because
+    `containerfiles.test_x` names the function the case is stuck inside.
+    """
+    ids = {f"{module_name}.{name}" for name, _ in case_functions(tree.body)}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            ids |= {
+                f"{module_name}.{node.name}.{method}"
+                for method, _ in case_functions(node.body)
+            }
+    return ids
 
 
 def declared_cases(path: Path) -> list[tuple[str, int]]:
@@ -187,12 +228,7 @@ def declared_case_ids(modules) -> set[str]:
     for module_name, module in modules.items():
         path = Path(module.__file__)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for name, _ in case_functions(tree.body):
-            ids.add(f"{module_name}.{name}")
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef):
-                for method, _ in case_functions(node.body):
-                    ids.add(f"{module_name}.{node.name}.{method}")
+        ids |= declared_case_ids_in(tree, module_name)
         # A base class defined in another module contributes its cases to the
         # subclasses that inherit them, so a module that imports a TestCase base
         # from elsewhere would otherwise look like it declared fewer than it
@@ -204,6 +240,45 @@ def declared_case_ids(modules) -> set[str]:
             for base in inherited_case_names(node, module):
                 ids.add(f"{module_name}.{node.name}.{base}")
     return ids
+
+
+# The escape hatch, and it is **empty on purpose**: a base class that has to carry
+# cases names itself here, and the case below turns an addition into a failure that
+# somebody has to look at.
+#
+# The obvious alternative -- exempting any class whose name ends in `TestCase`,
+# the convention this suite already uses for the four bases it has -- is exactly
+# the wrong opt-in, and this tree says so. `SetupScriptTestCase` ends in
+# `TestCase`, carried three cases, and is subclassed by three classes, so those
+# three cases ran nine extra times while its own docstring claimed "the cases are
+# not inherited". A name a base can end up with by accident cannot be the thing
+# that records a decision about it.
+DELIBERATE_CASE_BASES: frozenset[str] = frozenset()
+
+
+def inheriting_case_bases(
+    cases: dict[str, list[str]], bases: dict[str, list[str]]
+) -> list[tuple[str, str]]:
+    """(base, child) for every class inheriting another class's cases silently.
+
+    `cases` maps a class name to the case names it declares; `bases` maps a class
+    name to the names of its **direct** bases, so two classes in one module are
+    not inheritance. A (base, child) pair is reported when `child` really derives
+    from `base` and `base` **declares** a case -- which is the whole defect, since
+    `unittest` collects an inherited case once per subclass: a base with three
+    cases and three subclasses runs those cases nine times more than they were
+    written, and a failure is then a failure in three places under three sets of
+    dials.
+
+    Sorted, so a report does not depend on dictionary order.
+    """
+    reported: list[tuple[str, str]] = []
+    for child, parents in bases.items():
+        for base in parents:
+            if base != child and cases.get(base):
+                reported.append((base, child))
+    return sorted(reported)
+
 
 
 def inherited_case_names(node: ast.ClassDef, module) -> set[str]:
@@ -292,6 +367,227 @@ class SuiteShapeTest(unittest.TestCase):
                             f"first"
                         )
         self.assertEqual(shadowed, [], "a case is shadowed through inheritance:\n" + "\n".join(shadowed))
+
+    def test_a_case_nested_in_a_function_is_reported_as_a_loss(self):
+        """**Planted, then required to be caught.** The shape of this round's defect.
+
+        The source below is the real one: a module-level helper that ends with a
+        `return` and then defines six `test_*` functions underneath it, which is
+        what happened in `test_images.py` when a patch inserted the helper at column
+        zero inside a class body. The suite went on reporting `OK` and six cases
+        stopped running, so the *declared - loaded* difference was empty and the
+        guard was green.
+
+        Two halves, and the second is the one that would have caught it: the
+        detector **sees** the nested names, and the report **names the function they
+        are inside** -- a bare case name is a name a reader cannot find in the file.
+        """
+        planted = """
+def containerfiles(directory=None):
+    return sorted(directory.glob("*.Containerfile"))
+
+    def test_a_case_orphaned_into_a_helper(self):
+        assert True
+
+    def test_another_one_orphaned_with_it(self):
+        assert True
+
+
+class ResolverTest(unittest.TestCase):
+    def test_a_real_case(self):
+        assert True
+"""
+        found = declared_case_ids_in(ast.parse(planted, filename="planted.py"), "planted")
+        self.assertIn(
+            "planted.containerfiles.test_a_case_orphaned_into_a_helper", found,
+            "the detector does not see a case nested in a module-level function, so the "
+            "declared-minus-loaded equality is empty on a real six-case loss",
+        )
+        self.assertIn(
+            "planted.containerfiles.test_another_one_orphaned_with_it", found,
+            "the detector found one nested case and missed the other, so a partial "
+            "recovery would look complete",
+        )
+        # The real case is still found, under its own class -- so a case in a class
+        # and a case in a function come back in the same shape and one is a
+        # difference rather than neither.
+        self.assertIn("planted.ResolverTest.test_a_real_case", found)
+
+    def test_the_equality_reports_a_nested_case_as_declared_but_not_loaded(self):
+        """The same shape, through the equality the guard actually asserts.
+
+        A detector that finds the nested names is only half a fix: the guard's
+        assertion is `declared - loaded == set()`, so the nested names have to be in
+        `declared` and absent from `loaded` for the loss to surface. Computed here on
+        the planted source, with the loaded side supplied by the one real case.
+        """
+        planted_source = """
+def containerfiles():
+    return []
+
+    def test_orphaned(self):
+        assert True
+
+
+class RealCases(unittest.TestCase):
+    def test_the_real_one(self):
+        assert True
+"""
+        declared = declared_case_ids_in(
+            ast.parse(planted_source, filename="planted.py"), "planted"
+        )
+        loaded = {"planted.RealCases.test_the_real_one"}
+        self.assertEqual(
+            declared - loaded,
+            {"planted.containerfiles.test_orphaned"},
+            "a case nested in a function did not surface as a declared-but-not-loaded "
+            "difference, so the guard's equality is satisfied on a loss",
+        )
+
+    def test_this_tree_has_no_case_nested_in_a_function(self):
+        """The live check, over every discovered module rather than over a fixture.
+
+        The planted sources above prove the detector works. This is the one that
+        would have caught the real loss before a reviewer found it, and it is
+        deliberately an assertion about *this* tree: it is a gate, and a gate that
+        has never fired is a gate nobody knows works.
+        """
+        orphans: list[str] = []
+        for module_name, module in loaded_modules().items():
+            path = Path(module.__file__)
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for owner in [n for n in tree.body if isinstance(n, ast.FunctionDef)]:
+                for name, lineno in case_functions(owner.body, nested=True):
+                    orphans.append(
+                        f"{path.name}:{lineno} {name} is defined inside "
+                        f"{owner.name}(), so unittest never collects it"
+                    )
+        self.assertEqual(
+            orphans, [],
+            "a case is defined inside a function, where unittest cannot reach it:\n"
+            + "\n".join(orphans),
+        )
+
+    def test_a_class_carrying_cases_may_not_be_subclassed_without_a_deliberate_decision(self):
+        """**Planted, then required to be caught.** The second blind spot.
+
+        The MRO case reports a name appearing in more than one class of an MRO -- a
+        shadow. A subclass that shadows nothing inherits every case of its base and
+        is reported by nothing, so `class SomeTest(CommandLineTest)` would run all
+        of `CommandLineTest`'s cases a second time, and the ones that failed would
+        fail for a reason in the subclass's `setUp` rather than in the code under
+        test. That is not hypothetical: it is what this round's own
+        `MatrixProducesEvidenceTest` did before it was fixed.
+
+        The opt-in is **`DELIBERATE_CASE_BASES`, a named constant that is empty
+        today**, and not the `*TestCase` naming convention this suite already uses
+        for its four bases. That is not a preference; the naming convention is what
+        let the defect exist here. `SetupScriptTestCase` ends in `TestCase`, carried
+        three cases, and is subclassed by three classes -- so those three cases ran
+        nine extra times, and its own docstring claimed "the cases are not
+        inherited". A suffix a base can acquire by accident cannot record a decision,
+        and the constant makes opting in a two-place edit rather than an accident.
+        """
+        # A base nobody subclasses is not an inheritance problem, and two classes in
+        # one module are not inheritance either -- `bases` is the edge list, not the
+        # module's roster, which is what made the first version of this rule report
+        # every class in `test_report.py` as inheriting every other.
+        self.assertEqual(
+            inheriting_case_bases(
+                {"Helper": ["test_a"], "Other": ["test_b"]}, {"Other": []}
+            ),
+            [],
+            "a base that no class subclasses is not an inheritance problem",
+        )
+        # The planted defect: a subclass silently inheriting a class's cases. The
+        # two-class shape is the real one -- `SetupScriptTestCase` and one of its
+        # three subclasses -- and the reported pair is ordered (base, child) so the
+        # report says which definition is being run again.
+        self.assertEqual(
+            inheriting_case_bases(
+                {"CommandLineTest": ["test_a", "test_b"], "SomeTest": ["test_c"]},
+                {"SomeTest": ["CommandLineTest"]},
+            ),
+            [("CommandLineTest", "SomeTest")],
+            "a subclass silently inheriting a class's cases is not reported",
+        )
+        # The control: a case-free base is the normal shape of a shared harness, so
+        # a rule that reported those would report every base in the tree.
+        self.assertEqual(
+            inheriting_case_bases(
+                {"EntryPointTestCase": [], "SomethingElse": ["test_b"]},
+                {"SomethingElse": ["EntryPointTestCase"]},
+            ),
+            [],
+            "a case-free base is a shared harness, which is what a base is for",
+        )
+        # And a subclass inheriting a case-free base is reported by nothing, which
+        # is the point: `CommandLineTest` inheriting `EntryPointTestCase`'s helpers
+        # is the tree as it should look.
+        self.assertEqual(
+            inheriting_case_bases(
+                {"EntryPointTestCase": [], "CommandLineTest": ["test_a"]},
+                {"CommandLineTest": ["EntryPointTestCase"]},
+            ),
+            [],
+            "a subclass of a case-free base is the intended shape and must not be reported",
+        )
+
+    def test_no_class_in_this_tree_silently_inherits_a_class_that_carries_cases(self):
+        """The live check, over the real classes and their real `__bases__`.
+
+        This is the case that found the live instance: `SetupScriptTestCase` held
+        three cases and three subclasses, so three cases ran nine extra times while
+        the class's own docstring claimed "the cases are not inherited". It is
+        asserted over the loaded classes rather than over the AST because
+        inheritance is a property of the imported classes -- the same reason the MRO
+        case above asks the objects and not the tree.
+        """
+        offenders: list[str] = []
+        for module_name, module in loaded_modules().items():
+            classes = {
+                klass.__name__: sorted(
+                    member for member in vars(klass) if member.startswith("test")
+                )
+                for klass in vars(module).values()
+                if isinstance(klass, type) and issubclass(klass, unittest.TestCase)
+            }
+            bases = {
+                klass.__name__: [parent.__name__ for parent in klass.__bases__]
+                for klass in vars(module).values()
+                if isinstance(klass, type) and issubclass(klass, unittest.TestCase)
+            }
+            for base, child in inheriting_case_bases(classes, bases):
+                if base in DELIBERATE_CASE_BASES:
+                    continue
+                offenders.append(
+                    f"{module_name}: {child} inherits {base}'s cases "
+                    f"{classes[base]} without a recorded decision, so each runs once "
+                    f"per subclass under {child}'s dials"
+                )
+        self.assertEqual(
+            offenders, [],
+            "a class silently inherits another class's cases, so every one of them runs "
+            "once more per subclass:\n" + "\n".join(offenders),
+        )
+
+    def test_no_base_is_currently_opted_in_to_carrying_cases(self):
+        """The opt-in is empty, and adding a name is a two-place edit.
+
+        `DELIBERATE_CASE_BASES` exists so a base that genuinely has to carry cases
+        can, but nothing in this tree does: every base here is a case-free harness
+        (`PodmanTestCase`, `EntryPointTestCase`, `SnapshotTestCase`,
+        `SetupScriptTestCase`) whose whole purpose is to share setup. This is the
+        tripwire that makes the escape hatch a decision -- naming a class in the
+        constant turns *this* red, so the opt-in cannot be added silently and then
+        quietly inherited by the next class. If a future base really must carry
+        cases, this is the line that has to change, and changing it is the record.
+        """
+        self.assertEqual(
+            sorted(DELIBERATE_CASE_BASES), [],
+            "a base was opted in to carrying cases; the reason belongs in the comment "
+            "above the constant and in the docstring of the class that carries them",
+        )
 
     def test_the_declared_cases_are_exactly_the_cases_that_run(self):
         """The equality, in both directions, and derived from discovery.
