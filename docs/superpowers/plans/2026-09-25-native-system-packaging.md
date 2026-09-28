@@ -32,6 +32,8 @@
 - A failed install must leave a package that dpkg can still remove, and a failed removal must say what dpkg WILL do rather than what it would do.
 - **OPEN DECISION, and it is the user's: should anything run `emergency-rollback` unattended when the local resolver stops answering?** The health unit now fails within two minutes when `127.0.0.1:53` does not resolve resolvably, which is the signal. Whether a watchdog should act on that signal — which means mutating a machine's DNS with nobody watching — is NOT decided here and is NOT built. What an operator does today: `systemctl status mosdns-cdn-health.service` failing is the signal, and `sudo mosdns-cdnctl emergency-rollback` is the action. **The decision is recorded in THIS plan's ledger, `.superpowers/sdd/2026-09-25-native-system-packaging/progress.md`, under the final fix wave, with the owner as an explicit user decision recorded as open.** (An earlier version of this bullet pointed at "the Podman plan's ledger". There is no such file in this workspace — `.superpowers/sdd/` holds one directory per plan and the Podman plan has none — so the obligation was recorded and the entry could not be. The Podman plan, when it is written, is where a *second* ledger entry about the same question would belong; the decision itself lives in the entry named above.)
 - An upgrade must restart the daemons it finds running, AND a rollback must put a unit it restarted back the way it found it. The second half is not implied by the first: `try-restart` stops the unit on its way to restarting it, so a failed restart leaves a machine with no resolver at all. Both halves are in the failure-injection table, and a unit that was running and cannot be brought back is a rollback failure (exit 4) that says so and points at `emergency-rollback`.
+- **The undo of a restart is `systemctl start`, not `try-restart`.** `try-restart` is the right word for the forward action and the wrong one for the undo, and the asymmetry is the whole trap: `systemctl --help` says it restarts a unit "if active", so on a unit that is not running — which is exactly the state a failed `try-restart` leaves — it does nothing and exits zero. An undo built from it is a silent no-op that reports success: the rollback would record no failure, `recovery` would be empty, and the install would exit 3 claiming the machine is as it was found, on a machine with no resolver. `start` is a no-op that succeeds when the unit is up, a real start when it is not, and a FAILURE when the unit cannot be brought up — which is the only thing that routes that machine to exit 4 and the `MAY HAVE NO RESOLVER` line. `systemctl restart` is the other correct word; `start` is chosen because `restart` stops a unit that is already up, so an undo built from it can take away the resolver it is repairing. **The tests assert the STATE the undo achieves, not how many commands it issued**, because a command count cannot tell a `try-restart` on a running unit from the same command on a stopped one.
+- `postinst` is a script dpkg runs, and its own control flow is a property to test rather than to assert. A `fi` in the wrong place once made it exit 1 on EVERY configure including a successful one, with the three timers' enable as dead code below it, and three substring checks could not see it. The gate RUNS the script's own lines from its transaction step to its last against a stubbed installer, for every status the installer can return plus one it cannot, and reads the script's own exit status and which arm printed.
 - The re-install carry-forward is gated on the RECORD of the machine's original DNS, not on the ownership marker. The marker is written last, so it is absent on exactly the machine where the record matters most: an install that changed the connection and then failed its rollback.
 
 ---
@@ -488,6 +490,21 @@ A unit that was already running before this transaction is `try-restart`ed rathe
 than `start`ed, so an upgrade's verification describes the binaries this package
 just installed; the sequence above is the FIRST-install shape, and a unit whose
 prior state could not be read is still only `start`ed.
+
+That forward action has an undo, and the undo is `systemctl start` rather than
+another `try-restart`. `try-restart` stops the unit on its way to restarting it, so
+a failed one leaves a unit that WAS running down — and on an upgrade the connection
+is already `127.0.0.1` by that point in the order, so that is a machine with no
+resolver. The undo is registered BEFORE the attempt for that reason. It is a `start`
+because `try-restart` on a unit that is not running does nothing and exits zero,
+which would make the rollback report a unit it never started; a `start` succeeds
+when the unit is up, brings it up when it is not, and FAILS when it cannot be
+brought up, and that last is what routes the machine to exit 4 rather than to a
+clean exit 3. A unit that was running and cannot be brought back is therefore a
+rollback failure whose message says `MAY HAVE NO RESOLVER`, names one `systemctl
+restart <unit>` per unit rather than one command naming two, and points at
+`emergency-rollback`. Nothing acts on that signal unattended: whether a watchdog
+should is the open decision named in Review Focus.
 
 - [ ] **Step 2: Write failure-injection tests**
 
