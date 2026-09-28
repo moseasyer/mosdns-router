@@ -378,7 +378,26 @@ class ArgumentArrayTest(PodmanTestCase):
             self.client(broken).network_exists("mosdns-testnet")
         self.assertIn("cannot connect to podman socket", str(caught.exception))
 
-    def test_exec_passes_the_command_as_separate_arguments(self):
+    def test_run_container_emits_the_measured_flag_set_and_nothing_else(self):
+        """The whole array, as literals, because this is the measured target.
+
+        The plan's Task 1 Step 1 lists this command line exactly, and it is the
+        only place in the tree where `--systemd=always`, `--cgroupns=private`,
+        the three `--cap-add` values and `-d` appear. So this case holds the
+        entire array rather than a fragment: an assertion that checked the
+        mounts and left the flags unchecked would still be green on a target
+        that starts without an init, and the measured flag set is the thing a
+        later task would drop first.
+
+        It is also why the case is named for what it asserts. It used to be
+        called `test_exec_passes_the_command_as_separate_arguments`, the same
+        name as the `exec` case below: Python kept the second definition and
+        discarded the first without a word, so the only assertion of the
+        measured flags was dead code and the suite ran one case fewer than it
+        declared. `test_suite_shape.py` now fails on any duplicate case name
+        in this project's own test files, because `unittest` swallowing a test
+        is otherwise invisible.
+        """
         fake = self.fake()
         self.client(fake).run_container(
             image="localhost/mosdns-target:24.04",
@@ -402,6 +421,44 @@ class ArgumentArrayTest(PodmanTestCase):
                 "localhost/mosdns-target:24.04",
             ],
         )
+
+    def test_the_measured_target_flag_set_is_the_plan_own_listing(self):
+        """Step 1's array, read from the plan rather than from the wrapper.
+
+        The plan is the record the next implementer works from, so a later task
+        that changes the flags has to change the plan too. Reading the listing
+        out of the plan makes that a failing case rather than a divergence
+        nobody notices, and it means the literals in the case above are checked
+        against a second copy of the same list.
+        """
+        plan = (REPO / "docs/superpowers/plans/2026-09-25-podman-integration-matrix.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "podman run -d --name NAME --network mosdns-testnet --systemd=always "
+            "--cgroupns=private --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE "
+            "-v /sys/fs/cgroup:/sys/fs/cgroup:rw -v SOURCE:/workspace:ro IMAGE",
+            plan,
+        )
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-20260928T101010Z-target-24.04",
+            network="mosdns-testnet",
+        )
+        emitted = " ".join(fake.only())
+        for flag in (
+            "-d",
+            "--systemd=always",
+            "--cgroupns=private",
+            "--cap-add=SYS_ADMIN",
+            "--cap-add=NET_ADMIN",
+            "--cap-add=SYS_PTRACE",
+            "-v /sys/fs/cgroup:/sys/fs/cgroup:rw",
+            f"-v {self.source_tree}:/workspace:ro",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, emitted)
 
     def test_run_container_returns_the_container_id(self):
         fake = self.fake([{"match": ["run"], "stdout": "9f3c1d0e2b\n"}])
