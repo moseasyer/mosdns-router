@@ -2856,11 +2856,13 @@ class MaintainerScriptTests(_Staged):
         self.assertIn("daemon-reload", text)
 
     def test_a_timer_enable_that_fails_is_reported_and_does_not_fail_the_package(self):
-        """STEP 5's `systemctl enable` is the one command in `postinst` that is not
-        guarded by `|| true` under the script's own `set -e`, and until this round it
-        was the one command that was never reachable: the misplaced `fi` above it
-        meant no install ever got there. So it became the only command in the script
-        with no evidence about what its failure does.
+        """STEP 5's `systemctl enable` was, until this round, the one command in
+        `postinst` that was never reachable: the misplaced `fi` above it meant no
+        install ever got there. Run `postinst_transaction_run(0, text=<88bc2af>)` and
+        the call list is `[['daemon-reload']]` with no `enable` on it, while the same
+        run against the current text issues it. So its failure had been decided by
+        nobody, which is the one situation in which the decision below is a choice
+        rather than a reading of something that already happened.
 
         THE DECISION, and it is recorded in the script's own comment as well:
         REPORTED, NOT FATAL. Reaching STEP 5 means the transaction succeeded -- the
@@ -2917,10 +2919,21 @@ class MaintainerScriptTests(_Staged):
         The harness's `systemd_running=` existed to ask this and no test passed it, so
         the guards were held by a scan that could only confirm the spelling. In a
         chroot, in a `dpkg --root` install, or on any machine where systemd is not
-        PID 1, `systemctl` is absent: a `daemon-reload` or an `enable` there is a
-        command not found, and under this script's `set -e` the first one would end
-        the configure. So the guards have to hold, and a test that cannot make
-        systemd absent cannot show that they do.
+        PID 1, `systemctl` is absent, so both of these commands become `not found`
+        lines in the output dpkg shows the operator -- and the `enable` becomes a
+        pointless command whose failure STEP 5 then reports as a WARNING, which is a
+        machine with no systemd being told that its health timer is not enabled.
+
+        `set -e` IS NOT WHAT THE GUARDS ARE FOR, and this docstring says so because
+        the previous version of it claimed the opposite and was wrong about the
+        script as it now stands. Take the shipped text, replace the two guards with
+        `if true`, and run it with no `systemctl` on `PATH` at all: it still EXITS 0.
+        `daemon-reload` carries `|| true`, and the `enable` sits in an `if` CONDITION,
+        which `set -e` exempts -- so neither one reaches `set -e`, and the "the first
+        one would end the configure" the old text asserted cannot happen. What the
+        mutation does change is visible and is the whole of the case: two
+        `systemctl: not found` lines where the shipped run has none, and the entire
+        WARNING block printed about timers nothing will ever start.
         """
         completed, calls = postinst_transaction_run(0, systemd_running=False)
         self.assertEqual(
@@ -3999,31 +4012,37 @@ class ControlTests(unittest.TestCase):
     the ways this package can be wrong is manufactured here and the corresponding
     check is asserted to notice.
 
-    THE LIST, and it is a list of what this class HOLDS rather than a theme — thirty
-    cases, and the three groups are the three things a maintainer script, a staged
-    tree and a VERIFIER can each be wrong about. On the staged tree: a missing
-    executable, a missing file, a loose mode, a tight mode, a planted resolver address
-    on the denylist, an unlisted one the denylist could not have named, a planted
-    middlebox, a planted DoH endpoint, a compressed document, an unreadable blob, a
-    shipped state file, a reversed provisioning order, a directory created without its
-    group, the mode this plan itself first named, a missing tmpfiles reap pattern, a
-    reversed tmpfiles entry, a space-separated ACL, a reap pattern that matches too
-    much, a manifest entry that is not shipped, a routing document that is not the
-    render, and a provider-scan exemption that has grown. On the maintainer scripts: a
-    dpkg Policy 6.5 verb that is missing, a published pair an operator re-pinned, a
-    capture closed before its arms, a hard-coded capture, an `if`/`elif` chain in
-    place of the `case`, the timers enabled before the transaction, and prerm's two
-    refusals flattened into one sentence. And on the VERIFIERS themselves, because a
-    reader that cannot read a shape is also a gate that cannot fail.
+    THE LIST, and it is a list of what this class HOLDS rather than a theme. It is
+    all thirty of this class's `test_` methods, one entry each, so it can be counted
+    against them; the two groups are what the mutation plants. On the STAGED TREE,
+    twenty: a missing executable, a missing file, a loose mode, a tight mode, a
+    planted resolver address the content scan reports, that same planted address
+    found through the METHOD that scans for them, an unlisted address the denylist
+    could not have named, a planted middlebox, a planted DoH endpoint, a compressed
+    document, an unreadable blob, a shipped state file, a missing tmpfiles reap
+    pattern, a reversed tmpfiles entry, a tmpfiles entry with no default ACL, a
+    space-separated ACL, a reap pattern that matches too much, a routing document
+    that is not the render, a manifest entry that is not shipped, and a provider-scan
+    exemption that has grown. On the MAINTAINER SCRIPTS, ten: a dpkg Policy 6.5 verb
+    that is missing, a published pair an operator re-pinned, a capture closed before
+    its arms, an `if`/`elif` chain in place of the `case`, a hard-coded capture, the
+    timers enabled before the transaction, a reversed provisioning order, a directory
+    created without its group, the mode this plan itself first named, and prerm's two
+    refusals flattened into one sentence.
 
-    That last group is the reason the list is a list. Four of the entries above existed
-    in some earlier form of this suite and every one of them was a control that could
-    not have failed, because the mutation it built was not the defect the gate was
-    written for: `assertMethodFails` dropped the script substitutions, the swap helper
-    matched a comment, `unconditional_publish` was asserted against a token it had
-    itself removed, and `capture_closed_early` moved a different `fi` than the one it
-    named. The rule those four make is the only thing this class is for, and it is the
-    fifth time this project has had to write it down.
+    FOUR OF THOSE THIRTY are about a third thing -- a VERIFIER rather than a tree or a
+    script, because a reader that cannot read a shape is also a gate that cannot fail
+    -- and they are named here because the group is a SUBSET of the two above and
+    not a third set of cases: the missing-policy-verb case
+    (`assertMethodFails` dropped the script substitutions), the
+    timers-enabled-before-the-transaction case (the swap helper matched a comment),
+    the operator-re-pinned-pair case (`unconditional_publish` was asserted against a
+    token it had itself removed), and the capture-closed-before-its-arms case
+    (`capture_closed_early` moved a different `fi` than the one it named). Each of
+    those four existed in some earlier form of this suite and every one of them was a
+    control that could not have failed, because the mutation it built was not the
+    defect the gate was written for. The rule those four make is the only thing this
+    class is for, and it is the fifth time this project has had to write it down.
     """
 
     @classmethod

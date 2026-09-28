@@ -417,12 +417,12 @@ class FakeRunner:
     modelled that as a helpful tool, so a rollback whose undo was another
     ``try-restart`` reported a unit restored on a machine where nothing had been
     started at all. Every transition in ``_transition`` below is that manual's
-    sentence -- ``start``, ``stop`` and ``try-restart``, in both the succeeding and
-    the failing direction, plus ``restart`` insofar as ``try-restart`` models it --
-    and ``FakeUnitModelTests`` holds each of them, so the list here is a list of what
-    is tested rather than a list of what is intended. ``unit_state`` is what a test
-    reads to ask what the machine ended
-    up as rather than how many commands it was sent.
+    sentence, and there are four of them -- ``start``, ``stop``, ``try-restart`` and
+    ``restart`` -- so the list here is a list of what is tested rather than a list of
+    what is intended: ``FakeUnitModelTests`` holds ``start`` and ``stop`` succeeding
+    AND failing, and ``try-restart`` and ``restart`` succeeding. ``unit_state`` is
+    what a test reads to ask what the machine ended up as rather than how many
+    commands it was sent.
 
     Only a unit the test NAMED is modelled, and ``is-active`` on a modelled unit
     answers from the model rather than from the canned output, so a test that
@@ -706,8 +706,10 @@ class TransactionFixture(unittest.TestCase):
         # other correct word and `start` is chosen over it because `restart` stops a
         # unit that is already up, so an undo built from it can take away the
         # resolver it is repairing -- and that is the half of the property that is
-        # still true here: a `stop` in this table would be an undo that takes away a
-        # resolver the machine had before this run began.
+        # still true here, read against the two `start` rows ABOVE rather than
+        # against this table as a whole: a `stop` in one of THOSE would be an undo
+        # that takes away a resolver the machine had before this run began, and the
+        # table does contain two such undos.
         TRY_RESTART + (RESOLVER_UNIT,): START + (RESOLVER_UNIT,),
         TRY_RESTART + (ROUTER_UNIT,): START + (ROUTER_UNIT,),
         MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"): MODIFY + (UUID, "ipv4.ignore-auto-dns", "no"),
@@ -2715,8 +2717,11 @@ class FakeUnitModelTests(unittest.TestCase):
     and failing from any of them; `stop` succeeding and failing; `start` on a
     running unit not stopping it; `is-active` answering from the model and the
     canned answer for a unit nobody modelled; and a string command still refused.
-    The five verbs `FakeRunner._transition` models are therefore all covered in
-    both directions where the model can be wrong about a state.
+    The four verbs `FakeRunner._transition` models -- `try-restart`, `start`,
+    `restart` and `stop` -- are therefore each covered, but not each in both
+    directions: `start` and `stop` have a succeeding and a failing case, and
+    `try-restart` and `restart` are covered succeeding only, because a case that
+    injects a failing `try-restart` or a failing `restart` does not exist here.
     """
 
     def runner(self, **kwargs):
@@ -2808,7 +2813,10 @@ class FakeUnitModelTests(unittest.TestCase):
         restarted = self.modelled(UNIT_RUNNING)
         restarted.run(list(("systemctl", "restart", ROUTER_UNIT)))
         # `restart` also ends with the unit running, so the two are indistinguishable
-        # from the FINAL state and are told apart by the failure below.
+        # from the FINAL state. Nothing here injects a FAILING `restart` -- a failure
+        # is injected for `start` and for `stop` only, and this class's docstring
+        # says which of the four verbs have both directions rather than a comment
+        # here claiming a case that is not below it.
         self.assertEqual(restarted.unit_state[ROUTER_UNIT], UNIT_RUNNING)
 
     def test_is_active_answers_from_the_model_and_a_unit_nobody_named_keeps_its_answer(self):
