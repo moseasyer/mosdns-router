@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "Base images for the Podman integration matrix, pinned by digest.",
+    "",
+    "A tag is not a pin: ubuntu:24.04 is whatever the registry serves that day, and",
+    "Ubuntu ships a point release under the same tag without the tag changing. Two runs of",
+    "the matrix have to be the same three images, so every entry here is a digest and the",
+    "reference a build is given is docker.io/library/ubuntu:VERSION@DIGEST.",
+    "",
+    "resolved_by is the command each digest was actually read with, in this session, so a",
+    "reader who doubts one can re-run that one command. A digest with no provenance is a",
+    "claim rather than a pin, and the two are indistinguishable by inspection: both match",
+    "'sha256:' and both are 64 hex characters. That is the reason the field is here and the",
+    "reason 'tests/podman/tests/test_images.py' also asks the registry to serve each digest",
+    "again rather than trusting this file.",
+    "",
+    "A version whose image cannot be pulled is recorded with 'unavailable' and a reason, and",
+    "never with a plausible-looking digest. There are none: all three pulled."
+  ],
+  "arch": "amd64",
+  "images": {
+    "22.04": {
+      "digest": "sha256:281c5745f657873d78e5531fc5ba8575f46ab7769b94550ac99543f122679986",
+      "image": "docker.io/library/ubuntu:22.04",
+      "pulled_utc": "2026-09-28T13:49:41Z",
+      "resolved_by": "podman image inspect docker.io/library/ubuntu:22.04 --format '{{.Digest}}'",
+      "version_id": "22.04"
+    },
+    "24.04": {
+      "digest": "sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4",
+      "image": "docker.io/library/ubuntu:24.04",
+      "pulled_utc": "2026-09-28T13:49:55Z",
+      "resolved_by": "podman image inspect docker.io/library/ubuntu:24.04 --format '{{.Digest}}'",
+      "version_id": "24.04"
+    },
+    "26.04": {
+      "digest": "sha256:61ebaa5cc23ca45450db85eac015435199ec569e28ec222ea13f2aed2110b8a6",
+      "image": "docker.io/library/ubuntu:26.04",
+      "pulled_utc": "2026-09-28T13:50:09Z",
+      "resolved_by": "podman image inspect docker.io/library/ubuntu:26.04 --format '{{.Digest}}'",
+      "version_id": "26.04.1",
+      "release_note": "Ubuntu 26.04.1 LTS (Resolute Raccoon). The brief and the plan both said this release might not exist yet; it does. Verified by reading /etc/os-release out of a container of this digest, which reports VERSION_ID=26.04.1."
+    }
+  },
+  "podman_version": "5.7.0",
+  "schema": "mosdns-podman-images/1"
+}

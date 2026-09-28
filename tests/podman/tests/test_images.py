@@ -1,0 +1,1867 @@
+"""The three images, the digest lock, and the NetworkManager sequence that has to be in this order.
+
+Two things in this file are about a **file's contents** and one is about
+**behaviour**, and keeping them apart is the point.
+
+**The lock and the Containerfiles are configuration, and a test reads them the
+way a build does.** There is no way to run a Containerfile in this suite without
+building an image on the operator's machine, which the boundary forbids; a
+Containerfile *is* a set of lines, and "this line installs systemd-resolved" is
+the whole claim. So those cases parse the file and assert on what it says. What
+they do not do is assert that a line is merely *present* -- each one names the
+consequence of its absence, and several assert both directions, because a test
+that can only fail on a line that was added is a change detector rather than a
+test.
+
+**The entrypoint's order is behaviour, and it is tested by running it.** The
+previous plan's entire NetworkManager SKIPPED list came from concluding that a
+container cannot make NetworkManager manage a device. This harness does not
+conclude; it *runs the sequence and checks the field*. That is possible here
+because the harness can run the three commands, then ask, and a case can reorder
+them and require the check to fail -- which is what
+`EntryPointOrderTest` does, with a real `sh`, a real `nmcli` model and a real
+exit status. The plan's review focus is explicit that the sequence is "asserted,
+not assumed", and this file is where that assertion lives.
+
+**The measured facts, which are what make the check worth having:**
+
+* the profile must exist first. With no profile for `eth0`, `nmcli device set
+  eth0 managed yes` **returns success**, the audit log records
+  `op="device-managed" … result="success"`, and `GENERAL.NM-MANAGED` stays `no`
+  after the restart -- re-measured in this session on Ubuntu 24.04, see the
+  report;
+* the restart is required. The override is written under
+  `/run/NetworkManager/devices/` and only the restart re-reads it;
+* the device must be a bridge network's `eth0` of type `ethernet`. Podman's
+  default rootless network hands a container a `tun/tap` device and
+  NetworkManager refuses that type by design.
+
+So the check requires **both** the profile and the field, and reports both. A
+check that asserted only the field would pass on an entrypoint that reordered
+the steps if a later scenario created the profile -- which is exactly the defect
+that was amended into this task, and which had the previous plan's Task 2 and
+Task 3 disagreeing about who creates it.
+"""
+
+import json
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
+
+import images  # noqa: E402
+import podman  # noqa: E402
+
+IMAGES = REPO / "tests" / "podman" / "images"
+TARGET_CONTAINERFILE = IMAGES / "target.Containerfile"
+MOCK_ROUTER_CONTAINERFILE = IMAGES / "mock-router.Containerfile"
+MOCK_CDN_CONTAINERFILE = IMAGES / "mock-cdn.Containerfile"
+ENTRYPOINT = IMAGES / "target-entrypoint.sh"
+NM_SETUP = IMAGES / "target-nm-setup.sh"
+NM_UNIT = IMAGES / "target-nm-setup.service"
+LOCK = REPO / "tests" / "podman" / "images.lock.json"
+
+# The field the whole plan turns on, named once so a case can assert the script
+# reports *this* field rather than some other one.
+GENERAL_MANAGED_FIELD = "GENERAL.NM-MANAGED"
+
+# The packages the plan's Task 2 Step 3 names for the target image. Written out
+# rather than derived from the Containerfile, so a line that stops installing one
+# of them is a change this file can see -- the scenarios below need them by name.
+TARGET_PACKAGES = (
+    "systemd-sysv",
+    "dbus",
+    "network-manager",
+    "libnss-resolve",
+    "python3",
+    "iproute2",
+    "dnsutils",
+    "curl",
+    "ca-certificates",
+)
+
+
+def read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def run_lines(text: str) -> list[str]:
+    """The lines of a Containerfile that actually run something.
+
+    A comment is not an instruction, and these three Containerfiles talk about
+    the very things several cases forbid -- `dnsmasq-base`, `EXPOSE`, `go build`
+    -- in their prose. Reading raw text would have every case that checks what a
+    file *does* fail on a file that explains what it does not, which is how a
+    guard gets deleted.
+    """
+    lines = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("#"):
+            lines.append(stripped)
+    return lines
+
+
+def containerfile_stages(text: str) -> list[tuple[str, list[str]]]:
+    """A Containerfile's instructions grouped by stage, in file order.
+
+    A list of `(name, instructions)` pairs rather than a dict, because the last
+    stage is the one a container runs and the named ones are the ones a
+    `COPY --from` reads, and both are wanted -- a dict that also carried a
+    `final` alias would make a case about the stage *count* count the alias.
+    """
+    stages: list[tuple[str, list[str]]] = []
+    for line in folded_lines(text):
+        if line.startswith("FROM "):
+            parts = line.split()
+            name = parts[3] if len(parts) > 3 and parts[2] == "AS" else f"stage-{len(stages)}"
+            stages.append((name, []))
+            continue
+        if not stages:
+            continue
+        stages[-1][1].append(line)
+    return stages
+
+
+def stage_named(stages: list[tuple[str, list[str]]], name: str) -> list[str] | None:
+    """One stage's instructions, or None when there is no stage by that name."""
+    for stage_name, body in stages:
+        if stage_name == name:
+            return body
+    return None
+
+
+def shell_statements(path: Path) -> list[str]:
+    """A shell script's instructions: comments out, continuations joined.
+
+    The same reasoning as `run_lines`, for the two scripts in `images/`. Both
+    explain at length why they do *not* do a thing several cases forbid, and a
+    case that read the prose would fail on the explanation.
+    """
+    lines = run_lines(read(path))
+    statements: list[str] = []
+    index = 0
+    while index < len(lines):
+        statement = lines[index]
+        while statement.endswith("\\") and index + 1 < len(lines):
+            index += 1
+            statement = statement[:-1].rstrip() + " " + lines[index]
+        statements.append(statement)
+        index += 1
+    return statements
+
+
+def folded_lines(text: str) -> list[str]:
+    """Every non-comment line, with backslash continuations joined.
+
+    A Containerfile folds a long instruction over several lines, and a case that
+    looked for a token on one physical line would be testing the file's
+    formatting rather than what it says. So `systemd-resolved` counts whether it
+    is on its own line or the last of three.
+    """
+    lines = run_lines(text)
+    folded: list[str] = []
+    index = 0
+    while index < len(lines):
+        statement = lines[index]
+        while statement.endswith("\\") and index + 1 < len(lines):
+            index += 1
+            statement = statement[:-1].rstrip() + " " + lines[index]
+        folded.append(statement)
+        index += 1
+    return folded
+
+
+def instructions(text: str) -> list[str]:
+    """Every `RUN` in a Containerfile, continuations joined.
+
+    Only the `RUN` lines, because a case about what a file *installs* or *copies*
+    is a case about the instructions that do the installing -- and reading the
+    whole file would have every case match the prose that explains the file.
+    """
+    return [line for line in folded_lines(text) if line.startswith("RUN ")]
+
+
+def installed_packages(text: str) -> set[str]:
+    """Every package every `apt-get install` in the file installs.
+
+    Read from the joined instructions, and stopped at the first `&&`, so the
+    `rm -rf /var/lib/apt/lists/*` that follows the install in every one of these
+    files is not read as a package name. A Containerfile that installs nothing
+    names no package, and the case that says "no Containerfile installs the
+    project package" would pass on it -- which is why the control case builds a
+    Containerfile that does install it.
+    """
+    found: set[str] = set()
+    for statement in instructions(text):
+        if "apt-get" not in statement:
+            continue
+        tokens = statement.split()
+        if "install" not in tokens:
+            continue
+        for token in tokens[tokens.index("install") + 1 :]:
+            if token == "&&" or token.endswith(";"):
+                break
+            if token.startswith("-"):
+                continue
+            found.add(token)
+    return found
+
+
+def looks_like_no_registry(stderr: str) -> bool:
+    """Whether a podman failure is "the network is not there" rather than "no such digest".
+
+    The distinction is the difference between a skip and a failure, and getting it
+    backwards is the worst of both: a stale or fabricated digest would be skipped
+    as though the operator were offline. So it is a *named* set of network-shaped
+    messages, and a digest error is deliberately not in it -- a message naming a
+    manifest or a digest is a real answer from the registry and it fails the case.
+
+    The control below is what keeps this honest: a message naming a missing
+    manifest is not in the set.
+    """
+    lowered = stderr.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "dial tcp",
+            "connection refused",
+            "no such host",
+            "network is unreachable",
+            "temporary failure in name resolution",
+            "i/o timeout",
+            "context deadline exceeded",
+            "proxyconnect",
+            "x509: certificate",
+            "tls handshake",
+        )
+    )
+
+
+class LockFileTest(unittest.TestCase):
+    """`images.lock.json`, and what a build does with an entry in it."""
+
+    def test_the_lock_file_is_json_with_a_version_for_each_release(self):
+        """The three versions the plan's matrix runs, and no others.
+
+        Asserted as a set of literals, so a fourth entry -- a version nobody
+        decided to test -- is visible rather than silently swept along.
+        """
+        lock = images.load_lock(LOCK)
+        self.assertEqual(sorted(lock["images"]), ["22.04", "24.04", "26.04"])
+
+    def test_every_entry_carries_a_digest_with_the_sha256_prefix(self):
+        """A bare hex digest is not a digest a `podman pull` can be given.
+
+        The rule is structural rather than a convention: `docker.io/library/
+        ubuntu:24.04@<digest>` is only a valid reference when the digest is
+        `sha256:`-prefixed, and a lock entry that lost its prefix would produce a
+        reference that fails at `podman build` with a message about the
+        repository rather than about the lock.
+        """
+        lock = images.load_lock(LOCK)
+        for version, entry in sorted(lock["images"].items()):
+            with self.subTest(version=version):
+                self.assertIn("digest", entry, f"{version} has no digest")
+                self.assertTrue(
+                    entry["digest"].startswith("sha256:"),
+                    f"{version} holds {entry['digest']!r}, which is not a digest reference",
+                )
+                self.assertRegex(entry["digest"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_a_digest_is_sixty_four_hex_characters(self):
+        """Length and alphabet, because a plausible-looking digest is still a lie.
+
+        A digest nobody pulled would still match `sha256:` -- that is the whole
+        problem this case exists for. It would be written out of a habit, and a
+        habit produces the right prefix and 64 characters and nothing that could
+        distinguish it from a real one. What this holds is the *shape*; the
+        honest check is `ImageDigestVerificationTest`, which pulls.
+        """
+        lock = images.load_lock(LOCK)
+        for version, entry in sorted(lock["images"].items()):
+            with self.subTest(version=version):
+                digest = entry["digest"]
+                self.assertEqual(len(digest.split(":", 1)[1]), 64, version)
+                self.assertTrue(
+                    all(c in "0123456789abcdef" for c in digest.split(":", 1)[1]),
+                    f"{version} holds {digest!r}, which is not lowercase hex",
+                )
+
+    def test_a_lock_entry_without_the_sha256_prefix_is_refused(self):
+        """The rejection is in code, and it is the build that gets it.
+
+        A build constructs `docker.io/library/ubuntu:<version>@<digest>` from the
+        lock. A digest without the prefix makes that a reference podman cannot
+        resolve, and the error names the repository rather than the lock file --
+        so the check has to happen where the lock is read.
+        """
+        with self.assertRaises(images.LockError) as caught:
+            images.base_image_reference({"digest": "281c5745f657873d78e5531fc5ba8575f"}, "22.04")
+        message = str(caught.exception)
+        self.assertIn("sha256:", message)
+        self.assertIn("22.04", message)
+
+    def test_a_digest_that_is_not_a_digest_at_all_is_refused(self):
+        """The prefix check is a prefix, not a shape check, and the shape is here too.
+
+        `sha256:not-a-digest` passes a prefix test, and the reference it produces
+        is as unusable as the one without the prefix -- so the whole shape is
+        checked where the entry is read.
+        """
+        with self.assertRaises(images.LockError):
+            images.base_image_reference({"digest": "sha256:not-a-digest"}, "24.04")
+
+    def test_a_version_with_no_entry_is_refused_by_name(self):
+        """A build for a version the lock does not cover must stop.
+
+        Falling back to a tag would be the worst of the three answers available:
+        the run would use a floating image, the whole point of the lock -- that
+        two runs of the matrix are the same three images -- would be gone, and
+        nothing would report it. So the refusal names the version and the
+        versions the lock *does* cover, which is the information a caller needs to
+        act on.
+        """
+        with self.assertRaises(images.LockError) as caught:
+            images.reference_for_version("20.04", LOCK)
+        message = str(caught.exception)
+        self.assertIn("20.04", message)
+        self.assertIn("22.04", message)
+
+    def test_a_version_the_lock_covers_gives_a_usable_reference(self):
+        """The control for the case above: the ordinary path works.
+
+        Without it, a `LockError` that fired on *every* version would pass
+        `test_a_version_with_no_entry_is_refused_by_name` and leave the harness
+        unable to build anything at all.
+        """
+        self.assertEqual(
+            images.reference_for_version("24.04", LOCK),
+            "docker.io/library/ubuntu:24.04@sha256:"
+            "496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4",
+        )
+
+    def test_iterating_the_lock_refuses_a_version_recorded_unavailable(self):
+        """A matrix run with one version quietly missing is an incomplete run reported as complete.
+
+        `every_reference` is what a build iterates, so it raises on an absence
+        rather than skipping it. A caller that wanted to tolerate an absence has
+        the lock to read and the absence is *recorded*, with a reason.
+        """
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "images.lock.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "arch": "amd64",
+                        "images": {
+                            "22.04": {"digest": "sha256:" + "d" * 64},
+                            "26.04": {
+                                "unavailable": "no manifest for the tag on the registry"
+                            },
+                        },
+                        "schema": "mosdns-podman-images/1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(images.LockError) as caught:
+                images.every_reference(path)
+            self.assertIn("26.04", str(caught.exception))
+
+    def test_a_missing_lock_file_is_a_refusal_and_not_a_generated_one(self):
+        """The lock is a committed file; writing one at run time records a moving target.
+
+        A generated lock would record whatever the registry served that day, which
+        is the exact thing the file exists to prevent, and it would do so silently
+        -- the run would have a lock and a digest and no history.
+        """
+        with tempfile.TemporaryDirectory() as scratch:
+            with self.assertRaises(images.LockError) as caught:
+                images.load_lock(Path(scratch) / "images.lock.json")
+            self.assertIn("committed file", str(caught.exception))
+
+    def test_a_version_recorded_as_unavailable_says_why(self):
+        """An absent image is a finding with a reason, not a gap and not a guess.
+
+        A version whose image cannot be pulled is recorded `unavailable` with the
+        reason, so a reader learns *that* and *why* from the lock rather than
+        from a digest somebody typed. And `base_image_reference` refuses it,
+        because a build cannot use an absence.
+        """
+        entry = {"unavailable": "registry has no manifest for docker.io/library/ubuntu:99.04"}
+        with self.assertRaises(images.LockError) as caught:
+            images.base_image_reference(entry, "26.04")
+        message = str(caught.exception)
+        self.assertIn("26.04", message)
+        self.assertIn("no manifest", message)
+
+    def test_the_reference_it_builds_pins_the_tag_and_the_digest(self):
+        """`repo:tag@digest`, which is the form a build has to be given.
+
+        A tag alone floats to whatever the registry serves that day; a digest
+        alone loses which release the harness meant to test. Both are needed, in
+        that order and in one reference.
+        """
+        reference = images.base_image_reference(
+            {"digest": "sha256:" + "b" * 64}, "24.04"
+        )
+        self.assertEqual(
+            reference, "docker.io/library/ubuntu:24.04@sha256:" + "b" * 64
+        )
+
+    def test_the_lock_records_where_each_digest_came_from(self):
+        """A digest with no provenance is a claim, and a claim is not a pin.
+
+        Every entry says how it was obtained, so a reader who doubts one can
+        re-run that one command and get the same answer -- which is the only thing
+        that makes a lock file reviewable rather than decorative.
+        """
+        lock = images.load_lock(LOCK)
+        for version, entry in sorted(lock["images"].items()):
+            with self.subTest(version=version):
+                self.assertIn("resolved_by", entry, version)
+                self.assertTrue(
+                    "podman image inspect" in entry["resolved_by"],
+                    f"{version} does not say how its digest was read",
+                )
+                self.assertIn("docker.io/library/ubuntu:" + version, entry["resolved_by"])
+
+
+class TargetContainerfileTest(unittest.TestCase):
+    """The target image: the packages the scenarios need, and the ones it must not have."""
+
+    def test_it_installs_the_packages_the_plan_names(self):
+        """Each of the nine, by name.
+
+        They are not interchangeable and not a wish list: `systemd-sysv` is what
+        supplies `/sbin/init` for `--systemd=always`, `network-manager` is the
+        thing whose device state the harness asserts, `libnss-resolve` is what
+        makes a name lookup in the target go to the stub rather than past it, and
+        `dnsutils` supplies `dig`, which is how the routing scenarios measure the
+        resolver at all.
+        """
+        packages = installed_packages(read(TARGET_CONTAINERFILE))
+        for package in TARGET_PACKAGES:
+            with self.subTest(package=package):
+                self.assertIn(
+                    package,
+                    packages,
+                    f"the target image does not install {package}, and the scenarios need it",
+                )
+
+    def test_it_installs_nss_integration_for_the_stub_resolver(self):
+        """`libnss-resolve`, which exists on all three releases.
+
+        **This is the cross-version correction, and it was found by building the
+        image on 22.04.** The first version of this Containerfile named
+        `systemd-resolved`, which is a binary package on 24.04 and 26.04 and does
+        not exist on 22.04 at all -- there the daemon is part of `systemd`, which
+        `systemd-sysv` already pulls in. The build failed with:
+
+            E: Unable to locate package systemd-resolved
+
+        `libnss-resolve` is the package that exists on all three, and it is what
+        the matrix wants anyway rather than a coincidence:
+
+        * 22.04 -- `Depends: … systemd (= 249.11-0ubuntu3.22)`, the daemon comes
+          with it;
+        * 24.04 -- `Depends: … systemd-resolved (= 255.4-1ubuntu8.17)`;
+        * 26.04 -- `Depends: libc6`, the daemon is in `systemd` again.
+
+        and it is the NSS module, without which `getent hosts` in a target reads
+        `/etc/hosts` and then the network, and never asks 127.0.0.53 at all. A
+        routing scenario that measured names rather than queries would have been
+        measuring the wrong resolver and said nothing.
+        """
+        self.assertIn("libnss-resolve", installed_packages(read(TARGET_CONTAINERFILE)))
+
+    def test_it_names_no_resolved_package_that_only_exists_on_two_releases(self):
+        """`systemd-resolved` is the exact name that broke the 22.04 build.
+
+        Asserted because the name is *plausible*: it is the package on two of the
+        three releases and the daemon on all three, so it is what anyone reaching
+        for "the resolved package" writes. A case that only checked the packages
+        were present would have passed here -- the test above caught it, by
+        asking for a package the build could not find.
+        """
+        packages = installed_packages(read(TARGET_CONTAINERFILE))
+        self.assertNotIn(
+            "systemd-resolved",
+            packages,
+            "systemd-resolved is a binary package on 24.04 and 26.04 only; on 22.04 the daemon "
+            "is part of systemd, and naming it there fails the build with 'Unable to locate "
+            "package'. libnss-resolve is the package that exists on all three",
+        )
+
+    def test_it_installs_test_tools_too(self):
+        """`procps` for `ps`, which the failure scenarios read.
+
+        Named in the plan's Step 3 as "test tools" and asserted by name here,
+        because "and test tools" is exactly the phrase that goes stale: a
+        Containerfile written for an earlier task kept its own tools and lost this
+        one, and the scenario that needed `ps` failed for a reason that had
+        nothing to do with what it was testing.
+        """
+        self.assertIn("procps", installed_packages(read(TARGET_CONTAINERFILE)))
+
+    def test_it_does_not_install_the_project_package_at_build_time(self):
+        """The `.deb` is copied in at scenario time, by Task 4.
+
+        A Containerfile that installed the package would make the target's own
+        packaging the thing under test before a single scenario ran, and the
+        install transaction -- the claim this whole plan exists to close -- would
+        have been exercised by the image build instead of by `install_test.py`.
+        """
+        packages = installed_packages(read(TARGET_CONTAINERFILE))
+        for package in packages:
+            with self.subTest(package=package):
+                self.assertNotIn(
+                    "mosdns-router",
+                    package,
+                    "the target image installs the project's package at build time; the .deb "
+                    "is copied in at scenario time so the install transaction is what is tested",
+                )
+
+    def test_no_containerfile_installs_the_project_package(self):
+        """The rule over all three images, not just the target.
+
+        The mock router and the mock CDN are the images a scenario would be
+        *un*willing to trust if they carried the package, because a mock that
+        already had the thing it mocks answers differently from one that has to
+        have it installed into it.
+        """
+        for containerfile in (TARGET_CONTAINERFILE, MOCK_ROUTER_CONTAINERFILE, MOCK_CDN_CONTAINERFILE):
+            with self.subTest(containerfile=containerfile.name):
+                packages = installed_packages(read(containerfile))
+                self.assertFalse(
+                    [p for p in packages if "mosdns-router" in p],
+                    f"{containerfile.name} installs the project package at build time",
+                )
+
+    def test_the_rule_can_fail(self):
+        """The control. A check that cannot fail is a comment.
+
+        The four previous rounds in this project each found one, so every rule
+        this file states is also shown failing once on a file built for the
+        purpose. Here: a Containerfile that really does install the package must
+        be reported by the same code that just said the three real ones are
+        clean.
+        """
+        offending = "FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y mosdns-router\n"
+        self.assertIn("mosdns-router", installed_packages(offending))
+
+    def test_the_resolver_is_pointed_at_the_stub_by_the_entrypoint_not_the_build(self):
+        """`/etc/resolv.conf` is a runtime bind mount, so the image cannot own it.
+
+        **Measured, and it is the reason this lives where it does.** Podman mounts
+        a generated resolv.conf over `/etc/resolv.conf` in every container *and*
+        in every build step, so a `RUN ln -sf` in the Containerfile fails with `ln:
+        failed to create symbolic link '/etc/resolv.conf': Device or resource busy`
+        -- measured by building this image. At run time the same mount is in place
+        and both `rm` and `ln` fail against it. The entrypoint, running as PID 1
+        inside the target with the `SYS_ADMIN` the measured flag set already
+        grants, unmounts it *inside the container's own mount namespace* and puts
+        the resolved stub there.
+
+        The host is not involved: the mount is created by the runtime inside the
+        container's namespace, and this harness refuses to bind any host path
+        under `/etc`, `/run`, `/var` or `/sys` in the first place. Verified after
+        the real run: this host's `/etc/resolv.conf` was still the same
+        `../run/systemd/resolve/stub-resolv.conf` symlink with the same mtime.
+
+        Each half is asserted on its own statement rather than on one regex over
+        the whole file, because the script names the paths in variables -- a
+        single pattern that had to follow the indirection is a pattern that
+        quietly stops matching when the script is written a little differently,
+        and a check that stops matching is a check that has stopped failing.
+        """
+        statements = shell_statements(ENTRYPOINT)
+        assigned = dict(
+            statement.split("=", 1)
+            for statement in statements
+            if re.fullmatch(r"[A-Z_]+=/[^\s]*", statement)
+        )
+        self.assertEqual(assigned.get("RESOLV_CONF"), "/etc/resolv.conf", statements)
+        self.assertEqual(assigned.get("STUB"), "/run/systemd/resolve/stub-resolv.conf", statements)
+        self.assertTrue(
+            [line for line in statements if line.startswith("umount ") and "$RESOLV_CONF" in line],
+            f"the entrypoint never unmounts the runtime's bind over {assigned.get('RESOLV_CONF')}, "
+            f"so `rm` and `ln` below it fail with 'Device or resource busy': {statements}",
+        )
+        self.assertTrue(
+            [line for line in statements if "ln -s" in line and "$STUB" in line],
+            f"the entrypoint never points {assigned.get('RESOLV_CONF')} at the resolved stub: "
+            f"{statements}",
+        )
+
+    def test_the_containerfile_does_not_try_to_symlink_the_resolver_at_build_time(self):
+        """A build step cannot replace it, and the case says so rather than a comment.
+
+        The failure is `Device or resource busy` at STEP 4 of the build, so it is
+        loud -- but only once somebody tries it, and a reviewer reading a
+        Containerfile has no way to know. Asserted on the instructions.
+        """
+        self.assertFalse(
+            [line for line in instructions(read(TARGET_CONTAINERFILE)) if "/etc/resolv.conf" in line],
+            "the Containerfile touches /etc/resolv.conf, which is a runtime bind mount and cannot "
+            "be replaced at build time",
+        )
+
+    def test_the_build_time_symlink_detector_is_a_detector_and_not_a_pass(self):
+        """The control for the case above.
+
+        Without it, a case asserting "no instruction mentions /etc/resolv.conf"
+        would also be satisfied by an emptied Containerfile, and the defect would
+        be reported as covered.
+        """
+        offending = (
+            "FROM ubuntu:24.04\n"
+            "RUN ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf\n"
+        )
+        self.assertTrue(
+            [line for line in instructions(offending) if "/etc/resolv.conf" in line]
+        )
+
+    def test_the_entrypoint_refuses_a_target_it_could_not_give_the_stub_resolver(self):
+        """Silently continuing is the failure this rule is for.
+
+        If the resolver cannot be replaced, the target keeps the runtime's
+        resolv.conf -- `nameserver 10.89.0.1`, the bridge gateway. Every DNS
+        assertion in a scenario then measures the gateway rather than the mock
+        router or resolved, the package is not the thing under test, and the
+        failure reads like an installer bug in a package that is not installed
+        yet. The refusal belongs to the image, at boot, for the same reason the
+        managed-device check does: a scenario is the wrong place to learn that
+        the target was never measurable.
+
+        Both halves are held. The `umount` is allowed to fail -- a plain file
+        there is the right answer, not an error -- and the two that must not are
+        the `rm` and the `ln`, so the umount's `|| true` cannot be the thing that
+        swallows the failure.
+        """
+        statements = shell_statements(ENTRYPOINT)
+        unmounts = [line for line in statements if line.startswith("umount ")]
+        self.assertEqual(len(unmounts), 1, f"expected one umount of the runtime's bind: {statements}")
+        self.assertIn(
+            "||",
+            unmounts[0],
+            f"the umount is not allowed to fail, so a target whose resolver really is a bind "
+            f"mount would not boot: {unmounts[0]!r}",
+        )
+        replacing = [
+            line
+            for line in statements
+            if line.startswith(("rm -f", "ln -s")) or "rm -f" in line
+        ]
+        self.assertTrue(replacing, f"the entrypoint does not replace the resolver: {statements}")
+        for line in replacing:
+            with self.subTest(statement=line):
+                self.assertIn(
+                    "!",
+                    line,
+                    f"this replacement is not checked, so a target that could not be given the "
+                    f"stub would boot anyway: {line!r}",
+                )
+        self.assertTrue(
+            [line for line in statements if line.strip() == "exit 1"],
+            f"the entrypoint has no failure exit, so an unprepared target boots anyway: {statements}",
+        )
+
+    def test_it_masks_the_units_that_would_otherwise_fight_systemd(self):
+        """`systemd-networkd` and `systemd-resolved`'s own resolv.conf handling.
+
+        A container image that enables `systemd-networkd` alongside
+        NetworkManager has two managers claiming the same device, and the
+        resulting logs are a coin toss. This is asserted because the fix is
+        invisible when it works: a missing mask shows up as an intermittent
+        `dhcp_test` failure on one release and none at all.
+        """
+        text = read(TARGET_CONTAINERFILE)
+        self.assertIn("systemd-networkd", text)
+        self.assertRegex(text, r"(mask|disable).*systemd-networkd|systemd-networkd.*(mask|disable)")
+
+    def test_it_creates_the_users_the_scenarios_act_as(self):
+        """`mosdns` and `mosdns-cdn`, so the two-user scenario is not a `useradd` away.
+
+        The package creates them, and the image does not carry the package, so an
+        image that did not create them would make `two_user_lock_test` fail on a
+        missing user rather than on the control lock -- which is the failure the
+        scenario exists to detect.
+        """
+        text = read(TARGET_CONTAINERFILE)
+        for account in ("mosdns", "mosdns-cdn"):
+            with self.subTest(account=account):
+                self.assertIn(account, text)
+
+    def test_it_starts_nothing_from_the_image_that_a_scenario_owns(self):
+        """No `CMD` that starts the project, and no unit enabled for it.
+
+        The project installs its own units and enables them itself; an image that
+        pre-enabled one would make `is-enabled` pass on a package that never
+        installed anything.
+        """
+        text = read(TARGET_CONTAINERFILE)
+        for unit in ("mosdns-router.service", "mosdns-cdn-optimizer.service"):
+            with self.subTest(unit=unit):
+                self.assertNotIn(
+                    "systemctl enable " + unit,
+                    text,
+                    f"the image enables {unit}, so the packaged unit's own enable step is "
+                    f"never exercised",
+                )
+
+
+class MockRouterContainerfileTest(unittest.TestCase):
+    """The mock DHCP/DNS router: `dnsmasq`, and nothing that could answer for real."""
+
+    def test_it_installs_dnsmasq(self):
+        """The plan's Step 3 -- `dnsmasq-base`, which is the package on Ubuntu.
+
+        One daemon is both the DHCP server and the forwarder, which is what lets
+        a single container produce both the lease and the DNS change a target
+        observes; a router image with only `isc-dhcp-server` would have a lease
+        and no DNS to publish.
+
+        `dnsmasq-base` rather than `dnsmasq`: on Ubuntu the `dnsmasq` package is
+        the systemd unit wrapper, and this image runs the daemon in the
+        foreground as PID 1 where a unit is not what starts it. The assertion
+        accepts either, and separately requires the binary the CMD names, so a
+        future edit cannot satisfy the case with a package that provides no
+        daemon.
+        """
+        packages = installed_packages(read(MOCK_ROUTER_CONTAINERFILE))
+        self.assertTrue(
+            [package for package in packages if package.startswith("dnsmasq")],
+            f"the mock router image installs no dnsmasq package; it installs {sorted(packages)}",
+        )
+
+    def test_it_installs_the_dnsmasq_package_that_provides_the_daemon(self):
+        """The exact package, because the case above accepts a family.
+
+        `dnsmasq-base` is the one that ships `/usr/sbin/dnsmasq`. The other member
+        of the family is the unit wrapper, and an image that installed only that
+        would have no binary for the CMD to name.
+        """
+        self.assertIn("dnsmasq-base", installed_packages(read(MOCK_ROUTER_CONTAINERFILE)))
+
+    def test_it_has_a_command_a_control_action_can_hup(self):
+        """dnsmasq re-reads its configuration on SIGHUP, which is the control.
+
+        Task 3's step 3 rewrites the config inside the container and sends HUP, so
+        the image's command has to be one a signal can reach -- dnsmasq itself,
+        in the foreground, rather than a wrapper that started it in the
+        background and waited. A shell in between would be PID 1, the signal
+        would go to the shell, and the scenario would wait for a DNS change that
+        cannot arrive.
+        """
+        commands = [
+            line for line in run_lines(read(MOCK_ROUTER_CONTAINERFILE)) if line.startswith("CMD ")
+        ]
+        self.assertEqual(len(commands), 1, f"the router image has {len(commands)} CMD lines: {commands}")
+        self.assertRegex(
+            commands[0],
+            r"^CMD\s+\[?[\"']?/usr/sbin/dnsmasq\b",
+            f"the router's CMD does not exec dnsmasq itself: {commands[0]!r}",
+        )
+        self.assertIn("--keep-in-foreground", commands[0])
+
+    def test_it_does_not_bind_the_hosts_resolver_ports(self):
+        """No `EXPOSE`, and no published port for the resolver.
+
+        The whole plan is that a run changes no host state, and a mock router
+        reachable on the host's port 53 would break the host's resolver in order
+        to test a resolver. The bridge network is private, so the image needs no
+        port declaration at all -- asserted on the **instructions**, because the
+        file's comment says "No EXPOSE" and a case that read the prose would fail
+        on the explanation.
+        """
+        lines = run_lines(read(MOCK_ROUTER_CONTAINERFILE))
+        self.assertFalse(
+            [line for line in lines if line.upper().startswith("EXPOSE")],
+            "the mock router image declares an EXPOSE, and the run's network is private",
+        )
+        for port in ("53:53", "15353"):
+            with self.subTest(port=port):
+                self.assertFalse(
+                    [line for line in lines if port in line],
+                    f"the mock router image names {port}, which would reach the host's resolver",
+                )
+
+
+class MockCdnContainerfileTest(unittest.TestCase):
+    """The mock CDN: built from this repository's Go module, not from a base image."""
+
+    def test_it_builds_from_the_repositories_go_module(self):
+        """`go build` inside the image, from the source tree, in two stages.
+
+        Two stages because the plan's own constraint is that no image carries a
+        toolchain it does not need, and a CDN server with a Go toolchain in it is
+        a much larger image for the same few hundred kilobytes of static binary.
+        Asserted as the build stage *having* the toolchain and the serving stage
+        not having it, because a `FROM` count is a symptom and the two claims are
+        the ones that matter.
+        """
+        stages = containerfile_stages(read(MOCK_CDN_CONTAINERFILE))
+        self.assertEqual(len(stages), 2, f"the CDN image is not two stages: {stages}")
+        build = stage_named(stages, "build")
+        self.assertIsNotNone(
+            build,
+            f"no build stage: {[name for name, _ in stages]}. A multi-stage build names the "
+            f"stage it copies out of",
+        )
+        final = stages[-1][1]
+        self.assertTrue(
+            any("golang" in line for line in build),
+            "the build stage does not install a Go toolchain, so nothing here is compiled",
+        )
+        self.assertFalse(
+            [line for line in final if "golang" in line],
+            f"the serving stage installs a Go toolchain: {final}",
+        )
+        self.assertTrue(
+            any("COPY --from=build" in line for line in final),
+            f"the serving stage copies nothing out of the build stage: {final}",
+        )
+
+    def test_it_compiles_the_cdn_server_from_this_module(self):
+        """The module's own path, so the image is built from this checkout.
+
+        A CDN image built from a published module would test whatever that module
+        happens to be, and the plan's Task 5 step 3 makes assertions about *this*
+        project's ECH and CDN behaviour.
+        """
+        text = read(MOCK_CDN_CONTAINERFILE)
+        self.assertIn("go build", text)
+        self.assertRegex(text, r"mosdns-router|\./cmd/|/src")
+
+    def test_the_build_is_read_only_about_the_module_cache(self):
+        """`-mod=readonly`, so an image build cannot rewrite go.mod.
+
+        The gate's own rule, applied to the image build: a `go build` that
+        updated `go.mod` inside a container would be a silent edit to the
+        checkout, made by a command whose job is to change nothing.
+        """
+        self.assertIn("-mod=readonly", read(MOCK_CDN_CONTAINERFILE))
+
+
+class SetupUnitTest(unittest.TestCase):
+    """The systemd unit that runs the sequence once, at boot.
+
+    Found by running the image, which is the only way this was going to be found:
+    the unit as first written looked correct -- `Requires=NetworkManager.service`
+    reads like the obvious way to say "NetworkManager must be up first" -- and
+    produced a boot in which NetworkManager ended up not running at all.
+
+    The unit is a file in `images/`, `COPY`d into the image, rather than a
+    `printf` in the Containerfile. That is not tidiness: a unit written as a
+    `printf` argument list is not parseable as a unit file by anything, including
+    the cases below, so "this unit has no `Requires=`" was a claim about a
+    sentence in a Containerfile rather than about a unit.
+    """
+
+    def unit_directives(self, text: str) -> dict[str, set[str]]:
+        """A unit file's `[Section]` keys, as `Key=Value` strings.
+
+        The `Key=Value` shape rather than a dict, because a unit may repeat a key
+        (`After=` twice) and a dict would silently keep only one of them -- which
+        is how a case about a unit's ordering could pass on a unit that ordered
+        against the wrong thing.
+        """
+        sections: dict[str, set[str]] = {}
+        section = ""
+        for line in run_lines(text):
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                sections.setdefault(section, set())
+                continue
+            key, _, value = line.partition("=")
+            sections.setdefault(section, set()).add(f"{key.strip()}={value.strip()}")
+        return sections
+
+    def setUp(self):
+        self.assertTrue(
+            NM_UNIT.is_file(),
+            f"{NM_UNIT} does not exist, so the image installs the NetworkManager sequence from "
+            f"a printf and no case can read the unit it installs",
+        )
+        self.sections = self.unit_directives(read(NM_UNIT))
+        self.containerfile = read(TARGET_CONTAINERFILE)
+
+    def test_the_unit_is_installed_at_the_path_it_is_enabled_from(self):
+        self.assertIn(
+            f"COPY {NM_UNIT.relative_to(REPO)} /etc/systemd/system/{NM_UNIT.name}",
+            " ".join(folded_lines(self.containerfile)),
+        )
+        self.assertIn(
+            "systemctl enable target-nm-setup.service",
+            " ".join(instructions(self.containerfile)),
+        )
+
+    def test_the_unit_runs_the_script_the_image_installs(self):
+        """`ExecStart` names a path the image has to create.
+
+        A unit whose `ExecStart` names a script the image never copied fails at
+        boot with `status=203/EXEC`, which is a *different* diagnosis from the
+        managed-device one this unit exists to give, and it arrives with no
+        sequence run at all.
+        """
+        started = {
+            value.split("=", 1)[1]
+            for value in self.sections.get("Service", set())
+            if value.startswith("ExecStart=")
+        }
+        self.assertTrue(started, "the unit runs nothing")
+        for path in started:
+            with self.subTest(exec_start=path):
+                self.assertIn(path, " ".join(folded_lines(self.containerfile)))
+        self.assertEqual(
+            started,
+            {"/usr/local/bin/mosdns-target-nm-setup"},
+            f"the unit runs {sorted(started)} rather than the one script this image owns",
+        )
+
+    def test_the_unit_waits_for_networkmanager_without_requiring_it(self):
+        """`Requires=` propagates a restart's **stop** back into this unit.
+
+        **Measured, and it is the defect this case exists for.** The unit was
+        first written with `Requires=NetworkManager.service`, which reads like the
+        obvious way to say "NetworkManager must be up first". But the script's
+        third step *is* `systemctl restart NetworkManager`, and a restart is a
+        stop followed by a start: `Requires=` deactivates a requiring unit when a
+        required unit is deactivated, so NetworkManager's restart sent SIGTERM to
+        the setup unit, systemd restarted it, it created a second profile and
+        restarted NetworkManager again, and the target came up with **NetworkManager
+        not running at all**. The boot journal showed
+        `Main process exited, code=killed, status=15/TERM` on every pass and
+        `Warning: There are 4 other connections with the name 'eth0-managed'`.
+
+        `After=` orders the job, which is the only thing wanted here; the
+        script's own bounded wait for `nmcli general status` is what establishes
+        that the daemon is answering.
+        """
+        unit = self.sections.get("Unit", set())
+        self.assertIn("After=NetworkManager.service", unit)
+        self.assertNotIn(
+            "Requires=NetworkManager.service",
+            unit,
+            f"the unit requires the very service its own third step restarts: {sorted(unit)}",
+        )
+
+    def test_the_requires_check_sees_a_requires_when_one_is_written(self):
+        """The control for the case above.
+
+        Without it, "no `Requires=NetworkManager.service`" would also be satisfied
+        by a parser that never read a unit file at all.
+        """
+        written = "[Unit]\nAfter=NetworkManager.service\nRequires=NetworkManager.service\n"
+        self.assertIn(
+            "Requires=NetworkManager.service",
+            self.unit_directives(written).get("Unit", set()),
+        )
+        self.assertNotIn(
+            "Requires=NetworkManager.service",
+            self.unit_directives("[Unit]\nAfter=NetworkManager.service\n").get("Unit", set()),
+        )
+        # And a repeated key is visible, which is why the values are a set of
+        # `Key=Value` strings rather than a dict.
+        repeated = self.unit_directives("[Unit]\nAfter=a.service\nAfter=b.service\n")
+        self.assertEqual(repeated["Unit"], {"After=a.service", "After=b.service"})
+
+    def test_the_unit_runs_before_the_network_is_declared_online(self):
+        """Otherwise a scenario that waits for `network-online.target` waits for a device that is not managed.
+
+        Nothing else in the image brings the network up -- the profile this unit
+        creates is what activates -- so the ordering against
+        `network-online.target` is what makes "the device has its address" mean
+        "NetworkManager gave it one" rather than "the runtime gave it one".
+        """
+        self.assertIn(
+            "Before=network-online.target", self.sections.get("Unit", set())
+        )
+
+    def test_the_unit_is_oneshot_so_a_failure_is_a_failure_and_not_a_restart_loop(self):
+        """A `Type=simple` unit whose process exits non-zero is `failed`; the check's exit is the signal.
+
+        And `Restart=` is absent on purpose: a restart loop would re-run the
+        restart of NetworkManager, which is how the defect above turned into four
+        profiles. One run, one verdict, and the harness's own
+        `assert_networkmanager_manages_device` reports the cell as incomplete.
+        """
+        service = self.sections.get("Service", set())
+        self.assertIn("Type=oneshot", service)
+        self.assertFalse(
+            [value for value in service if value.startswith("Restart=")],
+            f"the unit restarts itself, and each pass restarts NetworkManager again: {sorted(service)}",
+        )
+
+    def test_the_profile_is_created_only_when_it_is_absent(self):
+        """Re-running the unit must not stack up profiles under one name.
+
+        **Measured.** `nmcli connection add` with a name that already exists does
+        not fail: it *warns* -- `Warning: There are 4 other connections with the
+        name 'eth0-managed'` -- and creates another. So a unit that runs twice,
+        which systemd did here, leaves several profiles for one device, and Task
+        3's `nmcli connection up eth0-managed` would then be ambiguous.
+
+        The three measured commands and their order are unchanged; what changes is
+        that the first is now guarded, and a case holds the guard.
+        """
+        statements = shell_statements(NM_SETUP)
+        guarded = [
+            index
+            for index, line in enumerate(statements)
+            if "connection show" in line and line.startswith(("if ", "if!", "if\t"))
+        ]
+        self.assertTrue(
+            guarded,
+            f"the setup adds the profile unconditionally, so a second run of the unit stacks "
+            f"profiles under one name: {statements}",
+        )
+        add_index = next(
+            (i for i, line in enumerate(statements) if "connection add" in line), None
+        )
+        self.assertIsNotNone(add_index, statements)
+        self.assertLess(
+            guarded[0],
+            add_index,
+            f"the guard is after the add, so it guards nothing: {statements}",
+        )
+
+
+class CopySourceTest(unittest.TestCase):
+    """Every `COPY` names a file that is in the repository.
+
+    A Containerfile is built with the repository as its context, so a `COPY` path
+    is relative to the repository root -- not to the Containerfile's own
+    directory, which is where a Containerfile's author naturally writes it. The
+    failure is loud (`Error: building at STEP "COPY …": copier: stat: "…": no
+    such file or directory`, measured) but it is loud only at the last step of a
+    build that has already installed a systemd and NetworkManager, so a case that
+    checks the paths costs nothing and saves that build.
+    """
+
+    def copy_sources(self, text: str) -> list[str]:
+        found = []
+        for line in folded_lines(text):
+            if not line.startswith("COPY "):
+                continue
+            parts = line.split()[1:]
+            for index, token in enumerate(parts):
+                if token.startswith("--from="):
+                    continue
+                if not token.startswith("/") and not token.startswith("."):
+                    found.append(token)
+        return found
+
+    def test_every_copy_source_exists_in_the_repository(self):
+        for containerfile in (TARGET_CONTAINERFILE, MOCK_ROUTER_CONTAINERFILE, MOCK_CDN_CONTAINERFILE):
+            for source in self.copy_sources(read(containerfile)):
+                with self.subTest(containerfile=containerfile.name, source=source):
+                    if "*" in source:
+                        continue
+                    self.assertTrue(
+                        (REPO / source).exists(),
+                        f"{containerfile.name} copies {source!r}, which is not in the repository. "
+                        f"A build's context is the repository root, not the Containerfile's "
+                        f"directory",
+                    )
+
+    def test_the_copy_check_sees_a_source_that_is_not_there(self):
+        """The control: the check has to be able to fail.
+
+        `COPY target-nm-setup.sh` is the exact mistake this task made, and it is
+        why the case exists. Asserted on a Containerfile that really does name a
+        file the repository does not have.
+        """
+        self.assertEqual(
+            self.copy_sources("FROM ubuntu:24.04\nCOPY target-nm-setup.sh /usr/local/bin/x\n"),
+            ["target-nm-setup.sh"],
+        )
+        self.assertFalse((REPO / "target-nm-setup.sh").exists())
+
+    def test_a_copy_from_another_stage_is_not_a_path_in_the_repository(self):
+        """`COPY --from=build …` reads a stage, not the context.
+
+        A case that required every COPY's first token to exist in the repository
+        would fail on a perfectly good multi-stage build -- and would be deleted
+        the first time somebody wrote one, which is the fate of a guard that
+        cannot tell the difference between two things.
+        """
+        self.assertEqual(
+            self.copy_sources("FROM ubuntu:24.04 AS build\nFROM ubuntu:24.04\nCOPY --from=build /out/x /usr/bin/x\n"),
+            [],
+        )
+
+
+class LockSchemaTest(unittest.TestCase):
+    """The file's shape, because a lock that cannot be read cannot be used."""
+
+    def test_it_is_valid_json_with_a_schema_and_the_images(self):
+        """Parsed, not read as text: `json.tool` is a gate and a reader is a parser."""
+        document = json.loads(read(LOCK))
+        self.assertEqual(document["schema"], images.SCHEMA)
+        self.assertIn("images", document)
+
+    def test_the_image_references_name_the_official_ubuntu_repository(self):
+        """`docker.io/library/ubuntu`, which is what the digests were pulled from.
+
+        A digest is a hash of one particular manifest in one particular
+        repository; naming a different repository's tag with it is a reference
+        that resolves to something else, or to nothing.
+        """
+        lock = images.load_lock(LOCK)
+        for version, entry in sorted(lock["images"].items()):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    images.base_image_reference(entry, version),
+                    f"docker.io/library/ubuntu:{version}@{entry['digest']}",
+                )
+
+    def test_a_version_key_that_is_not_a_release_is_refused(self):
+        """`24.4` is a typo, and a lock that accepted it would fail at pull time.
+
+        A cell for a version nobody ships produces a report row with a
+        requirement string naming a release that does not exist. The shape is
+        checked where the key is read, so a `--versions 24.4` fails with the
+        version in the message rather than at `podman build`.
+        """
+        for bad in ("24.4", "24", "24.04.1", "latest", ""):
+            with self.subTest(version=bad):
+                with self.assertRaises(images.LockError) as caught:
+                    images.base_image_reference({"digest": "sha256:" + "c" * 64}, bad)
+                self.assertIn(repr(bad), str(caught.exception))
+
+    def test_every_package_the_images_install_exists_on_every_locked_release(self):
+        """The build has to work on 22.04, 24.04 *and* 26.04.
+
+        **Found by building.** The first version of the target Containerfile named
+        `systemd-resolved`, and the 22.04 build failed with `E: Unable to locate
+        package systemd-resolved`: it is a binary package on 24.04 and 26.04 and
+        does not exist on 22.04, where the daemon is part of `systemd`. A
+        Containerfile that installs a package only two of the three releases have
+        is a matrix that is one third shorter than it claims, and the failure
+        arrives as a build error naming a package rather than as a report row.
+
+        So this asks each locked image's own apt, per release, for every package
+        the three Containerfiles install. It is the one case in the file that
+        needs a registry and a package archive, and it skips -- saying what it did
+        not check -- when it cannot ask.
+        """
+        import subprocess
+
+        wanted = sorted(
+            {
+                package
+                for containerfile in (TARGET_CONTAINERFILE, MOCK_ROUTER_CONTAINERFILE)
+                for package in installed_packages(read(containerfile))
+            }
+        )
+        for version, entry in sorted(images.load_lock(LOCK)["images"].items()):
+            if entry.get("unavailable"):
+                continue
+            reference = images.base_image_reference(entry, version)
+            probe = (
+                "apt-get update -qq >/dev/null 2>&1; "
+                + " ".join(f"apt-cache show {package} >/dev/null 2>&1 || echo MISSING:{package};" for package in wanted)
+                + " true"
+            )
+            completed = subprocess.run(
+                ["podman", "run", "--rm", reference, "sh", "-c", probe],
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            if completed.returncode != 0 and looks_like_no_registry(completed.stderr):
+                self.skipTest(
+                    f"{version} could not be run here, so the package list was NOT verified on "
+                    f"that release: {completed.stderr.strip()[:200]}"
+                )
+            self.assertEqual(
+                completed.returncode, 0, f"{version} could not be run: {completed.stderr.strip()[-200:]}"
+            )
+            missing = [
+                line.split(":", 1)[1]
+                for line in completed.stdout.splitlines()
+                if line.startswith("MISSING:")
+            ]
+            self.assertEqual(
+                missing, [],
+                f"the images install {missing}, which {version} does not have",
+            )
+
+    def test_the_skip_detector_does_not_call_a_missing_manifest_a_network_problem(self):
+        """The control for the skip rule the two verification cases use.
+
+        A skip detector that also matched a manifest error would turn a
+        fabricated or stale digest into a skip, and the run would report "no
+        network" for an answer the registry gave. So a message naming a manifest
+        is required NOT to be read as offline.
+        """
+        self.assertTrue(
+            looks_like_no_registry(
+                "Error: initializing source docker://docker.io/library/ubuntu:24.04: "
+                "dial tcp: lookup docker.io: no such host"
+            )
+        )
+        for answer in (
+            "reading manifest sha256:aaaa: manifest unknown",
+            "Error: initializing source: name unknown: Error reading manifest",
+            "manifest for docker.io/library/ubuntu@sha256:bbbb not found",
+        ):
+            with self.subTest(answer=answer):
+                self.assertFalse(
+                    looks_like_no_registry(answer),
+                    "a message naming a manifest is the registry's answer, not an offline host",
+                )
+
+    def test_it_names_the_architecture_the_digests_are_for(self):
+        """The digests are amd64, resolved on this host, and saying so is required.
+
+        A digest is per-architecture. A lock that did not say which one it pinned
+        would be read as pinning all of them, and an arm64 run would pull a
+        manifest the harness never verified.
+        """
+        self.assertIn("arch", json.loads(read(LOCK)))
+
+
+class EntryPointOrderTest(unittest.TestCase):
+    """The NetworkManager sequence, run, and required to be in this order.
+
+    Everything here executes a real shell script against a model of `nmcli` and
+    `systemctl`. That is possible -- and necessary -- because the three commands
+    are the load-bearing measured fact of this plan and a test that only found
+    the words in a file would not notice them in the wrong order.
+    """
+
+    # -- a model of the two tools -------------------------------------------
+
+    NMCLI_MODEL = '''#!/bin/sh
+# A model of the `nmcli` calls the target's setup makes, in the shape the real
+# ones have. State lives in $NM_STATE and every call is appended to $NM_TRACE as
+# the full expanded command line, so a case reads the *order the commands were
+# run in* rather than the order they appear in a file.
+#
+# The two behaviours this models that a naive model would get wrong, and which
+# are the whole reason the ordering is worth testing:
+#
+#   * `nmcli device set eth0 managed yes` **returns success whether or not a
+#     connection profile exists for the device.** Measured on this host: with no
+#     profile the audit log records `op="device-managed" ... result="success"`
+#     and `GENERAL.NM-MANAGED` is still `no` after the restart. A model that
+#     made `device set` fail without a profile would make the ordering test pass
+#     for the wrong reason, and the defect it exists to catch would go in.
+#   * `nmcli connection add` fails if the profile already exists, because the
+#     real one does.
+state="${NM_STATE:?}"
+trace="${NM_TRACE:?}"
+echo "nmcli $*" >> "$trace"
+fields=""
+while [ "$1" = "-g" ]; do fields="$2"; shift 2; done
+verb="$1"; shift
+case "$verb" in
+  general)
+    # The readiness probe the script makes before anything else. Answering it is
+    # what "NetworkManager is up" means here.
+    [ "$1" = "status" ] && exit 0
+    echo "unmodelled: nmcli general $1" >&2; exit 64
+    ;;
+  --version)
+    # The failure message asks for the version, because on 22.04 (nmcli 1.36)
+    # there is no persistent device override and a `no` means something quite
+    # different from what it means on 24.04 and 26.04.
+    echo "nmcli tool, version 1.36.6"
+    exit 0
+    ;;
+  connection)
+    what="$1"; shift
+    case "$what" in
+      add)
+        name=""
+        prev=""
+        for token in "$@"; do
+          if [ "$prev" = "con-name" ]; then name="$token"; fi
+          prev="$token"
+        done
+        if [ -f "$state/profile" ]; then
+          echo "Error: connection with the name '$name' already exists." >&2
+          exit 10
+        fi
+        printf '%s' "$name" > "$state/profile"
+        echo "Connection '$name' (52663ce3-8787-46a8-a924-968cb4f12df0) successfully added."
+        ;;
+      show)
+        if [ -f "$state/profile" ] && [ "$1" = "$(cat "$state/profile")" ]; then
+          echo "connection.id: $1"
+        else
+          echo "Error: unknown connection '$1'" >&2
+          exit 10
+        fi
+        ;;
+      *) echo "unmodelled: nmcli connection $what" >&2; exit 64 ;;
+    esac
+    ;;
+  device)
+    what="$1"; shift
+    case "$what" in
+      set)
+        # Success either way. That is the measured behaviour, and it is the
+        # reason step 1 has to come first: without a profile this writes
+        # nothing that the restart will re-read.
+        echo "Device '$1' state set to '$2'."
+        ;;
+      show)
+        case "$fields" in
+          GENERAL.NM-MANAGED)
+            [ -f "$state/managed" ] && cat "$state/managed" || echo "no"
+            ;;
+          GENERAL.TYPE)
+            cat "${STATE:-}" 2>/dev/null || echo "${NM_TYPE:-ethernet}"
+            ;;
+          *) echo "unmodelled field: $fields" >&2; exit 64 ;;
+        esac
+        ;;
+      *) echo "unmodelled: nmcli device $what" >&2; exit 64 ;;
+    esac
+    ;;
+  *) echo "unmodelled: nmcli $verb" >&2; exit 64 ;;
+esac
+'''
+
+    SYSTEMCTL_MODEL = '''#!/bin/sh
+# A model of `systemctl restart NetworkManager` and nothing else. The restart is
+# the step that re-reads the override under /run/NetworkManager/devices/, so a
+# model without it cannot tell a correct setup from one that forgot it -- which
+# is the second of the three mutations the suite applies.
+state="${NM_STATE:?}"
+trace="${NM_TRACE:?}"
+echo "systemctl $*" >> "$trace"
+if [ "$1" = "restart" ] && [ "$2" = "NetworkManager" ]; then
+  # The override is only re-read if a connection profile existed for the device
+  # when it was written. No profile, no override, `no` after the restart -- which
+  # is what was measured on this host.
+  if [ -f "$state/profile" ]; then
+    echo yes > "$state/managed"
+  else
+    echo no > "$state/managed"
+  fi
+  exit 0
+fi
+echo "unmodelled: systemctl $*" >&2
+exit 64
+'''
+
+    def setUp(self):
+        self.state = None
+
+    def _tmpdir(self):
+        import tempfile
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return directory.name
+
+    def _tool(self, name: str, model: str) -> Path:
+        directory = Path(self._tmpdir()) / "bin"
+        directory.mkdir(exist_ok=True)
+        path = directory / name
+        path.write_text(model, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def run_setup(self, script: Path):
+        """Run a setup script with the modelled tools on PATH, and read the trace back.
+
+        A **fresh** state directory per call, not one per test. The model's
+        `managed` file is what the restart writes and the check reads, so two runs
+        sharing one state directory see each other's answer -- and a case that ran
+        the correct script first and a mutation second would read the first run's
+        `yes` and pass a mutation that ought to fail. That is exactly the shape
+        of a control that cannot fail, so the state is per run.
+        """
+        import os
+        import subprocess
+
+        self.state = Path(self._tmpdir()) / "state"
+        self.state.mkdir(parents=True)
+        tools = Path(self._tmpdir()) / "bin"
+        tools.mkdir(exist_ok=True)
+        (tools / "nmcli").write_text(self.NMCLI_MODEL, encoding="utf-8")
+        (tools / "systemctl").write_text(self.SYSTEMCTL_MODEL, encoding="utf-8")
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        trace = tools / "trace"
+        trace.write_text("", encoding="utf-8")
+        environment = dict(os.environ)
+        environment["PATH"] = f"{tools}:{environment['PATH']}"
+        environment["NM_STATE"] = str(self.state)
+        environment["NM_TRACE"] = str(trace)
+        completed = subprocess.run(
+            ["sh", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=60,
+        )
+        return completed, [line for line in trace.read_text(encoding="utf-8").splitlines() if line]
+
+    def nm_managed(self) -> str:
+        return (self.state / "managed").read_text(encoding="utf-8").strip() if (self.state / "managed").exists() else "absent"
+
+    def profile_exists(self) -> bool:
+        return (self.state / "profile").exists()
+
+    # -- the cases ------------------------------------------------------------
+
+    def test_the_script_exists_and_is_executable_shape(self):
+        """A `sh` script with a shebang, so it can be both run here and `COPY`ed in.
+
+        Not a "it runs" case: this asserts the *form*, because the file is copied
+        into the image and executed as PID 1's entry, and a file without a
+        shebang is not that.
+        """
+        text = read(NM_SETUP)
+        self.assertTrue(text.startswith("#!/bin/sh"), text[:40])
+        self.assertIn("set -e", text)
+
+    def test_the_three_commands_are_in_this_order(self):
+        """**The case this task exists for.**
+
+        The order is not a style preference. Measured, twice in this plan: with
+        the profile first, the three commands take `GENERAL.NM-MANAGED` to
+        `yes`; with it last, the `device set` is accepted, the restart happens,
+        and the field stays `no` -- so a target boots unmanaged, every scenario
+        fails for a reason that has nothing to do with the package, and the whole
+        matrix is `incomplete` with exit 3.
+
+        Read off the **trace**, not the file: the case requires the calls in the
+        order the model recorded them, which is the order they were actually run
+        in. A script with the three commands in the right order and something
+        else before them would still pass this, and the next case is what holds
+        that.
+        """
+        completed, trace = self.run_setup(NM_SETUP)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"the setup script failed:\n{completed.stdout}\n{completed.stderr}",
+        )
+        profile = [i for i, line in enumerate(trace) if "connection add" in line]
+        override = [i for i, line in enumerate(trace) if "device set" in line]
+        restart = [i for i, line in enumerate(trace) if "systemctl restart" in line]
+        self.assertEqual(len(profile), 1, trace)
+        self.assertEqual(len(override), 1, trace)
+        self.assertEqual(len(restart), 1, trace)
+        self.assertLess(
+            profile[0],
+            override[0],
+            f"the profile must be created before the override; the trace was {trace}",
+        )
+        self.assertLess(
+            override[0],
+            restart[0],
+            f"the override must be set before the restart re-reads it; the trace was {trace}",
+        )
+
+    def test_the_commands_are_the_three_the_plan_names(self):
+        """The exact spellings, verbatim -- read off the trace, not the file.
+
+        The script writes `"$DEVICE"` and `"$PROFILE"` where the commands are, so
+        the *expanded* commands are what matter and what the model recorded. A
+        `nmcli device set eth0 managed no` in the same position would satisfy
+        the ordering case and unmanage every target; `systemctl restart
+        systemd-networkd` would satisfy it and do nothing.
+        """
+        completed, trace = self.run_setup(NM_SETUP)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            "nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto",
+            trace,
+        )
+        self.assertIn("nmcli device set eth0 managed yes", trace)
+        self.assertIn("systemctl restart NetworkManager", trace)
+
+    def test_it_fails_loudly_when_the_field_is_not_yes(self):
+        """A boot that cannot be measured must stop, and must say what it saw.
+
+        Silently continuing is the failure this rule exists for: every scenario
+        downstream then fails against an unmanaged device, and the failure reads
+        like an installer bug in a package that has not been installed yet.
+        """
+        text = read(NM_SETUP)
+        self.assertIn("GENERAL.NM-MANAGED", text)
+        self.assertIn("yes", text)
+        self.assertRegex(text, r"exit 1|return 1|false")
+
+    def test_the_failure_message_names_the_profile_and_the_observed_value(self):
+        """Both facts, not a bare "unmanaged".
+
+        A message that says only `NM-MANAGED is no` sends the reader to the
+        two-step sequence that the plan already measured as insufficient on its
+        own -- they run it, it succeeds, and they conclude the harness is wrong.
+        The profile is the part that is easy to forget.
+        """
+        text = read(NM_SETUP)
+        self.assertIn("eth0-managed", text)
+        self.assertIn("connection profile", text.lower())
+
+    def test_the_failure_message_names_the_networkmanager_version(self):
+        """**Measured: the two failures are identical from the outside and have different causes.**
+
+        On 24.04 and 26.04 the override is written under
+        `/run/NetworkManager/devices/` and the restart re-reads it, so a `no` means
+        the restart did not happen. On 22.04 (nmcli 1.36) there is no persistent
+        device override at all: the field stays `no` with or without a profile and
+        with or without a restart, and no change to this script can alter it.
+
+        A reader who is told "restart" on 22.04 checks the restart, finds it
+        happened, and has been sent looking at the wrong thing. So the message
+        carries the version, which is the one fact that distinguishes the two
+        causes, and it names the file to read to tell them apart.
+        """
+        completed, _ = self.run_setup(NM_SETUP)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        # With the override dropped the field reads `no`, and the message has to
+        # carry both the observed value and the version.
+        dropped = self.drop_line(NM_SETUP, "systemctl restart NetworkManager")
+        completed, _ = self.run_setup(dropped)
+        self.assertNotEqual(completed.returncode, 0)
+        message = completed.stdout + completed.stderr
+        self.assertIn("nmcli", message)
+        self.assertIn(GENERAL_MANAGED_FIELD, message)
+
+    def test_it_does_not_add_a_networkmanager_conf_d_entry(self):
+        """The override-and-restart path is the measured one; a conf.d entry is not.
+
+        Forcing `managed=true` in a drop-in would make the target come up
+        managed, which sounds like the goal -- and would mean the harness had not
+        measured the thing the plan's architecture note is about, and that the
+        `device set` + restart path had never been exercised. The plan forbids
+        it, so it is a case.
+        """
+        text = read(NM_SETUP)
+        for forbidden in ("conf.d", "unmanaged-devices", "[ifupdown]"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, text)
+
+    def test_moving_the_profile_after_the_restart_makes_the_check_fail(self):
+        """**The control, and the reason the case above is not a comment.**
+
+        The same script with one edit: the profile is created *after* the restart.
+        The model says the field is then `no` -- which is what was measured on
+        this host -- and the setup must exit non-zero rather than hand a target
+        to the scenarios. A test that only checked the good ordering would pass
+        here too, and would be a test of the file's spelling.
+        """
+        reordered = self.reorder(NM_SETUP)
+        completed, trace = self.run_setup(reordered)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with the profile created after the restart; the trace was {trace}\n"
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+        self.assertIn("eth0-managed", str(completed.stderr) + completed.stdout)
+
+    def test_dropping_the_restart_makes_the_check_fail(self):
+        """The other of the two measured facts.
+
+        `nmcli device set eth0 managed yes` returns success and does not take
+        effect until NetworkManager re-reads the override. Without the restart
+        the override is written and never read, the field stays `no`, and the
+        setup must fail.
+        """
+        dropped = self.drop_line(NM_SETUP, "systemctl restart NetworkManager")
+        completed, trace = self.run_setup(dropped)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with the restart dropped; the trace was {trace}\n"
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+
+    def test_dropping_the_profile_makes_the_check_fail(self):
+        """The third of the three, and the one the plan's architecture note is about.
+
+        With no profile at all, both remaining steps are accepted, the audit log
+        records `result="success"`, and the field stays `no`. This is what the
+        plan measured on every container it tried, and it is why the profile
+        belongs to this image's boot rather than to a later scenario.
+        """
+        dropped = self.drop_line(NM_SETUP, "nmcli connection add")
+        completed, trace = self.run_setup(dropped)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with the profile step dropped; the trace was {trace}\n"
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+
+    def test_reordering_needs_a_script_whose_profile_line_is_movable(self):
+        """The control's own precondition, asserted where the control is used.
+
+        `reorder` finds one profile line and one restart line and moves the first
+        after the second. If either stopped being findable -- a rewrite, a
+        variable, a loop -- the control would silently produce the *unmodified*
+        script, the assertion above would pass for the wrong reason, and the
+        defect it exists to catch would be reported as covered. So the mutation
+        has to be shown to be a mutation, and it was shown to be a broken one
+        here: an index computed before a `pop` puts the line back where it was.
+        """
+        original = read(NM_SETUP)
+        reordered = self.reorder(NM_SETUP)
+        mutated = read(reordered)
+        self.assertNotEqual(mutated, original, "the mutation produced the unmodified script")
+        self.assertLess(
+            original.index("nmcli connection add"),
+            original.index("systemctl restart NetworkManager"),
+            "the shipped script already has the profile after the restart, so the control "
+            "asserts nothing",
+        )
+        self.assertLess(
+            mutated.index("systemctl restart NetworkManager"),
+            mutated.index("nmcli connection add"),
+            "the mutation did not move the profile after the restart",
+        )
+        # A move, not an edit: the same statements, the same count. The variant is
+        # written from the comments-stripped statements (see `reorder`), so the
+        # comparison is against those and not against the file's prose.
+        self.assertEqual(
+            sorted(mutated.splitlines()),
+            sorted(shell_statements(NM_SETUP)),
+            "the mutation changed the script rather than moving one part of it, so the case "
+            "above is not testing the ordering",
+        )
+        self.assertEqual(
+            len(mutated.splitlines()), len(shell_statements(NM_SETUP))
+        )
+
+    # -- the mutations --------------------------------------------------------
+
+    def _write_variant(self, lines: list[str], name: str) -> Path:
+        directory = Path(self._tmpdir()) / name
+        directory.mkdir(exist_ok=True)
+        path = directory / "target-nm-setup.sh"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def reorder(self, script: Path) -> Path:
+        """A copy with the profile step moved to just after the restart.
+
+        Three things had to be got right, and each of them was got wrong first --
+        which is why they are written down rather than left in the code:
+
+        * **instructions, not text.** The profile step is named in this file's
+          own comments, and a helper that searches the raw text finds the comment
+          first and moves *that*, leaving the script unchanged. Every mutation in
+          this class runs on `shell_statements`, which is comments-stripped.
+        * **the index is recomputed after the pop.** The profile step is *before*
+          the restart in a correct script, so removing it shifts every later index
+          down by one, and inserting at the pre-pop index puts the line straight
+          back.
+        * **the whole `if … fi` block moves, not just the add.** The add is inside
+          a guard (`if ! nmcli connection show …; then`), and moving the one line
+          would leave a guard whose body is gone -- a different script, failing
+          for a reason that has nothing to do with the ordering.
+        """
+        statements = shell_statements(script)
+        block_start = next(
+            i for i, line in enumerate(statements) if "nmcli connection add" in line
+        )
+        guard = next(
+            (
+                i
+                for i in range(block_start - 1, -1, -1)
+                if statements[i].startswith(("if ", "if!", "if\t"))
+            ),
+            block_start,
+        )
+        end = next(
+            (i for i in range(block_start + 1, len(statements)) if statements[i] == "fi"),
+            block_start,
+        )
+        restart = next(
+            i
+            for i, line in enumerate(statements)
+            if line.startswith("systemctl restart NetworkManager")
+        )
+        block = statements[guard : end + 1]
+        remainder = statements[:guard] + statements[end + 1 :]
+        shifted = restart - 1 if guard < restart else restart
+        return self._write_variant(remainder[: shifted + 1] + block + remainder[shifted + 1 :], "reordered")
+
+    def drop_line(self, script: Path, needle: str) -> Path:
+        """A copy with the instruction containing `needle` removed."""
+        statements = [
+            line
+            for line in shell_statements(script)
+            if not (needle in line and not line.startswith("#"))
+        ]
+        return self._write_variant(statements, "dropped")
+
+    # -- the entrypoint the image runs ----------------------------------------
+
+    def test_the_entrypoint_hands_over_to_systemd(self):
+        """`exec` into the init, so it becomes PID 1.
+
+        Without the `exec`, the shell stays PID 1 and systemd is a child, which
+        is the shape that makes `--systemd=always` a no-op: a target whose units
+        systemd "started" are not managed by a PID 1 systemd at all, and
+        `systemctl` answers to the child.
+        """
+        text = read(ENTRYPOINT)
+        self.assertRegex(text, r"exec\s+/sbin/init|exec\s+.*init")
+
+    def test_the_entrypoint_does_not_perform_the_sequence_itself(self):
+        """The sequence runs once, from systemd, and not twice.
+
+        An entrypoint that also ran the three steps would do them before
+        `/sbin/init` exists -- before there is a D-Bus for `nmcli` to talk to.
+        Measured in this session, on the real image, for the entrypoint that
+        tried: `Error: Could not create NMClient object: Could not connect: No such
+        file or directory`, and `GENERAL.NM-MANAGED` stayed `no`.
+
+        The case reads the entrypoint's **instructions**, not its text: the file
+        quotes that error and names all three commands in the comment explaining
+        why it does not run them, and a case that read the prose would fail on
+        the explanation.
+        """
+        instructions = " ".join(shell_statements(ENTRYPOINT))
+        for command in ("nmcli", "systemctl", "device set", "connection add"):
+            with self.subTest(command=command):
+                self.assertNotIn(command, instructions)
+
+    def test_the_setup_is_installed_as_a_unit_the_image_enables(self):
+        """The sequence is part of the image's boot, not of a scenario.
+
+        A sequence a scenario ran would leave the window where the target is
+        unmanaged open to the first scenario, and the plan's whole correction --
+        that the profile must exist *before* the steps -- only holds if the steps
+        run once, at boot, in order.
+        """
+        text = read(TARGET_CONTAINERFILE)
+        self.assertIn("target-nm-setup.service", text)
+        self.assertRegex(text, r"systemctl\s+enable\s+.*target-nm-setup")
+
+
+class ImageDigestVerificationTest(unittest.TestCase):
+    """The digests are real, and the proof is that the registry still serves them.
+
+    A digest nobody pulled is indistinguishable from one that was, by inspection:
+    both match `sha256:` and both are 64 hex characters. So this case asks the
+    registry, and it is the only case in the file that needs a network.
+
+    Skipped -- never failed -- when there is no registry to ask, because a test
+    suite that turns red because the operator is offline is a suite that gets
+    muted. The skip says what it did not check, so the absence of the check is
+    visible in the output rather than silent.
+    """
+
+    def test_every_locked_digest_is_still_served_by_the_registry(self):
+        """Ask the registry for the manifest, from a `podman build` of nothing.
+
+        The reference is checked by *building* it, because that is what a real
+        build does with it and because it is the only form that exercises the
+        whole reference: `podman manifest inspect` refuses a reference carrying
+        both a tag and a digest (measured: `Error: Docker references with both a
+        tag and digest are currently not supported`), so a case that used it
+        would have been checking a different string than the one a build gets.
+        """
+        import subprocess
+        import tempfile
+
+        for version, entry in sorted(images.load_lock(LOCK)["images"].items()):
+            with self.subTest(version=version):
+                if entry.get("unavailable"):
+                    self.skipTest(f"{version} is recorded unavailable: {entry['unavailable']}")
+                reference = images.base_image_reference(entry, version)
+                tag = f"mosdns-lockprobe-{version.replace('.', '')}"
+                # The probe image is removed whether the case passes or fails. A
+                # verification that leaves an image behind is a verification the
+                # next run pays for, and three of them a day is a disk.
+                self.addCleanup(
+                    subprocess.run,
+                    ["podman", "rmi", "-f", tag],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                with tempfile.TemporaryDirectory() as scratch:
+                    containerfile = Path(scratch) / "Containerfile"
+                    containerfile.write_text(
+                        f"ARG BASE_IMAGE\nFROM ${{BASE_IMAGE}}\n", encoding="utf-8"
+                    )
+                    completed = subprocess.run(
+                        [
+                            "podman", "build", "-f", str(containerfile),
+                            "-t", tag,
+                            "--build-arg", f"BASE_IMAGE={reference}", scratch,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=900,
+                    )
+                if completed.returncode != 0 and looks_like_no_registry(completed.stderr):
+                    self.skipTest(
+                        f"the registry could not be asked about {version}, so the digest was "
+                        f"NOT verified in this run: {completed.stderr.strip()[:200]}"
+                    )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"{reference} cannot be built from, so the lock is stale and a build would "
+                    f"fail: {completed.stderr.strip()[-300:]}",
+                )
+
+    def test_the_lock_names_the_release_it_thinks_it_pinned(self):
+        """`ubuntu:26.04` really is 26.04, and not a tag that means something else.
+
+        The check is the image's own `/etc/os-release`, read from a throwaway
+        container of the locked digest. A `26.04` tag that resolved to a
+        different release would make every cell of the matrix mislabelled, and
+        nothing downstream could tell.
+        """
+        import subprocess
+
+        for version, entry in sorted(images.load_lock(LOCK)["images"].items()):
+            with self.subTest(version=version):
+                if entry.get("unavailable"):
+                    self.skipTest(f"{version} is recorded unavailable")
+                reference = images.base_image_reference(entry, version)
+                completed = subprocess.run(
+                    [
+                        "podman", "run", "--rm", "--network", "none", reference,
+                        "sh", "-c", '. /etc/os-release; printf "%s" "$VERSION_ID"',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if completed.returncode != 0 and looks_like_no_registry(completed.stderr):
+                    self.skipTest(
+                        f"the image for {version} could not be pulled here, so its VERSION_ID was "
+                        f"NOT verified in this run: {completed.stderr.strip()[:200]}"
+                    )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"{reference} could not be run: {completed.stderr.strip()[-200:]}",
+                )
+                # VERSION_ID carries the point release -- `26.04.1` for the
+                # 26.04 tag -- so this is a prefix test on the release the
+                # operator asked for, not an equality against the tag. A tag that
+                # resolved to a *different* release still fails it.
+                reported = completed.stdout.strip()
+                self.assertTrue(
+                    reported == version or reported.startswith(version + "."),
+                    f"the tag ubuntu:{version} serves VERSION_ID={reported!r}, which is a "
+                    f"different release than the one the matrix is testing",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

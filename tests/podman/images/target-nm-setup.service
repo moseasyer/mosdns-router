@@ -1,0 +1,41 @@
+# Make NetworkManager manage eth0, and refuse to continue if it does not.
+#
+# This unit is the reason the NetworkManager sequence lives in the image rather
+# than in a scenario, and the reason the *entrypoint* does not run it: `nmcli`
+# reaches NetworkManager over D-Bus, and before `/sbin/init` there is no bus to
+# connect to. Measured on this host, with an entrypoint that tried: `Error: Could
+# not create NMClient object: Could not connect: No such file or directory`.
+#
+# `After=NetworkManager.service` and deliberately NOT `Requires=NetworkManager.service`.
+#
+# `Requires=` looks like the obvious way to say "NetworkManager must be up
+# first", and it was what this file first said. It is wrong here, and the failure
+# is worse than not having the dependency: the setup script's third step *is*
+# `systemctl restart NetworkManager`, a restart is a stop followed by a start,
+# and `Requires=` deactivates a requiring unit when a required unit is
+# deactivated. So NetworkManager's restart sent SIGTERM to this unit, systemd
+# restarted it, it created a second profile and restarted NetworkManager again,
+# and the target came up with NetworkManager not running at all. The boot journal
+# showed `Main process exited, code=killed, status=15/TERM` on every pass and
+# `Warning: There are 4 other connections with the name 'eth0-managed'`.
+#
+# `After=` orders the job, which is the only thing wanted. The script's own
+# bounded wait for `nmcli general status` is what establishes that the daemon is
+# answering, and `Before=network-online.target` is what makes "the device has its
+# address" mean "NetworkManager gave it one".
+[Unit]
+Description=Make NetworkManager manage eth0, and refuse to continue if it does not
+After=NetworkManager.service
+Before=network-online.target
+
+# `Type=oneshot` so the script's exit status is the unit's verdict, and no
+# `Restart=`: a restart loop would re-run the restart of NetworkManager, which is
+# how the defect above turned four times. One run, one verdict, and the harness's
+# own `assert_networkmanager_manages_device` reports the cell as incomplete.
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/mosdns-target-nm-setup
+
+[Install]
+WantedBy=multi-user.target
