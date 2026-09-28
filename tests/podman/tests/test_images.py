@@ -1745,7 +1745,16 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         and its version table, and those were the other two claims that had gone
         stale in the same paragraph.
         """
-        step = self.plan[self.plan.index("### Task 2:") : self.plan.index("### Task 3:")]
+        # **The whole plan, not Task 2's slice.** This was `self.plan[index("### Task 2:")
+        # : index("### Task 3:")]`, and that region was the whole defect: the claim it
+        # is about is a claim *about Task 3*, and Task 3's step 4 said the opposite in
+        # two sentences, and the architecture note said it in a third. A case that
+        # scans the paragraph under test will pass on a plan whose other 300 lines
+        # contradict it, and this one did -- for a whole round, green, after the two
+        # sentences inside the region had already been fixed. The region is now the
+        # entire document, because "the plan does not say this" is a claim about the
+        # plan.
+        step = self.plan
         self.assertNotIn(
             "entrypoint must perform the NetworkManager device sequence",
             step,
@@ -1769,8 +1778,8 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         # boot would be unchecked.
         self.assertEqual(
             entrypoint_sentences_that_act(step), [],
-            "the plan's Task 2 still gives the image's entrypoint an action to perform; the "
-            "sequence and the check both run from target-nm-setup.service:",
+            "the plan still gives the image's entrypoint an action to perform; the sequence "
+            "and the check both run from target-nm-setup.service:",
         )
 
         # The control, because a detector that finds nothing is also a detector that
@@ -1804,19 +1813,65 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
             "it cannot be used to hold the two stale ones -- the verb list is too wide",
         )
 
+        # **The third one, verbatim, and it is the form the other two are not.** The
+        # architecture note stated the order as *data* -- "So the entrypoint order is:
+        # create the `eth0` connection profile, then `nmcli device set eth0 managed
+        # yes`, then `systemctl restart NetworkManager`" -- with no prepositional
+        # phrase, no "must" and no entrypoint-as-subject, so it was outside every
+        # enumerated construction and the detector reported the plan clean. That is
+        # the residual the last round recorded as "reads constructions, not grammar"
+        # landing on live text that contradicted the paragraph it had just fixed, and
+        # it is why the list is extended rather than the gap documented: a detector
+        # that misses contradictory text in the document it is the detector *for* is
+        # worse than no detector, because it reports a clean plan.
+        note_stale = (
+            "So the entrypoint order is: **create the `eth0` connection profile, then "
+            "`nmcli device set eth0 managed yes`, then `systemctl restart "
+            "NetworkManager`** — and the profile therefore belongs to **Task 2's image "
+            "entrypoint, not to Task 3**."
+        )
+        self.assertEqual(
+            len(entrypoint_sentences_that_act(note_stale)), 1,
+            "the detector does not recognise the architecture note's data form, so the case "
+            "above would pass on a plan whose own architecture preamble assigns the sequence "
+            "to the entrypoint",
+        )
+        # And the corrected form of the same sentence, so extending the list does not
+        # extend it into the plan's own text.
+        note_correct = (
+            "So the order is: **create the `eth0` connection profile, then `nmcli device "
+            "set eth0 managed yes`, then `systemctl restart NetworkManager`** — and the "
+            "profile therefore belongs to **Task 2, not to Task 3**. Within Task 2 it "
+            "belongs to `tests/podman/images/target-nm-setup.service` and **not** to the "
+            "image entrypoint: `nmcli` reaches NetworkManager over D-Bus, and there is no "
+            "bus before `/sbin/init`, so an entrypoint that ran any of the three would "
+            "fail its first one."
+        )
+        self.assertEqual(
+            entrypoint_sentences_that_act(note_correct), [],
+            "the detector flags the plan's own architecture note, which now assigns the "
+            "sequence to the unit and explains why the entrypoint cannot do it",
+        )
+
         # And the positive half, so the fix is not only "the old words are gone": the
-        # step has to *say* the unit creates the profile and the unit runs the check.
+        # plan has to *say* the unit creates the profile and the unit runs the check.
+        # Both patterns are read against the whole plan, and both are anchored so they
+        # cannot be satisfied by a sentence in a different section from the one that
+        # used to contradict them -- `target-nm-setup.service` must be the subject, and
+        # "fail loudly" must belong to the unit or the script rather than to anything
+        # else. Checked against the whole plan, not the Task 2 slice, for the reason
+        # above.
         self.assertRegex(
             step,
             r"target-nm-setup\.service[^.]*(?:creates|created)[^.]*profile",
-            "the plan's Task 2 no longer says which component creates the profile, so an "
-            "implementer has nothing to follow but the two sentences this case removed",
+            "the plan no longer says which component creates the profile, so an implementer "
+            "has nothing to follow but the sentences this case removed",
         )
         self.assertRegex(
             step,
             r"[Tt]he (?:unit|script)[^.]*fail loudly",
-            "the plan's Task 2 no longer says the boot check must fail loudly, which is the "
-            "only part of it that makes an ineffective declaration visible",
+            "the plan no longer says the boot check must fail loudly, which is the only part "
+            "of it that makes an ineffective declaration visible",
         )
 
     def test_the_plan_records_that_the_active_connection_is_nms_own(self):
@@ -1869,6 +1924,28 @@ ENTRYPOINT_MUST = re.compile(r"\bentrypoint\b[^.]{0,40}?\bmust\b", re.IGNORECASE
 ENTRYPOINT_IS_THE_SUBJECT = re.compile(
     r"\bentrypoint\s+(?:creates?|runs|performs|executes)\b", re.IGNORECASE
 )
+# **The data form, which is the branch the architecture note fell between.** "So the
+# entrypoint order is: create the `eth0` connection profile, then `nmcli device set
+# eth0 managed yes`, then `systemctl restart NetworkManager`" has no prepositional
+# phrase about the entrypoint, no "must" and no entrypoint as the subject of the verb
+# -- it names the entrypoint as the *thing whose order is being given*, and the verbs
+# belong to a list. So it was outside every other construction, the detector reported
+# the plan clean, and the sentence that every task brief derives from assigned the
+# sequence to the entrypoint. Hence a fourth branch rather than a documented gap: a
+# detector that misses contradictory text in the document it exists to check is worse
+# than no detector, because it is evidence of cleanliness.
+#
+# The window is kept tight (`order is: create`, `boot sequence is: … restart`) and
+# requires an action verb in the same sentence. `ACTION_VERB` is the reason that
+# second half is needed and the reason it is not enough on its own: the corrected
+# note names the same three commands, and a bare "three commands are named near the
+# word entrypoint" would flag it.
+ENTRYPOINT_OWNS_AN_ORDER = re.compile(
+    r"\bentrypoint(?:'s)?\s+(?:order|sequence|steps|boot)\b"
+    r"|\bentrypoint\s+(?:must\s+)?(?:create|run|perform|execute)s?\b"
+    r"|\b(?:creates?|runs|performs|executes?)\s+the\s+`?eth0`?\s+connection\b",
+    re.IGNORECASE,
+)
 
 
 def entrypoint_sentences_that_act(text: str) -> list[str]:
@@ -1885,7 +1962,11 @@ def entrypoint_sentences_that_act(text: str) -> list[str]:
     for sentence in re.split(r"(?<=\.)\s+", stripped):
         if (
             IN_THE_ENTRYPOINT.search(sentence) and ACTION_VERB.search(sentence)
-        ) or ENTRYPOINT_MUST.search(sentence) or ENTRYPOINT_IS_THE_SUBJECT.search(sentence):
+        ) or (
+            ENTRYPOINT_OWNS_AN_ORDER.search(sentence) and ACTION_VERB.search(sentence)
+        ) or ENTRYPOINT_MUST.search(sentence) or ENTRYPOINT_IS_THE_SUBJECT.search(
+            sentence
+        ):
             acted.append(" ".join(sentence.split()))
     return acted
 
