@@ -27,10 +27,13 @@ commands a disposable container run needs.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -111,6 +114,36 @@ class MountPolicyError(PodmanError):
 
 class ContainerPolicyError(PodmanError):
     """A container flag was refused: it would give the target the host."""
+
+
+class NetworkManagerDeviceError(PodmanError):
+    """A running target is not the machine these scenarios need.
+
+    Raised only for the device state, and its message always names the two
+    steps that fix it, because this failure is not the project's bug.
+    """
+
+
+# The device a target gets on a netavark bridge network, and the two steps that
+# make NetworkManager manage it. Both are measured facts and both are stated
+# wherever the check is, because the previous plan's SKIPPED list came from
+# believing the sequence was impossible.
+NM_DEVICE = "eth0"
+NM_MANAGED_FIELD = "GENERAL.NM-MANAGED"
+NM_MANAGED_YES = "yes"
+NM_MANAGE_STEPS = (
+    "nmcli device set eth0 managed yes",
+    "systemctl restart NetworkManager",
+)
+NM_UNMANAGED_EXPLANATION = (
+    "A target's device is only managed after both steps, in that order, in the "
+    "target container's own init: the override is written under "
+    "/run/NetworkManager/devices/ and only the restart re-reads it, so the "
+    "first command on its own returns success and does not take effect. The "
+    "device must also be a bridge network's eth0 of type ethernet -- Podman's "
+    "default rootless network hands a container a tun/tap device, which "
+    "NetworkManager refuses by design."
+)
 
 
 def _forbidden_root(path: str) -> str | None:
@@ -498,16 +531,23 @@ class Podman:
     def remove_volume(self, name: str) -> CommandResult:
         return self.run(["volume", "rm", "-f", name])
 
-    def container_names(self, prefix: str) -> tuple[str, ...]:
-        """Every container whose name starts with `prefix`, running or not."""
+    def all_container_names(self, prefix: str) -> tuple[str, ...]:
+        """Every container whose name starts with `prefix`, running or not.
+
+        The filter is anchored with a leading `^` because Podman's `name=`
+        filter is a substring match. An unanchored `mosdns-` finds another run's
+        containers as well, and a teardown that sweeps by prefix would remove
+        them -- which matters because two runs on one machine is the normal
+        case, not an edge case.
+        """
         result = self.run(
-            ["ps", "-a", "--filter", f"name={prefix}", "--format", "{{.Names}}"]
+            ["ps", "-a", "--filter", f"name=^{prefix}", "--format", "{{.Names}}"]
         )
         return tuple(line for line in result.output.splitlines() if line)
 
-    def volume_names(self, prefix: str) -> tuple[str, ...]:
+    def all_volume_names(self, prefix: str) -> tuple[str, ...]:
         result = self.run(
-            ["volume", "ls", "--filter", f"name={prefix}", "--format", "{{.Name}}"]
+            ["volume", "ls", "--filter", f"name=^{prefix}", "--format", "{{.Name}}"]
         )
         return tuple(line for line in result.output.splitlines() if line)
 
@@ -518,3 +558,259 @@ class Podman:
         one: the harness never installs its own prerequisites.
         """
         return shutil.which(self.executable) is not None or Path(self.executable).exists()
+
+    def nm_managed(self, container: str, device: str = NM_DEVICE) -> str:
+        """Ask a running target whether NetworkManager manages its device.
+
+        The query is a fixed read built as an argument array, not a script, so
+        it is the same bytes on every run. `check=True` means a target where the
+        device does not exist raises rather than answering.
+        """
+        return self.exec_container(
+            container, "nmcli", "-g", NM_MANAGED_FIELD, "device", "show", device
+        ).output
+
+
+def assert_networkmanager_manages_device(
+    podman: Podman, container: str, device: str = NM_DEVICE
+) -> str:
+    """Fail unless NetworkManager manages `device` in a running target.
+
+    This is the check the previous plan's largest SKIPPED list was built on the
+    absence of. A target that boots with an unmanaged `eth0` produces a
+    scenario failure that reads like an installer bug -- every DNS assertion
+    downstream fails at once, and for a reason that has nothing to do with the
+    package. So the harness asserts it before any scenario runs, and the
+    refusal names the two steps that produce a managed device rather than
+    saying "unmanaged" and leaving the reader to work it out.
+
+    Returns the value the field held, which is `yes` on the only path that does
+    not raise.
+    """
+    try:
+        value = podman.nm_managed(container, device)
+    except PodmanError as error:
+        raise NetworkManagerDeviceError(
+            f"NetworkManager device check failed in {container}: {error}\n"
+            f"Make the target manage {device} before any scenario runs:\n"
+            f"  1. {NM_MANAGE_STEPS[0]}\n"
+            f"  2. {NM_MANAGE_STEPS[1]}\n"
+            f"{NM_UNMANAGED_EXPLANATION}"
+        ) from error
+    if value != NM_MANAGED_YES:
+        raise NetworkManagerDeviceError(
+            f"NetworkManager does not manage {device} in {container}: "
+            f"'nmcli -g {NM_MANAGED_FIELD} device show {device}' answered {value!r}, "
+            f"not {NM_MANAGED_YES!r}\n"
+            f"Make the target manage {device} before any scenario runs:\n"
+            f"  1. {NM_MANAGE_STEPS[0]}\n"
+            f"  2. {NM_MANAGE_STEPS[1]}\n"
+            f"{NM_UNMANAGED_EXPLANATION}"
+        )
+    return value
+
+
+# -- the lifecycle ------------------------------------------------------------
+
+# Every resource this harness creates carries this prefix, and the run id that
+# follows it. The prefix is what makes a sweep safe: it is a namespace, so a
+# teardown can find what a run left behind without finding anything else.
+RESOURCE_PREFIX = "mosdns"
+
+# The plan's fixed private network. A bridge network, not Podman's default
+# rootless one, because the default hands a container a tun/tap device that
+# NetworkManager refuses by design.
+DEFAULT_NETWORK_SUBNET = "10.89.0.0/24"
+
+
+class CleanupFailed(PodmanError):
+    """Teardown left something of this run behind.
+
+    Carries the result so a caller can say which resource, rather than only
+    that something did.
+    """
+
+    def __init__(self, result: "CleanupResult"):
+        self.result = result
+        super().__init__(
+            "teardown left resources of this run behind: "
+            + ", ".join(f"{kind} {name}" for kind, name in result.survivors)
+            + "\nrun 'python3 tests/podman/run.py cleanup --run-id "
+            + result.run_id
+            + "' once the cause is cleared"
+        )
+
+
+@dataclass(frozen=True)
+class TeardownError:
+    """One teardown step that failed, kept even when nothing survived.
+
+    Recorded rather than raised, because a step that failed and left nothing
+    behind has done its job and a run that reports it as a failure teaches
+    everybody to ignore leaks.
+    """
+
+    kind: str
+    name: str
+    message: str
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """What teardown did, what it could not do, and what is still there.
+
+    `survivors` is a (kind, name) pair per resource rather than a bare name, so
+    "a network survived" and "a container survived" are different problems and
+    a reader of a failure is told which one they have.
+    """
+
+    run_id: str
+    removed: tuple[str, ...] = ()
+    errors: tuple[TeardownError, ...] = ()
+    survivors: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """True when nothing of this run survives.
+
+        Not "when nothing failed". The question a teardown has to answer is
+        whether the machine is clean, and podman is asked directly rather than
+        inferred from the harness's own bookkeeping.
+        """
+        return not self.survivors
+
+
+def new_run_id(when: datetime | None = None) -> str:
+    """A UTC run id, compact enough for a container name and sortable as text.
+
+    The timestamp is UTC because the run id is also the result directory's name
+    and the two have to agree in a log from a machine in another timezone.
+    """
+    moment = when or datetime.now(timezone.utc)
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc)
+    return moment.strftime("%Y%m%dT%H%M%SZ")
+
+
+class RunResources:
+    """The resources one run owns, and their teardown.
+
+    Naming is the whole mechanism: every container, network and volume carries
+    this run's prefix, so `cleanup` can be both precise -- it removes what this
+    run created and nothing else -- and complete, because it can also find a
+    resource a scenario created without recording it.
+    """
+
+    def __init__(self, podman: Podman, run_id: str, network: str | None = None):
+        self.podman = podman
+        self.run_id = run_id
+        self.network = network
+        self.containers: list[str] = []
+        self.volumes: list[str] = []
+        self.cleanup_result: CleanupResult | None = None
+
+    @property
+    def prefix(self) -> str:
+        return f"{RESOURCE_PREFIX}-{self.run_id}"
+
+    def container_name(self, role: str, version: str) -> str:
+        return f"{self.prefix}-{role}-{version}"
+
+    def volume_name(self, role: str) -> str:
+        return f"{self.prefix}-{role}"
+
+    def network_name(self, name: str) -> str:
+        return f"{self.prefix}-{name}"
+
+    def track_container(self, name: str) -> str:
+        self.containers.append(name)
+        return name
+
+    def track_volume(self, name: str) -> str:
+        self.volumes.append(name)
+        return name
+
+    def _attempt(self, kind: str, name: str, action) -> tuple[str | None, str | None]:
+        """Run one teardown step, reporting rather than raising.
+
+        A teardown that returns on the first failure strands everything after
+        it: one stuck container would leave the network and the volumes behind
+        too, and the next run would find a network it did not create.
+        """
+        try:
+            action()
+        except PodmanError as error:
+            return None, f"{kind} {name}: {error}"
+        return name, None
+
+    def cleanup(self) -> CleanupResult:
+        """Remove this run's resources and report what is still there.
+
+        Containers, then the network, then volumes -- the order is required,
+        not chosen: a container attached to a network cannot be removed after
+        the network is gone.
+        """
+        removed: list[str] = []
+        errors: list[TeardownError] = []
+
+        for name in list(self.containers):
+            done, message = self._attempt("container", name, lambda n=name: self.podman.remove_container(n))
+            (removed.append(done) if done else errors.append(TeardownError("container", name, message)))
+        # The sweep catches a container a scenario created without recording it.
+        for name in self.podman.all_container_names(self.prefix):
+            if name in removed:
+                continue
+            done, message = self._attempt("container", name, lambda n=name: self.podman.remove_container(n))
+            (removed.append(done) if done else errors.append(TeardownError("container", name, message)))
+
+        if self.network:
+            done, message = self._attempt("network", self.network, lambda: self.podman.remove_network(self.network))
+            (removed.append(done) if done else errors.append(TeardownError("network", self.network, message)))
+
+        for name in list(self.volumes):
+            done, message = self._attempt("volume", name, lambda n=name: self.podman.remove_volume(n))
+            (removed.append(done) if done else errors.append(TeardownError("volume", name, message)))
+        for name in self.podman.all_volume_names(self.prefix):
+            if name in removed:
+                continue
+            done, message = self._attempt("volume", name, lambda n=name: self.podman.remove_volume(n))
+            (removed.append(done) if done else errors.append(TeardownError("volume", name, message)))
+
+        # The survivorship question, asked of podman rather than of this
+        # bookkeeping: the harness may have forgotten a name, and podman cannot.
+        survivors: list[tuple[str, str]] = [
+            ("container", name) for name in self.podman.all_container_names(self.prefix)
+        ]
+        survivors += [("volume", name) for name in self.podman.all_volume_names(self.prefix)]
+        if self.network and self.podman.network_exists(self.network):
+            survivors.append(("network", self.network))
+
+        result = CleanupResult(
+            run_id=self.run_id,
+            removed=tuple(removed),
+            errors=tuple(errors),
+            survivors=tuple(survivors),
+        )
+        self.cleanup_result = result
+        return result
+
+
+@contextlib.contextmanager
+def podman_session(podman: Podman, run_id: str, network: str | None = None):
+    """Run a body of scenarios, then tear the run down however the body ended.
+
+    The teardown is in a `finally` because the shape that leaks is the obvious
+    one: do the work, then remove the resources on the next line, which the
+    exception skips. And a teardown failure is raised *only* when nothing else
+    is propagating -- raising it over a scenario's own exception would replace
+    the installer's error with "a container survived" and destroy the evidence
+    for why the run failed. The result is attached to the run either way, so
+    the leak is reported beside the failure rather than instead of it.
+    """
+    resources = RunResources(podman, run_id, network)
+    try:
+        yield resources
+    finally:
+        result = resources.cleanup()
+        if not result.ok and sys.exc_info()[0] is None:
+            raise CleanupFailed(result)

@@ -37,10 +37,12 @@ Podman. Nothing in this file starts, stops or inspects anything real.
 
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -49,11 +51,17 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
 
 from podman import (  # noqa: E402
+    CleanupFailed,
     ContainerPolicyError,
     MountPolicyError,
+    NetworkManagerDeviceError,
     Podman,
     PodmanError,
     PodmanTimeout,
+    RunResources,
+    assert_networkmanager_manages_device,
+    new_run_id,
+    podman_session,
 )
 
 # The five host roots the plan forbids binding into a target container, and the
@@ -149,12 +157,30 @@ def main():
             handle.write(json.dumps(argv) + "\\n")
     answer = {"returncode": 0, "stdout": "", "stderr": ""}
     table = os.environ.get("FAKE_PODMAN_TABLE")
+    state_path = os.environ.get("FAKE_PODMAN_STATE")
+    state = {}
+    if state_path and os.path.exists(state_path):
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
     if table:
         with open(table, encoding="utf-8") as handle:
-            for rule in json.load(handle).get("rules", []):
-                if contains(argv, rule["match"]):
+            for index, rule in enumerate(json.load(handle).get("rules", [])):
+                if not contains(argv, rule["match"]):
+                    continue
+                # A rule may carry a sequence of answers, so a case can say
+                # "the first listing shows it, the second does not" -- which is
+                # what a sweep that actually removed something looks like.
+                answers = rule.get("answers")
+                if answers:
+                    seen = state.get(str(index), 0)
+                    answer = answers[min(seen, len(answers) - 1)]
+                    state[str(index)] = seen + 1
+                    if state_path:
+                        with open(state_path, "w", encoding="utf-8") as handle:
+                            json.dump(state, handle)
+                else:
                     answer = rule
-                    break
+                break
     time.sleep(float(answer.get("sleep", 0)))
     if answer.get("dump_env"):
         sys.stdout.write(json.dumps(dict(os.environ), sort_keys=True))
@@ -193,7 +219,16 @@ class FakePodmanBinary:
     The table is a list of rules, each one a contiguous token run that selects
     the answer. The first matching rule wins, so a case that needs two
     different answers for one subcommand orders the narrower rule first.
+
+    The default is a machine already in the state a teardown wants to reach:
+    every command succeeds, nothing is listed, and a network is absent. That is
+    the state `run.py cleanup` documents itself as producing, so a case that
+    does not care about leftovers does not have to say so four times over. A
+    case that wants a survivor writes its own rule, which wins because it is
+    matched first.
     """
+
+    DEFAULT_RULES = ({"match": ["network", "exists"], "returncode": 1},)
 
     def __init__(self, directory, rules=None):
         self.directory = directory
@@ -202,15 +237,18 @@ class FakePodmanBinary:
         self.path.chmod(self.path.stat().st_mode | stat.S_IXUSR)
         self.log = directory / "invocations.jsonl"
         self.table = directory / "table.json"
+        self.state = directory / "state.json"
         self.write_table(rules or [])
 
     def write_table(self, rules):
-        self.table.write_text(json.dumps({"rules": rules}), encoding="utf-8")
+        ordered = list(rules) + [dict(rule) for rule in self.DEFAULT_RULES]
+        self.table.write_text(json.dumps({"rules": ordered}), encoding="utf-8")
 
     def extra_env(self):
         return {
             "FAKE_PODMAN_LOG": str(self.log),
             "FAKE_PODMAN_TABLE": str(self.table),
+            "FAKE_PODMAN_STATE": str(self.state),
         }
 
     def invocations(self):
@@ -458,8 +496,8 @@ class ArgumentArrayTest(PodmanTestCase):
             lambda: podman.remove_network("mosdns-testnet"),
             lambda: podman.create_volume("mosdns-x-state"),
             lambda: podman.remove_volume("mosdns-x-state"),
-            lambda: podman.container_names("mosdns-x-"),
-            lambda: podman.volume_names("mosdns-x-"),
+            lambda: podman.all_container_names("mosdns-x-"),
+            lambda: podman.all_volume_names("mosdns-x-"),
         ]
         for operation in operations:
             operation()
@@ -916,6 +954,485 @@ class ContainerPolicyTest(PodmanTestCase):
         )
         argv = fake.only()
         self.assertEqual(argv[-5:], ["--ip", "10.89.0.10", "--hostname", "mosdns-target", "localhost/mosdns-target:24.04"])
+
+
+class NetworkManagerDeviceTest(PodmanTestCase):
+    """The measured fact, asserted at run time instead of assumed.
+
+    The previous plan recorded its entire NetworkManager SKIPPED list on the
+    conclusion that a container cannot make NetworkManager manage a device.
+    That conclusion was measured and is false. What is true, measured here, is:
+
+    * a container on Podman's **default** rootless network gets a tun/tap
+      device, NetworkManager refuses that device type by design, and activation
+      fails with *device is strictly unmanaged*;
+    * a container on a **netavark bridge** network gets an ``eth0`` of type
+      ``ethernet``;
+    * ``nmcli device set eth0 managed yes`` then **returns success and does not
+      take effect** -- the override is written under ``/run/NetworkManager/
+      devices/`` and only ``systemctl restart NetworkManager`` re-reads it.
+
+    So the harness checks the device before any scenario runs, and a target
+    whose ``eth0`` is unmanaged fails with a message naming the two steps. It
+    is a runtime assertion because a target that boots wrong produces a
+    scenario failure that reads like an installer bug, and a comment would have
+    left the previous plan's conclusion standing.
+    """
+
+    def test_the_check_reads_the_managed_field_from_the_running_target(self):
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        self.assertEqual(
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04"),
+            "yes",
+        )
+        self.assertEqual(
+            fake.only(),
+            ["exec", "mosdns-x-target-24.04", "nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", "eth0"],
+        )
+
+    def test_the_check_asks_for_no_shell(self):
+        """The query is a fixed read, so it is an argument array and not a script.
+
+        A `sh -c` here would be a shell the harness did not need, on a command
+        whose whole job is to be the same bytes every time.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+        self.assertNotIn("sh", fake.only())
+
+    def test_an_unmanaged_device_fails_with_both_steps_named(self):
+        """The message has to be enough to act on without reading the plan.
+
+        A failure here is not the project's bug; it is the target booting
+        without the two-step sequence, and the operator reading the message is
+        the only one who can fix it.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "no\n"}])
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+        message = str(caught.exception)
+        self.assertIn("nmcli device set eth0 managed yes", message)
+        self.assertIn("systemctl restart NetworkManager", message)
+
+    def test_the_refusal_reports_what_the_field_actually_said(self):
+        """`no` and `yes` are one character apart, and the message must carry it.
+
+        The value is the evidence, and a message that only says "unmanaged"
+        makes the reader go and reproduce it.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "no\n"}])
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+        self.assertIn("no", str(caught.exception))
+
+    def test_a_query_that_fails_also_names_both_steps(self):
+        """`nmcli` erroring is the shape the refusal takes on a missing device.
+
+        `device show` on an interface that is not there exits non-zero, and that
+        is a target whose bridge network gave it something other than the
+        `eth0` this check asks about. Reporting it as a plain error would leave
+        the two steps unnamed.
+        """
+        fake = self.fake([{"match": ["nmcli"], "returncode": 1, "stderr": "Error: unknown device 'eth0'.\n"}])
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+        message = str(caught.exception)
+        self.assertIn("nmcli device set eth0 managed yes", message)
+        self.assertIn("systemctl restart NetworkManager", message)
+        self.assertIn("unknown device 'eth0'", message)
+
+    def test_an_empty_answer_is_a_failure_and_not_a_pass(self):
+        """Silence is not consent.
+
+        An empty answer is what a wrapper that swallowed the output would look
+        like, and a check that treated "not yes" as fine would turn that into a
+        green scenario against a target NetworkManager never touched.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": ""}])
+        with self.assertRaises(NetworkManagerDeviceError):
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+
+    def test_an_unexpected_answer_is_refused_rather_than_assumed_yes(self):
+        """Only the exact word `yes` passes, so nothing is inferred.
+
+        Podman has been known to answer `--get` with the field name as a header
+        on some versions, and a check that looked for "yes" anywhere in the
+        output would pass on `GENERAL.NM-MANAGED:no`.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "GENERAL.NM-MANAGED:yes\n"}])
+        with self.assertRaises(NetworkManagerDeviceError):
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+
+    def test_a_check_that_hangs_is_abandoned_rather_than_blocking_the_run(self):
+        """NetworkManager inside a wedged target does not answer.
+
+        Without a deadline a broken target turns into a run that never finishes
+        and never reports, which is the same as a run that silently passed.
+        """
+        fake = self.fake([{"match": ["nmcli"], "sleep": 30}])
+        podman = self.client(fake, timeout=0.5)
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(podman, "mosdns-x-target-24.04")
+        self.assertIn("nmcli device set eth0 managed yes", str(caught.exception))
+
+    def test_the_device_is_named_so_a_tun_tap_target_can_be_told_apart(self):
+        """The default rootless network's tun/tap device fails this check.
+
+        That is the point: a target on the wrong network reports a refusal
+        naming the two steps, and the reader can see the device is not the
+        bridge `eth0` rather than wondering why the override "did not work".
+        """
+        fake = self.fake([{"match": ["nmcli"], "returncode": 1, "stderr": "Error: unknown device 'eth0'.\n"}])
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+        self.assertIn("eth0", str(caught.exception))
+
+    def test_the_check_names_the_container_it_was_looking_at(self):
+        """Three versions run at once, and the failure has to say which one."""
+        fake = self.fake([{"match": ["nmcli"], "stdout": "no\n"}])
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-20260928T101010Z-target-24.04")
+        self.assertIn("mosdns-20260928T101010Z-target-24.04", str(caught.exception))
+
+    def test_a_refusal_is_a_podman_error_so_the_run_loop_reports_it(self):
+        with self.assertRaises(PodmanError):
+            assert_networkmanager_manages_device(
+                self.client(self.fake([{"match": ["nmcli"], "stdout": "no\n"}])), "mosdns-x-target-24.04"
+            )
+
+
+class CleanupOrderTest(PodmanTestCase):
+    """Containers, then the network, then volumes -- and past the failures.
+
+    The order is not cosmetic. A container attached to a network cannot be
+    removed after the network is gone, so a teardown that removed them in the
+    wrong order would report leftovers for a run that had nothing left to
+    clean, and the next run would refuse to start.
+    """
+
+    def removals(self, fake):
+        """Only the calls that change something, in order.
+
+        The survivorship sweep issues read-only `ps`/`volume ls` calls between
+        the phases, and this case is about the order of the removals.
+        """
+        mutating = (["rm", "-f"], ["network", "rm"], ["volume", "rm", "-f"])
+        return [
+            argv
+            for argv in fake.invocations()
+            if any(argv[: len(prefix)] == prefix for prefix in mutating)
+        ]
+
+    def test_a_whole_teardown_removes_containers_then_the_network_then_volumes(self):
+        fake = self.fake()
+        with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
+            run.track_container(run.container_name("target", "24.04"))
+            run.track_container(run.container_name("client", "24.04"))
+            run.track_volume(run.volume_name("state"))
+        self.assertEqual(
+            self.removals(fake),
+            [
+                ["rm", "-f", "mosdns-20260928T101010Z-target-24.04"],
+                ["rm", "-f", "mosdns-20260928T101010Z-client-24.04"],
+                ["network", "rm", "mosdns-20260928T101010Z-testnet"],
+                ["volume", "rm", "-f", "mosdns-20260928T101010Z-state"],
+            ],
+        )
+
+    def test_teardown_asks_whether_anything_of_this_run_survived(self):
+        """The consolidated failure is about survivors, not about errors.
+
+        A teardown step that failed and left nothing behind has done its job.
+        One that failed and left a container has not. Podman is asked directly,
+        so the answer is podman's rather than the harness's bookkeeping.
+        """
+        fake = self.fake()
+        with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
+            run.track_container(run.container_name("target", "24.04"))
+        self.assertEqual(
+            [argv[:2] for argv in fake.invocations()][-3:],
+            [["ps", "-a"], ["volume", "ls"], ["network", "exists"]],
+        )
+
+    def test_a_survivor_is_named_and_the_run_is_a_failure(self):
+        """A leftover is the failure, and it has to be identifiable."""
+        fake = self.fake([
+            {"match": ["rm", "-f"], "returncode": 2, "stderr": "no such container\n"},
+            {"match": ["ps", "-a"], "stdout": "mosdns-20260928T101010Z-target-24.04\n"},
+        ])
+        with self.assertRaises(CleanupFailed) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z") as run:
+                run.track_container(run.container_name("target", "24.04"))
+        self.assertFalse(caught.exception.result.ok)
+        self.assertIn(("container", "mosdns-20260928T101010Z-target-24.04"), caught.exception.result.survivors)
+
+    def test_a_teardown_error_that_left_nothing_is_reported_but_is_not_a_failure(self):
+        """Errors are recorded; the failure is reserved for what survived.
+
+        A container that was already gone, or a network that was never
+        created, makes `rm` fail while the run is in fact clean. Calling that a
+        failed teardown would make an ordinary rerun look like a leak, and a
+        harness that cries wolf about leaks stops being read about them.
+        """
+        fake = self.fake([
+            {"match": ["rm", "-f"], "returncode": 1, "stderr": "no such container\n"},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z") as run:
+            run.track_container(run.container_name("target", "24.04"))
+        outcome = run.cleanup_result
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(outcome.errors), 1)
+        self.assertEqual(outcome.errors[0].name, "mosdns-20260928T101010Z-target-24.04")
+        self.assertIn("no such container", outcome.errors[0].message)
+
+    def test_teardown_continues_past_a_container_it_could_not_remove(self):
+        """One stuck container does not strand the other eleven.
+
+        The tempting implementation returns on the first failure, and then the
+        network and the volumes stay behind too, and the next run finds a
+        network it did not create and refuses to use it.
+        """
+        fake = self.fake([
+            {"match": ["rm", "-f", "mosdns-20260928T101010Z-stuck-24.04"], "returncode": 125, "stderr": "device busy\n"},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
+            run.track_container(run.container_name("stuck", "24.04"))
+            run.track_container(run.container_name("ok", "24.04"))
+        removals = self.removals(fake)
+        self.assertEqual(
+            removals,
+            [["rm", "-f", "mosdns-20260928T101010Z-stuck-24.04"],
+             ["rm", "-f", "mosdns-20260928T101010Z-ok-24.04"],
+             ["network", "rm", "mosdns-20260928T101010Z-testnet"]],
+        )
+
+    def test_every_error_is_reported_not_only_the_first(self):
+        fake = self.fake([
+            {"match": ["rm", "-f"], "returncode": 125, "stderr": "device busy\n"},
+            {"match": ["network", "rm"], "returncode": 125, "stderr": "network busy\n"},
+            {"match": ["volume", "rm"], "returncode": 125, "stderr": "volume in use\n"},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
+            run.track_container(run.container_name("target", "24.04"))
+            run.track_volume(run.volume_name("state"))
+        outcome = run.cleanup_result
+        self.assertEqual(len(outcome.errors), 3)
+        self.assertEqual([error.kind for error in outcome.errors], ["container", "network", "volume"])
+
+    def test_a_volume_left_behind_is_a_survivor_too(self):
+        """A volume holds state, and state left behind is worse than a container.
+
+        A container is visible in `podman ps`; a volume is not, and a stale one
+        is the thing that makes a later install see a previous run's state.
+        """
+        fake = self.fake([
+            {"match": ["volume", "rm"], "returncode": 1, "stderr": "volume is in use\n"},
+            {"match": ["volume", "ls"], "stdout": "mosdns-20260928T101010Z-state\n"},
+        ])
+        with self.assertRaises(CleanupFailed) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z") as run:
+                run.track_volume(run.volume_name("state"))
+        self.assertIn(("volume", "mosdns-20260928T101010Z-state"), caught.exception.result.survivors)
+        self.assertFalse(caught.exception.result.ok)
+
+    def test_a_network_left_behind_is_a_survivor_too(self):
+        """The network is this run's, so its survival is this run's failure."""
+        fake = self.fake([
+            {"match": ["network", "rm"], "returncode": 1, "stderr": "network is in use\n"},
+            {"match": ["network", "exists"], "returncode": 0},
+        ])
+        with self.assertRaises(CleanupFailed) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet"):
+                pass
+        self.assertIn(("network", "mosdns-20260928T101010Z-testnet"), caught.exception.result.survivors)
+
+    def test_teardown_sweeps_up_a_resource_the_run_lost_track_of(self):
+        """The run prefix is the tracking, so a forgotten name is still found.
+
+        A scenario that creates a container through its own command line
+        leaves something the harness never recorded. Without the sweep it is
+        invisible to `cleanup`, and the run after it inherits a stray container.
+        The listing is present once and then empty, which is what a sweep that
+        actually removed it looks like.
+        """
+        fake = self.fake([
+            {"match": ["ps", "-a"], "answers": [
+                {"stdout": "mosdns-20260928T101010Z-rogue\n"},
+                {"stdout": ""},
+            ]},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z"):
+            pass
+        self.assertIn(["rm", "-f", "mosdns-20260928T101010Z-rogue"], fake.invocations())
+
+    def test_teardown_touches_nothing_belonging_to_another_run(self):
+        """The sweep is anchored on this run's prefix, not on the word `mosdns`.
+
+        An unanchored filter would remove the containers of a run happening in
+        parallel, and two runs on one machine is the normal case rather than an
+        edge case.
+        """
+        fake = self.fake([
+            {"match": ["ps", "-a"], "answers": [
+                {"stdout": "mosdns-20260928T101010Z-rogue\n"},
+                {"stdout": ""},
+            ]},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z"):
+            pass
+        filters = [argv[3] for argv in fake.invocations() if argv[:2] in (["ps", "-a"], ["volume", "ls"])]
+        self.assertEqual(
+            filters,
+            ["name=^mosdns-20260928T101010Z"] * 4,
+        )
+        removed = [argv[-1] for argv in fake.invocations() if argv[:2] == ["rm", "-f"]]
+        self.assertNotIn("mosdns-20260928T101011Z-target-24.04", removed)
+
+    def test_a_second_cleanup_of_the_same_run_reports_a_clean_run(self):
+        """`run.py cleanup` has to be safe to run twice.
+
+        It is the documented way to recover a host after a killed run, and a
+        recovery command that fails on the state it is meant to clear is not a
+        recovery command.
+        """
+        fake = self.fake()
+        podman = self.client(fake)
+        run = RunResources(podman, "20260928T101010Z")
+        run.track_container(run.container_name("target", "24.04"))
+        self.assertTrue(run.cleanup().ok)
+        self.assertTrue(run.cleanup().ok)
+
+
+class RaisingScenarioTest(PodmanTestCase):
+    """A scenario that raises still reaches teardown.
+
+    This is the requirement most easily asserted and least easily true. The
+    shape that leaks is `run_version` doing its work and then returning a
+    result, with the teardown on the line after: the exception skips it. So the
+    teardown is in a `finally`, and the two halves of the awkwardness -- an
+    exception from the scenario *and* a failing teardown -- are held here
+    separately, because getting the second one wrong silently destroys the
+    first one's evidence.
+    """
+
+    def test_a_raising_scenario_still_tears_its_run_down(self):
+        fake = self.fake()
+
+        def scenario():
+            raise AssertionError("the installer's postinst exited 1")
+
+        with self.assertRaises(AssertionError):
+            with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
+                run.track_container(run.container_name("target", "24.04"))
+                scenario()
+        self.assertIn(["rm", "-f", "mosdns-20260928T101010Z-target-24.04"], fake.invocations())
+        self.assertIn(["network", "rm", "mosdns-20260928T101010Z-testnet"], fake.invocations())
+        self.assertTrue(run.cleanup_result.ok)
+
+    def test_a_raising_scenario_is_not_masked_by_a_failing_teardown(self):
+        """The scenario's exception is the evidence; the leak is reported beside it.
+
+        Raising the teardown failure from a `finally` would replace the installer's
+        error with "a container survived", and the reason the installer failed
+        would be gone. So the teardown result is attached and the original
+        exception propagates.
+        """
+        fake = self.fake([
+            {"match": ["rm", "-f"], "returncode": 125, "stderr": "device busy\n"},
+            {"match": ["ps", "-a"], "stdout": "mosdns-20260928T101010Z-target-24.04\n"},
+        ])
+
+        def scenario():
+            raise AssertionError("the installer's postinst exited 1")
+
+        with self.assertRaises(AssertionError) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z") as run:
+                run.track_container(run.container_name("target", "24.04"))
+                scenario()
+        self.assertIn("postinst exited 1", str(caught.exception))
+        self.assertFalse(run.cleanup_result.ok)
+        self.assertIn(("container", "mosdns-20260928T101010Z-target-24.04"), run.cleanup_result.survivors)
+
+    def test_a_successful_run_that_leaves_something_behind_fails_loudly(self):
+        """With nothing to mask it, a leak is raised rather than logged.
+
+        A run that passes every scenario and leaks a container has still failed,
+        and the only place that can say so is the teardown.
+        """
+        fake = self.fake([
+            {"match": ["ps", "-a"], "stdout": "mosdns-20260928T101010Z-rogue\n"},
+        ])
+        with self.assertRaises(CleanupFailed) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z"):
+                pass
+        self.assertIn("mosdns-20260928T101010Z-rogue", str(caught.exception))
+        self.assertIn(("container", "mosdns-20260928T101010Z-rogue"), caught.exception.result.survivors)
+
+    def test_a_clean_run_leaves_nothing_to_raise(self):
+        fake = self.fake()
+        with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
+            run.track_container(run.container_name("target", "24.04"))
+        self.assertEqual(run.cleanup_result.survivors, ())
+        self.assertEqual(run.cleanup_result.errors, ())
+
+    def test_a_session_always_cleans_up_even_with_nothing_tracked(self):
+        """The network is a session's own resource, so it is removed regardless.
+
+        A caller that forgets to track its containers still gets its network
+        removed; the survivorship sweep is what catches the containers.
+        """
+        fake = self.fake()
+        with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet"):
+            pass
+        self.assertIn(["network", "rm", "mosdns-20260928T101010Z-testnet"], fake.invocations())
+
+
+class RunNamingTest(PodmanTestCase):
+    """Every resource carries this run's prefix, so one run cannot touch another's.
+
+    Two runs on one machine is the normal case for a release gate and a
+    developer's own run at the same time, and a fixed name for the network
+    would mean the second run either fails to create it or removes the first
+    run's.
+    """
+
+    def test_two_runs_get_different_ids(self):
+        first, second = new_run_id(when=datetime(2026, 9, 28, 10, 10, 10)), new_run_id(
+            when=datetime(2026, 9, 28, 10, 10, 11)
+        )
+        self.assertNotEqual(first, second)
+
+    def test_a_run_id_is_utc_sortable_and_usable_in_a_container_name(self):
+        run_id = new_run_id(when=datetime(2026, 9, 28, 10, 10, 10))
+        self.assertEqual(run_id, "20260928T101010Z")
+        self.assertTrue(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", run_id))
+
+    def test_every_name_a_run_produces_carries_its_prefix(self):
+        run = RunResources(self.client(self.fake()), "20260928T101010Z", network="testnet")
+        names = [
+            run.container_name("target", "24.04"),
+            run.container_name("client", "24.04"),
+            run.volume_name("state"),
+            run.network_name("testnet"),
+        ]
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(name.startswith("mosdns-20260928T101010Z-"), name)
+                self.assertTrue(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name), name)
+
+    def test_two_runs_never_produce_the_same_container_name(self):
+        fake = self.fake()
+        first = RunResources(self.client(fake), "20260928T101010Z")
+        second = RunResources(self.client(fake), "20260928T101011Z")
+        self.assertNotEqual(
+            first.container_name("target", "24.04"),
+            second.container_name("target", "24.04"),
+        )
+
+    def test_a_container_name_keeps_the_version_visible(self):
+        """Three versions run at once and a name has to say which it is."""
+        run = RunResources(self.client(self.fake()), "20260928T101010Z")
+        self.assertEqual(run.container_name("target", "26.04"), "mosdns-20260928T101010Z-target-26.04")
 
 
 if __name__ == "__main__":
