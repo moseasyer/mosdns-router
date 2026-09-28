@@ -3518,10 +3518,22 @@ class CommandLineTest(PodmanTestCase):
         `preflight` again, and gets the same sentence.
 
         The rule is unchanged and is what is now asserted: preflight does not
-        claim the field will be `yes`, and it names the two facts that decide it
-        -- the image, and the release's NetworkManager, which is what makes 22.04
-        different (measured: nmcli 1.36 has no persistent device override, so the
-        sequence cannot make the device managed there at all).
+        claim the field will be `yes`, and it names the facts that decide it.
+
+        **Corrected again after Fix Round 1**, which is the second time this
+        sentence has gone stale, and both times for the same reason: a preflight
+        cannot check the field, so whoever last changed the image had to write
+        down what the image now does, and got it right for a release rather than
+        for the matrix. The previous version said a 22.04 target "is expected to
+        refuse to boot", which was true when the only mechanism was the sequence
+        and is now false: the image declares the device managed by configuration,
+        so 22.04 comes up `yes` like the other two.
+
+        So this case now requires the *mechanism* rather than a prediction about a
+        release. A preflight that names the declaration and the two
+        `nmcli --version` facts stays true whatever the images do next; one that
+        predicts an outcome goes stale the moment an image changes, and the
+        version of this sentence in git is the history of that.
         """
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
         code, output = self.invoke(self.base(fake, "preflight"))
@@ -3532,8 +3544,14 @@ class CommandLineTest(PodmanTestCase):
             output,
             "the repository ships the target image now, so this sentence is false",
         )
+        # The declaration is the mechanism, so it is what the preflight names.
+        self.assertIn("conf.d", output)
         # And it must not claim the field will be `yes` -- that is the whole rule.
         self.assertNotIn("would come up with GENERAL.NM-MANAGED: yes.", output)
+        # Nor predict an outcome per release: a prediction is a claim a preflight
+        # cannot check, and this sentence has been wrong twice.
+        self.assertNotIn("is expected to refuse to boot", output)
+        self.assertNotIn("the field stays 'no'", output)
 
     def test_preflight_runs_no_command_that_changes_anything(self):
         """A preflight is a read, and a read that mutates is not one.

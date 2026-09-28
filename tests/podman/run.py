@@ -81,9 +81,14 @@ DEFAULT_RESULTS_DIR = REPO / "build" / "test-results"
 NM_DEVICE_FACT = (
     "NetworkManager: a target's device must be a bridge network's eth0 of type "
     "ethernet -- Podman's default rootless network hands it a tun/tap device, "
-    "which NetworkManager refuses -- and it becomes managed only after "
+    "which NetworkManager refuses -- and the target image makes it managed two "
+    "ways: by declaring it in "
+    "/etc/NetworkManager/conf.d/10-mosdns-target.conf ('except:interface-name:eth0', "
+    "which works on every release this matrix runs), and, where NetworkManager has "
+    "a persistent device override to re-read -- measured from nmcli 1.44 -- by "
     "'nmcli device set eth0 managed yes' followed by "
-    "'systemctl restart NetworkManager' in the target."
+    "'systemctl restart NetworkManager'. Below 1.44 the two commands are accepted "
+    "and change nothing, and the declaration is the only mechanism that works."
 )
 
 NM_DEVICE_NOT_CHECKABLE = (
@@ -94,12 +99,10 @@ NM_DEVICE_NOT_CHECKABLE = (
     "Two things decide the answer, and neither is a preference:\n"
     "  - the target must be on a netavark BRIDGE network (a tun/tap device is "
     "refused by design);\n"
-    "  - the release's NetworkManager must have a persistent device override. "
-    "Measured on this host: 24.04 (nmcli 1.46) and 26.04 (nmcli 1.54) take the "
-    "two steps above to 'yes'; 22.04 (nmcli 1.36) does not have the override, the "
-    "second command is accepted and has no effect, and the field stays 'no'. So a "
-    "22.04 target is expected to refuse to boot rather than to run scenarios "
-    "against an unmanaged device.\n"
+    "  - and the image's own check decides it either way. The two steps above are "
+    "skipped on a NetworkManager without a persistent device override (measured: "
+    "nmcli 1.36.6 and 1.42.4 have none, 1.44.2 and later do), and the check then "
+    "reports what it actually saw.\n"
     "This harness will not assume it either way: run_target asserts it on a "
     "running target and refuses with the two steps above if it is not 'yes'."
 )
