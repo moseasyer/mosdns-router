@@ -959,14 +959,86 @@ def postinst_status_arms(text=None):
     return numeric_case_arms(postinst_transaction_tail(text))
 
 
+# A line that OPENS a shell block, and a line that CLOSES one, for the walk in
+# `matching_closer`. Both are ANCHORED, and that is the whole of the reader: these
+# are maintainer scripts written as one command or one block per line, and the
+# arms' prose is full of the words a general matcher would take for keywords --
+# "…/var/lib/mosdns/installer for what was recorded", "…nothing here for them to
+# run against" -- so an unanchored match reads three blocks that are not there and
+# then pairs the `fi` with the wrong `if`. What the reader cannot see it says so
+# for: command substitution and single-line `if …; then …; fi`, neither of which
+# any of the four maintainer scripts contains, and the control below pins the
+# answer it gets against a second, independent derivation of the same line.
+SHELL_BLOCK_OPENER = re.compile(r"^(?:if|for|while|until|case)\b")
+SHELL_BLOCK_CLOSER = re.compile(r"^(?:fi|esac|done|\})\s*$")
+
+
+def matching_closer(lines, opening):
+    """The index of the line that closes the block ``opening`` opens.
+
+    ``opening`` is the index of an opening line and the answer is the index of the
+    matching `fi`/`esac`/`done`/`}` -- by MATCHING rather than by position, because
+    "the last `fi` below the capture" is a rule that answers a different question
+    the moment another block appears below it, and a control that silently starts
+    moving a different line is the failure this project has now recorded four times.
+    """
+    depth = 0
+    for index in range(opening, len(lines)):
+        body = lines[index].strip()
+        if body.startswith("#"):
+            continue
+        if SHELL_BLOCK_OPENER.match(body):
+            depth += 1
+        elif SHELL_BLOCK_CLOSER.match(body):
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError(
+        f"no line closes the block opened at line {opening + 1}, so this reader cannot "
+        "answer the question it is here to answer"
+    )
+
+
+def status_capture(text):
+    """``(capture, opening, closing, moved)`` for `postinst`'s status capture.
+
+    Four line indices and the line itself, zero-based, so a test can say WHICH `fi`
+    was moved rather than only that a `fi` moved. `closing` is the `fi` that closes
+    the transaction, found by matching `if "$INSTALLER" install` and nothing else.
+    """
+    lines = text.splitlines(keepends=True)
+    capture = next(
+        index for index, line in enumerate(lines) if line.strip() == "install_status=$?"
+    )
+    opening = max(
+        index for index, line in enumerate(lines)
+        if line.strip() == f'if "$INSTALLER" install; then'
+    )
+    if not opening < capture:
+        raise AssertionError(
+            "postinst does not capture the status INSIDE the if that runs the installer, so "
+            "there is no capture to close early"
+        )
+    closing = matching_closer(lines, opening)
+    if closing <= capture:
+        raise AssertionError(
+            "the `fi` that closes the transaction is not below the capture, so the reader "
+            "and the file disagree about where the transaction ends"
+        )
+    return capture, opening, closing, lines[closing]
+
+
 def capture_closed_early(text):
     """`postinst` with the `fi` that closed the status capture moved above the arms.
 
     This is the Critical, manufactured, and it is manufactured by moving ONE line:
-    a `fi` immediately after `install_status=$?` and the removal of the `fi` that
-    closed the transaction. Everything else is the shipped script, and the result is
-    the shape `88bc2af` shipped -- a capture whose variable is unset on a successful
-    run, `${install_status:-1}` reading as 1, and an unconditional `exit 1` below.
+    the `fi` that closed `if "$INSTALLER" install` is moved to sit immediately after
+    `install_status=$?`, which is the edit `88bc2af` made and the only edit it made.
+    Everything else is the shipped script, and the result parses, so what the
+    control manufactures is a BEHAVIOUR and not a parse error: the arms and the
+    `exit 1` are now at the top level, a run that SUCCEEDS falls into them with
+    `install_status` never assigned, and STEP 5 -- the timer enable -- is below an
+    `exit 1` no run can get past.
 
     It exists because the three substring checks that were in place instead were all
     TRUE of that script: they asserted that `install_status=$?` was present, that
@@ -974,22 +1046,41 @@ def capture_closed_early(text):
     missing resolver, and none of those can see a `fi` in the wrong place. A control
     that moved a line the checks never read would not have shown that, and one that
     rewrote the whole tail would be a second implementation of the check.
+
+    THE ONE PLACE THIS IS NOT THE SHIPPED SCRIPT, and the difference is the shape
+    rather than the defect: `88bc2af` read the capture as `${install_status:-1}`, so
+    its default arm printed "exited 1"; the current script retired that default --
+    `test_postinst_captures_the_installers_status_the_way_prerm_does` holds its
+    absence -- so a run that never assigned the variable prints "exited , which is
+    not a". What a successful configure does is the same either way: exit 1, and no
+    timer enabled. Every claim in this paragraph is asserted by
+    `ControlTests.test_a_capture_closed_before_the_arms_is_reported_by_the_method`.
     """
+    capture, _opening, closing, moved = status_capture(text)
     lines = text.splitlines(keepends=True)
-    capture = next(
-        index for index, line in enumerate(lines) if line.strip() == "install_status=$?"
+    return "".join(
+        lines[: capture + 1] + [moved] + lines[capture + 1 : closing] + lines[closing + 1 :]
     )
-    # The `fi` that closes the transaction is the LAST one at column zero after the
-    # capture; the two above it are the `[ -d /run/systemd/system ]` guard's and, for
-    # the arm on the installer's status 3, a nested `if [ -n "${2:-}" ]` -- which is
-    # indented, and is one of the reasons a reader that matched a stripped `fi` was
-    # reading a nested block and calling it the transaction.
-    closing = max(
-        index for index, line in enumerate(lines)
-        if index > capture and line.rstrip() == "fi"
-    )
-    mutated = lines[: capture + 1] + ["fi\n"] + lines[capture + 1 : closing] + lines[closing + 1 :]
-    return "".join(mutated)
+
+
+def shell_parses(text):
+    """Whether `sh` can PARSE ``text``, asked of the parser and not of a run.
+
+    A run only reaches the parser as far as control flow takes it, so a script that
+    is unparseable from here on can still run cleanly to its first `exit` -- and a
+    control that manufactured an unparseable script would then be holding a property
+    ("postinst parses") that it never claimed and that a mutation of the FI could
+    never have broken on its own. `sh -n` reads the whole file and is the only
+    question here that sees all of it.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="mosdns-parse.", dir=os.environ.get("MOSDNS_PACKAGE_TEST_TMPDIR") or None
+    ) as scratch:
+        script = Path(scratch) / "script.sh"
+        script.write_text(text, encoding="utf-8")
+        return subprocess.run(
+            ["sh", "-n", str(script)], capture_output=True, text=True, check=False
+        )
 
 
 def unpinned_pair(list_body, commit="0000000000000000000000000000000000000000"):
@@ -3998,33 +4089,160 @@ class ControlTests(unittest.TestCase):
         code. The three checks in place at the time were all TRUE of that script,
         so the suite was green over a package that could not be installed. This
         control moves the one line that caused it and asks the METHOD to fail.
+
+        The previous version of this control selected the LAST column-zero `fi` after
+        the capture, which in the fixed script is STEP 5's guard and not the
+        transaction's -- so it manufactured a script `sh` refuses to PARSE (an orphan
+        `fi`, and a STEP 5 `if` with no closer) rather than the defect, and its own
+        integrity check could not tell, because one `fi` was added and a different one
+        removed and the count was the same either way. Everything below is here so
+        that cannot recur: WHICH `fi` moved is derived twice and independently, the
+        move is asserted line by line rather than by a count, and the defect is
+        asserted as an OUTPUT rather than as a `sh -n` result.
         """
-        broken = capture_closed_early(POSTINST.read_text())
+        good = POSTINST.read_text()
+        broken = capture_closed_early(good)
+        lines = good.splitlines(keepends=True)
+        capture, opening, closing, moved = status_capture(good)
+
+        # (1) WHICH `fi` moved. The reader matched `if "$INSTALLER" install`; the
+        # second derivation does not read blocks at all and asks which column-zero
+        # `fi` ends the transaction -- the last one above STEP 5's own guard, which is
+        # the only other block between the capture and the end of the file. Two
+        # derivations that agree, so a reader that went wrong is a failure here rather
+        # than a control that quietly moved some other line.
+        guard = next(
+            index for index, line in enumerate(lines)
+            if index > capture and line.strip() == f"if [ -d {SYSTEMD_RUNTIME_DIRECTORY} ]; then"
+        )
+        above_guard = [
+            index for index, line in enumerate(lines)
+            if capture < index < guard and line.rstrip() == "fi"
+        ]
+        self.assertEqual(closing, max(above_guard),
+                         f"the reader moved the `fi` at line {closing + 1}, which is not the one "
+                         f"that ends the transaction: the column-zero `fi`s between the capture "
+                         f"(line {capture + 1}) and STEP 5's guard (line {guard + 1}) are "
+                         f"{[index + 1 for index in above_guard]}")
+        self.assertEqual(moved, "fi\n",
+                         f"the control moved a {moved!r} rather than a `fi`, so it is not moving "
+                         "the line the Critical was caused by")
+        after_moved = lines[closing + 1:closing + 3]
+        self.assertEqual(len(after_moved), 2, "there is no line after the `fi` that moved")
+        self.assertEqual(after_moved[0], "\n",
+                         "the line after the `fi` that moved is not a blank one, so the control is "
+                         "moving some other block's closer")
+        self.assertTrue(
+            after_moved[1].startswith("# --- STEP 5"),
+            f"the line after the `fi` that moved is {after_moved[1]!r} and not STEP 5's header, so "
+            "the control is moving some other block's closer",
+        )
+
+        # (2) THAT IT IS THE SAME LINE, and that nothing else changed. Not a count:
+        # `broken.count("fi\n") == good.count("fi\n")` is satisfied by adding one `fi`
+        # and removing a different one, which is exactly what the previous version of
+        # this control did. This compares every line, so the only difference that can
+        # pass is the line that was at `closing` now sitting at `capture + 1`.
+        after = broken.splitlines(keepends=True)
+        self.assertEqual(len(after), len(lines),
+                         "the control added or removed a line rather than moving one")
+        for index in range(len(lines)):
+            if index <= capture:
+                expected = lines[index]
+            elif index == capture + 1:
+                expected = moved
+            elif index <= closing:
+                # Between the two positions everything is the original one line
+                # earlier, because the `fi` is GONE from where it was rather than
+                # copied to the new one.
+                expected = lines[index - 1]
+            else:
+                expected = lines[index]
+            self.assertEqual(
+                after[index], expected,
+                f"line {index + 1} of the mutated script is not the line that was there, so the "
+                "control changed something beyond the one `fi` it moved",
+            )
+
+        # (3) THAT IT MANUFACTURES THE DEFECT AND NOT A PARSE ERROR. `88bc2af` shipped
+        # a syntactically valid script that failed on every configure; the previous
+        # version of this control shipped a script `sh` would not accept, which fails
+        # for a reason no operator would ever see and which a mutation of the `fi` could
+        # not have produced on its own. The mutant has to parse.
+        self.assertEqual(shell_parses(good).returncode, 0,
+                         "the shipped postinst does not parse, so dpkg cannot run it")
+        self.assertEqual(shell_parses(broken).returncode, 0,
+                         "the control's mutant does not parse, so it is holding a property it "
+                         "never claimed instead of the defect it was written for")
+
+        # (4) THAT IT PRODUCES THE OUTPUT THE DOCSTRING NAMES. A successful configure
+        # now reaches the arms with `install_status` never assigned, prints the
+        # unknown-status arm with the status EMPTY (the current script retired the
+        # `${install_status:-1}` default, so there is nothing for the arm to print),
+        # prints the advice that belongs only on a refusal, and never enables a timer.
+        completed, calls = postinst_transaction_run(0, text=broken)
+        self.assertNotEqual(completed.returncode, 0,
+                            "a successful configure still exits 0 with the capture closed early")
+        self.assertIn("exited , which is not a", completed.stderr,
+                      "the unknown-status arm did not print the unset status it was given")
+        self.assertIn("dpkg --configure mosdns-router", completed.stderr,
+                      "a successful configure printed the advice that belongs on a refusal")
+        self.assertEqual(
+            [call for call in calls if call[:1] == ["enable"]], [],
+            "a successful configure still enabled the timers, so STEP 5 is not dead code",
+        )
+        # And a run that really did refuse still reaches its OWN arm, because the only
+        # thing this mutation breaks is the guarantee that a success cannot.
+        refused, _calls = postinst_transaction_run(3, text=broken)
+        self.assertIn("refused this machine and rolled back", refused.stderr,
+                      "a run that refused reached the wrong arm, so this control is not holding "
+                      "the arm routing and only the successful-run case")
+
+        # (5) The three substring facts the OLD gate read are still present, which is
+        # why it passed the broken script and why this control exists at all.
+        self.assertIn("install_status=$?", broken)
+        self.assertIn('if "$INSTALLER" install', broken)
+        self.assertIn("no resolver", broken)
+
         self.assertMethodFails(
             MaintainerScriptTests,
             "test_postinst_succeeds_on_a_successful_install_and_reaches_the_timer_enable",
             postinst=broken,
         )
-        # The mutation is ONE line, and it is the line the three substring checks
-        # could not see: everything they read is still present.
-        self.assertIn("install_status=$?", broken)
-        self.assertIn('if "$INSTALLER" install', broken)
-        self.assertIn("no resolver", broken)
-        self.assertEqual(
-            broken.count("fi\n"), POSTINST.read_text().count("fi\n"),
-            "the control added or removed a `fi` beyond the one it moved",
-        )
+        # Only ONE of the two gates notices, and that is worth recording rather than
+        # leaving to be discovered: the arm-routing gate runs the script for 1, 3, 4,
+        # 5, 6 and 42, and a run that really did refuse still reaches its own arm
+        # under this mutation, so that gate is about the ROUTING and this defect is
+        # about the SUCCESSFUL run. Asserting the second gate here would be asserting
+        # something false -- and it was false, in the first draft of this control.
+        self.assertNotEqual(opening, closing)
 
     def test_a_status_capture_that_never_reads_the_transactions_status_is_reported(self):
-        """The second control on the same gate, for the same class of defect.
+        """The second control on the same gate, for a DIFFERENT defect in the same line.
 
-        Moving the `fi` is one way to make the arms read a status the transaction
-        never had. Hard-coding the captured value is another, it is the shape a
-        well-meaning edit takes when somebody wants the arm routing to be easier to
-        read, and it produces the same silence: every run lands in one arm.
+        Closing the capture early lets a SUCCESSFUL run reach the arms with no status
+        at all, and leaves every other run reaching its own arm. Hard-coding the
+        captured value does the opposite: the arms are reached on the right schedule
+        and every run lands in the SAME one, because the status the `case` reads is
+        no longer the status the transaction produced. It is the shape a well-meaning
+        edit takes when somebody wants the arm routing to be easier to read, and it is
+        caught by nothing a reader of the text can see -- `install_status=$?` is
+        still there, spelled exactly as before.
+
+        So the observable is asserted rather than described: a transaction that
+        refused with 3 lands in arm 1.
         """
-        broken = POSTINST.read_text().replace("install_status=$?", "install_status=1")
-        self.assertNotEqual(broken, POSTINST.read_text())
+        good = POSTINST.read_text()
+        broken = good.replace("install_status=$?", "install_status=1")
+        self.assertNotEqual(broken, good, "the control changed nothing, so it is empty")
+        completed, _calls = postinst_transaction_run(3, text=broken)
+        self.assertIn(
+            "refused this machine before it changed", completed.stderr,
+            "a transaction that exited 3 did not land in the arm the hard-coded capture sends "
+            "every run to, so this control is no longer producing the defect it describes",
+        )
+        self.assertNotIn("refused this machine and rolled back", completed.stderr)
+        self.assertNotEqual(completed.returncode, 0)
         self.assertMethodFails(
             MaintainerScriptTests,
             "test_every_installers_status_reaches_its_own_arm_and_a_refusal_exits_non_zero",
