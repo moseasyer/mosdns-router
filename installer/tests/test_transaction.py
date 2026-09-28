@@ -260,6 +260,11 @@ CONNECTION_UP = ("nmcli", "connection", "up")
 # issues there.
 TRY_RESTART = ("systemctl", "try-restart")
 START = ("systemctl", "start")
+# The verb the two `start` rows' undo is, and the one `FakeUnitModelTests` holds the
+# fake to in both directions. Named here because `UNDO_OF` writes it out twice
+# otherwise and a test that spelled it itself would be a test that could pass on a
+# typo in the table it is meant to be reading.
+STOP = ("systemctl", "stop")
 
 # The three states of a unit that decide what `systemctl try-restart` does with it,
 # named here because the finding is ABOUT the difference between them. `try-restart`
@@ -412,7 +417,11 @@ class FakeRunner:
     modelled that as a helpful tool, so a rollback whose undo was another
     ``try-restart`` reported a unit restored on a machine where nothing had been
     started at all. Every transition in ``_transition`` below is that manual's
-    sentence, and ``unit_state`` is what a test reads to ask what the machine ended
+    sentence -- ``start``, ``stop`` and ``try-restart``, in both the succeeding and
+    the failing direction, plus ``restart`` insofar as ``try-restart`` models it --
+    and ``FakeUnitModelTests`` holds each of them, so the list here is a list of what
+    is tested rather than a list of what is intended. ``unit_state`` is what a test
+    reads to ask what the machine ended
     up as rather than how many commands it was sent.
 
     Only a unit the test NAMED is modelled, and ``is-active`` on a modelled unit
@@ -690,15 +699,15 @@ class TransactionFixture(unittest.TestCase):
         ("systemctl", "enable", ROUTER_UNIT): ("systemctl", "disable", ROUTER_UNIT),
         ("systemctl", "start", RESOLVER_UNIT): ("systemctl", "stop", RESOLVER_UNIT),
         ("systemctl", "start", ROUTER_UNIT): ("systemctl", "stop", ROUTER_UNIT),
-        # The undo of a restart is another restart, and that is the whole of the
-        # property: the unit WAS running, `try-restart` stops it first, and the
-        # only way to put a unit back the way it was found is to have it running
-        # again. A `stop` here would be an undo that takes away a resolver the
-        # machine had before this run began.
         # The undo of a restart is a `start`, not another `try-restart`, and the
         # reason is `FakeRunner.unit_state`: `try-restart` acts on an active unit
         # and does nothing, successfully, to a stopped one, so it cannot be the
-        # undo of a forward action that STOPS the unit it issues.
+        # undo of a forward action that STOPS the unit it issues. `restart` is the
+        # other correct word and `start` is chosen over it because `restart` stops a
+        # unit that is already up, so an undo built from it can take away the
+        # resolver it is repairing -- and that is the half of the property that is
+        # still true here: a `stop` in this table would be an undo that takes away a
+        # resolver the machine had before this run began.
         TRY_RESTART + (RESOLVER_UNIT,): START + (RESOLVER_UNIT,),
         TRY_RESTART + (ROUTER_UNIT,): START + (ROUTER_UNIT,),
         MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"): MODIFY + (UUID, "ipv4.ignore-auto-dns", "no"),
@@ -2699,6 +2708,15 @@ class FakeUnitModelTests(unittest.TestCase):
     on the state has to hold the fake to the manual it is standing in for. A gate
     on a fake that could not model the defect is a gate that could not have
     failed.
+
+    WHAT IS HELD, so this class is a list of what it covers rather than a list of
+    what it intends: `try-restart` on an active unit, and on each of the three
+    states a failed start leaves; `start` succeeding from a stopped or failed unit
+    and failing from any of them; `stop` succeeding and failing; `start` on a
+    running unit not stopping it; `is-active` answering from the model and the
+    canned answer for a unit nobody modelled; and a string command still refused.
+    The five verbs `FakeRunner._transition` models are therefore all covered in
+    both directions where the model can be wrong about a state.
     """
 
     def runner(self, **kwargs):
@@ -2745,6 +2763,40 @@ class FakeUnitModelTests(unittest.TestCase):
                     runner.unit_state[ROUTER_UNIT], UNIT_FAILED,
                     "a start that failed did not leave the unit failed, so a rollback that could "
                     "not bring it back would be reported as one that did",
+                )
+
+    def test_stop_takes_a_running_unit_down_and_a_failure_leaves_it_running(self):
+        """`stop` is in this model's vocabulary and in `UNDO_OF`, and until now
+        nothing here held the fake to it.
+
+        The report and this class's own class-docstring both listed `stop` among the
+        `systemctl` semantics the class holds, and neither said so was true: the
+        other four verbs had a case each and this one did not. So the claim was
+        either true and unheld or false, and a class whose docstring is a list of
+        what it holds needs the list to be what it holds.
+
+        Both directions, because a `stop` that succeeded while leaving the unit
+        running would make the rollback of a `start` -- the two rows in `UNDO_OF` that
+        use it -- a rollback that put nothing back and said it had.
+        """
+        for state in (UNIT_RUNNING, UNIT_FAILED, UNIT_STOPPED):
+            with self.subTest(state=state, action="succeeds"):
+                runner = self.modelled(state)
+                runner.run(list(STOP + (ROUTER_UNIT,)))
+                self.assertEqual(
+                    runner.unit_state[ROUTER_UNIT], UNIT_STOPPED,
+                    "a `stop` that succeeded did not take a unit down, so a rollback that stops a "
+                    "unit this run started is reported as having put the machine back",
+                )
+        for state in (UNIT_RUNNING, UNIT_STOPPED):
+            with self.subTest(state=state, action="fails"):
+                runner = self.modelled(state, fail=[STOP + (ROUTER_UNIT,)])
+                with self.assertRaises(subprocess.CalledProcessError):
+                    runner.run(list(STOP + (ROUTER_UNIT,)))
+                self.assertEqual(
+                    runner.unit_state[ROUTER_UNIT], UNIT_RUNNING,
+                    "a `stop` that failed left the unit stopped, so a rollback that could not "
+                    "stop a unit is indistinguishable from one that did",
                 )
 
     def test_start_on_a_running_unit_is_a_no_op_that_does_not_stop_it(self):
@@ -3000,9 +3052,21 @@ class FailureInjectionTests(TransactionFixture):
                     "restored the unit is a `try-restart`, which is a silent no-op on a "
                     "stopped one",
                 )
-                # And a unit this run did NOT touch is still running, which is the
-                # property `start` was chosen over `restart` for.
-                self.assertTrue(self.runner.running(unit))
+                # The SIBLING, and what this loop is really about. Both units are
+                # already running, so the transaction restarts both; this sub-test
+                # failed the restart of one, and the rollback had to put BOTH back --
+                # the failed one, which it down, and the one whose restart succeeded,
+                # which was never down and had to be left alone. The assertion that was
+                # here before asked about `unit` a second time under a comment about a
+                # unit the run did not touch, which is the same fact twice and the
+                # wrong fact once; the fact it meant to ask is about the other unit.
+                sibling = RESOLVER_UNIT if unit == ROUTER_UNIT else ROUTER_UNIT
+                self.assertTrue(
+                    self.runner.running(sibling),
+                    f"the rollback that put {unit} back took {sibling} down as well "
+                    f"({self.unit_state[sibling]!r}); {sibling} was running before this run and "
+                    "its own restart had succeeded, so nothing about it needed undoing",
+                )
 
     def test_a_unit_that_could_not_be_brought_back_is_a_rollback_failure(self):
         # The other machine, and the one the decision this round records is about.
