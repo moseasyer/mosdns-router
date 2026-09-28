@@ -812,6 +812,236 @@ class SnapshotDocumentTest(SnapshotTestCase):
             snapshot.collect_document(run_id="20260928T120000Z", taken_utc="2026-09-28T12:00:00Z")
 
 
+class MutatingCommandDetectionTest(unittest.TestCase):
+    """`mutating_command` has to recognise a write, including the ones a denylist misses.
+
+    The first version of this table listed `nmcli radio` under the *read*
+    subcommands, on the reasoning that a radio query is a read. `nmcli radio wifi
+    on` is not a read: it turns the interface up. And the two sets the table
+    referred to -- `READ_ONLY_COMMANDS` and `NMCLI_READ_SUBCOMMANDS` -- were read
+    by nothing at all, while a comment beside them claimed the suite asked about
+    them. A comment that describes a guard which is not there is worse than no
+    comment, because it is a reader's evidence that the case is covered.
+    """
+
+    def test_the_read_only_nmcli_forms_are_not_flagged(self):
+        for argv in (
+            ("nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", "eth0"),
+            ("nmcli", "-f", "NAME,DEVICE", "connection", "show"),
+            ("nmcli", "general", "status"),
+            ("nmcli", "--version"),
+        ):
+            with self.subTest(command=" ".join(argv)):
+                self.assertFalse(snapshot.mutating_command(argv))
+
+    def test_the_nmcli_forms_that_change_something_are_flagged(self):
+        for argv in (
+            ("nmcli", "radio", "wifi", "on"),
+            ("nmcli", "radio", "all", "off"),
+            ("nmcli", "general", "logging", "level", "trace"),
+            ("nmcli", "general", "reset"),
+            ("nmcli", "connectivity", "check", "now"),
+            ("nmcli", "device", "set", "eth0", "managed", "yes"),
+            ("nmcli", "connection", "modify", "eth0", "ipv4.never-default", "yes"),
+            ("nmcli", "connection", "up", "eth0"),
+            ("nmcli", "connection", "delete", "eth0"),
+        ):
+            with self.subTest(command=" ".join(argv)):
+                self.assertTrue(
+                    snapshot.mutating_command(argv),
+                    f"{' '.join(argv)} changes the machine and was classified as a read",
+                )
+
+    def test_the_programs_a_snapshot_could_name_are_all_classified(self):
+        """No program is left unclassified, which is what a missing table entry means.
+
+        `mutating_command` returned `False` for anything not in its table, so a
+        program nobody thought of was silently a read. The table is now closed over
+        the six programs `collect_command_fields` actually runs, and this case holds
+        that closure -- so adding a field with a new program forces a decision here
+        rather than inheriting a default.
+        """
+        for argv in snapshot.COMMAND_FIELDS:
+            with self.subTest(field=argv[0]):
+                program = argv[1][0]
+                self.assertIn(
+                    program, snapshot.READ_ONLY_PROGRAMS,
+                    f"the {argv[0]} field runs {program!r}, which is not in the table, so "
+                    f"mutating_command() would classify it as a read by default",
+                )
+
+    def test_a_program_nobody_thought_of_is_refused_rather_than_assumed_a_read(self):
+        """The control, and the direction of the default.
+
+        An unknown program is refused, not read. The six commands this module runs
+        are all named, so the refusal never fires in production -- and the reason it
+        is the safe direction is that a snapshot exists to prove a run changed
+        nothing, and a command it cannot classify is a command whose effect is
+        unknown.
+        """
+        self.assertTrue(
+            snapshot.mutating_command(("some-new-tool", "--read-some-flag")),
+            "an unclassifiable program is treated as a read, which is the direction that "
+            "silently weakens the claim the snapshot makes",
+        )
+
+
+class RunnerEnvironmentTest(unittest.TestCase):
+    """The runner's child environment, and what its docstring claims about it.
+
+    The docstring said "no env to inherit a token from" and the code passed
+    `env=None`, which is `subprocess.run` for *inherit the parent's environment*.
+    So the claim and the code disagreed, and the direction of the disagreement was
+    the bad one: a token in the operator's shell would have been handed to every
+    command a snapshot runs, and a command's environment is exactly the kind of
+    thing this repository's Podman wrapper goes out of its way not to record.
+    """
+
+    def test_the_child_gets_a_named_set_of_variables_and_nothing_else(self):
+        import os
+
+        recorded = {}
+        real = os.environ
+        try:
+            os.environ = {
+                **real,
+                "AWS_SECRET_ACCESS_KEY": "must-not-be-forwarded",
+                "MOSDNS_TOKEN": "must-not-be-forwarded",
+            }
+            runner = snapshot.SubprocessRunner()
+            child = runner.child_environment()
+        finally:
+            os.environ = real
+        recorded.update(child)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", recorded)
+        self.assertNotIn("MOSDNS_TOKEN", recorded)
+        for name in recorded:
+            with self.subTest(variable=name):
+                self.assertIn(
+                    name, snapshot.SNAPSHOT_ENV_NAMES,
+                    "the runner forwards a variable its own allowlist does not name, which is "
+                    "the same shape of hole as an unredacted environment",
+                )
+
+    def test_an_explicit_override_is_merged_and_still_named(self):
+        runner = snapshot.SubprocessRunner(extra_env={"LC_ALL": "C"})
+        child = runner.child_environment()
+        self.assertEqual(child["LC_ALL"], "C")
+
+    def test_the_documented_allowlist_is_the_one_the_runner_docstring_names(self):
+        """The docstring and the code, compared.
+
+        A docstring that describes a guard which is not there is a reader's evidence
+        that the case is covered, and this pair of claims -- the environment and the
+        two dead sets -- is the third time this file has had one.
+        """
+        import inspect
+
+        source = inspect.getsource(snapshot.SubprocessRunner)
+        # Whitespace is collapsed first: the claim is a sentence, and a sentence
+        # that happens to be wrapped across a line is not a different claim. A
+        # literal search over wrapped prose fails on a reformat and passes on a
+        # docstring that says the opposite, which is the worst of both.
+        flattened = " ".join(source.split())
+        self.assertIn("SNAPSHOT_ENV_NAMES", source)
+        self.assertIn(
+            "no environment to inherit a token from",
+            flattened,
+            "the runner's docstring no longer states that it withholds the environment, so a "
+            "reader looking for that guarantee in the class is looking for a claim that has "
+            "moved -- and the guarantee is the thing this class exists for",
+        )
+
+
+
+class ProjectUnitDerivationTest(unittest.TestCase):
+    """The unit list comes from the package, not from a list that can fall behind it.
+
+    `PROJECT_UNITS` was five literals, and a case's docstring claimed "the names
+    come from the package". A sixth unit shipped by the package would then be
+    absent from the snapshot's `project_units` field -- and that field is one of the
+    seven the host-isolation comparison reads, so the unit a run left behind would
+    not be in the record that exists to catch it. Silent, and in the one direction
+    that matters.
+    """
+
+    def test_the_derived_names_are_the_units_the_package_ships(self):
+        derived = snapshot.project_units()
+        shipped = sorted(
+            path.name for path in (REPO / "packaging" / "systemd").glob("*.service")
+        )
+        self.assertEqual(
+            sorted(derived), shipped,
+            "the snapshot's project-unit list and the package's systemd/ directory have "
+            "drifted apart, so a unit the package ships is not in the record a run's "
+            "leftovers are compared against",
+        )
+
+    def test_a_documented_limit_is_stated_where_somebody_would_look(self):
+        """The one thing the derivation cannot do, written down rather than implied.
+
+        The package installs a unit from `packaging/systemd/` and the derivation
+        follows that directory. A unit shipped from anywhere else would be missed,
+        and no case can tell that from here without becoming a second inventory of
+        the package -- which is the thing that drifts. So the limit is recorded and
+        this case holds the record.
+        """
+        self.assertIn("packaging/systemd", snapshot.project_units.__doc__)
+        self.assertIn("not", snapshot.project_units.__doc__.lower())
+
+
+class FieldDigestTest(unittest.TestCase):
+    """A field's digest covers everything the field records, error included.
+
+    `resolv_conf_link` had a case whose docstring said a command's error "is part of
+    what the digest covers" and a `_field` that hashed `records` only. So a
+    resolver that was a symlink and a resolver that was a *missing file* produced
+    the same digest -- an empty `records` list either way -- and Task 7's
+    comparison would have called them equal. The docstring and the code disagreed
+    and the code was the weaker of the two.
+
+    Hashing the error as well as the records is the fix, because the error *is* part
+    of what the field observed. The alternative -- comparing whole documents
+    rather than digests -- is Task 7's choice and does not remove the trap from this
+    module's own output.
+    """
+
+    def field(self, records, error):
+        return snapshot._field("resolv_conf_link", records, error)
+
+    def test_a_missing_file_and_a_link_that_is_not_one_have_different_digests(self):
+        absent = self.field([], "FileNotFoundError: /etc/resolv.conf: no such file")
+        not_a_link = self.field([], "OSError: readlink: /etc/resolv.conf: Not a symbolic link")
+        self.assertEqual(absent["records"], not_a_link["records"])
+        self.assertNotEqual(
+            absent["digest"], not_a_link["digest"],
+            "two different failures both produce an empty record list and the same digest, so "
+            "a comparison of digests cannot tell them apart",
+        )
+
+    def test_a_field_with_an_error_never_digests_as_a_clean_field(self):
+        self.assertNotEqual(
+            self.field([], "OSError: something")["digest"],
+            self.field([], None)["digest"],
+            "a field that failed to be collected digests the same as one that was empty, and an "
+            "empty field is what an unchanged host looks like",
+        )
+
+    def test_the_digest_is_still_reproducible_from_the_records_alone(self):
+        """The recomputation case, and it is why the error is folded in as text.
+
+        A reader who wants to check "the snapshots differ" by hand has to be able to
+        recompute a digest from the document. So the error is hashed *as a string*
+        alongside the records rather than through a different path, and this case
+        holds the two in step.
+        """
+        document = self.field(["link -> stub"], "OSError: partial read")
+        self.assertEqual(
+            document["digest"],
+            snapshot.digest_of(["link -> stub"], error="OSError: partial read"),
+        )
+
+
 class WalkShapeTest(unittest.TestCase):
     """The walk itself, on paths a fixture did not build for it."""
 

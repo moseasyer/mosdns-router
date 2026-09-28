@@ -9,9 +9,10 @@ this module could have been written wrongly:
   fields come from one command each, built as a tuple and handed to an injected
   runner. There is no shell anywhere on the path from a field name to a process,
   so no field's text can become a second command. The commands themselves are an
-  allowlist in the module body rather than a convention: ``MUTATING_COMMANDS``
-  names the shapes a snapshot must refuse, and a command this module does not
-  recognise is not one it runs.
+  allowlist in the module body rather than a convention: ``READ_ONLY_PROGRAMS``
+  names the six, ``WRITE_VERBS`` and ``NMCLI_WRITE_PAIRS`` say which invocations of
+  them write, and a program the module does not recognise is refused rather than
+  assumed a read.
 
 * **Firefox profiles are metadata, never content.** The field is path name,
   mtime and size, gathered with ``os.lstat`` and ``os.scandir`` -- which read a
@@ -76,19 +77,49 @@ BEFORE = "before"
 AFTER = "after"
 MOMENTS = (BEFORE, AFTER)
 
-# This project's systemd units, from `packaging/debian/control` and the unit
-# files it installs. The snapshot asks `systemctl` for every unit on the host and
-# keeps only these, because a run does not change `dbus.service` and a record of
-# the whole list is a diff of the machine rather than of the run. The list is the
-# names, not a prefix: a prefix filter would adopt a third party's unit and then
-# fail a run for it.
-PROJECT_UNITS = (
-    "dnscrypt-proxy.service",
-    "mosdns-cdn-health.service",
-    "mosdns-cdn-optimizer.service",
-    "mosdns-list-check.service",
-    "mosdns-router.service",
-)
+# The directory the package's systemd units live in, and the one thing the
+# derivation below cannot do.
+#
+# **Derived, not listed.** A literal tuple of five names was here, with a test's
+# docstring claiming "the names come from the package" -- and a sixth unit shipped
+# by the package would have been absent from the `project_units` field, which is
+# one of the seven the host-isolation comparison reads. So the unit a run left
+# behind would not be in the record that exists to catch it, and nothing would say
+# so. Reading the directory is the difference between a list and an inventory.
+#
+# **The limit, stated rather than implied:** this follows one directory. A unit
+# the package installed from anywhere else would be missed, and no case here can
+# tell that from the outside without becoming a second inventory of the package --
+# which is the thing that drifts. A unit installed from elsewhere is a change to
+# this function, and the case in the suite holds the record of that.
+PACKAGING_UNIT_DIRECTORY = "packaging/systemd"
+
+
+def project_units() -> tuple:
+    """The unit files the package ships, as `*.service` names.
+
+    Read from the package's own directory on every call rather than computed at
+    import, so a unit added to the package is in the next snapshot without this
+    module being reloaded -- and so a checkout without the directory fails at the
+    point of use with a message saying why, rather than at import with a
+    `NameError`.
+
+    **What it does not do:** a unit the package installed from somewhere other
+    than `packaging/systemd` is not found. No case here can tell that from the
+    outside without becoming a second inventory of the package, which is the thing
+    that drifts. A unit installed from elsewhere is a change to
+    `PACKAGING_UNIT_DIRECTORY`, and `ProjectUnitDerivationTest` holds this
+    paragraph so the limit stays written down.
+    """
+    directory = Path(__file__).resolve().parents[3] / PACKAGING_UNIT_DIRECTORY
+    if not directory.is_dir():
+        raise RuntimeError(
+            f"cannot tell which units this project ships: {directory} does not exist, so the "
+            f"project_units field would be empty and an empty field compares equal to a host "
+            f"that changed nothing. The harness runs from a source checkout, so this is a "
+            f"checkout that is not one"
+        )
+    return tuple(sorted(path.name for path in directory.glob("*.service")))
 
 # The six command fields, in the order they are collected, as literal argument
 # arrays. `readlink` and not `cat` for the resolver: this host's
@@ -143,62 +174,69 @@ _UUID = re.compile(
 # is an address, a port and a program, and a pid is which run of the program.
 _PID = re.compile(r"pid=\d+")
 
-# The commands and subcommand pairs that change something. This is not a filter
-# applied to what a caller passes -- there is no caller here, the six arrays above
-# are the whole of what runs -- but it is the table the module carries so that a
-# future field is checked against it rather than added next to it, and
-# `mutating_command` is what the suite asserts over the real arrays.
-MUTATING_COMMANDS: dict[str, frozenset[str]] = {
-    "nmcli": frozenset({"connection", "device", "general", "networking", "radio"}),
+# The six programs a snapshot runs, and the fact that all six are reads **at the
+# program level** -- the question then becomes which *invocation* of them is a
+# read, which is answered per program below.
+#
+# Named explicitly, and the enumeration is held by a case over `COMMAND_FIELDS`:
+# the alternative is a table of programs that can write, and a program missing
+# from it is then a read by default. That default is the wrong direction for a
+# module whose whole purpose is to prove a run changed nothing.
+READ_ONLY_PROGRAMS = frozenset(
+    {"cat", "readlink", "nmcli", "resolvectl", "ss", "systemctl"}
+)
+
+# Programs that run a command through a shell, or with privileges this module never
+# wants. Not used by any field -- they are here because the rule "no shell, ever"
+# is a property of `mutating_command` and a caller reading a field's array should
+# find the table closed rather than discover the gap by running it.
+SHELL_WRAPPERS = frozenset({"bash", "dash", "sh", "sudo"})
+
+# The subcommand verbs that write, per program. `cat`, `readlink` and `ss` have no
+# such verb -- every invocation of them is a read -- and their absence from this
+# table is the point.
+#
+# `nmcli` is the awkward one and gets its own handling below: `nmcli device show`
+# is a read and `nmcli device set` is a write, and the difference is the word after
+# the subcommand. Three of the pairs are mutations with **no** verb in
+# `NMCLI_WRITE_VERBS` at all -- `nmcli radio wifi on` turns the interface up,
+# `nmcli general logging level trace` changes the daemon's logging, and
+# `nmcli general reset` reloads its configuration. The first version of this
+# module listed `radio` as a read subcommand, which classified the first of those
+# as safe.
+WRITE_VERBS = {
+    "resolvectl": frozenset({"dns", "domain", "flush-caches", "revert"}),
     "systemctl": frozenset(
         {
             "daemon-reload",
             "disable",
             "enable",
+            "halt",
+            "isolate",
             "mask",
+            "poweroff",
             "reboot",
             "restart",
             "set-property",
             "start",
             "stop",
+            "suspend",
             "unmask",
         }
     ),
-    "resolvectl": frozenset({"dns", "domain", "flush-caches", "revert"}),
-    "nm-online": frozenset(),
-    "sh": frozenset(),
-    "bash": frozenset(),
-    "sudo": frozenset(),
-    "rm": frozenset(),
-    "mv": frozenset(),
-    "cp": frozenset(),
-    "tee": frozenset(),
-    "mount": frozenset(),
-    "umount": frozenset(),
-    "kill": frozenset(),
-    "pkill": frozenset(),
-    "chmod": frozenset(),
-    "chown": frozenset(),
-    "ln": frozenset(),
-    "truncate": frozenset(),
-    "dd": frozenset(),
-    "apt": frozenset(),
-    "apt-get": frozenset(),
-    "dpkg": frozenset(),
-    "systemctl-poweroff": frozenset(),
 }
-
-# The commands this module runs, which is what `mutating_command` is asked about
-# in the suite. A command outside this set is not one this module has an answer
-# for, and the suite says so rather than staying quiet.
-READ_ONLY_COMMANDS = frozenset(
-    {"cat", "readlink", "nmcli", "resolvectl", "systemctl", "ss"}
+NMCLI_WRITE_VERBS = frozenset(
+    {"add", "delete", "down", "modify", "reload", "remove", "set", "up"}
 )
-
-# `nmcli device show` and `nmcli connection show` are reads; the same two words
-# with `set` or `modify` are writes. The table above is keyed on the *subcommand*,
-# so the read forms are named here as the exceptions rather than the rule.
-NMCLI_READ_SUBCOMMANDS = frozenset({"device", "connection", "general", "monitor", "radio"})
+# (subcommand, any-of-these) pairs. A pair is a write whatever else the array
+# contains, so `nmcli general reset` is caught by its subcommand and
+# `nmcli radio wifi on` by its verb.
+NMCLI_WRITE_PAIRS = (
+    ("general", frozenset({"logging", "permissions", "reset"})),
+    ("radio", frozenset({"all", "gsm", "off", "on", "wifi", "wimax"})),
+    ("connectivity", frozenset({"check"})),
+    ("networking", frozenset({"off", "on"})),
+)
 
 
 def mutating_command(argv: Sequence[str]) -> bool:
@@ -213,36 +251,51 @@ def mutating_command(argv: Sequence[str]) -> bool:
     if not argv:
         return False
     program = Path(str(argv[0])).name
-    if program in ("sh", "bash", "dash", "sudo"):
+    rest = [str(token) for token in argv[1:]]
+    if program in SHELL_WRAPPERS:
         return True
     if program == "nmcli":
-        # `nmcli device set eth0 managed yes` and `nmcli connection modify …`
-        # are the two writes; both name a verb straight after the subcommand.
-        verbs = {"set", "modify", "add", "delete", "remove", "up", "down", "reload"}
-        return any(str(token) in verbs for token in argv[2:])
-    verbs = MUTATING_COMMANDS.get(program)
-    if verbs is None:
+        if any(token in NMCLI_WRITE_VERBS for token in rest):
+            return True
+        for subcommand, triggers in NMCLI_WRITE_PAIRS:
+            if subcommand in rest and triggers & set(rest):
+                return True
         return False
-    if not verbs:
-        # Listed with no subcommand set: the program is a write whatever it is
-        # asked to do. `rm`, `tee` and `chmod` have no read-only spelling, and a
-        # check that required one of the table's words to appear would pass them
-        # all -- which is the direction this table exists to fail.
-        return True
-    return any(str(token) in verbs for token in argv[1:])
+    verbs = WRITE_VERBS.get(program)
+    if program in READ_ONLY_PROGRAMS:
+        # `cat`, `readlink` and `ss` are not in `WRITE_VERBS`, and that is the
+        # whole of their classification: every invocation of them reads.
+        return any(token in verbs for token in rest) if verbs else False
+    # **A program nobody thought of is refused, not assumed a read.** This
+    # function's job is to tell a reader whether a command can change the machine,
+    # and a command it cannot classify is a command whose effect is unknown -- so
+    # the answer is "yes, treat it as a write" and the caller stops. Returning
+    # False made a new program silently a read, which is the one direction that
+    # weakens the claim a snapshot exists to support without anything saying so.
+    return True
 
 
-def digest_of(records: Iterable[str]) -> str:
-    """The digest of a field's records, so "the snapshots differ" is checkable by hand.
+def digest_of(records: Iterable[str], error: str | None = None) -> str:
+    """The digest of a field, so "the snapshots differ" is checkable by hand.
 
     Over the *stored* records rather than over the text they came from, so a
     reader can recompute it and get the same answer -- which is what stops the
     digest from being an opaque number that changes for reasons nobody can find.
+
+    **The error is folded in as a string, and it has to be.** A field whose command
+    failed has an empty `records` list, and so does a field that succeeded and read
+    nothing -- so hashing the records alone made "the resolver is not a symlink"
+    and "the resolver is missing" the same digest, and made a field that could not
+    be collected equal to one that was genuinely empty. The second of those is the
+    answer an unchanged host gives, so a field that failed would have been read as
+    proof that nothing changed. A field's error is part of what it observed.
     """
     digest = hashlib.sha256()
     for record in records:
         digest.update(record.encode("utf-8", "surrogateescape"))
         digest.update(b"\0")
+    digest.update(b"\0error=")
+    digest.update((error or "").encode("utf-8", "surrogateescape"))
     return "sha256:" + digest.hexdigest()
 
 
@@ -270,7 +323,7 @@ def project_unit_records(text: str) -> list[str]:
     records = []
     for line in normalize(text):
         fields = line.split(None, 1)
-        if fields and fields[0] in PROJECT_UNITS:
+        if fields and fields[0] in project_units():
             records.append(" ".join(fields))
     return sorted(records)
 
@@ -281,7 +334,7 @@ def _field_commands() -> dict[str, tuple[str, ...]]:
 
 def _field(name: str, records: list[str], error: str | None = None) -> dict:
     return {
-        "digest": digest_of(records),
+        "digest": digest_of(records, error=error),
         "error": error,
         "records": records,
     }
@@ -437,6 +490,12 @@ def write_snapshot(document: dict, results_dir: Path | str, run_id: str, moment:
     return path
 
 
+# The variables a snapshot's commands may inherit. An allowlist, for the same
+# reason the Podman wrapper has one: a token in the operator's shell must not
+# reach a command a harness runs, and then a report.
+SNAPSHOT_ENV_NAMES = ("HOME", "LANG", "LC_ALL", "PATH", "TZ")
+
+
 class SubprocessRunner:
     """A runner that executes an argument array -- no shell, a deadline, no env.
 
@@ -445,11 +504,29 @@ class SubprocessRunner:
     array rather than a string, and there is no environment to inherit a token
     from. The timeout is not optional, because a `nmcli` that has wedged is a
     scenario that will never finish and says so on its own.
+
+    **The environment is an allowlist and not an inheritance.** This used to pass
+    `env=None`, which is `subprocess.run` for *use the caller's environment* -- so
+    the docstring's claim and the code disagreed, in the direction that hands every
+    variable the operator exported to six commands. `nmcli`, `resolvectl` and
+    `systemctl` do not need a token, and a command's environment is exactly what
+    this repository's Podman wrapper goes out of its way not to record. So the
+    child gets `SNAPSHOT_ENV_NAMES` and `extra_env`, and nothing else.
     """
 
-    def __init__(self, timeout: float = 30.0, env: dict | None = None):
+    def __init__(self, timeout: float = 30.0, extra_env: Mapping[str, str] | None = None):
         self.timeout = timeout
-        self.env = env
+        self.extra_env = dict(extra_env or {})
+
+    def child_environment(self) -> dict:
+        """The variables a snapshot's commands run with.
+
+        The allowlist from this process, plus whatever the caller added on top.
+        The merge is here rather than at the call to `subprocess.run` so that
+        "what does a snapshot's command inherit" has one answer to read.
+        """
+        inherited = {name: os.environ[name] for name in SNAPSHOT_ENV_NAMES if name in os.environ}
+        return inherited | self.extra_env
 
     def __call__(self, argv: Sequence[str]) -> str:
         completed = subprocess.run(
@@ -458,7 +535,7 @@ class SubprocessRunner:
             text=True,
             timeout=self.timeout,
             check=False,
-            env=self.env,
+            env=self.child_environment(),
         )
         if completed.returncode != 0 and not completed.stdout:
             detail = completed.stderr.strip() or f"exited {completed.returncode}"
@@ -473,7 +550,8 @@ __all__ = [
     "DEFAULT_FIREFOX_ROOTS",
     "FIREFOX_FIELD",
     "MOMENTS",
-    "PROJECT_UNITS",
+    "PACKAGING_UNIT_DIRECTORY",
+    "SNAPSHOT_ENV_NAMES",
     "SCHEMA",
     "SubprocessRunner",
     "collect",
@@ -484,6 +562,7 @@ __all__ = [
     "mutating_command",
     "new_run_id",
     "normalize",
+    "project_units",
     "project_unit_records",
     "write_snapshot",
 ]
