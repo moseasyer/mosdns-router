@@ -1868,7 +1868,9 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         self.assertEqual(
             entrypoint_sentences_that_act(step), [],
             "the plan still gives the image's entrypoint an action to perform; the sequence "
-            "and the check both run from target-nm-setup.service:",
+            "and the check both run from target-nm-setup.service. NOTE: this detector does not "
+            "model negation, so a hit is a REVIEW ITEM -- read each one and decide; see the "
+            "contract above ENTRYPOINT_OWNS_AN_ORDER.",
         )
 
         # The control, because a detector that finds nothing is also a detector that
@@ -1919,6 +1921,12 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
             "NetworkManager`** — and the profile therefore belongs to **Task 2's image "
             "entrypoint, not to Task 3**."
         )
+        self.assertNotIn(
+            note_stale, self.plan,
+            "the architecture note has reverted to the sentence this control plants, so the "
+            "plant is no longer a plant and the control below is testing the detector "
+            "against text the plan does not contain",
+        )
         self.assertEqual(
             len(entrypoint_sentences_that_act(note_stale)), 1,
             "the detector does not recognise the architecture note's data form, so the case "
@@ -1926,15 +1934,27 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
             "to the entrypoint",
         )
         # And the corrected form of the same sentence, so extending the list does not
-        # extend it into the plan's own text.
-        note_correct = (
-            "So the order is: **create the `eth0` connection profile, then `nmcli device "
-            "set eth0 managed yes`, then `systemctl restart NetworkManager`** — and the "
-            "profile therefore belongs to **Task 2, not to Task 3**. Within Task 2 it "
-            "belongs to `tests/podman/images/target-nm-setup.service` and **not** to the "
-            "image entrypoint: `nmcli` reaches NetworkManager over D-Bus, and there is no "
-            "bus before `/sbin/init`, so an entrypoint that ran any of the three would "
-            "fail its first one."
+        # extend it into the plan's own text. **Read out of the plan, not typed here.**
+        # The first version of this control was a hand-written paraphrase that ended
+        # "an entrypoint that ran any of of the three would fail its first one", while
+        # the plan says "... measured on this host as `Error: Could not create NMClient
+        # object: Could not connect: No such file or directory`" -- so a report
+        # describing it as "verbatim" was quoting the test rather than the document,
+        # and the two files visibly disagreed. Reading the real text makes the drift
+        # impossible rather than corrected, and `assertIn` below makes a paraphrase a
+        # failure instead of a silent substitution.
+        # Anchored forward from the note itself, and closed at the end of the
+        # measured error rather than at the next sentence: both anchors occur in the
+        # note *above* this one as well, so a plain `index` for either finds line 17
+        # and slices an empty string.
+        closing = "No such file or directory`."
+        start = self.plan.index("Within Task 2 it belongs to")
+        note_correct = self.plan[start : self.plan.index(closing, start) + len(closing)]
+        self.assertTrue(
+            note_correct.startswith("Within Task 2 it belongs to")
+            and note_correct.endswith(closing),
+            "the architecture note's text has changed shape and this control reads the "
+            f"plan rather than a paraphrase, so it has to be re-pointed: {note_correct!r}",
         )
         self.assertEqual(
             entrypoint_sentences_that_act(note_correct), [],
@@ -1963,6 +1983,77 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
             "of it that makes an ineffective declaration visible",
         )
 
+    def test_the_detector_cannot_fire_on_a_sentence_it_cannot_see(self):
+        """**The branch's third alternative could never fire, and it was the one that
+        could false-positive.**
+
+        `entrypoint_sentences_that_act` replaces every inline-code span with two
+        spaces *before* matching -- correctly, because a sentence is delimited by a
+        full stop and `/etc/NetworkManager/conf.d/10-mosdns-target.conf` is full of
+        them. The third alternative of `ENTRYPOINT_OWNS_AN_ORDER` required the
+        literal `eth0` between `the` and `connection`, so it matched a sentence
+        nobody writes (no backticks) and missed every sentence the plan writes
+        (always backticked). Measured: raw 1, post-strip 0.
+
+        So the branch was credited with a form it did not have, and the one form it
+        had was the dangerous one: `target-nm-setup.service creates the eth0
+        connection profile` -- a correct sentence with **no mention of the
+        entrypoint in it** -- is reported as the entrypoint acting. That is a false
+        positive waiting for the day somebody stops backticking `eth0`, and a guard
+        that reports correct text as a defect trains the next reader to ignore it.
+
+        Three properties, and the second is the one this round exists for:
+
+        1. every alternative of the branch fires on a sentence the plan actually
+           writes, and is required to;
+        2. a correct sentence is **not** reported -- several of them, including the
+           two that a naive version of this branch does report;
+        3. a stale one still is, so (2) is not the detector being switched off.
+        """
+        # 1. Reach. Each alternative gets a sentence in the plan's own idiom.
+        for label, sentence in (
+            ("a named order", "So the entrypoint order is: create the connection profile, then restart NetworkManager."),
+            ("an adjectival head noun", "The entrypoint boot sequence is: set the device managed, then restart NetworkManager."),
+            ("a possessive", "The entrypoint's order is: create the connection profile, then restart NetworkManager."),
+        ):
+            with self.subTest(alternative=label):
+                self.assertEqual(
+                    len(entrypoint_sentences_that_act(sentence)), 1,
+                    f"the detector's {label} form did not fire on a sentence the plan writes "
+                    f"in exactly this shape: {sentence!r}",
+                )
+
+        # 2. The false positives, one per way this branch has produced one. A correct
+        # sentence must yield nothing, and a sentence that is *about* the entrypoint
+        # saying it does not do the work is the case a reviewer found.
+        for sentence in (
+            "The entrypoint order is not the unit's order: the unit creates the profile, "
+            "then sets the device managed, then restarts NetworkManager.",
+            "The unit creates the eth0 connection profile, then sets the device managed, "
+            "then restarts NetworkManager. The entrypoint has its own job.",
+            "target-nm-setup.service creates the eth0 connection profile.",
+            "The entrypoint has its own job: it points the resolver at the stub, then "
+            "execs /sbin/init.",
+        ):
+            with self.subTest(should_not_report=sentence[:60]):
+                self.assertEqual(
+                    entrypoint_sentences_that_act(sentence), [],
+                    "the detector reports a correct sentence as a defect, so the guard is a "
+                    "thing to be worked around rather than obeyed",
+                )
+
+        # 3. And the reach survives the tightening, or (2) proves only that the
+        # detector was switched off.
+        self.assertEqual(
+            len(entrypoint_sentences_that_act(
+                "So the entrypoint order is: create the `eth0` connection profile, then "
+                "`systemctl restart NetworkManager`, and the profile belongs to Task 2."
+            )),
+            1,
+            "the detector no longer recognises the architecture note's own wording, so the "
+            "two assertions above would pass on a detector that finds nothing",
+        )
+
     def test_the_plan_records_that_the_active_connection_is_nms_own(self):
         """Task 3's first surprise, recorded where Task 3 will read it.
 
@@ -1976,28 +2067,29 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
 # The constructions that put an **action** on the image's entrypoint, spelled out
 # rather than inferred.
 #
-# Inferred was the first attempt and it does not work, which is worth recording: the
-# rule has to tell a prescriptive sentence from the plan's three *correct* sentences
-# about the entrypoint, and all four mention it. The correct ones are negative and
-# past-tense -- "an entrypoint that ran these commands itself would fail its first
-# one" -- while the stale ones are present-tense or imperative. A verb list wide
-# enough to catch them also flags "The sequence runs from ... and *not* from the
-# entrypoint", where "runs" belongs to the sequence. So the detector reads the
-# constructions an implementer would follow, and the case that uses it holds the
-# plan's *correct* wording as a control -- which is the half that keeps the list
-# from widening until it is meaningless.
-# An action verb, and the constructions that put one on the entrypoint.
+# ## The contract: a hit is a REVIEW ITEM, not a defect
 #
-# Inferred was the first attempt and it does not work, which is worth recording: the
-# rule has to tell a prescriptive sentence from the plan's three *correct* sentences
-# about the entrypoint, and all four mention it. The correct ones are negative or
+# This detector reads prose, and the branch below reads it badly on purpose in one
+# narrow way: it does **not** model negation. A sentence that names the entrypoint
+# and then denies it does the work is flagged, because denying negation generally in
+# a regex over English is a losing game. The plan's own correct sentences pass
+# because of the *phrasings they happen to use*, not because the detector can tell
+# right from wrong, and the next reader needs that here rather than in a report that
+# lives outside version control.
+#
+# So: a hit is something to **read and judge**, and the case that uses this reports
+# them in full rather than a count. Two live false positives are pinned as controls
+# -- a correct sentence about the unit that the naive version of this branch reports,
+# and a sentence that says the entrypoint's order is *not* the order -- so the
+# detector's reach is bounded by something other than hope. If this ever gets noisy
+# enough to be ignored, the fix is a narrower branch and a new control, not a
+# quieter assertion.
+#
+# Inferred was the first attempt and it did not work, which is worth recording: the
+# rule has to tell a prescriptive sentence from the plan's *correct* sentences about
+# the entrypoint, and all of them mention it. The correct ones are negative or
 # past-tense -- "an entrypoint that ran these commands itself would fail its first
-# one" -- while the stale ones are present-tense or imperative. A verb list wide
-# enough to catch them also flags "The sequence runs from ... and *not* from the
-# entrypoint", where "runs" belongs to the sequence and not to the entrypoint. So
-# the detector reads constructions, and the case that uses it holds the plan's
-# *correct* wording as a control -- which is the half that stops the list widening
-# until it means nothing.
+# one" -- while the stale ones are present-tense or imperative.
 ACTION_VERB = re.compile(
     r"\b(?:creat|run|perform|execut|restart|set)\w*\b", re.IGNORECASE
 )
@@ -2009,30 +2101,43 @@ IN_THE_ENTRYPOINT = re.compile(
 )
 # "The entrypoint must then fail loudly" -- a prescription about the entrypoint.
 ENTRYPOINT_MUST = re.compile(r"\bentrypoint\b[^.]{0,40}?\bmust\b", re.IGNORECASE)
-# "the entrypoint creates the profile" -- the entrypoint as the subject.
+# "the entrypoint creates the profile" -- the entrypoint as the subject of a verb.
 ENTRYPOINT_IS_THE_SUBJECT = re.compile(
     r"\bentrypoint\s+(?:creates?|runs|performs|executes)\b", re.IGNORECASE
 )
-# **The data form, which is the branch the architecture note fell between.** "So the
-# entrypoint order is: create the `eth0` connection profile, then `nmcli device set
-# eth0 managed yes`, then `systemctl restart NetworkManager`" has no prepositional
-# phrase about the entrypoint, no "must" and no entrypoint as the subject of the verb
-# -- it names the entrypoint as the *thing whose order is being given*, and the verbs
-# belong to a list. So it was outside every other construction, the detector reported
-# the plan clean, and the sentence that every task brief derives from assigned the
-# sequence to the entrypoint. Hence a fourth branch rather than a documented gap: a
-# detector that misses contradictory text in the document it exists to check is worse
-# than no detector, because it is evidence of cleanliness.
+# **The data form: the entrypoint named as the thing whose ORDER is being given.**
+# "So the entrypoint order is: create the `eth0` connection profile, then `nmcli
+# device set eth0 managed yes`, then `systemctl restart NetworkManager`" -- no
+# prepositional phrase about the entrypoint, no "must", no entrypoint as the subject
+# of a verb. It is the shape the architecture note used, and it was outside all three
+# other branches, so the detector reported the plan clean while the sentence every
+# task brief derives from assigned the sequence to the entrypoint.
 #
-# The window is kept tight (`order is: create`, `boot sequence is: … restart`) and
-# requires an action verb in the same sentence. `ACTION_VERB` is the reason that
-# second half is needed and the reason it is not enough on its own: the corrected
-# note names the same three commands, and a bare "three commands are named near the
-# word entrypoint" would flag it.
+# **One alternative, and the other two are gone.** It used to have three:
+#
+#   * a third alternative requiring the literal `eth0` between `the` and `connection`
+#     -- which **could never fire**, because the caller replaces inline-code spans
+#     before matching and the plan always backticks `eth0` (raw 1, post-strip 0), and
+#     which was the only alternative that flagged a *correct* sentence: "the unit
+#     creates the eth0 connection profile" mentions no entrypoint at all. It was
+#     dead code with a false-positive future, and dropping it is the honest fix;
+#   * an `entrypoint <verb>` alternative that was **entirely redundant** with
+#     `ENTRYPOINT_IS_THE_SUBJECT` above and with the `must` in `ENTRYPOINT_MUST`,
+#     which between them cover every string it matched.
+#
+# What is left is the one thing the branch is for: a sentence that gives the
+# entrypoint an ordered set of actions. The head noun may carry an adjective --
+# "the entrypoint order", "the entrypoint boot sequence" -- because the first plant
+# for this branch used the second form and the branch did not match it, which is the
+# same lesson as the dead alternative in the other direction: a pattern nobody
+# exercised is a pattern whose reach is unknown.
+#
+# The copula is required, and the one negation the branch handles is a single
+# lookahead: "the entrypoint order **is not** the unit's order" is a denial, and it
+# was a live false positive.
 ENTRYPOINT_OWNS_AN_ORDER = re.compile(
-    r"\bentrypoint(?:'s)?\s+(?:order|sequence|steps|boot)\b"
-    r"|\bentrypoint\s+(?:must\s+)?(?:create|run|perform|execute)s?\b"
-    r"|\b(?:creates?|runs|performs|executes?)\s+the\s+`?eth0`?\s+connection\b",
+    r"\bentrypoint(?:'s)?\s+(?:\w+\s+){0,2}(?:order|sequence|steps|boot)\b"
+    r"\s+(?:is|are|was|were)\b(?!\s*(?:not\b|n't\b))",
     re.IGNORECASE,
 )
 
@@ -2040,11 +2145,18 @@ ENTRYPOINT_OWNS_AN_ORDER = re.compile(
 def entrypoint_sentences_that_act(text: str) -> list[str]:
     """The sentences of `text` that give the image's entrypoint an action to take.
 
+    **A hit is a review item, not a defect.** See the note above
+    `ENTRYPOINT_OWNS_AN_ORDER`: this reads prose and does not model negation, so
+    what it returns is a list for a person to read. It is reported in full rather
+    than as a count, because a count would hide which sentence fired.
+
     Sentence-shaped on purpose, so a report quotes the whole instruction an
     implementer would follow rather than a bare match. Inline-code spans are
     replaced first, because a sentence is delimited by a full stop and
     `/etc/NetworkManager/conf.d/10-mosdns-target.conf` is full of them -- and the
     replacement is a code span too, so the boundaries still come from the prose.
+    That replacement is also why no pattern below may require a name from inside a
+    backtick span: it will never see one.
     """
     stripped = re.sub(r"`[^`]*`", " `` ", text)
     acted = []
