@@ -1754,6 +1754,71 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         )
         self.assertIn("target-nm-setup.service", step)
 
+        # **And the two sentences that were left behind in the same paragraph.** The
+        # fix round corrected the paragraph's opening claim and left the rest of it
+        # saying the opposite, which is worse than not having corrected it: a
+        # reader who trusts the corrected sentence reads past the two below and
+        # implements them. A Task 3 implementer following "The profile is created
+        # here, in the image's entrypoint" puts the profile in the entrypoint --
+        # before there is a D-Bus -- and every target boots unmanaged, and
+        # `test_the_entrypoint_does_not_perform_the_sequence_itself` in
+        # `ImageHandsOverToSystemdTest` fails, so the cause is at least visible.
+        # The second one is the subtler: "The entrypoint must then fail loudly if
+        # `nmcli -g GENERAL.NM-MANAGED` is not `yes`" asks for a check in a place
+        # where `nmcli` cannot answer, so the check would pass vacuously and the
+        # boot would be unchecked.
+        self.assertEqual(
+            entrypoint_sentences_that_act(step), [],
+            "the plan's Task 2 still gives the image's entrypoint an action to perform; the "
+            "sequence and the check both run from target-nm-setup.service:",
+        )
+
+        # The control, because a detector that finds nothing is also a detector that
+        # cannot find the real thing. Run against the two sentences that *were*
+        # there, verbatim, plus the three the plan still says correctly -- so the
+        # detector is shown to separate them rather than to flag the word.
+        stale = (
+            "The profile is created **here, in the image's entrypoint**, and not at "
+            "scenario time: Task 3 step 4 works on the profile this line creates.\n"
+            "The entrypoint must then **fail loudly** if `nmcli -g GENERAL.NM-MANAGED "
+            "device show eth0` is not `yes` afterwards.\n"
+        )
+        correct = (
+            "The sequence runs from `target-nm-setup.service`, and not from the "
+            "entrypoint.\n"
+            "The target's **entrypoint** has its own job and does not touch "
+            "NetworkManager: it points `/etc/resolv.conf` at the resolved stub and "
+            "then `exec`s `/sbin/init` so systemd is PID 1.\n"
+            "An entrypoint that ran these commands itself would fail its first one, "
+            "because there is no D-Bus before `/sbin/init`.\n"
+        )
+        found = entrypoint_sentences_that_act(stale)
+        self.assertEqual(
+            len(found), 2,
+            f"the detector does not recognise the two stale sentences, so the case above "
+            f"would pass on a plan that still had them; it found {found}",
+        )
+        self.assertEqual(
+            entrypoint_sentences_that_act(correct), [],
+            "the detector flags the plan's own correct sentences about the entrypoint, so "
+            "it cannot be used to hold the two stale ones -- the verb list is too wide",
+        )
+
+        # And the positive half, so the fix is not only "the old words are gone": the
+        # step has to *say* the unit creates the profile and the unit runs the check.
+        self.assertRegex(
+            step,
+            r"target-nm-setup\.service[^.]*(?:creates|created)[^.]*profile",
+            "the plan's Task 2 no longer says which component creates the profile, so an "
+            "implementer has nothing to follow but the two sentences this case removed",
+        )
+        self.assertRegex(
+            step,
+            r"[Tt]he (?:unit|script)[^.]*fail loudly",
+            "the plan's Task 2 no longer says the boot check must fail loudly, which is the "
+            "only part of it that makes an ineffective declaration visible",
+        )
+
     def test_the_plan_records_that_the_active_connection_is_nms_own(self):
         """Task 3's first surprise, recorded where Task 3 will read it.
 
@@ -1764,6 +1829,67 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         """
         self.assertIn("connected (externally)", self.plan)
         self.assertIn("eth0-managed", self.plan)
+# The constructions that put an **action** on the image's entrypoint, spelled out
+# rather than inferred.
+#
+# Inferred was the first attempt and it does not work, which is worth recording: the
+# rule has to tell a prescriptive sentence from the plan's three *correct* sentences
+# about the entrypoint, and all four mention it. The correct ones are negative and
+# past-tense -- "an entrypoint that ran these commands itself would fail its first
+# one" -- while the stale ones are present-tense or imperative. A verb list wide
+# enough to catch them also flags "The sequence runs from ... and *not* from the
+# entrypoint", where "runs" belongs to the sequence. So the detector reads the
+# constructions an implementer would follow, and the case that uses it holds the
+# plan's *correct* wording as a control -- which is the half that keeps the list
+# from widening until it is meaningless.
+# An action verb, and the constructions that put one on the entrypoint.
+#
+# Inferred was the first attempt and it does not work, which is worth recording: the
+# rule has to tell a prescriptive sentence from the plan's three *correct* sentences
+# about the entrypoint, and all four mention it. The correct ones are negative or
+# past-tense -- "an entrypoint that ran these commands itself would fail its first
+# one" -- while the stale ones are present-tense or imperative. A verb list wide
+# enough to catch them also flags "The sequence runs from ... and *not* from the
+# entrypoint", where "runs" belongs to the sequence and not to the entrypoint. So
+# the detector reads constructions, and the case that uses it holds the plan's
+# *correct* wording as a control -- which is the half that stops the list widening
+# until it means nothing.
+ACTION_VERB = re.compile(
+    r"\b(?:creat|run|perform|execut|restart|set)\w*\b", re.IGNORECASE
+)
+# "created here, in the image's entrypoint" -- an action located in the entrypoint.
+# It needs an action verb in the same sentence, or it would also catch the plan's
+# correct "nmcli cannot answer in the entrypoint", which is the opposite claim.
+IN_THE_ENTRYPOINT = re.compile(
+    r"in the (?:image's |target's )?entrypoint\b", re.IGNORECASE
+)
+# "The entrypoint must then fail loudly" -- a prescription about the entrypoint.
+ENTRYPOINT_MUST = re.compile(r"\bentrypoint\b[^.]{0,40}?\bmust\b", re.IGNORECASE)
+# "the entrypoint creates the profile" -- the entrypoint as the subject.
+ENTRYPOINT_IS_THE_SUBJECT = re.compile(
+    r"\bentrypoint\s+(?:creates?|runs|performs|executes)\b", re.IGNORECASE
+)
+
+
+def entrypoint_sentences_that_act(text: str) -> list[str]:
+    """The sentences of `text` that give the image's entrypoint an action to take.
+
+    Sentence-shaped on purpose, so a report quotes the whole instruction an
+    implementer would follow rather than a bare match. Inline-code spans are
+    replaced first, because a sentence is delimited by a full stop and
+    `/etc/NetworkManager/conf.d/10-mosdns-target.conf` is full of them -- and the
+    replacement is a code span too, so the boundaries still come from the prose.
+    """
+    stripped = re.sub(r"`[^`]*`", " `` ", text)
+    acted = []
+    for sentence in re.split(r"(?<=\.)\s+", stripped):
+        if (
+            IN_THE_ENTRYPOINT.search(sentence) and ACTION_VERB.search(sentence)
+        ) or ENTRYPOINT_MUST.search(sentence) or ENTRYPOINT_IS_THE_SUBJECT.search(sentence):
+            acted.append(" ".join(sentence.split()))
+    return acted
+
+
 def _gate_line(gate: str) -> str:
     """The one conditional of a setup script, for a failure message.
 
