@@ -102,6 +102,14 @@ COPY tests/podman/images/10-mosdns-target.conf /etc/NetworkManager/conf.d/10-mos
 # race, and the symptom is an intermittent DHCP failure on one release and none at
 # all on another -- which is a very expensive thing to debug from a later failure.
 #
+# **Disabled and masked in two instructions, not one with `||` between them.**
+# `systemctl disable X || systemctl mask X && systemctl mask Y` is a chain whose
+# meaning depends on whether `disable` succeeded: when it did, the `&&` branch never
+# ran and the image masked one unit instead of two. So the image's masked set was
+# a function of the release, and a case reading the file's text could not tell --
+# which is the same "a claim about intent" the review named. Two instructions, one
+# unconditional `mask`, and a case that reads the *instructions* has a set to hold.
+#
 # `netplan-configure.service` is masked because it **fails on every boot**: it is
 # netplan's backend configuration unit, this image has no netplan configuration to
 # apply, and it exits non-zero regardless. Measured as the only failed unit in a
@@ -111,9 +119,8 @@ COPY tests/podman/images/10-mosdns-target.conf /etc/NetworkManager/conf.d/10-mos
 # operator stops trusting. The mask is held to this unit and
 # `systemd-networkd.service` by a case, because masking the world would make the
 # next failure invisible instead.
-RUN systemctl disable systemd-networkd.service \
-    || systemctl mask systemd-networkd.service \
-    && systemctl mask netplan-configure.service
+RUN systemctl disable systemd-networkd.service || true
+RUN systemctl mask systemd-networkd.service netplan-configure.service
 
 # The two unprivileged accounts the two-user scenario acts as, and the
 # setgid-shared directory it checks the control lock in. The package creates these

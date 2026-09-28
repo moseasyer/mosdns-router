@@ -36,8 +36,9 @@ It changes nothing.
 
 **`matrix` exits 3 today**, with every version reported `incomplete` and the
 reason `no scenario is registered in this build of the harness`. That is the
-honest answer: the target image, the mock router and the scenarios are built
-by later tasks, and until one is registered nothing ran. Exit 3 means
+honest answer: the images, the image lock and the host snapshot ship with this
+repository, and the *scenarios* are built by later tasks — so until one is
+registered nothing ran, and no image was started. Exit 3 means
 *incomplete*, which is deliberately not a pass. Exit codes are the interface:
 
 - `0` — everything requested passed
@@ -100,9 +101,11 @@ of by the install scenario.
 
 ## The host snapshot: what it is for
 
-A run writes `build/test-results/<run-id>/host-before.json` and `host-after.json`
-before and after, and the comparison is the plan's evidence that the run changed
-nothing on this machine.
+A `matrix` run writes `build/test-results/<run-id>/host-before.json` **before** it
+does anything and `host-after.json` on the way out, whatever happened in between,
+and the comparison is the plan's evidence that the run changed nothing on this
+machine. Until that wiring existed the two files could not exist at all, and the
+collector being able to do it in isolation was not evidence of anything.
 
 Seven fields, and they are the ones that would change if a run reached the host's
 resolver:
@@ -160,7 +163,25 @@ wrapper emits:
 
 ### Two mechanisms, and which one applies
 
-**1. The declaration, which is the baseline on every release.** NetworkManager
+**1. The declaration, which is the baseline on every release — and is only
+*load-bearing* on 22.04.** On 24.04 and 26.04 the shipped snippet is **inert**:
+measured on a fresh 24.04 (nmcli 1.46.0) and 26.04 (nmcli 1.54.3) target with the
+file removed *and* `/run/NetworkManager/devices` cleared, the device still comes up
+`GENERAL.NM-MANAGED: yes`, `STATE: 100 (connected)`, because a bridge device on
+those releases is managed by NetworkManager by default. So on those two, masking,
+misspelling or renaming the file changes nothing and **the boot check still
+passes**. **22.04 is where a rename is caught**, because there the snippet is the
+only mechanism that manages the device. If you rename it and watch 24.04 pass, you
+have learned nothing about 22.04.
+
+The override wins for a reason worth knowing before you rename anything:
+NetworkManager merges `conf.d` over the main file, and within a merged *list* the
+administrator directory is appended after the `lib/` ones — which is why the file is
+named `10-mosdns-target.conf`, to sort after
+`10-globally-managed-devices.conf`. A name that sorted earlier would be merged
+first and the shipped `unmanaged-devices=*` would win. Nothing errors.
+
+NetworkManager
 ships `/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf` containing
 
 ```ini
