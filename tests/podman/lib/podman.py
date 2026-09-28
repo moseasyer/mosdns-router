@@ -160,20 +160,97 @@ NM_UNMANAGED_EXPLANATION = (
 )
 
 
-def _forbidden_root(path: str) -> str | None:
+def _forbidden_root(path: str, exempt_cgroup: bool = True) -> str | None:
     """The forbidden host root `path` is inside, if any.
 
     `/sys/fs/cgroup` is inside `/sys`, and it is the measured exception, so a
     path that is inside a forbidden root and is not the cgroup filesystem is
-    what this names.
+    what this names. The exception belongs to that one *mount*, so a caller
+    deciding whether a path may be the source tree passes
+    `exempt_cgroup=False`: allowing `/sys/fs/cgroup` as the workspace would
+    bind the host's cgroup hierarchy at `/workspace` instead of a checkout.
     """
-    if path == CGROUP_HOST_PATH or path.startswith(CGROUP_HOST_PATH + "/"):
+    if exempt_cgroup and (path == CGROUP_HOST_PATH or path.startswith(CGROUP_HOST_PATH + "/")):
         return None
     resolved = os.path.normpath(path) if path else ""
     for root in FORBIDDEN_HOST_ROOTS:
         if resolved == root or resolved.startswith(root + "/"):
             return root
     return None
+
+
+# The schemes a Podman *service* URI can carry. A connection is a URI or it is
+# nothing: the harness refuses a machine, and this is where the refusal is
+# structural rather than a sentence in a docstring.
+CONNECTION_SCHEMES = ("ssh://", "unix://", "tcp://", "npipe://")
+
+
+def _checked_connection(connection: str | None) -> str | None:
+    """The connection URI, or a refusal naming the shapes that are not one.
+
+    A bare word is refused because that is how a machine is spelled: `podman
+    --connection podman-machine-default` is a valid invocation, and this
+    harness's whole architecture is that there is no machine. A name of any
+    other kind is still ambiguous -- podman resolves it through a shared
+    configuration file, which is a second piece of state this plan refuses to
+    write -- so a connection is either a URI or it is absent.
+
+    The check is the shape, not a list of known machines: an unknown scheme is
+    refused too, because a scheme this harness cannot read is a connection it
+    cannot vouch for, the same rule the mount options are held to.
+    """
+    if connection is None or connection == "":
+        return None
+    if not any(connection.startswith(scheme) for scheme in CONNECTION_SCHEMES):
+        raise PodmanError(
+            f"refusing --connection {connection!r}: a connection is a Podman service URI, "
+            f"never a name. It must start with one of "
+            f"{', '.join(CONNECTION_SCHEMES)} -- a bare word would name a podman machine, and "
+            f"this harness uses rootless containers on the local host and has no machine at all. "
+            f"Omit the option for the local rootless Podman, which is the acceptance path"
+        )
+    return connection
+
+
+def _checked_source_tree(source_tree: str | None) -> str | None:
+    """The source tree, resolved, or a refusal when it is not a legal parameter.
+
+    The mount allowlist is an allowlist of two, and the second entry is
+    parameterized: a checkout is wherever the operator's checkout is, and
+    pinning it would make the harness unusable. But the parameter *decides what
+    /workspace contains*, so a source tree of `/etc` or of `/` made the policy
+    `run.py --source-tree /etc matrix` bind the host's `/etc` -- including its
+    `/etc/resolv.conf` -- into a target that holds SYS_ADMIN and runs systemd.
+    Every later check compares the source against the allowlist's own entry, so
+    a parameter that is itself forbidden makes them agree and the check passes.
+    That is the defect this function exists to close: the parameter must be
+    legal, not only the destinations.
+
+    Checked after resolution, so `/etc/../etc` and `//etc` are refused too --
+    a check on the raw string is defeated by a relative component, and a
+    relative component is what an operator types out of habit. `/` is refused
+    explicitly: it is not under any of the five roots in the sense the prefix
+    test uses, and it contains all five.
+    """
+    if not source_tree:
+        return None
+    resolved = str(Path(source_tree).resolve())
+    if resolved == "/":
+        raise MountPolicyError(
+            f"refusing source tree {resolved!r}: it is the whole filesystem, which contains "
+            f"every forbidden host root ({', '.join(FORBIDDEN_HOST_ROOTS)}). The source tree is "
+            f"mounted read-only at {WORKSPACE_MOUNT_POINT}, and a mount of '/' would put the "
+            f"host's /etc, /run, /var, /sys and /home there instead of a checkout"
+        )
+    root = _forbidden_root(resolved, exempt_cgroup=False)
+    if root:
+        raise MountPolicyError(
+            f"refusing source tree {resolved!r}: it would be bound at {WORKSPACE_MOUNT_POINT} "
+            f"read-only, and it is under the forbidden host root {root}, which this plan does "
+            f"not mount into a target container. Point --source-tree at a checkout outside "
+            f"{', '.join(FORBIDDEN_HOST_ROOTS)}"
+        )
+    return resolved
 
 
 def _parse_mount_spec(spec: str) -> tuple[str | None, str | None, list[str]]:
@@ -250,9 +327,10 @@ class Podman:
     ):
         self.executable = executable
         # A Podman service URI -- `ssh://…`, `unix://…`, `tcp://…`. It is never
-        # a machine name: there is no machine.
-        self.connection = connection
-        self.source_tree = str(Path(source_tree).resolve()) if source_tree else None
+        # a machine name: there is no machine, and a bare word is refused here
+        # rather than documented in prose.
+        self.connection = _checked_connection(connection)
+        self.source_tree = _checked_source_tree(source_tree)
         self.timeout = timeout
         self._extra_env = dict(extra_env or {})
 

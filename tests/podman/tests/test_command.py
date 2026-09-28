@@ -41,6 +41,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -851,6 +852,92 @@ class MountAllowlistTest(PodmanTestCase):
             self.client(self.fake()).run(["run", "-v", "/sys:/sys:rw", "localhost/img"])
         with self.assertRaises(MountPolicyError):
             self.client(self.fake()).run(["run", "-v", "/sys/fs:/sys/fs:rw", "localhost/img"])
+
+    def test_a_source_tree_inside_a_forbidden_host_root_is_refused_at_construction(self):
+        """The allowlist's *parameter* must itself be legal, or it empties it.
+
+        The allowlist is right to be parameterized: a checkout is wherever the
+        operator's checkout is, and pinning it to one path would make the
+        harness unusable. But the parameter decides what `/workspace` contains,
+        so a source tree of `/etc` or of `/` made the policy
+        `run.py --source-tree /etc matrix` -> `-v /etc:/workspace:ro`, and a
+        target holding SYS_ADMIN and running systemd could then read the host's
+        `/etc/resolv.conf`. The refusal has to be at construction, because by
+        the time an argument array exists the mount is legal as far as
+        `_check_mount` can tell: it compares the source against the
+        allowlist's own entry and the two agree.
+
+        Every case names the root it broke in the message -- a refusal that
+        says "refused" without a path is a shrug.
+        """
+        for root in FORBIDDEN_HOST_ROOTS:
+            for path in (root, os.path.join(root, "inside"), os.path.join(root, "a", "b")):
+                with self.subTest(source_tree=path):
+                    with self.assertRaises(MountPolicyError) as caught:
+                        Podman(executable="/bin/true", source_tree=path)
+                    message = str(caught.exception)
+                    self.assertIn(root, message)
+                    self.assertIn(WORKSPACE, message)
+
+    def test_the_root_itself_is_refused_as_a_source_tree(self):
+        """`/` contains all five forbidden roots, so it is the worst case.
+
+        It is also the one a prefix check gets wrong: no forbidden root is a
+        prefix of `/` followed by a separator, so `"/" == root` is false and
+        `"/".startswith("//")` is false, and a prefix comparison alone lets the
+        whole host through.
+        """
+        with self.assertRaises(MountPolicyError) as caught:
+            Podman(executable="/bin/true", source_tree="/")
+        self.assertIn("every forbidden host root", str(caught.exception))
+
+    def test_a_source_tree_that_traverses_out_of_a_forbidden_root_is_refused(self):
+        """`..` must not launder a path, and the wrapper resolves before it checks.
+
+        A check against the raw string is defeated by a relative component, and
+        a relative component is a thing an operator types out of habit. Each
+        spelling below resolves to a path the case above already refuses.
+        """
+        for spelling in ("/etc/../etc", "/home/../home/ubuntu", "//etc", "/etc/"):
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(MountPolicyError):
+                    Podman(executable="/bin/true", source_tree=spelling)
+
+    def test_a_source_tree_at_a_legal_path_is_accepted_and_still_mounted_read_only(self):
+        """The parameter stays parameterized; a refusal would end the harness.
+
+        The whole point of `--source-tree` is that a checkout is wherever the
+        operator put it. So a path outside all five roots is accepted, the
+        mount is emitted, and it is read-only -- the property the policy exists
+        for, and one a case that only tested refusals would not hold.
+        """
+        legal = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, legal, True)
+        podman = Podman(executable="/bin/true", source_tree=str(legal))
+        self.assertEqual(
+            podman.allowed_mounts(),
+            {
+                CGROUP: (CGROUP, "rw"),
+                WORKSPACE: (str(legal), "ro"),
+            },
+        )
+        self.assertEqual(
+            podman.mount_arguments(),
+            ["-v", f"{CGROUP}:{CGROUP}:rw", "-v", f"{legal}:{WORKSPACE}:ro"],
+        )
+
+    def test_the_cgroup_exception_is_not_a_source_tree_exception(self):
+        """`/sys/fs/cgroup` is allowed as a *mount*; as a source tree it is not.
+
+        The exception exists because a systemd container cannot start without
+        its cgroup hierarchy, and it is scoped to that one mount. Extending it
+        to the source tree would let `--source-tree /sys/fs/cgroup` bind the
+        host's cgroup hierarchy at `/workspace`, which is the same class of
+        mount the plan forbids.
+        """
+        with self.assertRaises(MountPolicyError) as caught:
+            Podman(executable="/bin/true", source_tree=CGROUP)
+        self.assertIn("/sys", str(caught.exception))
 
     def test_the_source_tree_may_not_be_mounted_writable(self):
         """`ro` is a property of the workspace mount, not of the caller.
@@ -1695,7 +1782,8 @@ class CommandLineTest(PodmanTestCase):
         results = self.directory / "results"
         code, _ = self.invoke([
             "matrix", "--arch", "amd64", "--versions", "24.04",
-            "--podman", str(fake.path), "--results-dir", str(results),
+            "--podman", str(fake.path), "--source-tree", str(self.source_tree),
+            "--results-dir", str(results),
         ])
         self.assertEqual(code, run.EXIT_INCOMPLETE)
         self.assertTrue((results).rglob("report.json").__next__().is_file())
@@ -1705,10 +1793,12 @@ class CommandLineTest(PodmanTestCase):
         first = self.directory / "a"
         second = self.directory / "b"
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
-        self.invoke(["--podman", str(fake.path), "--results-dir", str(first),
+        self.invoke(["--podman", str(fake.path), "--source-tree", str(self.source_tree),
+                     "--results-dir", str(first),
                      "matrix", "--arch", "amd64", "--versions", "24.04"])
         self.invoke(["matrix", "--arch", "amd64", "--versions", "24.04",
-                     "--podman", str(fake.path), "--results-dir", str(second)])
+                     "--podman", str(fake.path), "--source-tree", str(self.source_tree),
+                     "--results-dir", str(second)])
         one = json.loads(next(first.rglob("report.json")).read_text(encoding="utf-8"))
         two = json.loads(next(second.rglob("report.json")).read_text(encoding="utf-8"))
         for document in (one, two):
@@ -1789,14 +1879,74 @@ class CommandLineTest(PodmanTestCase):
 
         Podman is a prerequisite the operator provides; the plan says the
         harness never installs it, and a missing binary is reported rather than
-        solved.
+        solved. The source tree is named explicitly because the default is this
+        repository, and a repository under a forbidden host root is refused by
+        the mount policy before podman is ever asked about -- which is the
+        subject of `test_the_default_source_tree_is_this_repository` and
+        `test_a_source_tree_the_policy_refuses_is_reported_as_such`.
         """
         code, output = self.invoke(
-            ["--podman", str(self.directory / "no-such-podman"), "preflight"]
+            [
+                "--podman", str(self.directory / "no-such-podman"),
+                "--source-tree", str(self.source_tree),
+                "preflight",
+            ]
         )
         self.assertEqual(code, run.EXIT_HARNESS_ERROR)
         self.assertIn("not found", output)
         self.assertIn("does not install", output)
+
+    def test_the_default_source_tree_is_this_repository(self):
+        """The default is the checkout, and the policy is applied to it.
+
+        A default that silently became something else would make a run
+        un-reproducible: two checkouts, two mount arguments, and nothing in the
+        report saying which was mounted. So the default is named here, and this
+        case states plainly what happens when the checkout is not a legal
+        parameter.
+        """
+        self.assertEqual(run.GLOBAL_DEFAULTS["source_tree"], str(REPO))
+
+    def test_a_source_tree_the_policy_refuses_is_reported_as_such(self):
+        """A forbidden source tree is a refusal with a remedy, not a crash.
+
+        On a host whose checkout lives under a forbidden host root -- this one
+        does, under `/home` -- the default is not mountable, and the plan's own
+        global constraint ("do not mount host `/home`") is what forbids it. The
+        harness therefore cannot run from such a checkout, and the only
+        acceptable answer is to say so, name the root, and name the remedy:
+        the operator points `--source-tree` at a checkout outside the five
+        roots. Silently widening the allowlist, or mounting it anyway, would
+        trade a structural property for convenience.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            ["--podman", str(fake.path), "--source-tree", "/etc", "preflight"]
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("/etc", output)
+        self.assertIn("--source-tree", output)
+        self.assertEqual(fake.invocations(), [])
+
+    def test_this_checkout_cannot_be_the_source_tree_on_this_host(self):
+        """Recorded, not asserted away: the constraint has a real consequence.
+
+        The plan mounts "the source tree" and also forbids mounting host
+        `/home`. Those two are compatible only where the checkout is not under
+        a forbidden root. So the two facts are stated here as a test rather than
+        left as a surprise the first operator hits: if this checkout is inside
+        a forbidden root, the harness refuses to run from it, and the failure
+        mode is a named refusal rather than a host mount.
+        """
+        inside = None
+        for root in FORBIDDEN_HOST_ROOTS:
+            if str(REPO) == root or str(REPO).startswith(root + "/"):
+                inside = root
+        if inside is None:
+            self.skipTest(f"this checkout is at {REPO}, outside every forbidden host root")
+        with self.assertRaises(MountPolicyError) as caught:
+            Podman(executable="/bin/true", source_tree=str(REPO))
+        self.assertIn(inside, str(caught.exception))
 
     def test_preflight_reports_the_podman_facts_it_can_read(self):
         fake = self.fake([
