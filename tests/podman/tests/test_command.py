@@ -1172,8 +1172,8 @@ class CleanupOrderTest(PodmanTestCase):
         with podman_session(self.client(fake), "20260928T101010Z", network="mosdns-20260928T101010Z-testnet") as run:
             run.track_container(run.container_name("target", "24.04"))
         self.assertEqual(
-            [argv[:2] for argv in fake.invocations()][-3:],
-            [["ps", "-a"], ["volume", "ls"], ["network", "exists"]],
+            [argv[:2] for argv in fake.invocations()][-4:],
+            [["ps", "-a"], ["volume", "ls"], ["network", "ls"], ["network", "exists"]],
         )
 
     def test_a_survivor_is_named_and_the_run_is_a_failure(self):
@@ -1624,6 +1624,108 @@ class CommandLineTest(PodmanTestCase):
 
     def base(self, fake, *extra):
         return ["--podman", str(fake.path), "--source-tree", str(self.source_tree), *extra]
+
+    def test_global_options_are_accepted_after_the_subcommand(self):
+        """The plan's own acceptance commands put them there.
+
+        `run.py matrix --arch amd64 --versions 22.04 --results-dir X` is the
+        shape the plan writes, and argparse's subparsers reject a global option
+        that follows the subcommand unless it is also attached to it. Without
+        this the invocation dies with "unrecognized arguments" and exit 2, and
+        the failure reads like a harness fault rather than a parser fault.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        results = self.directory / "results"
+        code, _ = self.invoke([
+            "matrix", "--arch", "amd64", "--versions", "24.04",
+            "--podman", str(fake.path), "--results-dir", str(results),
+        ])
+        self.assertEqual(code, run.EXIT_INCOMPLETE)
+        self.assertTrue((results).rglob("report.json").__next__().is_file())
+
+    def test_global_options_are_accepted_before_the_subcommand_too(self):
+        """Both spellings resolve to the same run, not to two different ones."""
+        first = self.directory / "a"
+        second = self.directory / "b"
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        self.invoke(["--podman", str(fake.path), "--results-dir", str(first),
+                     "matrix", "--arch", "amd64", "--versions", "24.04"])
+        self.invoke(["matrix", "--arch", "amd64", "--versions", "24.04",
+                     "--podman", str(fake.path), "--results-dir", str(second)])
+        one = json.loads(next(first.rglob("report.json")).read_text(encoding="utf-8"))
+        two = json.loads(next(second.rglob("report.json")).read_text(encoding="utf-8"))
+        for document in (one, two):
+            for key in ("run_id", "started_utc", "finished_utc"):
+                document.pop(key)
+        self.assertEqual(one, two)
+
+    def test_a_bare_cleanup_reports_nothing_to_clean_rather_than_an_error(self):
+        """A recovery command that fails on a clean host is not a recovery command.
+
+        A cleanup that reconstructed a run's network name instead of reading
+        the networks back reported `network not found` as a teardown error on a
+        machine with nothing to clean. The fake never showed it, because the
+        fake's `network ls` answers empty for a reason the test chose rather
+        than one the real podman chose.
+        """
+        fake = self.fake()
+        code, output = self.invoke(self.base(fake, "cleanup"))
+        self.assertEqual(code, run.EXIT_OK)
+        self.assertIn("nothing to clean up", output)
+        self.assertNotIn("teardown:", output)
+
+    def test_a_bare_cleanup_asks_the_networks_rather_than_guessing_one(self):
+        """The network is read back from podman, not reconstructed from a prefix.
+
+        A run's network is `<prefix>-testnet` by convention, and a cleanup that
+        removed a network by an invented name reports an error for a network
+        that never existed -- on a clean host, for the first run anyone makes.
+        """
+        fake = self.fake()
+        self.invoke(self.base(fake, "cleanup"))
+        self.assertIn(["network", "ls", "--format", "{{.Name}}"], fake.invocations())
+        self.assertEqual([argv for argv in fake.invocations() if argv[:2] == ["network", "rm"]], [])
+
+    def test_a_bare_cleanup_removes_a_network_it_found(self):
+        # The listing is present once and then empty, which is what podman does
+        # after the network is actually gone.
+        fake = self.fake([
+            {"match": ["network", "ls"], "answers": [
+                {"stdout": "podman\nmosdns-20260928T101010Z-testnet\n"},
+                {"stdout": "podman\n"},
+            ]},
+            {"match": ["network", "exists"], "returncode": 1},
+        ])
+        code, _ = self.invoke(self.base(fake, "cleanup"))
+        self.assertEqual(code, run.EXIT_OK)
+        self.assertIn(["network", "rm", "mosdns-20260928T101010Z-testnet"], fake.invocations())
+
+    def test_a_bare_cleanup_does_not_touch_a_network_it_did_not_create(self):
+        """`podman` is podman's own default network, and it is not ours."""
+        fake = self.fake([
+            {"match": ["network", "ls"], "answers": [
+                {"stdout": "podman\nmosdns-20260928T101010Z-testnet\n"},
+                {"stdout": "podman\n"},
+            ]},
+            {"match": ["network", "exists"], "returncode": 1},
+        ])
+        self.invoke(self.base(fake, "cleanup"))
+        removed = [argv[-1] for argv in fake.invocations() if argv[:2] == ["network", "rm"]]
+        self.assertNotIn("podman", removed)
+
+    def test_a_network_this_run_forgot_is_a_survivor(self):
+        """The survivorship sweep covers networks as well as containers.
+
+        A run whose network was created and then not recorded is invisible to
+        a name list, and the next run finds a network it did not create.
+        """
+        fake = self.fake([
+            {"match": ["network", "ls"], "stdout": "mosdns-20260928T101010Z-testnet\n"},
+        ])
+        with self.assertRaises(CleanupFailed) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z"):
+                pass
+        self.assertIn(("network", "mosdns-20260928T101010Z-testnet"), caught.exception.result.survivors)
 
     def test_preflight_reports_a_missing_podman_and_installs_nothing(self):
         """A preflight that installed Podman would break the host boundary.

@@ -565,6 +565,17 @@ class Podman:
         )
         return tuple(line for line in result.output.splitlines() if line)
 
+    def network_names(self, prefix: str) -> tuple[str, ...]:
+        """Every network whose name starts with `prefix`.
+
+        Anchored for the same reason as the container and volume listings, and
+        read back rather than reconstructed: a cleanup that removed a network
+        by a name it had invented would report an error for a network that
+        never existed.
+        """
+        result = self.run(["network", "ls", "--format", "{{.Name}}"])
+        return tuple(line for line in result.output.splitlines() if line.startswith(prefix))
+
     def available(self) -> bool:
         """True when the executable exists on this machine.
 
@@ -715,10 +726,24 @@ class RunResources:
     resource a scenario created without recording it.
     """
 
-    def __init__(self, podman: Podman, run_id: str, network: str | None = None):
+    def __init__(
+        self,
+        podman: Podman,
+        run_id: str,
+        network: str | None = None,
+        scope: str | None = None,
+    ):
         self.podman = podman
         self.run_id = run_id
         self.network = network
+        # A run makes one network, but `run.py cleanup` sweeps the namespace
+        # across every run this harness has made, so teardown takes a list.
+        self.networks: list[str] = [network] if network else []
+        # What this teardown is responsible for. It is this run's own prefix
+        # for a run, and the whole `mosdns-` namespace for a sweep, so a bare
+        # `run.py cleanup` clears every run and a session's teardown never
+        # reaches a parallel one.
+        self.scope = scope if scope is not None else (f"{RESOURCE_PREFIX}-{run_id}" if run_id else RESOURCE_PREFIX)
         self.containers: list[str] = []
         self.volumes: list[str] = []
         self.cleanup_result: CleanupResult | None = None
@@ -771,20 +796,20 @@ class RunResources:
             done, message = self._attempt("container", name, lambda n=name: self.podman.remove_container(n))
             (removed.append(done) if done else errors.append(TeardownError("container", name, message)))
         # The sweep catches a container a scenario created without recording it.
-        for name in self.podman.all_container_names(self.prefix):
+        for name in self.podman.all_container_names(self.scope):
             if name in removed:
                 continue
             done, message = self._attempt("container", name, lambda n=name: self.podman.remove_container(n))
             (removed.append(done) if done else errors.append(TeardownError("container", name, message)))
 
-        if self.network:
-            done, message = self._attempt("network", self.network, lambda: self.podman.remove_network(self.network))
-            (removed.append(done) if done else errors.append(TeardownError("network", self.network, message)))
+        for name in list(self.networks):
+            done, message = self._attempt("network", name, lambda n=name: self.podman.remove_network(n))
+            (removed.append(done) if done else errors.append(TeardownError("network", name, message)))
 
         for name in list(self.volumes):
             done, message = self._attempt("volume", name, lambda n=name: self.podman.remove_volume(n))
             (removed.append(done) if done else errors.append(TeardownError("volume", name, message)))
-        for name in self.podman.all_volume_names(self.prefix):
+        for name in self.podman.all_volume_names(self.scope):
             if name in removed:
                 continue
             done, message = self._attempt("volume", name, lambda n=name: self.podman.remove_volume(n))
@@ -792,12 +817,18 @@ class RunResources:
 
         # The survivorship question, asked of podman rather than of this
         # bookkeeping: the harness may have forgotten a name, and podman cannot.
+        # The prefix is the namespace this teardown is responsible for, which is
+        # this run's own prefix for a run and the harness namespace for a sweep
+        # across every run -- so a network or container from a parallel run is
+        # not this teardown's business, and one from an earlier run is.
         survivors: list[tuple[str, str]] = [
-            ("container", name) for name in self.podman.all_container_names(self.prefix)
+            ("container", name) for name in self.podman.all_container_names(self.scope)
         ]
-        survivors += [("volume", name) for name in self.podman.all_volume_names(self.prefix)]
-        if self.network and self.podman.network_exists(self.network):
-            survivors.append(("network", self.network))
+        survivors += [("volume", name) for name in self.podman.all_volume_names(self.scope)]
+        survivors += [("network", name) for name in self.podman.network_names(self.scope)]
+        for name in self.networks:
+            if self.podman.network_exists(name):
+                survivors.append(("network", name))
 
         result = CleanupResult(
             run_id=self.run_id,

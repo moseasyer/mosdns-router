@@ -224,6 +224,11 @@ def command_preflight(args) -> int:
 def command_matrix(args) -> int:
     podman = _podman_from(args)
     _require_podman(podman)
+    # The run id names the result directory, so a run that writes one needs
+    # one. `cleanup` does not: with no --run-id it sweeps the whole namespace,
+    # and a run id invented here would silently narrow that sweep to a run that
+    # never happened.
+    args.run_id = args.run_id or new_run_id()
     started = _now()
     versions = _versions(args)
     # Task 1 of the plan registers no scenario: the target image, the mock
@@ -256,43 +261,35 @@ def command_matrix(args) -> int:
 def command_cleanup(args) -> int:
     podman = _podman_from(args)
     _require_podman(podman)
-    if args.run_id:
-        prefixes = [f"mosdns-{args.run_id}"]
-        network = f"mosdns-{args.run_id}-testnet"
-    else:
-        # Every run this harness has ever made shares the one namespace, so a
-        # bare `cleanup` is the documented way to recover a host.
-        prefixes = [_all_harness_prefixes(podman)]
-        network = None
-    failures = 0
-    for prefix in prefixes:
-        run = RunResources(podman, prefix[len("mosdns-"):], network=network)
-        for name in podman.all_container_names(prefix):
-            run.track_container(name)
-        for name in podman.all_volume_names(prefix):
-            run.track_volume(name)
-        outcome = run.cleanup()
-        for error in outcome.errors:
-            print(f"teardown: {error.message}")
-        for kind, name in outcome.survivors:
-            failures += 1
-            print(f"still present: {kind} {name}")
-        if failures:
-            break
-    if failures:
-        print(f"cleanup left {failures} resource(s) behind")
+    # Every run this harness makes shares the one `mosdns-` namespace, so a bare
+    # `cleanup` is the documented way to recover a host. Podman's `name=`
+    # filter is a substring match and `RunResources` anchors it, so the sweep
+    # reaches this harness's own runs and nothing else.
+    prefix = f"mosdns-{args.run_id}" if args.run_id else "mosdns-"
+    # With no --run-id the sweep is responsible for the whole namespace, so its
+    # scope is `mosdns-` rather than one run's prefix.
+    run = RunResources(podman, args.run_id or "", network=None, scope=prefix)
+    for name in podman.all_container_names(prefix):
+        run.track_container(name)
+    for name in podman.all_volume_names(prefix):
+        run.track_volume(name)
+    # Networks are swept by listing rather than by guessing a name: a run's
+    # network is `<prefix>-testnet` by convention, and a cleanup that removed a
+    # network by a name it invented would report an error for a network that
+    # never existed.
+    networks = [name for name in podman.network_names(prefix) if name.startswith(prefix)]
+    run.networks = networks
+    outcome = run.cleanup()
+    for error in outcome.errors:
+        print(f"teardown: {error.message}")
+    for kind, name in outcome.survivors:
+        print(f"still present: {kind} {name}")
+    if not outcome.ok:
+        print(f"cleanup left {len(outcome.survivors)} resource(s) behind")
         return EXIT_HARNESS_ERROR
+    if not outcome.removed:
+        print("nothing to clean up")
     return EXIT_OK
-
-
-def _all_harness_prefixes(podman: Podman) -> str:
-    """The namespace every run of this harness shares, as a filter prefix.
-
-    Podman's `name=` filter is a substring match, so the sweep is anchored by
-    `RunResources` and the prefix here is the literal `mosdns-`, which is this
-    harness's own namespace and nothing else's.
-    """
-    return "mosdns-"
 
 
 def _versions(args) -> tuple[str, ...]:
@@ -306,31 +303,17 @@ def build_parser() -> argparse.ArgumentParser:
         prog="run.py",
         description="Run the Podman integration matrix in disposable containers.",
     )
-    parser.add_argument(
-        "--podman", default="podman",
-        help="the podman executable to use (default: podman on PATH)",
-    )
-    parser.add_argument(
-        "--connection", default=None,
-        help=(
-            "a Podman service URI for a remote or native service, e.g. "
-            "ssh://host/run/user/1000/podman/podman.sock. Never a machine name: "
-            "there is no machine."
-        ),
-    )
-    parser.add_argument(
-        "--source-tree", default=str(REPO),
-        help="the checkout to mount read-only at /workspace (default: this repository)",
-    )
-    parser.add_argument(
-        "--results-dir", default=str(DEFAULT_RESULTS_DIR),
-        help=f"where run results are written (default: {DEFAULT_RESULTS_DIR})",
-    )
-    parser.add_argument("--run-id", default=None, help="the run id; a UTC timestamp by default")
+    _add_global_options(parser)
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("preflight", help="report whether this host can run the matrix")
+    # The same global options are attached to every subcommand as well, because
+    # a caller who writes the subcommand first is not wrong, and `run.py matrix
+    # --arch amd64 --results-dir X` is the shape the plan's own acceptance
+    # commands use. Without this, argparse rejects the whole invocation with
+    # "unrecognized arguments" and exit 2.
+    preflight = subparsers.add_parser("preflight", help="report whether this host can run the matrix")
+    _add_global_options(preflight)
 
     matrix = subparsers.add_parser("matrix", help="run scenarios across the Ubuntu version matrix")
     matrix.add_argument("--arch", default="amd64", help="the architecture to run (default: amd64)")
@@ -342,11 +325,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--scenario", default=None, action="append",
         help="a scenario to run; repeatable. No scenario is registered yet.",
     )
+    _add_global_options(matrix)
 
-    cleanup = subparsers.add_parser("cleanup", help="remove this harness's leftover containers, network and volumes")
-    cleanup.add_argument("--run-id", default=None, help="one run only (default: every run)")
+    cleanup = subparsers.add_parser(
+        "cleanup",
+        help="remove this harness's leftover containers, network and volumes",
+        epilog=(
+            "With no --run-id every run of this harness is swept. The sweep is "
+            "anchored on the mosdns- namespace and reaches nothing else."
+        ),
+    )
+    _add_global_options(cleanup)
 
     return parser
+
+
+def _add_global_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--podman", default=argparse.SUPPRESS,
+        help="the podman executable to use (default: podman on PATH)",
+    )
+    parser.add_argument(
+        "--connection", default=argparse.SUPPRESS,
+        help=(
+            "a Podman service URI for a remote or native service, e.g. "
+            "ssh://host/run/user/1000/podman/podman.sock. Never a machine name: "
+            "there is no machine."
+        ),
+    )
+    parser.add_argument(
+        "--source-tree", default=argparse.SUPPRESS,
+        help="the checkout to mount read-only at /workspace (default: this repository)",
+    )
+    parser.add_argument(
+        "--results-dir", default=argparse.SUPPRESS,
+        help=f"where run results are written (default: {DEFAULT_RESULTS_DIR})",
+    )
+    parser.add_argument(
+        "--run-id", default=argparse.SUPPRESS,
+        help="the run id; a UTC timestamp by default",
+    )
+
+
+# The defaults for the options argparse suppresses on the subparsers, applied
+# once after parsing so that the two spellings of every option resolve to one
+# value regardless of where on the command line they were written.
+GLOBAL_DEFAULTS = {
+    "podman": "podman",
+    "connection": None,
+    "source_tree": str(REPO),
+    "results_dir": str(DEFAULT_RESULTS_DIR),
+    "run_id": None,
+}
 
 
 def main(argv=None) -> int:
@@ -358,8 +388,9 @@ def main(argv=None) -> int:
         # from here rather than from argparse's own exit, so that the four exit
         # codes are one contract rather than two.
         return EXIT_HARNESS_ERROR if refusal.code else EXIT_OK
-    if not getattr(args, "run_id", None):
-        args.run_id = new_run_id()
+    for name, value in GLOBAL_DEFAULTS.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
     handlers = {
         "preflight": command_preflight,
         "matrix": command_matrix,
