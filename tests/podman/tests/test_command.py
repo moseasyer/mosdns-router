@@ -3124,14 +3124,15 @@ class RunTargetTest(PodmanTestCase):
         self.assertEqual(result.status, "incomplete")
 
 
-class CommandLineTest(PodmanTestCase):
-    """The exit codes are the interface a release gate reads.
+class EntryPointTestCase(PodmanTestCase):
+    """How a case drives the real entry point. No cases of its own.
 
-    0 all requested tests passed, 1 a test failure, 2 a harness or
-    configuration error, 3 an incomplete matrix or a skipped required
-    architecture. They are exercised through the real entry point rather than
-    through the report's properties alone, because the number a Make target
-    sees comes from `main` and not from the object it was derived on.
+    Extracted from `CommandLineTest` so that a second class of case can drive
+    `run.py` without inheriting that class's thirty. Inheritance runs a parent's
+    cases in the subclass as well as in the parent, and it is silent: a subclass
+    that wanted five properties of a `matrix` run was running all thirty exit-code
+    cases a second time, and the ones that failed did so for a reason in the
+    subclass's `setUp` rather than in the code under test.
     """
 
     def invoke(self, argv):
@@ -3143,6 +3144,18 @@ class CommandLineTest(PodmanTestCase):
 
     def base(self, fake, *extra):
         return ["--podman", str(fake.path), "--source-tree", str(self.source_tree), *extra]
+
+
+class CommandLineTest(EntryPointTestCase):
+    """The exit codes are the interface a release gate reads.
+
+    0 all requested tests passed, 1 a test failure, 2 a harness or
+    configuration error, 3 an incomplete matrix or a skipped required
+    architecture. They are exercised through the real entry point rather than
+    through the report's properties alone, because the number a Make target
+    sees comes from `main` and not from the object it was derived on.
+    """
+
 
     def test_global_options_are_accepted_after_the_subcommand(self):
         """The plan's own acceptance commands put them there.
@@ -3310,15 +3323,19 @@ class CommandLineTest(PodmanTestCase):
                     self.assertEqual(code, run.EXIT_HARNESS_ERROR)
                     self.assertIn("is not a version", output)
 
-    def test_every_known_release_is_still_accepted(self):
-        """The check is on the shape, not against the three known releases.
+    def test_every_release_the_lock_pins_is_accepted(self):
+        """A version the lock covers is accepted, whatever the parser thinks.
 
         A list of valid versions belongs to the image lock, not to the argument
         parser, so a later task that adds a release does not have to change
         this file -- and a case that only tested refusals would not say which
-        of the two it is.
+        of the two it is. The list is now *derived* from the lock, because the set
+        of versions a run may name and the set it may build are the same set, and
+        a case that spelled both out would be a second list to forget.
         """
-        for version in ("22.04", "24.04", "26.04", "9.10", "18.04"):
+        import images as images_module
+
+        for version in sorted(images_module.load_lock()["images"]):
             with self.subTest(version=version):
                 fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
                 results = self.directory / f"r-{version}"
@@ -3329,6 +3346,57 @@ class CommandLineTest(PodmanTestCase):
                 self.assertEqual(code, run.EXIT_INCOMPLETE)
                 document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
                 self.assertEqual([r["version"] for r in document["results"]], [version])
+                # And the cell names the image it would have used, so a report
+                # left on disk says which Ubuntu it was about.
+                self.assertIn(
+                    "docker.io/library/ubuntu:" + version + "@sha256:",
+                    document["results"][0]["skips"][0]["requirement"],
+                )
+
+    def test_a_release_the_lock_does_not_pin_is_refused_by_the_lock_not_the_parser(self):
+        """**The two version checks are now different checks, and this is the seam.**
+
+        Task 1's case here asserted that *any* well-formed release is accepted,
+        with `9.10` and `18.04` in the list, because at that point the only version
+        check was the parser's shape. Wiring the image lock in added a second
+        check with a different answer: a run cannot build a version the lock does
+        not pin, because there is no digest to build it from and the fallback --
+        a bare tag -- is the failure this plan exists to prevent.
+
+        So `9.10` is still a *well-formed* version and the parser still accepts it;
+        what refuses it now is the lock, and the two are told apart by the message:
+        the parser's complaint is about a shape, the lock's names the versions it
+        does cover. Asserting both is what keeps a later reader from concluding
+        the parser gained a hard-coded list of releases.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        results = self.directory / "r-910"
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(results),
+                      "matrix", "--arch", "amd64", "--versions", "9.10")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        self.assertIn("9.10", output)
+        # The lock's refusal lists what it does cover, which the parser's never does.
+        self.assertIn("24.04", output)
+        self.assertNotIn(
+            "is not a version", output, "the parser refused the shape, so the lock was never read"
+        )
+
+    def test_a_malformed_version_is_still_refused_by_the_parser(self):
+        """The shape check is unchanged, and it fires before the lock is read.
+
+        `24.4` is a typo, and it should be reported as a typo -- not as a version
+        the lock happens not to cover, which would send a reader to edit the lock
+        instead of their own command line.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "r-244"),
+                      "matrix", "--arch", "amd64", "--versions", "24.4")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        self.assertIn("is not a version", output)
 
     def test_a_bare_cleanup_reports_nothing_to_clean_rather_than_an_error(self):
         """A recovery command that fails on a clean host is not a recovery command.
@@ -3744,6 +3812,351 @@ class CommandLineTest(PodmanTestCase):
         self.assertTrue(fake.invocations())
         for recorded in fake.invocations():
             self.assertNotIn("machine", recorded, f"a machine subcommand was emitted: {recorded!r}")
+
+
+
+class MatrixProducesEvidenceTest(EntryPointTestCase):
+    """A run writes the evidence the plan's host-isolation comparison consumes.
+
+    "A module exists" and "a run produces the evidence" are different properties,
+    and this repository has been bitten by the first being reported as the second
+    more than once: `lib/snapshot.py` and `lib/images.py` were both written, both
+    tested in isolation, and neither was called by anything. So
+    `build/test-results/<run>/host-before.json` and `host-after.json` could not
+    exist, Task 7's comparison had nothing to consume, and the report's wording
+    about them was true of the module and false of the harness.
+
+    Every case here goes through the real entry point, so what is asserted is what
+    a run does rather than what a function offers.
+
+    **The host is not read.** A snapshot would normally run `cat`, `readlink`,
+    `nmcli`, `resolvectl`, `systemctl` and `ss` on this machine and walk the
+    operator's Firefox profiles, and a *test* that did that would depend on the
+    machine it runs on -- which is the thing NO-HOST-MUTATION.md forbids. So the
+    runner and the profile roots come from one named seam, `run.snapshot_settings`,
+    which production fills from `snapshot.SubprocessRunner` and the default roots
+    and every case here fills from a table and a temp directory. The live run that
+    is the actual evidence is done by hand, once, and its output is in the report.
+    """
+
+    # The six commands, answered from a table, and a profile root that is a
+    # temporary directory. Nothing here reads the machine.
+    TABLE = {
+        ("cat", "/etc/os-release"): 'PRETTY_NAME="Ubuntu 24.04.3 LTS"\nID=ubuntu\n',
+        ("readlink", "/etc/resolv.conf"): "../run/systemd/resolve/stub-resolv.conf\n",
+        ("nmcli",): "NAME                UUID                                  TYPE      DEVICE\n"
+        "Wired connection 1  0e4a3b21-2f8f-4a1e-9b0e-3f2c1d4e5f60  ethernet  eth0\n",
+        ("resolvectl", "status"): (
+            "Link 2 (eth0): 2: eth0\n                 DNS Servers: 127.0.0.53\n"
+        ),
+        ("systemctl", "list-unit-files"): "mosdns-router.service          enabled\n"
+        "NetworkManager.service         enabled\n",
+        ("ss",): 'tcp   LISTEN 0      4096   127.0.0.53%lo:53    0.0.0.0:*    '
+        'users:(("systemd-resolve",pid=812,fd=12))\n',
+    }
+
+    def setUp(self):
+        super().setUp()
+        import test_snapshot
+
+        # A profile tree built here rather than imported from the snapshot suite:
+        # the two files test different modules and one importing the other's
+        # fixtures couples them for no gain. What matters is that the snapshot
+        # walks a real directory of real files, not that it is a Firefox profile.
+        self.profile_root = self.directory / "firefox" / "abc.default"
+        self.profile_root.mkdir(parents=True)
+        (self.profile_root / "prefs.js").write_text("// profile\n", encoding="utf-8")
+        self.runner = test_snapshot.FakeCommandRunner(self.TABLE)
+        self._real_settings = run.snapshot_settings
+        run.snapshot_settings = lambda: {
+            "runner": self.runner,
+            "firefox_roots": [self.directory / "firefox"],
+        }
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        run.snapshot_settings = self._real_settings
+
+    def matrix(self, *extra, results_dir=None, expect=run.EXIT_INCOMPLETE):
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        directory = results_dir or (self.directory / "results")
+        code, output = self.invoke(
+            [
+                "matrix", "--arch", "amd64", "--versions", "24.04",
+                "--podman", str(fake.path), "--source-tree", str(self.source_tree),
+                "--results-dir", str(directory), *extra,
+            ]
+        )
+        self.assertEqual(code, expect, output)
+        return directory, output
+
+    def run_directory(self, results_dir):
+        directories = [d for d in results_dir.iterdir() if d.is_dir()]
+        self.assertEqual(len(directories), 1, f"expected one run directory, got {directories}")
+        return directories[0]
+
+    def test_a_matrix_run_writes_a_host_before_and_a_host_after(self):
+        """The two files, under the run's directory, named for the moment.
+
+        This is the whole of it. `host-before.json` and `host-after.json` do not
+        exist because nothing in the harness writes them, and Task 7's comparison
+        is a function of these two paths.
+        """
+        results, _ = self.matrix()
+        run_directory = self.run_directory(results)
+        self.assertTrue(
+            (run_directory / "host-before.json").is_file(),
+            f"no host-before.json in {sorted(q.name for q in run_directory.iterdir())}",
+        )
+        self.assertTrue(
+            (run_directory / "host-after.json").is_file(),
+            f"no host-after.json in {sorted(q.name for q in run_directory.iterdir())}",
+        )
+
+    def test_the_snapshots_are_real_snapshots_of_this_run(self):
+        """Written documents, not empty files, and they name the run they belong to.
+
+        A pair of zero-byte files would satisfy the case above, and an empty
+        snapshot compares equal to every other empty snapshot -- which is the
+        answer the host-isolation check must never give by accident.
+        """
+        import snapshot as snapshot_module
+
+        results, _ = self.matrix()
+        run_directory = self.run_directory(results)
+        for moment in ("before", "after"):
+            with self.subTest(moment=moment):
+                document = json.loads(
+                    (run_directory / f"host-{moment}.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(document["schema"], snapshot_module.SCHEMA)
+                self.assertEqual(document["run_id"], run_directory.name)
+                self.assertIn("networkmanager_connections", document["fields"])
+                self.assertTrue(document["fields"]["resolvectl_status"]["records"])
+
+    def test_the_before_snapshot_is_taken_before_the_run_and_the_after_after(self):
+        """Ordering, from the documents themselves.
+
+        A pair written in the other order -- or both after the run -- would compare
+        a machine that had already been changed against itself, and a run that
+        failed halfway would leave two snapshots of the same state. The report's
+        `started_utc` and `finished_utc` bracket them, so the three timestamps are
+        enough to tell which is which, and that is what is asserted.
+        """
+        results, _ = self.matrix()
+        run_directory = self.run_directory(results)
+        before = json.loads((run_directory / "host-before.json").read_text(encoding="utf-8"))
+        after = json.loads((run_directory / "host-after.json").read_text(encoding="utf-8"))
+        report = json.loads((run_directory / "report.json").read_text(encoding="utf-8"))
+        self.assertLessEqual(
+            before["taken_utc"],
+            report["started_utc"],
+            f"the 'before' snapshot was taken at {before['taken_utc']} but the run started at "
+            f"{report['started_utc']}",
+        )
+        self.assertGreaterEqual(
+            after["taken_utc"],
+            report["finished_utc"],
+            f"the 'after' snapshot was taken at {after['taken_utc']} but the run finished at "
+            f"{report['finished_utc']}",
+        )
+
+    def test_the_snapshots_ran_the_six_read_only_commands(self):
+        """The runner was used, so the snapshot is of this machine and not a fixture.
+
+        Without this, a pair of hand-written documents would pass every case above
+        and the comparison in Task 7 would be comparing fiction. And the count is
+        asserted too: one collection before, one after, and not one or three.
+        """
+        self.matrix()
+        self.assertEqual(
+            [call for call in self.runner.calls if not call[0].startswith("-")],
+            [
+                ("cat", "/etc/os-release"),
+                ("readlink", "/etc/resolv.conf"),
+                ("nmcli", "-f", "NAME,UUID,DEVICE,TYPE,STATE", "connection", "show"),
+                ("resolvectl", "status"),
+                ("systemctl", "list-unit-files", "--no-legend", "--no-pager", "--type=service"),
+                ("ss", "-H", "-lntup"),
+            ]
+            * 2,
+            f"the run did not collect the six fields twice, so the pair it wrote is not a pair "
+            f"of snapshots: {self.runner.calls}",
+        )
+
+    def test_a_refused_run_leaves_no_snapshots(self):
+        """The lock is read first, so a run that stops leaves no misleading evidence.
+
+        A pair of snapshots from a run that never started would be worse than none:
+        Task 7's comparison would read two documents describing an unchanged host
+        and conclude the right thing for the wrong reason, and the two files would
+        look exactly like the evidence a real run produced.
+
+        So the order is: resolve the lock, then snapshot, then run. And a runner
+        whose commands all *raise* is not a failure of the run -- a command this
+        host does not have is recorded as a field error, which is a property the
+        snapshot module holds deliberately and a case there already covers.
+        """
+        lock = self.directory / "unusable.lock.json"
+        lock.write_text(
+            json.dumps(
+                {
+                    "arch": "amd64",
+                    "images": {"24.04": {"digest": "not-a-digest"}},
+                    "schema": "mosdns-podman-images/1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        results = self.directory / "results"
+        code, _ = self.invoke(
+            [
+                "matrix", "--versions", "24.04", "--podman",
+                str(self.fake([{"match": ["version"], "stdout": "5.7.0\n"}]).path),
+                "--source-tree", str(self.source_tree), "--results-dir", str(results),
+                "--lock", str(lock),
+            ]
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertEqual(
+            [p.name for p in results.rglob("*.json")] if results.exists() else [],
+            [],
+            "a run that refused to start wrote result files, so Task 7 would read them as a "
+            "real run's evidence",
+        )
+
+
+class ImageLockWiringTest(EntryPointTestCase):
+    """A target is started from the locked digest, and the lock is read to find out.
+
+    `lib/images.py` refuses a lock entry without a `sha256:` prefix, and a
+    `matrix` run that ignored it would build and start targets against a floating
+    tag while the lock sat in the repository saying otherwise. So the reference a
+    target is started from is the lock's, and a lock the harness cannot use stops
+    the run before it starts anything.
+    """
+
+    def test_the_reference_for_a_version_is_the_locked_one(self):
+        """The value, read from the committed lock, written out as a literal.
+
+        Not "some string ending in a digest": `images.reference_for_version` is what
+        the harness calls, so comparing it to itself would be tautological. What is
+        asserted is that the committed lock produces exactly this reference.
+        """
+        import images as images_module
+
+        self.assertEqual(
+            images_module.reference_for_version("24.04"),
+            "docker.io/library/ubuntu:24.04@sha256:"
+            "496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4",
+        )
+
+    def test_a_matrix_run_reads_the_lock_before_it_does_anything(self):
+        """A run whose lock is unusable stops, rather than falling back to a tag.
+
+        The fallback is the one answer worse than none: the run would proceed
+        against a floating image and the lock would be doing nothing at all, with
+        nothing in the report to say so.
+        """
+        lock = self.directory / "unusable.lock.json"
+        lock.write_text(
+            json.dumps(
+                {
+                    "arch": "amd64",
+                    "images": {"24.04": {"digest": "496754492fb28b4d"}},
+                    "schema": "mosdns-podman-images/1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            [
+                "matrix", "--versions", "24.04", "--podman", str(fake.path),
+                "--source-tree", str(self.source_tree),
+                "--results-dir", str(self.directory / "results"),
+                "--lock", str(lock),
+            ]
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        self.assertIn("sha256:", output)
+        # And nothing was started: a refusal that created a container first would
+        # be a refusal that already did the thing it refused.
+        self.assertFalse(
+            [call for call in fake.invocations() if "run" in call and "-d" in call],
+            fake.invocations(),
+        )
+
+    def test_a_matrix_run_refuses_a_version_the_lock_does_not_cover(self):
+        """`--versions 24.04,26.04` against a lock that pins only 24.04 is a refusal.
+
+        Not a cell reported `incomplete` for a release nobody ships, and not a
+        fallback to the tag. The message names the version, because that is the
+        one thing a caller can act on.
+        """
+        lock = self.directory / "small.lock.json"
+        lock.write_text(
+            json.dumps(
+                {
+                    "arch": "amd64",
+                    "images": {"24.04": {"digest": "sha256:" + "a" * 64}},
+                    "schema": "mosdns-podman-images/1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            [
+                "matrix", "--versions", "24.04,26.04", "--podman", str(fake.path),
+                "--source-tree", str(self.source_tree),
+                "--results-dir", str(self.directory / "results"),
+                "--lock", str(lock),
+            ]
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        self.assertIn("26.04", output)
+
+    def test_a_target_is_started_from_the_locked_reference_verbatim(self):
+        """The chain, end to end: the reference reaches the `podman run` array.
+
+        The last link, and the one the cases above do not reach. A run that
+        resolved the digest correctly and then started a target from a
+        hand-written image string would satisfy all of them, and the gap is exactly
+        the kind that shows up only as a matrix that quietly tested a different
+        Ubuntu than the one it was pinned to.
+        """
+        import images as images_module
+
+        reference = images_module.reference_for_version("24.04")
+        fake = self.fake(
+            [
+                {"match": ["nmcli"], "stdout": "yes\n"},
+                {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
+                {"match": ["version"], "stdout": "5.7.0\n"},
+            ]
+        )
+        run.run_target(
+            _podman_for(self, fake),
+            run_id="20260928T120000Z",
+            arch="amd64",
+            version="24.04",
+            image=reference,
+            scenarios=(),
+        )
+        arrays = [call for call in fake.invocations() if "run" in call and "-d" in call]
+        self.assertEqual(len(arrays), 1, arrays)
+        self.assertIn("@sha256:", arrays[0][-1])
+        self.assertEqual(
+            arrays[0][-1], reference, "the target was started from something else entirely"
+        )
+
+
+def _podman_for(case, fake):
+    """A Podman pointed at a case's fake binary, for calling `run_target` directly."""
+    from podman import Podman as _Podman
+
+    return _Podman(executable=str(fake.path), source_tree=str(case.source_tree))
 
 
 if __name__ == "__main__":

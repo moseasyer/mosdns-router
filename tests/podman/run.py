@@ -51,6 +51,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
+import images  # noqa: E402
+import snapshot  # noqa: E402
 from podman import (  # noqa: E402
     DEFAULT_NETWORK_SUBNET,
     CleanupFailed,
@@ -197,6 +199,66 @@ def _require_podman(podman: Podman) -> None:
         )
 
 
+def snapshot_settings() -> dict:
+    """Where a snapshot's command runner and Firefox roots come from.
+
+    One function, two values, and it exists so that a *case* can supply a table
+    and a temp directory instead of this machine. A snapshot collects the state of
+    whatever host it runs on, so a test that took a real one would assert on the
+    operator's resolver and NetworkManager and Firefox profile -- which is the
+    dependency NO-HOST-MUTATION.md exists to forbid, in the one place the harness
+    deliberately looks at the host.
+
+    Production reads nothing from the environment here: the runner is
+    `snapshot.SubprocessRunner` and the roots are its defaults. A case replaces
+    this attribute. It is a seam rather than a CLI option because a way to ask the
+    harness to snapshot a *fake* host is not a thing an operator needs.
+    """
+    return {
+        "runner": snapshot.SubprocessRunner(),
+        "firefox_roots": snapshot.DEFAULT_FIREFOX_ROOTS,
+    }
+
+
+def _snapshot(moment: str, run_id: str, results_dir: Path) -> Path:
+    """Take one snapshot and write it where the plan's comparison looks for it.
+
+    `build/test-results/<run-id>/host-before.json` and `host-after.json`. The
+    comparison is Task 7's and this is the producer; until both exist the claim
+    "a run changed nothing on the host" has no evidence behind it, whatever the
+    collector can do on its own.
+    """
+    settings = snapshot_settings()
+    document = snapshot.collect_document(
+        settings["runner"],
+        run_id=run_id,
+        taken_utc=_now(),
+        firefox_roots=settings["firefox_roots"],
+    )
+    return snapshot.write_snapshot(document, results_dir, run_id, moment)
+
+
+def _base_images(versions, lock: str | None) -> dict:
+    """Each version's base image reference, read from the lock.
+
+    Resolved **before** the run does anything, so a lock the harness cannot use
+    stops the run rather than being discovered when a container will not start.
+    The failure that matters is the fallback, and there is none: a version with no
+    entry, an entry without a `sha256:` digest, and an entry recorded `unavailable`
+    are all refusals carrying their reason. Falling back to a tag would let the
+    run succeed against a floating image with the lock sitting in the repository
+    saying otherwise, and nothing in the report to say so.
+
+    A `LockError` is translated into a `PodmanError` so that it reaches the exit
+    code every other configuration failure reaches -- 2, harness or configuration
+    error -- rather than falling through the interpreter's own handler.
+    """
+    try:
+        return {version: images.reference_for_version(version, lock) for version in versions}
+    except images.LockError as refusal:
+        raise PodmanError(str(refusal)) from refusal
+
+
 def _write_report(report: Report, results_dir: Path) -> Path:
     directory = results_dir / report.run_id
     directory.mkdir(parents=True, exist_ok=True)
@@ -243,6 +305,42 @@ def command_preflight(args) -> int:
     return EXIT_OK
 
 
+def _run_cells(args, podman: Podman, versions, base_images: dict) -> list:
+    """Run one cell per version, and say honestly which ones did not run.
+
+    **No scenario is registered yet**, which is the whole of the plan's Task 2
+    state: the target image and the lock are here, the scenarios arrive in Task 3
+    on. So every requested version is reported `incomplete` with the reason, which
+    is the honest answer and the reason the exit code is 3 rather than 0.
+
+    The loop is shaped for what Task 3 registers, and the shape is the point: the
+    image a cell is started from is `base_images[version]` -- the locked
+    reference, resolved before the run -- and not a name this function builds. A
+    cell that reached for its own tag would be a matrix that tested a different
+    Ubuntu than the one it was pinned to, on the one run nobody re-reads the lock.
+
+    The requirement string each cell carries names that reference, so a report
+    left behind says which image it was about rather than only which version it
+    asked for.
+    """
+    reason = "no scenario is registered in this build of the harness"
+    return [
+        VersionResult(
+            version=version,
+            arch=args.arch,
+            detail=f"{reason}, so this cell was not run",
+            skips=[
+                Skip(
+                    requirement=f"the {version} {args.arch} scenarios on "
+                    f"{base_images[version]}",
+                    reason=reason,
+                )
+            ],
+        )
+        for version in versions
+    ]
+
+
 def command_matrix(args) -> int:
     podman = _podman_from(args)
     _require_podman(podman)
@@ -269,27 +367,25 @@ def command_matrix(args) -> int:
     args.run_id = args.run_id or new_run_id()
     started = _now()
     versions = _versions(args)
-    # Task 1 of the plan registers no scenario: the target image, the mock
-    # router and the scenarios arrive in the tasks after it. Every requested
-    # version is therefore reported incomplete with the reason, which is the
-    # honest answer and the reason the exit code is 3 rather than 0.
-    reason = "no scenario is registered in this build of the harness"
-    results = [
-        VersionResult(
-            version=version,
-            arch=args.arch,
-            detail=f"{reason}, so this cell was not run",
-            skips=[
-                Skip(
-                    requirement=f"the {version} {args.arch} scenarios",
-                    reason=reason,
-                )
-            ],
-        )
-        for version in versions
-    ]
-    report = _report_shell(args, podman, results, started, None)
-    path = _write_report(report, Path(args.results_dir))
+    # The lock is read before the run does anything, not when a container starts.
+    # A reference resolved lazily is a reference a run can get wrong quietly, and
+    # the failure it produces -- a build or a pull against a floating tag, with
+    # the lock in the repository saying otherwise -- is invisible in the report.
+    base_images = _base_images(versions, args.lock)
+    results_dir = Path(args.results_dir)
+
+    # The 'before' snapshot, and the 'after' on the way out whatever happened in
+    # between. Taken in a `try`/`finally` rather than after the report because the
+    # case where a contributor wants to know what the host looked like afterwards
+    # is the case where the run broke, and a snapshot taken only on the happy path
+    # is a snapshot that exists when it is least needed.
+    _snapshot(snapshot.BEFORE, args.run_id, results_dir)
+    try:
+        results = _run_cells(args, podman, versions, base_images)
+        report = _report_shell(args, podman, results, started, None)
+        path = _write_report(report, results_dir)
+    finally:
+        _snapshot(snapshot.AFTER, args.run_id, results_dir)
     print(f"run {report.run_id}: {report.status} (exit {report.exit_code})")
     for result in report.results:
         print(f"  {result.arch}/{result.version}: {result.status}")
@@ -467,6 +563,12 @@ def _add_global_options(parser: argparse.ArgumentParser) -> None:
         "--run-id", default=argparse.SUPPRESS,
         help="the run id; a UTC timestamp by default",
     )
+    parser.add_argument(
+        "--lock", default=argparse.SUPPRESS,
+        help=(
+            f"the image lock to resolve base images from (default: {images.LOCK_RELATIVE_PATH})"
+        ),
+    )
 
 
 # The defaults for the options argparse suppresses on the subparsers, applied
@@ -481,6 +583,7 @@ GLOBAL_DEFAULTS = {
     "arch": "amd64",
     "versions": None,
     "scenario": None,
+    "lock": None,
 }
 
 
