@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,22 @@ def command_preflight(args) -> int:
 def command_matrix(args) -> int:
     podman = _podman_from(args)
     _require_podman(podman)
+    # A scenario that was asked for and is not registered is a configuration
+    # error, not a cell that did not run. `--scenario` is the flag the plan's
+    # own acceptance commands pass from Task 3 on, and parsing it and then
+    # ignoring it made the plan's first "expected: PASS" command report
+    # "no scenario is registered" -- which reads as though the harness looked
+    # for `dhcp` and did not find it, when in fact it never looked. So the
+    # refusal is explicit, names the scenario, and is exit 2.
+    requested = tuple(args.scenario or ())
+    if requested:
+        raise PodmanError(
+            f"refusing --scenario {', '.join(requested)}: no scenario is registered in this "
+            f"build of the harness, so the requested one cannot be run. The target image, the "
+            f"mock router and the scenarios arrive in the tasks after this one; until a scenario "
+            f"is registered, 'matrix' with no --scenario reports every version incomplete and "
+            f"exits {EXIT_INCOMPLETE}"
+        )
     # The run id names the result directory, so a run that writes one needs
     # one. `cleanup` does not: with no --run-id it sweeps the whole namespace,
     # and a run id invented here would silently narrow that sweep to a run that
@@ -235,15 +252,16 @@ def command_matrix(args) -> int:
     # router and the scenarios arrive in the tasks after it. Every requested
     # version is therefore reported incomplete with the reason, which is the
     # honest answer and the reason the exit code is 3 rather than 0.
+    reason = "no scenario is registered in this build of the harness"
     results = [
         VersionResult(
             version=version,
             arch=args.arch,
-            detail="no scenario is registered yet, so this cell was not run",
+            detail=f"{reason}, so this cell was not run",
             skips=[
                 Skip(
-                    requirement=f"the {version} amd64 scenarios",
-                    reason="no scenario is registered in this build of the harness",
+                    requirement=f"the {version} {args.arch} scenarios",
+                    reason=reason,
                 )
             ],
         )
@@ -254,6 +272,13 @@ def command_matrix(args) -> int:
     print(f"run {report.run_id}: {report.status} (exit {report.exit_code})")
     for result in report.results:
         print(f"  {result.arch}/{result.version}: {result.status}")
+        # The reason a cell did not pass, on the terminal as well as in the
+        # report. A run that prints three `incomplete` lines and nothing else
+        # leaves the reader to open the JSON to learn that nothing ran at all,
+        # and "incomplete" is exactly the status that most needs its reason
+        # next to it.
+        for skip in result.skips:
+            print(f"      not closed: {skip.reason}")
     print(f"report: {path}")
     return report.exit_code
 
@@ -293,9 +318,38 @@ def command_cleanup(args) -> int:
 
 
 def _versions(args) -> tuple[str, ...]:
+    """The requested versions, or a refusal naming the one that is not a version.
+
+    `--versions 24.4` used to produce a row for a version that does not exist:
+    a cell reported `incomplete` for an Ubuntu release nobody ships, and the
+    report carried a requirement string naming it. That is a typo the run
+    cannot see and the reader cannot act on, and this plan's rule is that a
+    requirement which was not closed is recorded -- it is not a rule that a
+    misspelling becomes a requirement. So the shape is checked: two or three
+    dot-separated numbers, which is what `22.04`, `24.04` and `26.04` are.
+
+    The check is on the shape and not against the three known releases, so a
+    later task that adds a release does not have to change the parser -- and a
+    release that has genuinely stopped being published is caught by the image
+    lock, which is where the list of real versions belongs.
+
+    The shape is a year and a **zero-padded** month, which is what Ubuntu uses
+    for every release since 2006: `24.04` and `26.10` are releases, `24.4` is
+    the same month written badly and is the spelling the review measured
+    producing a row, and `24.04.1` is a point release, which is not a thing
+    this matrix has an image for.
+    """
     if not args.versions:
         return DEFAULT_VERSIONS
-    return tuple(part.strip() for part in args.versions.split(",") if part.strip())
+    versions = tuple(part.strip() for part in args.versions.split(",") if part.strip())
+    for version in versions:
+        if not re.fullmatch(r"\d+\.(0[1-9]|1[0-2])", version):
+            raise PodmanError(
+                f"refusing --versions {args.versions!r}: {version!r} is not a version. A "
+                f"release is a year and a zero-padded month ('24.04', '26.10'), and a cell "
+                f"for a version that does not exist is a row in the report nobody can act on"
+            )
+    return versions
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -316,15 +370,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_options(preflight)
 
     matrix = subparsers.add_parser("matrix", help="run scenarios across the Ubuntu version matrix")
-    matrix.add_argument("--arch", default="amd64", help="the architecture to run (default: amd64)")
-    matrix.add_argument(
-        "--versions", default=None,
-        help=f"a comma-separated version list (default: {','.join(DEFAULT_VERSIONS)})",
-    )
-    matrix.add_argument(
-        "--scenario", default=None, action="append",
-        help="a scenario to run; repeatable. No scenario is registered yet.",
-    )
+    # The matrix options are on the top-level parser as well, for the same
+    # reason the globals are on every subparser: the plan's own Task 7 targets
+    # write `run.py matrix --connection … --arch arm64 --versions …`, and a CI
+    # variable or a Make target that puts the options first is not wrong.
+    # Attaching them only to the subparser made the first half of the fix
+    # invisible: `run.py --arch arm64 matrix` died with argparse's usage error
+    # and exit 2, and only the post-subcommand spelling was tested.
+    _add_matrix_options(parser)
+    _add_matrix_options(matrix)
     _add_global_options(matrix)
 
     cleanup = subparsers.add_parser(
@@ -338,6 +392,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_options(cleanup)
 
     return parser
+
+
+def _add_matrix_options(parser: argparse.ArgumentParser) -> None:
+    """The options `matrix` reads, on the top-level parser and on the subparser.
+
+    `argparse.SUPPRESS` for the same reason as the globals: the subparser must
+    not overwrite a value the top-level parser already set, and the two
+    spellings have to resolve to one value whichever side of the subcommand
+    they were written on. These are not attached to `preflight` or `cleanup`,
+    which do not read them -- a global option is one every subcommand honours,
+    and these are two.
+    """
+    parser.add_argument(
+        "--arch", default=argparse.SUPPRESS,
+        help="the architecture to run (default: amd64)",
+    )
+    parser.add_argument(
+        "--versions", default=argparse.SUPPRESS,
+        help=f"a comma-separated version list (default: {','.join(DEFAULT_VERSIONS)})",
+    )
+    parser.add_argument(
+        "--scenario", default=argparse.SUPPRESS, action="append",
+        help=(
+            "a scenario to run; repeatable. No scenario is registered in this build of "
+            "the harness, so naming one is refused rather than ignored."
+        ),
+    )
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:
@@ -376,6 +457,9 @@ GLOBAL_DEFAULTS = {
     "source_tree": str(REPO),
     "results_dir": str(DEFAULT_RESULTS_DIR),
     "run_id": None,
+    "arch": "amd64",
+    "versions": None,
+    "scenario": None,
 }
 
 
@@ -400,11 +484,23 @@ def main(argv=None) -> int:
         return handlers[args.command](args)
     except PodmanError as error:
         # A harness or configuration error, and distinctly not a test failure:
-        # nothing was proved either way.
+        # nothing was proved either way. `CleanupFailed` is a `PodmanError` --
+        # it subclasses it, deliberately, so a teardown failure raised out of a
+        # scenario loop is reported rather than escaping as a crash -- so this
+        # one `except` covers it and there is no second branch for it below.
         print(f"harness error: {error}")
         return EXIT_HARNESS_ERROR
-    except CleanupFailed as failure:
-        print(f"harness error: {failure}")
+    except Exception as error:  # noqa: BLE001 - the exit-code contract's net
+        # Anything else a handler raises is still the harness's own fault, and
+        # the contract reserves exit 1 for a *test* failure. Without this a
+        # `TypeError` in a later task's handler escaped as a traceback and exit
+        # 1 from the interpreter, which a caller reading the number would go
+        # and investigate as a broken installer.
+        #
+        # `KeyboardInterrupt` and `SystemExit` derive from `BaseException` and
+        # are not caught: a Ctrl-C is a Ctrl-C, and `argparse` already routes
+        # its own exits through the `SystemExit` handler above.
+        print(f"harness error: {type(error).__name__}: {error}")
         return EXIT_HARNESS_ERROR
 
 

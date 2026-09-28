@@ -621,7 +621,7 @@ class Podman:
     def remove_network(self, name: str) -> CommandResult:
         return self.run(["network", "rm", name])
 
-    def network_exists(self, name: str) -> bool:
+    def network_exists(self, name: str, timeout: float | None = None) -> bool:
         """Whether a network is still there, asked the way podman answers it.
 
         `network exists` exits 0 for present and 1 for absent, and says nothing
@@ -629,6 +629,10 @@ class Podman:
         diagnostic is a service that could not be asked, which is a different
         answer and is raised rather than reported as absence -- a teardown that
         read it as absence would claim a clean sweep it never performed.
+
+        The deadline is a parameter for the same reason `run`'s is: this is the
+        question at the end of a run, and a caller with a shorter budget than
+        the default has to be able to say so rather than wait out the full one.
         """
         argv = self.build_argv(["network", "exists", name])
         try:
@@ -638,7 +642,7 @@ class Podman:
                 env=self.child_environment(),
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired as expired:
@@ -955,21 +959,47 @@ class RunResources:
         Containers, then the network, then volumes -- the order is required,
         not chosen: a container attached to a network cannot be removed after
         the network is gone.
+
+        Each container is **stopped** before it is removed, and this is the
+        correction of a claim the first report made: `podman rm -f` does not
+        stop a container gracefully, it SIGKILLs it. A systemd target's units
+        are then never shut down, its journal is truncated at the kill rather
+        than closed, and `systemd-resolved`'s state is whatever the kernel left
+        -- which is exactly the state the later tasks read out to decide
+        whether the package's units behaved. `stop --time 30` gives the init the
+        grace period to stop what it started, and it happens before the
+        removal, which is the only order in which it means anything.
         """
         removed: list[str] = []
         errors: list[TeardownError] = []
 
+        def shut_down(n: str) -> tuple[str | None, str | None]:
+            """Stop a container, then remove it, reporting rather than raising."""
+            self.podman.stop(n)
+            return self.podman.remove_container(n)
+
         for name in list(self.containers):
-            done, message = self._attempt("container", name, lambda n=name: self.podman.remove_container(n))
+            done, message = self._attempt("container", name, lambda n=name: shut_down(n))
             (removed.append(done) if done else errors.append(TeardownError("container", name, message)))
         # The sweep catches a container a scenario created without recording it.
         for name in self.podman.all_container_names(self.scope):
             if name in removed:
                 continue
-            done, message = self._attempt("container", name, lambda n=name: self.podman.remove_container(n))
+            done, message = self._attempt("container", name, lambda n=name: shut_down(n))
             (removed.append(done) if done else errors.append(TeardownError("container", name, message)))
 
         for name in list(self.networks):
+            done, message = self._attempt("network", name, lambda n=name: self.podman.remove_network(n))
+            (removed.append(done) if done else errors.append(TeardownError("network", name, message)))
+        # And the same sweep for the networks. A network this run created and
+        # did not record was previously *reported* and left behind, which is
+        # the one thing a teardown must not do: the next run finds a network it
+        # did not create, and `run.py cleanup` is the documented recovery for
+        # exactly that situation. The containers and the volumes were swept
+        # here already; a network was the odd one out.
+        for name in self.podman.network_names(self.scope):
+            if name in removed:
+                continue
             done, message = self._attempt("network", name, lambda n=name: self.podman.remove_network(n))
             (removed.append(done) if done else errors.append(TeardownError("network", name, message)))
 

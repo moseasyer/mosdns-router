@@ -202,7 +202,25 @@ def main():
     time.sleep(float(answer.get("sleep", 0)))
     if answer.get("dump_env"):
         sys.stdout.write(json.dumps(dict(os.environ), sort_keys=True))
-    sys.stdout.write(answer.get("stdout", ""))
+    stdout = answer.get("stdout", "")
+    # `respect_filter` makes this fake apply podman's own `name=` filter to the
+    # lines it was going to print. Podman treats the value as a regular
+    # expression, which is why the harness anchors it with `^` -- and a fake
+    # that ignores the filter cannot tell a sweep that reaches only this run
+    # from one that reaches the whole namespace, so a case about that property
+    # would be asserting about the fake rather than about podman.
+    if answer.get("respect_filter"):
+        pattern = ""
+        for position, token in enumerate(argv):
+            if token.startswith("--filter") and position + 1 < len(argv):
+                pattern = argv[position + 1].split("=", 1)[-1]
+        import re as _re
+        stdout = "".join(
+            line + "\\n"
+            for line in stdout.splitlines()
+            if _re.search(pattern, line)
+        )
+    sys.stdout.write(stdout)
     sys.stderr.write(answer.get("stderr", ""))
     return int(answer.get("returncode", 0))
 
@@ -367,6 +385,26 @@ class ArgumentArrayTest(PodmanTestCase):
 
         absent = self.fake([{"match": ["network", "exists"], "returncode": 1}])
         self.assertIs(self.client(absent).network_exists("mosdns-testnet"), False)
+
+    def test_network_exists_honours_a_per_call_deadline(self):
+        """The per-call timeout is a parameter, so a caller can shorten it.
+
+        `run()` has taken an override since the first version; `network_exists`
+        is the question at the *end* of a run, which is the one place a caller
+        may want a shorter budget than the default, and an override that is
+        accepted and then ignored is worse than no override at all -- it reads
+        as though the deadline was configurable.
+        """
+        fake = self.fake([{"match": ["network", "exists"], "sleep": 30}])
+        with self.assertRaises(PodmanTimeout) as caught:
+            self.client(fake, timeout=120.0).network_exists("mosdns-testnet", timeout=0.5)
+        self.assertIn("0.5", str(caught.exception))
+
+    def test_network_exists_still_defaults_to_the_client_deadline(self):
+        fake = self.fake([{"match": ["network", "exists"], "sleep": 30}])
+        with self.assertRaises(PodmanTimeout) as caught:
+            self.client(fake, timeout=0.5).network_exists("mosdns-testnet")
+        self.assertIn("0.5", str(caught.exception))
 
     def test_network_exists_distinguishes_an_absent_network_from_a_broken_service(self):
         """Podman's own answer is the answer; a broken service is still an error.
@@ -1730,11 +1768,95 @@ class CleanupOrderTest(PodmanTestCase):
         self.assertIn(["rm", "-f", "mosdns-20260928T101010Z-rogue"], fake.invocations())
 
     def test_teardown_touches_nothing_belonging_to_another_run(self):
-        """The sweep is anchored on this run's prefix, not on the word `mosdns`.
+        """The sweep reaches this run and not the one next to it.
 
-        An unanchored filter would remove the containers of a run happening in
-        parallel, and two runs on one machine is the normal case rather than an
-        edge case.
+        Two runs on one machine is the normal case for a release gate and a
+        developer's own run at the same time, so the anchoring is the property:
+        an unanchored `name=mosdns-` filter would remove the containers of the
+        run happening in parallel.
+
+        The previous version of this case asserted a filter *literal* and then
+        asserted that a container the fake had never returned was not removed
+        -- the second half was vacuous, and the first half was a check on a
+        string rather than on the behaviour. So the fake is now told to apply
+        podman's own `name=` regexp filter (`respect_filter`), and the world it
+        reports includes the name that is actually at risk from an unanchored
+        filter: a container whose name *contains* this run's prefix but does
+        not start with it. Removing that one is the accident, and it can only
+        be avoided by the anchor.
+        """
+        world = (
+            "mosdns-20260928T101010Z-rogue\n"
+            "mosdns-20260928T101011Z-target-24.04\n"
+            "backup-of-mosdns-20260928T101010Z-target-24.04\n"
+            "unrelated-container\n"
+        )
+        fake = self.fake([
+            {"match": ["ps", "-a"], "answers": [
+                # the sweep: the whole world, with podman's own filter applied
+                # to it, so what comes back is what podman would return
+                {"stdout": world, "respect_filter": True},
+                # the survivorship re-read, by which the rogue is gone
+                {"stdout": "", "respect_filter": True},
+            ]},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z"):
+            pass
+        removed = [argv[-1] for argv in fake.invocations() if argv[:2] == ["rm", "-f"]
+                   and argv[1] == "-f"]
+        self.assertIn("mosdns-20260928T101010Z-rogue", removed)
+        self.assertNotIn("mosdns-20260928T101011Z-target-24.04", removed)
+        self.assertNotIn("backup-of-mosdns-20260928T101010Z-target-24.04", removed)
+        self.assertNotIn("unrelated-container", removed)
+        # And the filter podman was given is podman's own, so the exclusion is
+        # podman's behaviour under this filter rather than the fake's choice:
+        # unanchored, the same filter would have matched the `backup-of-` name
+        # too, and the sweep would have removed it.
+        filters = {argv[3] for argv in fake.invocations() if argv[:2] in (["ps", "-a"], ["volume", "ls"])}
+        self.assertEqual(filters, {"name=^mosdns-20260928T101010Z"})
+        pattern = next(iter(filters)).split("=", 1)[1]
+        self.assertIsNotNone(re.search(pattern, "mosdns-20260928T101010Z-rogue"))
+        for name in (
+            "mosdns-20260928T101011Z-target-24.04",
+            "backup-of-mosdns-20260928T101010Z-target-24.04",
+            "unrelated-container",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(re.search(pattern, name))
+
+    def test_a_container_is_stopped_before_it_is_removed(self):
+        """`rm -f` is SIGKILL, not a graceful shutdown, and that matters here.
+
+        The first report claimed "podman's forced remove stops a container
+        gracefully first". It does not: `podman rm -f` force-removes, and the
+        wrapper implements the graceful path separately as `stop --time 30`.
+        For every other harness that would be a cosmetic difference. For this
+        one it is not, because a systemd target's units are what the later
+        tasks read out of the container -- `journalctl -b` for a clean service
+        start, the resolved state, the unit statuses -- and a SIGKILL truncates
+        exactly the evidence. So teardown stops first, with the measured grace
+        period, and then removes.
+        """
+        fake = self.fake()
+        with podman_session(self.client(fake), "20260928T101010Z") as run:
+            run.track_container(run.container_name("target", "24.04"))
+        invocations = fake.invocations()
+        stop = [argv for argv in invocations if argv[:1] == ["stop"]]
+        self.assertEqual(stop, [["stop", "--time", "30", "mosdns-20260928T101010Z-target-24.04"]])
+        removal = next(i for i, argv in enumerate(invocations) if argv[:2] == ["rm", "-f"])
+        self.assertLess(
+            invocations.index(stop[0]), removal,
+            "a container must be stopped before it is removed, or the stop is a no-op",
+        )
+
+    def test_a_swept_container_is_stopped_before_it_is_removed_too(self):
+        """The container the run lost track of gets the same shutdown.
+
+        The stop is inside the removal helper rather than in the tracking
+        loop, so a container found by the prefix sweep is shut down as
+        gracefully as a tracked one. A teardown that stopped only what it
+        tracked would SIGKILL exactly the container whose name nobody wrote
+        down.
         """
         fake = self.fake([
             {"match": ["ps", "-a"], "answers": [
@@ -1744,13 +1866,52 @@ class CleanupOrderTest(PodmanTestCase):
         ])
         with podman_session(self.client(fake), "20260928T101010Z"):
             pass
-        filters = [argv[3] for argv in fake.invocations() if argv[:2] in (["ps", "-a"], ["volume", "ls"])]
-        self.assertEqual(
-            filters,
-            ["name=^mosdns-20260928T101010Z"] * 4,
+        self.assertIn(
+            ["stop", "--time", "30", "mosdns-20260928T101010Z-rogue"],
+            fake.invocations(),
         )
-        removed = [argv[-1] for argv in fake.invocations() if argv[:2] == ["rm", "-f"]]
-        self.assertNotIn("mosdns-20260928T101011Z-target-24.04", removed)
+
+    def test_a_network_the_run_forgot_is_removed_rather_than_only_reported(self):
+        """A sweep that finds a leak and leaves it is a leak.
+
+        The containers and the volumes were swept by prefix and removed; the
+        networks were listed for the survivorship report and then left, so a
+        run that created a network and did not record it ended with a teardown
+        failure naming a network this teardown could have removed. The next run
+        then finds a network it did not create, and `run.py cleanup` -- the
+        documented recovery for exactly that state -- is the only thing that
+        clears it. The asymmetry is closed: the sweep removes.
+        """
+        fake = self.fake([
+            {"match": ["network", "ls"], "answers": [
+                {"stdout": "podman\nmosdns-20260928T101010Z-testnet\n"},
+                {"stdout": "podman\n"},
+            ]},
+            {"match": ["network", "exists"], "returncode": 1},
+        ])
+        with podman_session(self.client(fake), "20260928T101010Z"):
+            pass
+        self.assertIn(["network", "rm", "mosdns-20260928T101010Z-testnet"], fake.invocations())
+        # And podman's own default network is not this harness's to remove.
+        removed = [argv[-1] for argv in fake.invocations() if argv[:2] == ["network", "rm"]]
+        self.assertNotIn("podman", removed)
+
+    def test_a_swept_network_that_cannot_be_removed_is_still_a_survivor(self):
+        """Removing it is an attempt, not a claim, so the report is unchanged.
+
+        A sweep that removed what it found and then reported nothing would be
+        the worse bug: a network podman refused to remove would be reported as
+        gone. So a failed removal is an error AND a survivor, and the run still
+        fails.
+        """
+        fake = self.fake([
+            {"match": ["network", "rm"], "returncode": 1, "stderr": "network is in use\n"},
+            {"match": ["network", "ls"], "stdout": "mosdns-20260928T101010Z-testnet\n"},
+        ])
+        with self.assertRaises(CleanupFailed) as caught:
+            with podman_session(self.client(fake), "20260928T101010Z"):
+                pass
+        self.assertIn(("network", "mosdns-20260928T101010Z-testnet"), caught.exception.result.survivors)
 
     def test_a_second_cleanup_of_the_same_run_reports_a_clean_run(self):
         """`run.py cleanup` has to be safe to run twice.
@@ -2103,6 +2264,155 @@ class CommandLineTest(PodmanTestCase):
             for key in ("run_id", "started_utc", "finished_utc"):
                 document.pop(key)
         self.assertEqual(one, two)
+
+    def test_the_matrix_options_are_accepted_on_both_sides_of_the_subcommand(self):
+        """`--arch`, `--versions` and `--scenario` are global too, not matrix-only.
+
+        The previous fix attached the five *global* options to every subparser
+        and left the three *matrix* options on the `matrix` subparser alone, so
+        `run.py --arch arm64 matrix` -- the shape a Make target or a CI
+        variable produces, and the shape `make test-system-arm64` in the plan
+        writes -- died with argparse's usage error and exit 2. Only the
+        post-subcommand spelling was tested, so the other half was untested and
+        unfixed. Both sides are held here for all three.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        before = self.directory / "before"
+        after = self.directory / "after"
+        common = ["--podman", str(fake.path), "--source-tree", str(self.source_tree)]
+        code, _ = self.invoke([
+            *common, "--results-dir", str(before),
+            "--arch", "arm64", "--versions", "24.04", "matrix",
+        ])
+        self.assertEqual(code, run.EXIT_INCOMPLETE)
+        self.invoke([
+            "matrix", "--arch", "arm64", "--versions", "24.04",
+            *common, "--results-dir", str(after),
+        ])
+        for directory in (before, after):
+            document = json.loads(next(directory.rglob("report.json")).read_text(encoding="utf-8"))
+            self.assertEqual(document["arch"], "arm64")
+            self.assertEqual([r["version"] for r in document["results"]], ["24.04"])
+
+    def test_an_unregistered_scenario_is_refused_rather_than_parsed_and_ignored(self):
+        """`--scenario` is either run or refused, and never parsed and dropped.
+
+        The plan's own Task 3 acceptance command is `run.py matrix --arch amd64
+        --versions 22.04 --scenario dhcp`, so the flag is passed on the first
+        command in the plan that expects a cell to be *run*. Silently ignoring
+        it produced exit 3 with "no scenario is registered in this build of the
+        harness" -- honest, but it reads as though the harness looked for `dhcp`
+        and did not find it, when in fact it never looked. So a requested
+        scenario that is not registered is a configuration error: exit 2, the
+        name in the message, and the reason.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "matrix", "--arch", "amd64", "--versions", "24.04",
+                      "--scenario", "dhcp")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("dhcp", output)
+        self.assertIn("no scenario is registered", output)
+
+    def test_matrix_with_no_scenario_requested_still_reports_incomplete(self):
+        """The no-op path is unchanged: no flag, nothing run, exit 3.
+
+        Refusing `--scenario` must not turn "I asked for nothing and got
+        nothing" into an error. That is the state this build is in, and it is
+        reported as incomplete rather than as a harness fault.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "matrix", "--arch", "amd64", "--versions", "24.04")
+        )
+        self.assertEqual(code, run.EXIT_INCOMPLETE)
+        self.assertIn("no scenario is registered in this build of the harness", output)
+
+    def test_a_subcommand_that_raises_something_unexpected_is_still_a_harness_error(self):
+        """The exit-code contract has a net under it.
+
+        `main` caught `PodmanError` and nothing else, so a `TypeError`, an
+        `AttributeError` or a bug in a later task's handler escaped as a
+        traceback: exit 1 from the interpreter, which the contract reserves for
+        "a test failure". A caller reading that as a test failure would go
+        looking for a broken installer when the harness is what broke. So
+        anything a handler raises is exit 2, named, with the type -- and a
+        `KeyboardInterrupt` is deliberately not caught, because a Ctrl-C is
+        not a harness fault.
+        """
+        def broken(args):
+            raise TypeError("a later task's handler returned None where it promised a dict")
+
+        original = run.command_preflight
+        run.command_preflight = broken
+        self.addCleanup(setattr, run, "command_preflight", original)
+        code, output = self.invoke(self.base(self.fake(), "preflight"))
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("TypeError", output)
+        self.assertIn("promised a dict", output)
+
+    def test_an_interrupt_is_not_converted_into_a_harness_error(self):
+        """A Ctrl-C must stay a Ctrl-C.
+
+        `except Exception` does not catch `KeyboardInterrupt` -- it derives
+        from `BaseException` -- and this case says so, because the net above
+        would be a bad thing to add and the reason it is not a bad thing is
+        that it is not there.
+        """
+        def interrupted(args):
+            raise KeyboardInterrupt
+
+        original = run.command_preflight
+        run.command_preflight = interrupted
+        self.addCleanup(setattr, run, "command_preflight", original)
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke(self.base(self.fake(), "preflight"))
+
+    def test_a_version_that_is_not_a_version_is_refused_rather_than_reported(self):
+        """`--versions 24.4` used to produce a row for a release nobody ships.
+
+        The cell was reported `incomplete` with a requirement string naming
+        `24.4`, so a typo became a requirement in the machine-readable record
+        -- and this plan's rule is that a requirement which was not closed is
+        recorded, which is not a rule that a misspelling is one. So the shape
+        is checked: dot-separated numbers, which is what a release is.
+        """
+        for spelling in ("24.4", "jammy", "24.04.1", "24-04", "v24.04", ""):
+            with self.subTest(versions=spelling):
+                fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+                code, output = self.invoke(
+                    self.base(fake, "--results-dir", str(self.directory / "results"),
+                              "matrix", "--arch", "amd64", "--versions", spelling)
+                )
+                # An empty list is the default, not a refusal: `--versions ""`
+                # is how a shell passes an unset variable.
+                self.assertIn(code, (run.EXIT_OK, run.EXIT_INCOMPLETE, run.EXIT_HARNESS_ERROR))
+                if spelling:
+                    self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+                    self.assertIn("is not a version", output)
+
+    def test_every_known_release_is_still_accepted(self):
+        """The check is on the shape, not against the three known releases.
+
+        A list of valid versions belongs to the image lock, not to the argument
+        parser, so a later task that adds a release does not have to change
+        this file -- and a case that only tested refusals would not say which
+        of the two it is.
+        """
+        for version in ("22.04", "24.04", "26.04", "9.10", "18.04"):
+            with self.subTest(version=version):
+                fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+                results = self.directory / f"r-{version}"
+                code, _ = self.invoke(
+                    self.base(fake, "--results-dir", str(results),
+                              "matrix", "--arch", "amd64", "--versions", version)
+                )
+                self.assertEqual(code, run.EXIT_INCOMPLETE)
+                document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+                self.assertEqual([r["version"] for r in document["results"]], [version])
 
     def test_a_bare_cleanup_reports_nothing_to_clean_rather_than_an_error(self):
         """A recovery command that fails on a clean host is not a recovery command.
