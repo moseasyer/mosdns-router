@@ -135,14 +135,28 @@ NM_MANAGE_STEPS = (
     "nmcli device set eth0 managed yes",
     "systemctl restart NetworkManager",
 )
+# A connection profile has to exist on the device before the override sticks.
+# Measured here, not assumed: with a profile for eth0 present, the two steps
+# above take the device to `yes` on three consecutive fresh containers, and
+# without one the two steps leave the field at `no` on every container tried.
+# The plan's Target task already creates an Ethernet profile for eth0 (Task 3,
+# step 4), so this is a fact the sequence depends on rather than a third step
+# added here.
+NM_PROFILE_STEP = (
+    "a connection profile must already exist for the device, e.g. "
+    "'nmcli connection add type ethernet ifname eth0 con-name eth0-managed "
+    "ipv4.method auto' -- with no profile the override is accepted and the "
+    "field stays 'no'"
+)
 NM_UNMANAGED_EXPLANATION = (
-    "A target's device is only managed after both steps, in that order, in the "
-    "target container's own init: the override is written under "
-    "/run/NetworkManager/devices/ and only the restart re-reads it, so the "
-    "first command on its own returns success and does not take effect. The "
-    "device must also be a bridge network's eth0 of type ethernet -- Podman's "
-    "default rootless network hands a container a tun/tap device, which "
-    "NetworkManager refuses by design."
+    "A target's device is only managed after a connection profile exists for "
+    "it and then both steps, in that order, in the target container's own "
+    "init: the override is written under /run/NetworkManager/devices/ and "
+    "only the restart re-reads it, so the first command on its own returns "
+    "success and does not take effect. The device must also be a bridge "
+    "network's eth0 of type ethernet -- Podman's default rootless network "
+    "hands a container a tun/tap device, which NetworkManager refuses by "
+    f"design. Note also that {NM_PROFILE_STEP}."
 )
 
 

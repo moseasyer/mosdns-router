@@ -1008,8 +1008,8 @@ class NetworkManagerDeviceTest(PodmanTestCase):
         """The message has to be enough to act on without reading the plan.
 
         A failure here is not the project's bug; it is the target booting
-        without the two-step sequence, and the operator reading the message is
-        the only one who can fix it.
+        without the sequence, and the operator reading the message is the only
+        one who can fix it.
         """
         fake = self.fake([{"match": ["nmcli"], "stdout": "no\n"}])
         with self.assertRaises(NetworkManagerDeviceError) as caught:
@@ -1017,6 +1017,24 @@ class NetworkManagerDeviceTest(PodmanTestCase):
         message = str(caught.exception)
         self.assertIn("nmcli device set eth0 managed yes", message)
         self.assertIn("systemctl restart NetworkManager", message)
+
+    def test_the_refusal_names_the_connection_profile_the_sequence_depends_on(self):
+        """Measured on this host, and the brief did not state it.
+
+        With a connection profile present for `eth0`, `nmcli device set eth0
+        managed yes` followed by `systemctl restart NetworkManager` takes the
+        field to `yes` -- three fresh containers, three times. Without a
+        profile, both steps are accepted, the audit log says
+        `result="success"`, the override is never written, and the field stays
+        `no`. A refusal that named only the two steps would send an operator
+        to run them, watch them succeed, and conclude the harness is wrong.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "no\n"}])
+        with self.assertRaises(NetworkManagerDeviceError) as caught:
+            assert_networkmanager_manages_device(self.client(fake), "mosdns-x-target-24.04")
+        message = str(caught.exception)
+        self.assertIn("connection profile", message)
+        self.assertIn("nmcli connection add type ethernet ifname eth0", message)
 
     def test_the_refusal_reports_what_the_field_actually_said(self):
         """`no` and `yes` are one character apart, and the message must carry it.
