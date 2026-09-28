@@ -59,9 +59,23 @@ command per policed name and is worth repeating when podman is upgraded:
 $ for f in --privileged --cgroupns --network --net --pid --ipc --uts --userns \
            --cap-add --device --security-opt --volumes-from; do
 >   printf '%-16s ' "$f"
->   podman run "$f=x" --help >/dev/null 2>&1 && echo 'ACCEPTED' || echo 'unknown'
+>   { podman run "$f=x" --help || podman run "$f" --help; } >/dev/null 2>&1 \
+>     && echo 'ACCEPTED' || echo 'unknown'
 > done
 ```
+
+The `||` is not decoration and its absence was a recorded defect. `--privileged`
+is a **boolean**, so `podman run --privileged=x --help` exits non-zero with
+`invalid argument "x" for "--privileged" flag: strconv.ParseBool` — pflag
+*registered* the name and then failed to parse the value. A loop that reads exit
+status alone calls that `unknown` for a flag podman accepts, and a contributor
+following the guidance above would have gone looking for a phantom alias. So the
+bare form is asked second, and either form answering is a name podman has; the
+value-taking names never reach the bare probe, where `--help` is spent as their
+value and podman then refuses for want of an image (exit 125, nothing started).
+`pflag_knows` above is the same two probes, and it does not read exit status at
+all — it looks for `unknown flag`, which is the only answer that means *not
+registered*.
 
 Run it against the new podman first and the documented set second, and a name
 that answers `ACCEPTED` in one and not the other is an alias nobody wrote down.
@@ -88,9 +102,11 @@ iterates a set, and a set that stopped matching the code would still pass.
 Podman is not installed on every machine that checks out this repository, and
 this harness refuses to install it (see `docs/testing.md`). So this case skips
 where podman is absent — loudly, with the one-line command a contributor runs by
-hand, rather than passing on an empty reading. A skip is not a pass: the case
-that does not depend on podman, the table-closure guard, is in
-`test_command.py` and always run.
+hand, rather than passing on an empty reading. A skip is not a pass: the cases
+that do not depend on podman — the table-closure guard and
+`test_policed_container_flags_covers_every_name_the_guard_refuses` — are in
+`test_command.py` and always run, and the second of those is what holds the set
+this file iterates to the guard that polices it.
 """
 
 import gzip
@@ -177,15 +193,36 @@ def pflag_knows(spelling):
     and `--ns` is accepted and documented only under `podman ps`. `--help` is
     what makes pflag report an unknown name, and it exits before doing anything
     else, so this starts no container and touches no host state.
+
+    **Both probe forms, because one flag name does not answer to the other.**
+    `--privileged` is a boolean, so `podman run --privileged=x --help` exits
+    non-zero with `invalid argument "x" for "--privileged" flag:
+    strconv.ParseBool` -- a *parse* failure, not an unknown name. Reading exit
+    status calls that `unknown` for a flag podman accepts, and the manual command
+    at the top of this file used to do exactly that. Every other policed name
+    takes a value, so the bare form cannot be the only probe either:
+    `podman run --cgroupns --help` spends `--help` as the value of `--cgroupns`
+    and then refuses for want of an image (exit 125), which starts nothing. So:
+    the `=x` form first, the bare form second, and *either* answering is a name
+    podman has.
+
+    A name podman does not have answers `unknown flag` in both, which is the only
+    answer that means *not registered* and the only one this reads -- so the
+    two-probe form is what makes this helper and the manual command ask the same
+    question, rather than a fix to a bug in the helper. `test_the_probe_asks_a_
+    boolean_flag_in_the_form_a_boolean_answers` holds the asymmetry open.
     """
-    completed = subprocess.run(
-        ["podman", "run", f"{spelling}=x", "--help"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    return not UNKNOWN_FLAG.search(completed.stdout + completed.stderr)
+    for probe in (f"{spelling}=x", spelling):
+        completed = subprocess.run(
+            ["podman", "run", probe, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if not UNKNOWN_FLAG.search(completed.stdout + completed.stderr):
+            return True
+    return False
 
 
 class PodmanVocabularyTest(unittest.TestCase):
@@ -346,6 +383,66 @@ class PodmanVocabularyTest(unittest.TestCase):
             "is vacuous",
         )
         self.assertFalse(pflag_knows("--networ"), "pflag abbreviates flag names; this gate assumes it does not")
+
+    def test_the_probe_asks_a_boolean_flag_in_the_form_a_boolean_answers(self):
+        """The control for the defect the recorded command had, planted.
+
+        `--privileged` is the one policed name that takes no value, and a probe
+        that asks it the value form gets a *parse* failure rather than an
+        unknown-name failure:
+
+        ```console
+        $ podman run --privileged=x --help; echo $?
+        Error: invalid argument "x" for "--privileged" flag: strconv.ParseBool: parsing "x": ...
+        125
+        $ podman run --privileged --help >/dev/null; echo $?
+        0
+        ```
+
+        So the one-probe version read exit status and answered `unknown` for a
+        flag podman accepts -- the exact shape of a phantom alias, which is what
+        the manual command at the top of this file used to tell a contributor to
+        go and look for. `pflag_knows` asks the bare form second, and this case
+        holds the asymmetry open so the fix cannot be quietly reverted: if the
+        bare form stops being the one that answers, the assertion below fails
+        here rather than in a phantom-alias hunt.
+        """
+        valued = subprocess.run(
+            ["podman", "run", "--privileged=x", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        bare = subprocess.run(
+            ["podman", "run", "--privileged", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(
+            bare.returncode,
+            0,
+            "the bare form of a policed boolean no longer answers -- this podman differs from the "
+            "one the probe was measured against, and the second probe is now asking the wrong "
+            "question",
+        )
+        self.assertIn(
+            "strconv.ParseBool",
+            valued.stdout + valued.stderr,
+            "the value form of a boolean no longer fails to parse; if it now exits 0 the second "
+            "probe in pflag_knows is unnecessary and the note at the top of this file is stale",
+        )
+        # Neither probe says "unknown flag" for it -- pflag registered the name
+        # and objected to the value -- so `pflag_knows`, which reads that one
+        # answer and not the exit status, gets it right.
+        self.assertNotRegex(valued.stdout + valued.stderr, UNKNOWN_FLAG)
+        self.assertTrue(
+            pflag_knows("--privileged"),
+            "a policed boolean answers neither probe, so pflag_knows cannot see it and the "
+            "closure above is blind to every alias a boolean might grow",
+        )
 
 
 if __name__ == "__main__":
