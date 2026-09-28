@@ -187,6 +187,45 @@ def instructions(text: str) -> list[str]:
     return [line for line in folded_lines(text) if line.startswith("RUN ")]
 
 
+# Every way a Containerfile can get a `.deb`'s contents into the image. The rule
+# the suite enforces is "no Containerfile installs the project's package at build
+# time", and a rule that only reads `apt-get install` tokens is a rule about one
+# spelling of "install": `RUN dpkg -i /tmp/mosdns-router.deb`, `ADD x.deb /`, and
+# `COPY` of a `.deb` all bypass it, and the first two do it in a single line that
+# looks nothing like a package list.
+PACKAGE_INSTALLERS = ("apt-get", "apt", "dpkg", "apk", "yum", "dnf", "zypper", "pip", "pip3")
+DEB_SUFFIX = (".deb", ".rpm")
+
+
+def package_artifacts(text: str) -> list[str]:
+    """Every package file and every installer's argument list a Containerfile uses.
+
+    Two shapes, because there are two ways to be wrong: a *named package* (through
+    `apt-get install`, which the previous version of this rule read) and a *package
+    file* (through `dpkg -i`, `ADD`, or a `COPY` of a `.deb`). The second is the
+    one that matters for this project, whose own artifact is a `.deb` -- a build
+    that installed it would make the image's own packaging the thing under test
+    before a scenario ran.
+    """
+    found: list[str] = []
+    for line in instructions(text):
+        tokens = line.split()
+        for installer in PACKAGE_INSTALLERS:
+            if installer in tokens:
+                index = tokens.index(installer)
+                found.append(" ".join(tokens[index : index + 6]))
+    # Scanned over *every* instruction, not only the `RUN` ones: `ADD x.deb /tmp/`
+    # and `COPY x.deb /tmp/` are two of the three shapes this rule exists for, and
+    # an earlier version of it read `apt-get install` tokens only, so a `COPY` of a
+    # `.deb` -- the spelling this project would actually use, its artifact being a
+    # `.deb` -- scored as clean.
+    for line in folded_lines(text):
+        for token in line.split():
+            if token.endswith(DEB_SUFFIX):
+                found.append(token)
+    return found
+
+
 def installed_packages(text: str) -> set[str]:
     """Every package every `apt-get install` in the file installs.
 
@@ -526,6 +565,52 @@ class TargetContainerfileTest(unittest.TestCase):
                     "is copied in at scenario time so the install transaction is what is tested",
                 )
 
+    def test_no_image_installs_a_package_file_or_names_a_package_installer(self):
+        """The rule, over the ways to install that `apt-get install` is not.
+
+        The previous version of this rule read `apt-get install` tokens and nothing
+        else, so `RUN dpkg -i /tmp/x.deb` -- the spelling this project actually
+        uses, since its artifact is a `.deb` -- passed it. That is a rule about one
+        spelling of "install", and the artifact a build would have smuggled in is
+        exactly the one the spelling does not catch.
+        """
+        for containerfile in containerfiles():
+            with self.subTest(containerfile=containerfile.name):
+                offenders = [
+                    artifact
+                    for artifact in package_artifacts(read(containerfile))
+                    if "mosdns-router" in artifact
+                    or artifact.endswith(DEB_SUFFIX)
+                ]
+                self.assertEqual(
+                    offenders, [],
+                    f"{containerfile.name} gets a package into the image at build time: {offenders}. "
+                    f"The .deb is copied in at scenario time, so the install transaction is what "
+                    f"is under test",
+                )
+
+    def test_the_package_file_detector_sees_a_deb(self):
+        """The control, and the limit of the previous rule beside it.
+
+        Three shapes, each of which a build could plausibly write, and the first of
+        which is what the old `apt-get`-only rule scored as clean.
+        """
+        for offending in (
+            "FROM ubuntu:24.04\nRUN dpkg -i /tmp/mosdns-router_0.1.0_amd64.deb\n",
+            "FROM ubuntu:24.04\nADD build/mosdns-router_0.1.0_amd64.deb /tmp/\n",
+            "FROM ubuntu:24.04\nCOPY build/mosdns-router.deb /tmp/\n",
+        ):
+            with self.subTest(containerfile=offending.splitlines()[1]):
+                self.assertTrue(
+                    [a for a in package_artifacts(offending) if a.endswith(DEB_SUFFIX)],
+                    "the detector misses a way of getting a .deb into an image",
+                )
+                self.assertFalse(
+                    installed_packages(offending),
+                    "installed_packages scores a dpkg/ADD/COPY of a .deb as no package at all, "
+                    "which is the hole this case documents",
+                )
+
     def test_no_containerfile_installs_the_project_package(self):
         """The rule over all three images, not just the target.
 
@@ -823,6 +908,62 @@ class MockCdnContainerfileTest(unittest.TestCase):
             f"the serving stage copies nothing out of the build stage: {final}",
         )
 
+    def test_the_cdn_image_serves_from_this_module_and_installs_no_server(self):
+        """The plan's own answer, and the absence is the point.
+
+        The plan says the mock CDN is built from the repository's Go module, so the
+        server is `crypto/tls` in that module. The first version of this file
+        installed `caddy` in the serving stage to avoid writing it, and **caddy
+        does not exist on Ubuntu 22.04** -- measured against the locked digest with
+        `universe` enabled: `apt-cache policy caddy` and `apt-cache search ^caddy`
+        are both empty. So the image could not be built on a third of the matrix.
+
+        Two properties, because either alone is satisfiable by accident: it
+        **builds** the server from this module, and its serving stage **installs no
+        package**, so there is nothing for a release to lack.
+        """
+        stages = containerfile_stages(read(MOCK_CDN_CONTAINERFILE))
+        build = stage_named(stages, "build")
+        self.assertIsNotNone(build, [name for name, _ in stages])
+        self.assertTrue(
+            any("golang" in line for line in build),
+            "the build stage does not install a Go toolchain, so nothing here is compiled",
+        )
+        self.assertTrue(
+            any("go build" in line and "tests/podman/mock-cdn" in line for line in build),
+            f"the CDN server is not built from this module: {build}",
+        )
+        serving = stages[-1][1]
+        self.assertEqual(
+            [line for line in serving if "apt-get install" in line],
+            [],
+            f"the serving stage installs a package, and a package is a thing a release may not "
+            f"have: {serving}",
+        )
+        self.assertTrue(
+            any("COPY --from=build" in line for line in serving),
+            f"the serving stage copies nothing out of the build stage: {serving}",
+        )
+
+    def test_the_cdn_rule_can_fail(self):
+        """The control: a Containerfile that installs caddy is reported.
+
+        Without it, "the serving stage installs nothing" would also be satisfied by
+        a helper that never read the file -- and this round's defect was exactly a
+        check that could not see the file it was supposed to read.
+        """
+        offending = (
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE} AS build\n"
+            "RUN apt-get update && apt-get install -y golang-go\n"
+            "FROM ${BASE_IMAGE}\n"
+            "RUN apt-get update && apt-get install -y caddy\n"
+        )
+        serving = containerfile_stages(offending)[-1][1]
+        self.assertTrue(
+            [line for line in serving if "apt-get install" in line],
+            "the control does not reproduce the defect, so the case above is not a check",
+        )
+
     def test_it_compiles_the_cdn_server_from_this_module(self):
         """The module's own path, so the image is built from this checkout.
 
@@ -882,6 +1023,69 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
     def locked_versions(self) -> list[str]:
         return sorted(images.load_lock(LOCK)["images"])
 
+
+def containerfiles(directory: Path | None = None) -> list[Path]:
+    """Every Containerfile in the images directory, sorted.
+
+    **Discovered, not listed.** The first version of the availability check named
+    two of the three files, and its own docstring said "every package the three
+    Containerfiles install" -- so the one it left out was the one carrying
+    `caddy`, which does not exist on 22.04, and the check written to catch exactly
+    that could not see it. A hand-maintained list of the files to check is a
+    fourth thing that can drift from the three that exist, and it drifts silently:
+    a Containerfile added in a later task is checked by nobody.
+
+    Discovered by glob, so a new image joins the set the moment it is written. The
+    control below is what makes that a claim rather than a hope.
+    """
+    return sorted((directory or IMAGES).glob("*.Containerfile"))
+
+    def test_it_checks_every_containerfile_in_the_images_directory(self):
+        """The set is discovered, and the control shows a new file joins it.
+
+        The defect this round fixes was a two-file list in a check that claimed to
+        cover three. A glob cannot have that defect, and the control is what makes
+        the glob load-bearing rather than decorative: a directory containing an
+        extra Containerfile must produce a longer list, with no edit to this file.
+        """
+        self.assertEqual(
+            [path.name for path in containerfiles()],
+            ["mock-cdn.Containerfile", "mock-router.Containerfile", "target.Containerfile"],
+            "the images directory no longer holds the three files this suite was written "
+            "against; a new image must be added to this list deliberately or not at all",
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            for name in ("a.Containerfile", "b.Containerfile"):
+                (directory / name).write_text("FROM ubuntu:24.04\n", encoding="utf-8")
+            (directory / "not-a-containerfile.txt").write_text("x\n", encoding="utf-8")
+            self.assertEqual(
+                [path.name for path in containerfiles(directory)],
+                ["a.Containerfile", "b.Containerfile"],
+                "the discovery is not driven by the directory's contents, so adding a "
+                "Containerfile would not add it to the set this check looks at",
+            )
+
+    def test_every_image_in_the_set_is_covered_by_a_case_class(self):
+        """A new image joins the availability set *and* the rest of this file.
+
+        Discovery fixes the availability check. This is the other half: the file
+        also has to be a `MockRouter`-shaped or `Target`-shaped image for the
+        package and copy-source cases to mean anything, and a Containerfile nobody
+        asserts anything about is an image nobody has read.
+        """
+        mentioned = " ".join(read(path) for path in containerfiles())
+        for path in containerfiles():
+            with self.subTest(containerfile=path.name):
+                self.assertIn(
+                    path.name,
+                    read(LOCK).replace("mock-cdn", "mock-cdn")
+                    + mentioned
+                    + Path(__file__).read_text(encoding="utf-8"),
+                    f"{path.name} is not named anywhere outside this case, so nothing in the "
+                    f"suite reads it",
+                )
+
     def test_the_table_covers_every_release_the_lock_pins(self):
         """A table that has fallen behind the lock would certify nothing.
 
@@ -907,20 +1111,20 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
         works on two releases and fails on the third, with a matrix of three that
         reports two thirds of itself as passing.
         """
-        installed = installed_packages(read(TARGET_CONTAINERFILE))
-        for package in sorted(installed):
-            with self.subTest(package=package):
-                recorded = self.AVAILABILITY.get(package, {})
-                absent = [
-                    version
-                    for version, note in recorded.items()
-                    if note.startswith("ABSENT")
-                ]
-                self.assertEqual(
-                    absent, [],
-                    f"the target image installs {package}, which the availability table records "
-                    f"as absent on {', '.join(absent)}",
-                )
+        for containerfile in containerfiles():
+            for package in sorted(installed_packages(read(containerfile))):
+                with self.subTest(containerfile=containerfile.name, package=package):
+                    recorded = self.AVAILABILITY.get(package, {})
+                    absent = [
+                        version
+                        for version, note in recorded.items()
+                        if note.startswith("ABSENT")
+                    ]
+                    self.assertEqual(
+                        absent, [],
+                        f"{containerfile.name} installs {package}, which the availability "
+                        f"table records as absent on {', '.join(absent)}",
+                    )
 
     def test_the_check_would_fail_on_a_package_absent_from_one_release(self):
         """The control, and the reason the case above is not a tautology.
@@ -1322,6 +1526,65 @@ class ManagedDeclarationTest(unittest.TestCase):
             "twice and the two can disagree",
         )
 
+    def test_the_declaration_names_the_device_the_harness_asserts(self):
+        """`except:interface-name:eth0`, tied to `podman.NM_DEVICE` rather than to a literal.
+
+        The harness asserts the managed field on `podman.NM_DEVICE` and the
+        declaration excepts a name typed into a configuration file. Nothing
+        connected them, so an interface rename in one place left the other
+        asserting a device that no longer exists -- and on 24.04 and 26.04, where
+        the declaration is inert, **nothing would fail**: the target comes up
+        managed anyway and every case stays green over a declaration that names
+        the wrong device. On 22.04 it would fail, which is the reason to catch it
+        here rather than there.
+        """
+        from podman import NM_DEVICE
+
+        self.assertIn(
+            f"except:interface-name:{NM_DEVICE}",
+            self.text,
+            f"the declaration does not name {NM_DEVICE}, which is the device the harness "
+            f"asserts on and the one this image creates a profile for",
+        )
+        self.assertIn(
+            f"DEVICE={NM_DEVICE}",
+            read(NM_SETUP),
+            f"the setup script creates a profile for a device that is not {NM_DEVICE}",
+        )
+
+    def test_the_declaration_is_documented_as_the_mechanism_only_where_it_is_one(self):
+        """**The one thing a contributor cannot discover for themselves.**
+
+        Measured: on 24.04 (nmcli 1.46.0) and 26.04 (nmcli 1.54.3), a bridge
+        device comes up **managed with the declaration removed and
+        `/run/NetworkManager/devices` cleared** -- `GENERAL.NM-MANAGED: yes`,
+        `STATE: 100 (connected)`. So on those two releases the shipped snippet is
+        **inert**: masked, misspelled or renamed, the boot check still passes and
+        the target still comes up managed. The check cannot fail because of the
+        declaration there, and it can only fail on 22.04, where the snippet is the
+        mechanism.
+
+        Presenting it as load-bearing on all three is the falsifiable claim this
+        case exists for, and the failure it causes is concrete: a contributor
+        renames the file, runs the matrix, sees 24.04 pass, concludes the rename
+        is fine, and ships an image whose 22.04 target is unmanaged. So the
+        inertness is stated in all three records, and this case is what stops it
+        being quietly dropped from one of them.
+        """
+        for path, label in (
+            (NM_DECLARATION, "the declaration's own comment"),
+            (REPO / "docs/testing.md", "the contributor page"),
+            (REPO / "docs/superpowers/plans/2026-09-25-podman-integration-matrix.md", "the plan"),
+        ):
+            with self.subTest(record=label):
+                body = read(path).lower()
+                self.assertIn("inert", body, f"{label} does not say the snippet is inert on 24.04 and 26.04")
+                for release in ("24.04", "26.04"):
+                    self.assertIn(release, body, f"{label} does not name {release}")
+                self.assertIn(
+                    "22.04", body, f"{label} does not say where the declaration IS the mechanism"
+                )
+
     def test_the_declaration_is_a_conf_d_snippet_and_not_a_whole_main_conf(self):
         """It belongs in `conf.d/`, not over `/etc/NetworkManager/NetworkManager.conf`.
 
@@ -1414,6 +1677,80 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, self.plan)
 
+    def test_the_plan_does_not_name_a_package_22_04_does_not_have(self):
+        """**The plan would have sent the next implementer into a failed build.**
+
+        The plan's Task 2 Step 3 still listed `systemd-resolved` among the packages
+        the target image installs. That is the exact package this task measured
+        absent from 22.04 -- `E: Unable to locate package systemd-resolved` -- and
+        the Containerfile now says `libnss-resolve` with the reason. A plan that
+        names the other one sends the next implementer straight back to the
+        failure, and no case in the suite can stop them, because they would not
+        read the Containerfile.
+
+        The check is on the plan's *instruction*, not on a comment: the sentence
+        that tells an implementer what to install.
+        """
+        step = self.plan[self.plan.index("### Task 2:") : self.plan.index("### Task 3:")]
+        # Matched on the *instruction* rather than on any mention: the step is
+        # allowed to name systemd-resolved in order to say it is not the one to
+        # install, and a case that forbade the word would forbid the correction as
+        # well as the error. What must not appear is an "installs …" sentence naming
+        # it, and the sentence is delimited at the first full stop so the search
+        # cannot run past the end of the instruction into the explanation.
+        instruction = re.search(r"Target image installs[^.]*", step)
+        self.assertIsNotNone(
+            instruction, "the plan's Task 2 no longer says what the target image installs"
+        )
+        self.assertIn("libnss-resolve", instruction.group(0))
+        self.assertNotIn(
+            "systemd-resolved",
+            instruction.group(0),
+            "the plan's Task 2 still tells an implementer to install systemd-resolved, which "
+            "22.04 does not have; the Containerfile says libnss-resolve and says why",
+        )
+        # And the control, because a search that finds nothing is also a search that
+        # cannot find the real thing. Run against a synthetic stale sentence rather
+        # than against this plan: the first version of this control asserted the
+        # plan *still* contained the stale wording, which is a self-defeating case
+        # -- it fails exactly when the correction lands.
+        stale = "Target image installs `systemd-sysv`, `systemd-resolved`, `python3`."
+        self.assertIsNotNone(
+            re.search(r"Target image installs[^.]*systemd-resolved", stale),
+            "the detector does not recognise the stale instruction, so the case above would "
+            "pass on a plan that still had it",
+        )
+        self.assertIsNone(
+            re.search(r"Target image installs[^.]*systemd-resolved", "Target image installs `python3`."),
+            "the detector matches nothing at all, so the control above is not a control",
+        )
+
+    def test_the_plan_says_the_sequence_runs_from_the_unit_and_not_the_entrypoint(self):
+        """**Same paragraph, second stale claim, and it is the load-bearing one.**
+
+        The plan said "The target's **entrypoint** must perform the NetworkManager
+        device sequence". The implementation deliberately runs it from
+        `target-nm-setup.service`, because `nmcli` reaches NetworkManager over
+        D-Bus and there is no bus before `/sbin/init` -- measured: `Error: Could not
+        create NMClient object: Could not connect: No such file or directory` -- and
+        a case in this suite *asserts* the entrypoint must not perform it. So a
+        Task 3 implementer following the plan would put the sequence in the
+        entrypoint, boot every target unmanaged, and fail every cell for a reason
+        that has nothing to do with the package.
+
+        Held here because this suite already holds the plan's conf.d prohibition
+        and its version table, and those were the other two claims that had gone
+        stale in the same paragraph.
+        """
+        step = self.plan[self.plan.index("### Task 2:") : self.plan.index("### Task 3:")]
+        self.assertNotIn(
+            "entrypoint must perform the NetworkManager device sequence",
+            step,
+            "the plan still tells an implementer to run the sequence from the entrypoint, which "
+            "has no D-Bus before /sbin/init; the image runs it from target-nm-setup.service",
+        )
+        self.assertIn("target-nm-setup.service", step)
+
     def test_the_plan_records_that_the_active_connection_is_nms_own(self):
         """Task 3's first surprise, recorded where Task 3 will read it.
 
@@ -1424,6 +1761,19 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         """
         self.assertIn("connected (externally)", self.plan)
         self.assertIn("eth0-managed", self.plan)
+def _gate_line(gate: str) -> str:
+    """The one conditional of a setup script, for a failure message.
+
+    The whole flattened script is several hundred characters of unrelated `echo`,
+    so quoting it in an assertion failure buries the two words that matter. The
+    conditional is the sentence a reader needs.
+    """
+    for fragment in gate.split(" if "):
+        if "-ge" in fragment and "nm_minor" in fragment:
+            return "if " + fragment.split("; then")[0] + "; then"
+    return gate[:120]
+
+
 class CopySourceTest(unittest.TestCase):
     """Every `COPY` names a file that is in the repository.
 
@@ -1546,9 +1896,14 @@ class LockSchemaTest(unittest.TestCase):
         wanted = sorted(
             {
                 package
-                for containerfile in (TARGET_CONTAINERFILE, MOCK_ROUTER_CONTAINERFILE)
+                for containerfile in containerfiles()
                 for package in installed_packages(read(containerfile))
             }
+        )
+        self.assertTrue(
+            wanted,
+            "no image installs anything, so this check would pass on an empty set and say "
+            "nothing about package availability",
         )
         for version, entry in sorted(images.load_lock(LOCK)["images"].items()):
             if entry.get("unavailable"):
@@ -2497,31 +2852,112 @@ class OverrideVersionGateTest(SetupScriptTestCase):
                 )
 
     def test_the_boundary_is_the_measured_one_and_not_a_round_number(self):
-        """The threshold, asserted against the five measured points.
+        """The threshold, compared **numerically** against the measurements.
 
-        A gate at 1.40 or 1.50 would be a number nobody measured, and it would
-        look exactly as authoritative. The case states the measured set and
-        requires the gate to put every `no` below every `yes`.
+        A gate at 1.40 or 1.50 would be a number nobody measured and would look
+        exactly as authoritative. So this does not check that the string `1.44`
+        appears somewhere in the script -- the weakest form of check there is, and
+        the one the previous version of this case used, which passed on a comment
+        saying `1.44` in a sentence about something else. It **parses the number
+        out of the script's own comparison** and puts every measured `no` below it
+        and every measured `yes` at or above it, using the table in `podman.py`.
+
+        The table is the one record of the five measurements, and this case is what
+        makes it load-bearing. Previously `podman.NM_OVERRIDE_MEASUREMENTS` existed,
+        carried a comment claiming "the suite asserts both against this list", and
+        was read by nothing: a table that nothing checks is a comment with braces
+        on it, and a comment that a later reader believes is a measurement.
         """
-        measured_no = ("1.36.6", "1.42.4")
-        measured_yes = ("1.44.2", "1.46.0", "1.54.3")
-        for version in measured_no:
-            with self.subTest(released_as_no=version):
-                _, trace = self.run_setup(NM_SETUP, NM_VERSION=version)
-                self.assertNotIn("nmcli device set", " ".join(trace))
-        for version in measured_yes:
-            with self.subTest(released_as_yes=version):
-                _, trace = self.run_setup(NM_SETUP, NM_VERSION=version)
-                self.assertIn("nmcli device set", " ".join(trace))
-                self.assertIn("systemctl restart NetworkManager", " ".join(trace))
-        # And the script's own threshold, as a literal, so the two lists and the
-        # gate cannot drift apart silently.
-        self.assertIn(
-            "1.44",
-            read(NM_SETUP),
-            "the setup script does not name the measured boundary, so a later edit could move it "
-            "with nothing comparing it to the measurements",
+        from podman import NM_OVERRIDE_MEASUREMENTS
+
+        threshold = self.script_threshold()
+        self.assertEqual(
+            len(threshold), 2,
+            f"the script does not declare its override boundary as a major.minor number: "
+            f"{threshold!r}. A threshold read out of prose cannot be compared to a measurement",
         )
+        for version, works in sorted(NM_OVERRIDE_MEASUREMENTS.items()):
+            with self.subTest(nmcli=version, sequence_works=works):
+                major, minor = (int(part) for part in version.split(".")[:2])
+                at_or_above = (major, minor) >= threshold
+                self.assertEqual(
+                    at_or_above, works,
+                    f"nmcli {version} was measured to "
+                    f"{'work' if works else 'not work'} with the override sequence, and the "
+                    f"script's threshold {threshold[0]}.{threshold[1]} puts it on the other "
+                    f"side. The gate would run two commands that do nothing, or skip two that "
+                    f"work",
+                )
+        # And the table is not empty, because an empty one would satisfy the loop.
+        self.assertEqual(len(NM_OVERRIDE_MEASUREMENTS), 5)
+
+    def script_threshold(self) -> tuple:
+        """The boundary the script's own comparison uses, as a number.
+
+        Read from the comparison rather than from the comment above it, because a
+        comment is prose and this is the value the shell acts on. The two spellings
+        of "1" are both accepted for the major, since the script compares
+        `[ "$nm_major" -gt 1 ]` and `[ "$nm_major" -eq 1 ]`.
+        """
+        gate = " ".join(shell_statements(NM_SETUP))
+        # The gate is a shell conditional, so it is read as one: `major > M` or
+        # (`major == M` and `minor >= N`). Both numbers come from the comparison
+        # itself -- which is the value the shell acts on -- and not from the prose
+        # above it, which is where the previous version of this case looked and
+        # which is why a comment saying `1.44` about something else satisfied it.
+        minor = re.search(r'nm_minor"?\s+-ge\s+(\d+)', gate)
+        major = re.search(r'nm_major"?\s+-eq\s+(\d+)', gate)
+        above = re.search(r'nm_major"?\s+-gt\s+(\d+)', gate)
+        for pattern, name in ((minor, "-ge nm_minor"), (major, "-eq nm_major"), (above, "-gt nm_major")):
+            self.assertIsNotNone(
+                pattern,
+                f"the gate has no `{name}` comparison; the conditional reads: "
+                f"{_gate_line(gate)}",
+            )
+        # `-gt N` and `-eq N` name the same boundary major: a major above it passes
+        # unconditionally, and that major itself is decided by the minor test. Two
+        # different numbers would mean a band of majors the gate skips, which is
+        # the one thing a version comparison must not have.
+        self.assertEqual(
+            int(above.group(1)), int(major.group(1)),
+            f"the gate passes majors above {above.group(1)} unconditionally and decides "
+            f"{major.group(1)} by the minor test, so there is a band of majors it skips",
+        )
+        return (int(major.group(1)), int(minor.group(1)))
+
+    def test_the_threshold_the_script_uses_is_the_one_podman_records(self):
+        """The two records, compared, so neither can move alone.
+
+        `podman.py`'s refusal prints the boundary to an operator and the script
+        gates on it. Those are two files and two purposes, and a case that checked
+        only one of them would leave a refusal quoting 1.44 beside a gate at 1.40 --
+        which reads as authoritative and is wrong.
+        """
+        from podman import NM_OVERRIDE_MINIMUM
+
+        self.assertEqual(
+            self.script_threshold(),
+            tuple(NM_OVERRIDE_MINIMUM),
+            "the setup script gates on a different version than the harness's refusal quotes",
+        )
+
+    def test_a_two_digit_major_runs_the_sequence(self):
+        """The `[ "$nm_major" -gt 1 ]` branch, which no other case reached.
+
+        It is the branch for a hypothetical NetworkManager 2.x, and it is
+        unreachable by every measured release -- which is exactly why it needs a
+        case. A guard on an unreachable branch is a guard nobody has run, and the
+        review is right that the harness makes this one argument away. The failure
+        direction is safe either way (skipping costs nothing the declaration does
+        not provide), so this is about the *other* direction: a 2.x that does have
+        the override must not have its sequence silently dropped.
+        """
+        completed, trace = self.run_setup(NM_SETUP, NM_VERSION="2.0.0")
+        self.assertEqual(
+            completed.returncode, 0, completed.stdout + completed.stderr
+        )
+        self.assertIn("nmcli device set eth0 managed yes", " ".join(trace))
+        self.assertIn("systemctl restart NetworkManager", " ".join(trace))
 
     def test_the_profile_is_still_created_where_the_sequence_is_skipped(self):
         """Task 3 modifies this profile, so it has to exist on 22.04 too.

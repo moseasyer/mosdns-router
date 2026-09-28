@@ -6,10 +6,31 @@
 # kilobytes of static binary, and every layer of it is in the image a run leaves
 # behind.
 #
-# The build context is the repository, read-only into the build; nothing here
-# writes to it. `-mod=readonly` is the reason: a `go build` that updated `go.mod`
-# or `go.sum` inside the build would be a silent edit to the checkout, made by a
-# command whose job is to change nothing, and it is asserted rather than assumed.
+# **The serving stage installs nothing at all, and that is deliberate.** The plan's
+# Task 5 step 1 needs certificate-authenticated HTTPS on `cloudflare.test` and
+# `distribution.test`, with Cloudflare-style and CloudFront-style response
+# headers, an expected body marker, a small file and a throttled large one. The
+# plan also says the mock CDN is "built from the repository's Go module", and
+# `crypto/tls` in that module does all of it.
+#
+# The first version of this file installed `caddy` in the serving stage to avoid
+# writing the TLS server. That was the wrong trade in two ways, and the second one
+# only showed up when the build was measured:
+#
+#   * `caddy` **does not exist on Ubuntu 22.04** -- not in `main`, not in
+#     `universe`, not in the archive at all. Measured against the locked 22.04
+#     digest: `apt-cache policy caddy` and `apt-cache search ^caddy` are both
+#     empty. So the image could not be built on a third of the matrix, and
+#     nothing in the suite could see it, because the availability check named two
+#     of the three Containerfiles. Both are fixed: the file is discovered by glob
+#     now, and `caddy` is gone.
+#   * A CDN server that is not this project's code answers differently from one
+#     that is, and the plan's Task 5 step 3 makes assertions about *this* module's
+#     ECH and CDN behaviour. Caddy would have been the thing under test.
+#
+# The certificates are not baked in: Task 5 generates its own test material and
+# `podman cp`s it, because a private key in a committed image layer is a private
+# key in the repository's history.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE} AS build
 
@@ -31,16 +52,11 @@ RUN go mod download
 COPY . .
 RUN go build -mod=readonly -trimpath -o /out/mock-cdn ./tests/podman/mock-cdn
 
-# The serving stage. Caddy is here because the plan's Task 5 step 1 needs
-# certificate-authenticated HTTPS with Cloudflare-style and CloudFront-style
-# response headers, and doing that in a hand-written listener is a second TLS
-# stack to get wrong before a single ECH assertion is reached.
+# The serving stage: the base image and the binary. No package, so there is no
+# package that a release might not have -- which is the property the availability
+# check enforces across every image in this directory, and the reason it is worth
+# stating here rather than leaving to the reader.
 FROM ${BASE_IMAGE}
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends caddy ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY --from=build /out/mock-cdn /usr/local/bin/mock-cdn
 
 # No EXPOSE: the CDN is reached from the target and the client container over the

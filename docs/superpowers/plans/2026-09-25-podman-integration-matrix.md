@@ -224,15 +224,23 @@ Sort output, redact environment-specific UUIDs only when they are not relevant t
 
 - [ ] **Step 3: Create Containerfiles**
 
-Target image installs `systemd-sysv`, `dbus`, `NetworkManager`, `systemd-resolved`, `python3`, `iproute2`, `dnsutils`, `curl`, `ca-certificates`, and test tools, but does not install the project package at build time. Mock router installs `dnsmasq`; mock CDN is built from the repository's Go module.
+Target image installs `systemd-sysv`, `dbus`, `NetworkManager`, `libnss-resolve`, `python3`, `iproute2`, `dnsutils`, `curl`, `ca-certificates`, and test tools, but does not install the project package at build time. Mock router installs `dnsmasq-base`; mock CDN is built from the repository's Go module and installs no server package at all.
 
-**The target's entrypoint must perform the NetworkManager device sequence in this exact order, and the profile comes first:**
+**`libnss-resolve`, and not the package named `systemd-resolved`.** The latter is a binary package on 24.04 and 26.04 and does not exist on 22.04 at all, where the daemon is part of `systemd` — so naming it fails the 22.04 build with `E: Unable to locate package systemd-resolved` (measured, in this task). `libnss-resolve` exists on all three, brings the daemon with it where it is a separate package, and is the NSS module without which a lookup in a target reads `/etc/hosts` and then the network and never asks 127.0.0.53.
+
+**The mock CDN installs nothing in its serving stage, and that is a measurement too.** `caddy` does not exist on 22.04 — not in `main`, not in `universe` — so an image that installed it could not be built on a third of the matrix, and the plan's own answer is the Go module's own TLS server. Every package any of the three images installs is checked against all three locked releases, and **the set of images is discovered by glob**, so a Containerfile added in a later task is covered without anybody editing the check.
+
+**The sequence runs from `tests/podman/images/target-nm-setup.service`, a systemd unit the target image installs and enables — and *not* from the entrypoint.** `nmcli` reaches NetworkManager over D-Bus, and before `/sbin/init` there is no bus to connect to, so an entrypoint that ran these commands itself would fail its first one with `Error: Could not create NMClient object: Could not connect: No such file or directory` (measured) and leave every target unmanaged. The unit runs the sequence in this exact order, and the profile comes first:
 
 ```sh
 nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto
 nmcli device set eth0 managed yes
 systemctl restart NetworkManager
 ```
+
+The target's **entrypoint** has its own job and does not touch NetworkManager: it points `/etc/resolv.conf` at the resolved stub — Podman bind-mounts a generated one over that path in every container *and* every build step, so the image cannot own it and the entrypoint unmounts it inside the container's own mount namespace — and then `exec`s `/sbin/init` so systemd is PID 1.
+
+**The declaration is the baseline, the sequence is the second mechanism, and on 24.04 and 26.04 the declaration is inert.** `/etc/NetworkManager/conf.d/10-mosdns-target.conf` narrows NetworkManager's shipped `unmanaged-devices=*` with `except:interface-name:eth0` and works on all three releases; on 22.04 it is the *only* mechanism that does, because the sequence is skipped there (no persistent device override below nmcli 1.44). But measured on a fresh 24.04 and 26.04 target with the declaration removed and `/run/NetworkManager/devices` cleared, the device still comes up `yes` — so a rename of the file is caught **only on 22.04**, and the boot check cannot fail because of it on the other two. The image gates the sequence on the measured nmcli boundary, and the boot check asserts the field on every release.
 
 The first line is the same command as `NM_PROFILE_STEP` in `tests/podman/lib/podman.py`, which was measured on this host: with **no** profile for `eth0`, the two steps are accepted, the audit log records `op="device-managed" … result="success"`, the override is never written to `/run/NetworkManager/devices/`, and `GENERAL.NM-MANAGED` stays `no`. The profile is created **here, in the image's entrypoint**, and not at scenario time: an entrypoint that ran the two steps first would boot every target unmanaged, fail its own boot check, and leave every cell of the matrix `incomplete` with exit 3. Task 3 step 4 works on the profile this line creates.
 
