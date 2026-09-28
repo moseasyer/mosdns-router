@@ -55,6 +55,9 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
 
 from podman import (  # noqa: E402
+    FORBIDDEN_CONTAINER_FLAG_FAMILIES,
+    FORBIDDEN_CONTAINER_FLAGS,
+    ALLOWED_CAPABILITIES as ALLOWED_CAPS,
     CleanupFailed,
     ContainerPolicyError,
     MountPolicyError,
@@ -287,8 +290,14 @@ class PodmanTestCase(unittest.TestCase):
         # these cases is the resolved one.
         self.source_tree = self.source_tree.resolve()
 
-    def fake(self, rules=None):
-        return FakePodmanBinary(self.directory, rules)
+    def fake(self, rules=None, directory=None):
+        """A fake binary, in `directory` when a case needs its own log.
+
+        The log is appended to, so two cases sharing one fake share one
+        `invocations()` list; a case that counts invocations passes its own
+        directory rather than reading a list that grew underneath it.
+        """
+        return FakePodmanBinary(directory or self.directory, rules)
 
     def client(self, fake, **kwargs):
         # Nothing is plumbed through the environment: the fake finds its own
@@ -1029,52 +1038,273 @@ class MountAllowlistTest(PodmanTestCase):
         self.assertEqual(fake.invocations(), [["version", "--format", "{{.Client.Version}}"]])
 
 
+# The measured cap ceiling, written out here rather than read from the module:
+# a guard that derived its own allowlist from the code it guards agrees with
+# itself, and the whole point of the ceiling is what a later task may add.
+ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")
+
+# Every flag family refused in `extra_args`, in the two spellings pflag accepts
+# and in both positions, written as one table so the sweep is the table. If a
+# later task needs one of these, the honest move is to measure why the ceiling
+# has to move and change it here too, not to reach for a spelling the sweep
+# forgot.
+#
+# pflag accepts `--flag value` for a string flag as well as `--flag=value`, and
+# `run_container` already emits `--network <net>` *before* `extra_args`, so the
+# last occurrence of a repeated flag is the one podman reads. That combination
+# is what the previous spelling-sensitive guard missed: `--network host` in the
+# space form, in the hatch, after the legal value.
+#
+# Each entry is (extra_args, the token the refusal must name). The second
+# element is not decoration: a guard that raised a generic message would satisfy
+# "did it refuse?" while telling the operator nothing about which of the four
+# flags in the array was the problem, which is the one thing they need.
+FORBIDDEN_EXTRA_ARGS = (
+    # privilege and host namespaces, both spellings
+    (["--privileged"], "--privileged"),
+    (["--cgroupns=host"], "--cgroupns"),
+    (["--cgroupns", "host"], "--cgroupns"),
+    (["--network=host"], "--network"),
+    (["--network", "host"], "--network"),
+    (["--pid=host"], "--pid"),
+    (["--pid", "host"], "--pid"),
+    (["--ipc=host"], "--ipc"),
+    (["--ipc", "host"], "--ipc"),
+    (["--uts=host"], "--uts"),
+    (["--uts", "host"], "--uts"),
+    (["--userns=host"], "--userns"),
+    (["--userns", "host"], "--userns"),
+    # the cap ceiling
+    (["--cap-add=ALL"], "--cap-add"),
+    (["--cap-add", "ALL"], "--cap-add"),
+    (["--cap-add=DAC_OVERRIDE"], "--cap-add"),
+    (["--cap-add", "DAC_OVERRIDE"], "--cap-add"),
+    # devices, which is the host's own hardware
+    (["--device=/dev/kvm"], "--device"),
+    (["--device", "/dev/kvm"], "--device"),
+    (["--device=/dev/net/tun"], "--device"),
+    (["--device", "/dev/sda"], "--device"),
+    # seccomp and apparmor, which are the other half of a container boundary
+    (["--security-opt=seccomp=unconfined"], "--security-opt"),
+    (["--security-opt", "seccomp=unconfined"], "--security-opt"),
+    (["--security-opt=apparmor=unconfined"], "--security-opt"),
+    (["--security-opt", "apparmor=unconfined"], "--security-opt"),
+    (["--security-opt", "label=disable"], "--security-opt"),
+    # another run's or another container's filesystems
+    (["--volumes-from=some-other-container"], "--volumes-from"),
+    (["--volumes-from", "some-other-container"], "--volumes-from"),
+    # each of the above again, positioned after an allowed flag, because
+    # run_container's own flags come first and the last occurrence wins
+    (["--ip", "10.89.0.10", "--network", "host"], "--network"),
+    (["--hostname", "mosdns-target", "--privileged"], "--privileged"),
+    (["--env", "A=1", "--device", "/dev/kvm"], "--device"),
+    (["--ip", "10.89.0.10", "--cap-add", "ALL"], "--cap-add"),
+    (["--dns", "10.89.0.2", "--security-opt", "seccomp=unconfined"], "--security-opt"),
+    (["--add-host", "router.test:10.89.0.2", "--volumes-from", "other"], "--volumes-from"),
+    (["--tmpfs", "/run:rw", "--device", "/dev/net/tun"], "--device"),
+    (["--userns=keep-id", "--privileged"], "--privileged"),
+    (["--pid=container", "--ipc", "host"], "--ipc"),
+    # a capability in a name a later task might invent, to show the ceiling is
+    # an allowlist rather than a denylist of the names somebody thought of
+    (["--cap-add", "NET_RAW"], "--cap-add"),
+    (["--cap-add=DAC_READ_SEARCH"], "--cap-add"),
+    (["--cap-add=MKNOD"], "--cap-add"),
+    (["--cap-add=SYS_BOOT"], "--cap-add"),
+    # `--pid=container` is legal, so the refusal beside it is the one that
+    # counts: a legal value must not launder an illegal neighbour
+    (["--pid=container", "--cgroupns", "host"], "--cgroupns"),
+    # the same, with the illegal one in the space form and the legal one inline
+    (["--uts=private", "--userns", "host"], "--userns"),
+    # the boolean spelled `=false`, which is NOT privileged. It is refused
+    # anyway, and that is a deliberate over-refusal rather than a miss: the
+    # policy is on the flag being present at all, so there is no spelling of
+    # `--privileged` to reason about. A false positive here costs a token
+    # somebody typed out of habit; a false negative hands over the host.
+    (["--privileged=false"], "--privileged"),
+    (["--privileged=false", "--cap-add=ALL"], "--cap-add"),
+    # two violations in one array: the guard must not return on the first, or
+    # a caller that fixes one and re-runs meets the other without a message
+    (["--privileged", "--device=/dev/kvm"], "--device"),
+    (["--cgroupns=host", "--cap-add=ALL", "--pid", "host"], "--pid"),
+    (["--network", "host", "--ipc=host", "--uts=host", "--userns", "host"], "--userns"),
+)
+
+
 class ContainerPolicyTest(PodmanTestCase):
     """A target container may not be handed the host it runs on.
 
     The measured flag set for a systemd target is three capabilities, a private
     cgroup namespace and no privilege flag. `extra_args` is the escape hatch
-    every later task reaches for when something will not run, so the three
-    flags that would defeat the isolation are refused there rather than trusted
-    to the caller.
+    every later task reaches for when something will not run, so the guard lives
+    there rather than in prose -- and a hatch with no cap ceiling, no device
+    policy and one spelling of everything is a hatch that reaches the host.
+
+    The guard is spelling-independent, the way the mount guard already is: pflag
+    accepts `--flag value` as well as `--flag=value`, and `run_container` emits
+    `--network <net>` before `extra_args`, so a later occurrence of a repeated
+    flag is the one podman reads. The sweep below is the table, forty-eight cases,
+    and every one of them must be refused before the binary is started.
     """
 
-    def test_privileged_is_refused(self):
+    def refused(self, extra_args):
+        """Start a target with `extra_args` and return the refusal message."""
         with self.assertRaises(ContainerPolicyError) as caught:
             self.client(self.fake()).run_container(
                 image="localhost/mosdns-target:24.04",
                 name="mosdns-x-target-24.04",
                 network="mosdns-testnet",
-                extra_args=["--privileged"],
+                extra_args=extra_args,
             )
-        self.assertIn("--privileged", str(caught.exception))
+        return str(caught.exception)
 
-    def test_the_host_cgroup_namespace_is_refused(self):
-        """`--cgroupns=host` was written for the architecture this plan dropped.
+    def test_every_forbidden_extra_argument_is_refused_in_every_spelling(self):
+        """The sweep: forty-eight cases, one refusal each, each naming its own flag.
 
-        It is also the flag that makes a container's cgroup changes land on the
-        host's hierarchy, and it is measured not to start systemd here.
+        The count is asserted so the table cannot be quietly shortened -- a
+        guard with fewer cases in it than the family has spellings is a guard
+        on a spelling, which is the defect this table exists to close. It is
+        written in the same shape as the mount sweep: a table of cases, each
+        one refusing, so a family added to the policy has to be added here too.
         """
-        with self.assertRaises(ContainerPolicyError) as caught:
-            self.client(self.fake()).run_container(
-                image="localhost/mosdns-target:24.04",
-                name="mosdns-x-target-24.04",
-                network="mosdns-testnet",
-                extra_args=["--cgroupns=host"],
-            )
-        self.assertIn("--cgroupns=host", str(caught.exception))
+        self.assertEqual(len(FORBIDDEN_EXTRA_ARGS), 48)
+        for extra_args, named in FORBIDDEN_EXTRA_ARGS:
+            with self.subTest(extra_args=extra_args):
+                self.assertIn(named, self.refused(extra_args))
 
-    def test_sharing_a_host_namespace_is_refused(self):
-        for flag in ("--pid=host", "--ipc=host", "--userns=host", "--network=host"):
-            with self.subTest(flag=flag):
-                with self.assertRaises(ContainerPolicyError) as caught:
-                    self.client(self.fake()).run_container(
-                        image="localhost/mosdns-target:24.04",
-                        name="mosdns-x-target-24.04",
-                        network="mosdns-testnet",
-                        extra_args=[flag],
-                    )
-                self.assertIn(flag, str(caught.exception))
+    def test_the_cap_ceiling_is_the_three_measured_capabilities(self):
+        """`--cap-add` is allowlisted, not denylisted.
+
+        `--cap-add=ALL` is a one-word route to every capability, including
+        `SYS_ADMIN` for a target that does not need it, and it is the first
+        thing anybody reaches for when a scenario will not start. So the
+        ceiling is the three measured values and the guard names them, so the
+        person who hit it knows what the alternative is.
+        """
+        for cap in ALLOWED_CAPS:
+            with self.subTest(cap=cap):
+                # A fresh fake per case: `FakePodmanBinary` keeps one log
+                # beside itself, so a shared one would accumulate three runs and
+                # `only()` would be asserting about the wrong one.
+                directory = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, directory, True)
+                fake = self.fake(directory=directory)
+                self.client(fake).run_container(
+                    image="localhost/mosdns-target:24.04",
+                    name="mosdns-x-target-24.04",
+                    network="mosdns-testnet",
+                    extra_args=[f"--cap-add={cap}"],
+                )
+                self.assertIn(f"--cap-add={cap}", fake.only())
+        message = self.refused(["--cap-add=SYS_BOOT"])
+        for cap in ALLOWED_CAPS:
+            self.assertIn(cap, message)
+
+    def test_a_device_is_refused_and_the_wrapper_has_no_opt_in_for_one(self):
+        """A device is host hardware, and there is no flag to ask for it.
+
+        `/dev/kvm` is what a previous architecture wanted and is absent here;
+        `/dev/net/tun` is the device Podman's own default network needs, and
+        the target is on a bridge network precisely so it does not. A policy
+        that allowed a device under an opt-in nobody sets is a policy with a
+        door in it, so there is no opt-in: the family is refused, both
+        spellings, and the refusal says why.
+        """
+        for spelling in (["--device=/dev/net/tun"], ["--device", "/dev/kvm"]):
+            with self.subTest(spelling=spelling):
+                self.assertIn("--device", self.refused(spelling))
+
+    def test_a_capability_can_be_dropped_but_not_added_beyond_the_ceiling(self):
+        """`--cap-drop` is not a route to the host, so it is not policed.
+
+        A guard that refused everything containing the word `cap` would be
+        removed the first time a scenario wanted a *narrower* container, and
+        the reviewer's "refuse, or leave it legal" question has an answer here:
+        dropping a capability can only take privilege away, so the flag is
+        outside the ceiling's subject. The cap ceiling is on `--cap-add` alone
+        and that asymmetry is deliberate, and a case says so -- a guard whose
+        boundary is a substring is a guard on a spelling.
+        """
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+            extra_args=["--cap-drop=SYS_PTRACE"],
+        )
+        self.assertIn("--cap-drop=SYS_PTRACE", fake.only())
+        # And the combination that would be a real escape is still refused: a
+        # drop alongside an add of everything is the shape "make it wide, then
+        # take the ceiling away" takes, and the ceiling is what says no.
+        self.assertIn("--cap-add", self.refused(["--cap-drop=ALL", "--cap-add=ALL"]))
+
+    def test_a_later_occurrence_of_a_flag_is_refused_even_after_a_legal_one(self):
+        """The wrapper emits `--network` first, so the last one is the one read.
+
+        `run_container` builds `... --network mosdns-testnet ...` and then
+        appends `extra_args`, so a hatch carrying `--network host` overrides
+        the legal value rather than conflicting with it -- and pflag keeps the
+        last value it is given. The refusal is what makes the first value
+        mean anything.
+        """
+        message = self.refused(["--network", "host"])
+        self.assertIn("--network", message)
+        self.assertIn("host", message)
+
+    def test_every_violation_in_one_array_is_named(self):
+        """The scan does not return on the first thing it finds.
+
+        A guard that reported one forbidden flag and stopped would let a caller
+        fix that one, re-run, and meet the next -- a loop of one at a time for
+        a defect that was fully visible. So all of them are named at once.
+        """
+        message = self.refused(["--privileged", "--device=/dev/kvm", "--pid", "host"])
+        for token in ("--privileged", "--device", "--pid"):
+            self.assertIn(token, message)
+
+    def test_an_ordinary_extra_argument_is_still_allowed(self):
+        """The refusal is a policy, not a closed door.
+
+        A guard that refused anything would be replaced the first time a
+        scenario needed `--ip`, and the guard would be gone with it. So the
+        ordinary case is held as firmly as the forbidden one: a static address,
+        a hostname, a DNS server, an environment variable, an extra host entry.
+        """
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+            extra_args=[
+                "--ip", "10.89.0.10",
+                "--hostname", "mosdns-target",
+                "--dns", "10.89.0.2",
+                "--env", "MOSDNS_TEST=1",
+                "--add-host", "router.test:10.89.0.2",
+                "--cgroupns=private",
+                "--log-driver", "k8s-file",
+            ],
+        )
+        argv = fake.only()
+        self.assertIn("mosdns-testnet", argv)
+        self.assertIn("10.89.0.10", argv)
+        self.assertEqual(argv[-1], "localhost/mosdns-target:24.04")
+
+    def test_a_value_that_merely_contains_a_forbidden_word_is_not_a_flag(self):
+        """`--hostname host` is a hostname, and `--network mosdns-testnet` is legal.
+
+        A guard that refused a token because the word `host` appeared somewhere
+        near it would refuse the measured flag set itself and be removed on the
+        first real run. The check is on the flag name and the value that flag
+        carries, never on a substring of a value.
+        """
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+            extra_args=["--hostname", "host", "--network", "mosdns-testnet"],
+        )
+        self.assertIn("host", fake.only())
 
     def test_a_refused_container_is_never_started(self):
         fake = self.fake()
@@ -1087,21 +1317,44 @@ class ContainerPolicyTest(PodmanTestCase):
             )
         self.assertEqual(fake.invocations(), [])
 
-    def test_an_ordinary_extra_argument_is_still_allowed(self):
-        """The refusal is three flags, not a closed door.
+    def test_the_wrapper_emits_no_flag_of_its_own_that_the_policy_refuses(self):
+        """The wrapper's own array is inside its own policy, not beside it.
 
-        A guard that refused anything would be replaced the first time a
-        scenario needed `--ip`, and the guard would be gone with it.
+        A guard that only examined `extra_args` would let the wrapper emit
+        `--cap-add=ALL` and pass, because the token is not in the hatch. So the
+        whole array is checked, which is also why the flag set is asserted as
+        literals in `ArgumentArrayTest`: the two cases together say the wrapper
+        emits only what the policy allows.
         """
         fake = self.fake()
         self.client(fake).run_container(
             image="localhost/mosdns-target:24.04",
             name="mosdns-x-target-24.04",
             network="mosdns-testnet",
-            extra_args=["--ip", "10.89.0.10", "--hostname", "mosdns-target"],
         )
+        # Read the way the guard reads: a flag's name, and the value that flag
+        # carries. `--cgroupns` and `--network` are policed *names* -- the
+        # refusal is on the value `host` -- so asserting the names are absent
+        # would be asserting that the measured flag set contains no policed
+        # flag, which is the opposite of what this case is for.
         argv = fake.only()
-        self.assertEqual(argv[-5:], ["--ip", "10.89.0.10", "--hostname", "mosdns-target", "localhost/mosdns-target:24.04"])
+        index = 0
+        while index < len(argv):
+            token = argv[index]
+            index += 1
+            if not token.startswith("-"):
+                continue
+            name, separator, inline = token.partition("=")
+            value = inline if separator else (argv[index] if index < len(argv) else None)
+            if separator:
+                continue
+            index += 1
+            with self.subTest(token=token):
+                self.assertNotIn(name, FORBIDDEN_CONTAINER_FLAG_FAMILIES)
+                if name in FORBIDDEN_CONTAINER_FLAGS:
+                    self.assertNotEqual(value, FORBIDDEN_CONTAINER_FLAGS[name])
+                if name == "--cap-add":
+                    self.assertIn(value, ALLOWED_CAPS)
 
 
 class NetworkManagerDeviceTest(PodmanTestCase):

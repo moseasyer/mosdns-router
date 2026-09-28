@@ -11,6 +11,11 @@ that system's resolver are all properties of how a command line is built.
   going to get any, and the previous architecture of the Podman plan was built
   on it. Rootless Podman is the architecture now, and the refusal is here
   because this is the only module that builds an argument array.
+* **A hatch with a ceiling.** ``extra_args`` is the escape every later task
+  reaches for when something will not start, so the policy is enforced there
+  and not merely documented: a cap ceiling, no device, no seccomp or apparmor
+  override, no ``--volumes-from``, no privilege flag, and no host namespace --
+  in both spellings pflag accepts, in any position, without returning early.
 * **A redacted environment.** The child gets a named set of variables and
   nothing else, so a token in the operator's shell cannot reach a command line
   and then a report.
@@ -18,7 +23,8 @@ that system's resolver are all properties of how a command line is built.
   for a remote or native service, never a machine name, and it is passed on
   every invocation rather than written to a configuration file that would change
   every other podman user on the machine. Omitted -- the default -- is the local
-  rootless Podman, which is the acceptance path here.
+  rootless Podman, which is the acceptance path here. The shape is checked at
+  construction, not documented: a bare word is refused.
 
 Nothing in this module installs, enables or starts anything on the host, reads
 the host's resolver, or mutates NetworkManager. The commands it builds are the
@@ -82,22 +88,52 @@ CGROUP_MOUNT_POINT = "/sys/fs/cgroup"
 # root it broke is a diagnosis and a refusal that says "refused" is a shrug.
 FORBIDDEN_HOST_ROOTS = ("/etc", "/run", "/var", "/sys", "/home")
 
-# Flags that would hand a target the host it runs on. `--privileged` is the
-# obvious one; `--cgroupns=host` was written for the machine architecture this
-# plan no longer has, is measured not to start systemd here, and puts a
-# container's cgroup changes on the host's hierarchy. The namespace-sharing
-# flags are the same escape in four spellings. `extra_args` is the hatch every
-# later task reaches for when something will not start, so the hatch is where
-# the refusal lives.
-FORBIDDEN_CONTAINER_FLAGS = (
-    "--privileged",
-    "--cgroupns=host",
-    "--network=host",
-    "--pid=host",
-    "--ipc=host",
-    "--uts=host",
-    "--userns=host",
+# Flags that would hand a target the host it runs on, and the value each one
+# is refused *with*. `--privileged` is the obvious one and takes no value;
+# `--cgroupns=host` was written for the machine architecture this plan no longer
+# has, is measured not to start systemd here, and puts a container's cgroup
+# changes on the host's hierarchy; the namespace-sharing flags are the same
+# escape in five spellings. `extra_args` is the hatch every later task reaches
+# for when something will not start, so the hatch is where the refusal lives.
+#
+# Keyed on the flag's NAME and the value it carries, because pflag accepts both
+# `--flag value` and `--flag=value` for a string flag, and because
+# `run_container` emits its own `--network <net>` before `extra_args` -- so the
+# last occurrence of a repeated flag is the one podman reads. A list of
+# `--flag=value` strings checked with `token == flag or token.startswith(flag +
+# "=")` refuses the equals form only, which is a check on a spelling rather than
+# on a policy.
+FORBIDDEN_CONTAINER_FLAGS = {
+    "--privileged": None,
+    "--cgroupns": "host",
+    "--network": "host",
+    "--pid": "host",
+    "--ipc": "host",
+    "--uts": "host",
+    "--userns": "host",
+}
+
+# The flag names alone, for a caller that wants to know which names are policed
+# without repeating the value table.
+FORBIDDEN_CONTAINER_FLAG_NAMES = tuple(sorted(FORBIDDEN_CONTAINER_FLAGS))
+
+# Families refused outright, in both spellings, whatever the value. A device is
+# host hardware; a seccomp or apparmor override removes a layer of the boundary
+# the caps are inside; `--volumes-from` is another container's filesystems, and
+# the name would have to be one this harness created for the boundary to mean
+# anything, which is a property of the caller rather than of the flag.
+FORBIDDEN_CONTAINER_FLAG_FAMILIES = (
+    "--device",
+    "--security-opt",
+    "--volumes-from",
 )
+
+# The cap ceiling. The measured target needs exactly these three, and
+# `--cap-add=ALL` is a one-word route to every capability including `SYS_ADMIN`
+# for a target that does not need it. The ceiling is the three measured values
+# rather than a denylist of the dangerous ones, so a capability nobody has
+# thought of yet is refused too.
+ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")
 
 
 class PodmanError(RuntimeError):
@@ -376,15 +412,68 @@ class Podman:
         return sum((["-v", part] for part in spec.split(",")), [])
 
     def _check_container_flags(self, args: Sequence[str]) -> None:
-        for token in args:
-            for flag in FORBIDDEN_CONTAINER_FLAGS:
-                if token == flag or token.startswith(flag + "="):
-                    raise ContainerPolicyError(
-                        f"refusing '{token}': a target container may not be given the host it "
-                        f"runs on. The measured flag set is --systemd=always "
-                        f"--cgroupns=private with SYS_ADMIN, NET_ADMIN and SYS_PTRACE, and no "
-                        f"privilege or host-namespace flag"
+        """Refuse any flag that would hand the target the host, in any spelling.
+
+        pflag accepts `--flag value` and `--flag=value` for the same string
+        flag, and `run_container` appends `extra_args` after its own
+        `--network <net>`, so a repeated flag's last occurrence is the one podman
+        reads. Both facts are why this walks tokens, reads a flag's name and
+        the value that flag carries, and compares those -- rather than matching
+        a list of `--flag=value` strings, which is a check on a spelling.
+
+        Every violation in the array is collected and reported together, and the
+        scan does not stop at the first: a guard that named one and returned
+        would make a caller fix them one at a time for a defect that was
+        visible from the start.
+
+        It examines the whole array, not only `extra_args`, so the wrapper's own
+        flags are inside the policy rather than beside it. A wrapper that grew a
+        `--cap-add=ALL` of its own would be caught by this case, and the flag
+        set it is allowed to emit is asserted as literals in `ArgumentArrayTest`.
+        """
+        violations: list[str] = []
+        index = 0
+        while index < len(args):
+            token = args[index]
+            index += 1
+            if not token.startswith("-"):
+                continue
+            name, separator, inline = token.partition("=")
+            # The space-separated form's value is the next token, and only for a
+            # flag this policy knows takes one. `--privileged` followed by a
+            # value-looking token is still a bare `--privileged`, which is
+            # already refused, so reading the successor is safe either way.
+            value = inline if separator else (args[index] if index < len(args) else None)
+
+            if name in FORBIDDEN_CONTAINER_FLAG_FAMILIES:
+                violations.append(
+                    f"{token!r} (this harness has no opt-in for it: a device is host hardware, "
+                    f"a seccomp or apparmor override removes a layer of the boundary, and "
+                    f"--volumes-from is another container's filesystems)"
+                )
+                continue
+            if name == "--cap-add":
+                if value not in ALLOWED_CAPABILITIES:
+                    violations.append(
+                        f"{token!r} (the cap ceiling is "
+                        f"{', '.join(ALLOWED_CAPABILITIES)}; --cap-add=ALL is a one-word route "
+                        f"to every capability)"
                     )
+                continue
+            if name in FORBIDDEN_CONTAINER_FLAGS:
+                forbidden_value = FORBIDDEN_CONTAINER_FLAGS[name]
+                if forbidden_value is None or value == forbidden_value:
+                    violations.append(
+                        f"{token!r} (a target container may not be given the host it runs on. "
+                        f"The measured flag set is --systemd=always --cgroupns=private with "
+                        f"{', '.join(ALLOWED_CAPABILITIES)}, and no privilege or host-namespace "
+                        f"flag)"
+                    )
+        if violations:
+            raise ContainerPolicyError(
+                "refusing to start the target:\n"
+                + "\n".join(f"  - {violation}" for violation in violations)
+            )
 
     def _check_mount_arguments(self, args: Sequence[str]) -> None:
         index = 0
