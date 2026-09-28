@@ -88,9 +88,20 @@ NM_DEVICE_FACT = (
 
 NM_DEVICE_NOT_CHECKABLE = (
     "Whether a target would come up with GENERAL.NM-MANAGED: yes cannot be "
-    "checked here, because no target image is built yet. This harness will not "
-    "assume it: run_target asserts it on a running target and refuses with the "
-    "two steps above if it is not 'yes'."
+    "checked here, because checking it means building tests/podman/images/"
+    "target.Containerfile and running a container from it, and a preflight is a "
+    "read. Build the image and ask a running target instead.\n"
+    "Two things decide the answer, and neither is a preference:\n"
+    "  - the target must be on a netavark BRIDGE network (a tun/tap device is "
+    "refused by design);\n"
+    "  - the release's NetworkManager must have a persistent device override. "
+    "Measured on this host: 24.04 (nmcli 1.46) and 26.04 (nmcli 1.54) take the "
+    "two steps above to 'yes'; 22.04 (nmcli 1.36) does not have the override, the "
+    "second command is accepted and has no effect, and the field stays 'no'. So a "
+    "22.04 target is expected to refuse to boot rather than to run scenarios "
+    "against an unmanaged device.\n"
+    "This harness will not assume it either way: run_target asserts it on a "
+    "running target and refuses with the two steps above if it is not 'yes'."
 )
 
 

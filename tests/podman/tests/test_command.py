@@ -3508,11 +3508,32 @@ class CommandLineTest(PodmanTestCase):
         Claiming the device would come up managed is the false claim the
         previous plan's SKIPPED list was built on, and it is the one thing this
         harness must not assert without a running target to ask.
+
+        **Updated when the target image arrived.** This case used to require the
+        words "no target image is built yet", which were true when Task 1 landed
+        and stopped being true when `tests/podman/images/target.Containerfile` and
+        its three Containerfile siblings were added. A preflight that tells an
+        operator the repository ships no image, while the repository ships three,
+        is worse than one that says nothing: the operator builds one, runs
+        `preflight` again, and gets the same sentence.
+
+        The rule is unchanged and is what is now asserted: preflight does not
+        claim the field will be `yes`, and it names the two facts that decide it
+        -- the image, and the release's NetworkManager, which is what makes 22.04
+        different (measured: nmcli 1.36 has no persistent device override, so the
+        sequence cannot make the device managed there at all).
         """
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
         code, output = self.invoke(self.base(fake, "preflight"))
         self.assertIn("cannot be checked", output)
-        self.assertIn("no target image is built yet", output)
+        self.assertIn("tests/podman/images/target.Containerfile", output)
+        self.assertNotIn(
+            "no target image is built yet",
+            output,
+            "the repository ships the target image now, so this sentence is false",
+        )
+        # And it must not claim the field will be `yes` -- that is the whole rule.
+        self.assertNotIn("would come up with GENERAL.NM-MANAGED: yes.", output)
 
     def test_preflight_runs_no_command_that_changes_anything(self):
         """A preflight is a read, and a read that mutates is not one.
