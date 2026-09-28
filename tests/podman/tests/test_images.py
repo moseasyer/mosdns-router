@@ -252,6 +252,38 @@ def installed_packages(text: str) -> set[str]:
     return found
 
 
+def _by_package(conflicts) -> dict:
+    """`[(package, release), ...]` regrouped as `{package: [releases]}`, for a message."""
+    grouped: dict = {}
+    for package, version in conflicts:
+        grouped.setdefault(package, []).append(version)
+    return grouped
+
+
+def package_release_conflicts(installed, availability) -> list[tuple[str, str]]:
+    """(package, release) for every package `installed` names that `availability`
+    records as absent from a release.
+
+    The rule the availability case enforces, as a function, so that a control can
+    point **this** code at a Containerfile that violates it. A control that
+    re-implements the rule proves nothing about the rule; a control that calls it
+    proves the rule can fail.
+
+    `installed` is a set of package names and `availability` maps a package to
+    `{release: note}`, where a note beginning `ABSENT` is the recorded absence. A
+    package the table does not mention at all produces no conflict, which is the
+    other half of the rule: a package nobody recorded cannot be known to be missing
+    anywhere, and the table's own coverage case is what holds that the table is
+    about this matrix.
+    """
+    conflicts: list[tuple[str, str]] = []
+    for package in sorted(installed):
+        for version, note in availability.get(package, {}).items():
+            if note.startswith("ABSENT"):
+                conflicts.append((package, version))
+    return conflicts
+
+
 def looks_like_no_registry(stderr: str) -> bool:
     """Whether a podman failure is "the network is not there" rather than "no such digest".
 
@@ -1113,34 +1145,91 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
         reports two thirds of itself as passing.
         """
         for containerfile in containerfiles():
-            for package in sorted(installed_packages(read(containerfile))):
-                with self.subTest(containerfile=containerfile.name, package=package):
-                    recorded = self.AVAILABILITY.get(package, {})
-                    absent = [
-                        version
-                        for version, note in recorded.items()
-                        if note.startswith("ABSENT")
-                    ]
-                    self.assertEqual(
-                        absent, [],
-                        f"{containerfile.name} installs {package}, which the availability "
-                        f"table records as absent on {', '.join(absent)}",
+            conflicts = package_release_conflicts(
+                installed_packages(read(containerfile)), self.AVAILABILITY
+            )
+            with self.subTest(containerfile=containerfile.name):
+                self.assertEqual(
+                    conflicts, [],
+                    f"{containerfile.name} installs "
+                    + ", ".join(
+                        f"{package}, which the availability table records as absent on "
+                        f"{', '.join(releases)}"
+                        for package, releases in _by_package(conflicts).items()
                     )
+                    if conflicts
+                    else f"{containerfile.name} conflicts with nothing, which is the rule",
+                )
 
     def test_the_check_would_fail_on_a_package_absent_from_one_release(self):
-        """The control, and the reason the case above is not a tautology.
+        """The control, and it is the same code as the case above this one.
 
-        A case that read a table and found nothing wrong would also pass on a
-        check that never looked. So the same code is pointed at
-        `systemd-resolved` — the package that really is absent from 22.04, and the
-        one the Containerfile used to name — and it has to report it.
+        A case that read a table and found nothing wrong would also pass on a check
+        that never looked, so the rule is pointed at a Containerfile that violates
+        it and it has to report the violation.
+
+        **The first version of this control was a tautology wearing a control's
+        name.** It ended
+
+            self.assertIn("systemd-resolved", installed_packages(read(TARGET_CONTAINERFILE))
+                          | {"systemd-resolved"})
+
+        which is `assertIn` against a set that contains the probed value by
+        construction -- true for `set()`, for `{"libnss-resolve"}`, and for
+        `{"totally-unrelated"}`. It called itself "the reason the case above is not a
+        tautology" while being unable to fail for any input at all. A case that says
+        it is a control and is not one is worse than no case, because it is read as
+        evidence.
+
+        So the rule is now `package_release_conflicts`, the case above calls it, and
+        this control calls it too -- against synthetic Containerfile text, which is
+        what `installed_packages` takes, so nothing on disk is involved. Two probes:
+        the package the images used to name, which must be reported, and the package
+        they name now, which must not.
         """
+        # The recorded half, so the control is not only about the helper.
         recorded = self.AVAILABILITY["systemd-resolved"]
         absent = [
             version for version, note in recorded.items() if note.startswith("ABSENT")
         ]
         self.assertEqual(absent, ["22.04"])
-        self.assertIn("systemd-resolved", installed_packages(read(TARGET_CONTAINERFILE)) | {"systemd-resolved"})
+
+        def containerfile_including(package: str) -> str:
+            return (
+                "FROM ubuntu:24.04\n"
+                "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
+                f"    {package} \\\n"
+                "    && rm -rf /var/lib/apt/lists/*\n"
+            )
+
+        self.assertEqual(
+            package_release_conflicts(
+                installed_packages(containerfile_including("systemd-resolved")),
+                self.AVAILABILITY,
+            ),
+            [("systemd-resolved", "22.04")],
+            "the rule does not report the package the images used to install, so the case "
+            "above would pass on a rule that never fails",
+        )
+        # And the other direction, or "reports everything" would satisfy the case
+        # above just as well as "reports nothing".
+        self.assertEqual(
+            package_release_conflicts(
+                installed_packages(containerfile_including("libnss-resolve")),
+                self.AVAILABILITY,
+            ),
+            [],
+            "the rule reports a package the table records as present everywhere, so the "
+            "control above would be satisfied by a rule that flags every package",
+        )
+        # And that the synthetic file really does install what it claims to, so the
+        # control is not passing because the probe read nothing.
+        self.assertEqual(
+            installed_packages(containerfile_including("systemd-resolved")),
+            {"systemd-resolved"},
+            "the synthetic Containerfile did not install what the control claims, so both "
+            "probes above are vacuous",
+        )
 
     def test_the_resolver_integration_package_is_one_of_them(self):
         """The matrix's own answer, and it has to be a name the table covers.
