@@ -79,13 +79,41 @@ RUN apt-get update \
 # So the target's entrypoint replaces it at boot, inside the container's own
 # mount namespace. `tests/podman/tests/test_images.py` holds both halves of that.
 
+# `eth0` is declared managed by NetworkManager, on every release.
+#
+# NetworkManager's shipped default leaves every non-radio device unmanaged
+# (`unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma`), and
+# the `device set` + restart sequence in the setup unit cannot override that on
+# 22.04: NetworkManager 1.36 has no persistent device override, so the command is
+# accepted and does nothing. `except:interface-name:eth0` is NetworkManager's own
+# key for "this device is handled by NetworkManager even when it would not
+# otherwise be", and in a disposable target whose interface is not special that
+# is the mechanism rather than a way around one.
+#
+# The snippet is a file, `COPY`ed into `conf.d/` and nowhere else: a `RUN` that
+# wrote it would be a second copy of the same text that could drift from this one,
+# and overwriting the main `NetworkManager.conf` would drop every other `lib:`
+# snippet the distribution ships.
+COPY tests/podman/images/10-mosdns-target.conf /etc/NetworkManager/conf.d/10-mosdns-target.conf
+
 # `systemd-networkd` is disabled, and NetworkManager is the only manager.
 #
 # Both daemons claim the same device. With both enabled, which one owns eth0 is a
 # race, and the symptom is an intermittent DHCP failure on one release and none at
 # all on another -- which is a very expensive thing to debug from a later failure.
+#
+# `netplan-configure.service` is masked because it **fails on every boot**: it is
+# netplan's backend configuration unit, this image has no netplan configuration to
+# apply, and it exits non-zero regardless. Measured as the only failed unit in a
+# fresh 26.04 target. Nothing is broken by it and every scenario still runs, which
+# is exactly the problem -- a scenario asserting `systemctl --failed` would have to
+# special-case it, and a target that boots with a red unit is the shape of thing an
+# operator stops trusting. The mask is held to this unit and
+# `systemd-networkd.service` by a case, because masking the world would make the
+# next failure invisible instead.
 RUN systemctl disable systemd-networkd.service \
-    || systemctl mask systemd-networkd.service
+    || systemctl mask systemd-networkd.service \
+    && systemctl mask netplan-configure.service
 
 # The two unprivileged accounts the two-user scenario acts as, and the
 # setgid-shared directory it checks the control lock in. The package creates these

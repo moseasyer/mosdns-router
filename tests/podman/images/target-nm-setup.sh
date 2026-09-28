@@ -80,12 +80,55 @@ if ! nmcli connection show "$PROFILE" >/dev/null 2>&1; then
     nmcli connection add type ethernet ifname "$DEVICE" con-name "$PROFILE" ipv4.method auto
 fi
 
-# 2. The override. Returns success on its own and does not take effect.
-nmcli device set "$DEVICE" managed yes
+# 2 and 3. The override and the restart that re-reads it, **only where
+#    NetworkManager has a persistent device override to re-read.**
+#
+#    Measured on this host, with the profile above present, on five releases:
+#
+#        nmcli 1.36.6  22.04   three steps -> no    no `managed=true` as input
+#        nmcli 1.42.4  23.04   three steps -> no    no `managed=true` as input
+#        nmcli 1.44.2  23.10   three steps -> yes   `managed=true` re-read
+#        nmcli 1.46.0  24.04   three steps -> yes   `managed=true` re-read
+#        nmcli 1.54.3  26.04   three steps -> yes   `managed=true` re-read
+#
+#    "as input" is the careful half. On 22.04 the override file *does* grow a
+#    `managed=true` key once something else has made the device managed -- that is
+#    NetworkManager recording state it already has. With the declaration removed,
+#    the command is accepted, the restart happens, the field stays `no` and no key
+#    appears. So the discriminator is the field, and the key is a consequence.
+#
+#    So the boundary is 1.44, and the two sides are adjacent releases: 1.42.4
+#    fails and 1.44.2 works, with nothing in between to be excused. Below it the
+#    command is *accepted* and changes nothing, and running it anyway would print
+#    a success that means nothing -- which is exactly how an operator ends up
+#    concluding the harness is wrong.
+#
+#    22.04 is not left unmanaged by skipping this: the image declares the device
+#    managed in /etc/NetworkManager/conf.d/10-mosdns-target.conf, and the check
+#    below is what decides whether that declaration took effect.
+#
+#    The gate's failure direction is the safe one. A version wrongly read as old
+#    skips two commands whose effect the declaration already provides; a version
+#    wrongly read as new runs a sequence measured to do nothing. So the cost of a
+#    wrong answer is silence rather than an unmanaged device.
+nm_version=$(nmcli --version 2>&1 | sed -n 's/.*version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+nm_major=${nm_version%%.*}
+nm_minor=${nm_version#*.}
+nm_minor=${nm_minor%%.*}
+if [ -z "$nm_version" ] || [ "$nm_major" -gt 1 ] || { [ "$nm_major" -eq 1 ] && [ "$nm_minor" -ge 44 ]; }; then
+    # 2. The override. Returns success on its own and does not take effect.
+    nmcli device set "$DEVICE" managed yes
 
-# 3. The restart that re-reads the override written under
-#    /run/NetworkManager/devices/. Not optional, and step 2 without it is a lie.
-systemctl restart NetworkManager
+    # 3. The restart that re-reads the override written under
+    #    /run/NetworkManager/devices/. Not optional: step 2 without it is a lie.
+    systemctl restart NetworkManager
+else
+    echo "target-nm-setup: this NetworkManager ($(nmcli --version 2>&1 | tr '\n' ' ')) has no" >&2
+    echo "target-nm-setup: persistent device override, so 'nmcli device set $DEVICE managed" >&2
+    echo "target-nm-setup: yes' would be accepted and would change nothing, and no restart could" >&2
+    echo "target-nm-setup: re-read it. Skipping both; the managed state comes from the conf.d" >&2
+    echo "target-nm-setup: declaration, and the check below is what decides whether it took effect." >&2
+fi
 
 # The check, and it asserts BOTH facts rather than only the field.
 #
@@ -120,26 +163,17 @@ fi
 
 if [ "$managed" != "yes" ]; then
     echo "target-nm-setup: refusing to continue -- 'nmcli -g $MANAGED_FIELD device show $DEVICE'" >&2
-    echo "target-nm-setup: answered '$managed', not 'yes', even though the connection profile" >&2
-    echo "target-nm-setup: '$PROFILE' exists and NetworkManager was restarted." >&2
-    # The NetworkManager version, because the cause is not the same on every
-    # release and the two causes look identical from the outside. Measured on
-    # this host against these three images:
-    #
-    #   nmcli 1.46 (24.04), 1.54 (26.04) -- the override is written under
-    #     /run/NetworkManager/devices/ and the restart re-reads it. The restart
-    #     is what to look at if it says no.
-    #   nmcli 1.36 (22.04) -- there is no persistent device override in this
-    #     version at all. `nmcli device set eth0 managed yes` is accepted, the
-    #     audit log records `op="device-managed" ... result="success"`, the file
-    #     under /run/NetworkManager/devices/ gets no `managed=true` key, and the
-    #     field stays `no` with or without the restart and with or without a
-    #     profile. Nothing in this script can change that, and the check is here
-    #     so the reason is the one above rather than a scenario failing later.
-    echo "target-nm-setup: NetworkManager here is $(nmcli --version 2>&1 | tr '\n' ' ')" >&2
-    echo "target-nm-setup: ('journalctl -u NetworkManager' in this target, then" >&2
-    echo "target-nm-setup: 'cat /run/NetworkManager/devices/*' to see whether the override was" >&2
-    echo "target-nm-setup: written at all.)" >&2
+    echo "target-nm-setup: answered '$managed', not 'yes'. Two mechanisms are supposed to" >&2
+    echo "target-nm-setup: produce 'yes' here, and between them they did not:" >&2
+    echo "target-nm-setup:   1. the declaration -- /etc/NetworkManager/conf.d/10-mosdns-target.conf" >&2
+    echo "target-nm-setup:      narrows NetworkManager's shipped unmanaged-devices list with" >&2
+    echo "target-nm-setup:      'except:interface-name:$DEVICE'. If that file is present and the" >&2
+    echo "target-nm-setup:      field is still '$managed', the declaration did not take effect." >&2
+    echo "target-nm-setup:   2. the sequence, which ran only if NetworkManager has a persistent" >&2
+    echo "target-nm-setup:      device override -- it has one from 1.44, and this one is" >&2
+    echo "target-nm-setup:      $(nmcli --version 2>&1 | tr '\n' ' ')" >&2
+    echo "target-nm-setup: ('cat /etc/NetworkManager/conf.d/10-mosdns-target.conf' and" >&2
+    echo "target-nm-setup: 'journalctl -u NetworkManager' in this target.)" >&2
     exit 1
 fi
 

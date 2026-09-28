@@ -356,15 +356,48 @@ NM_PROFILE_STEP = (
     "ipv4.method auto' -- with no profile the override is accepted and the "
     "field stays 'no'"
 )
+# The measured NetworkManager version boundary for the persistent device
+# override, and the five measurements that establish it. The target image's
+# setup script gates the same two commands on it, and the suite asserts both
+# against this list, so the two records cannot drift apart.
+#
+# The shape of this fact is why it is a constant rather than a sentence: below
+# 1.44 the `device set` + restart sequence **cannot** make a device managed --
+# the command is accepted, the audit log records `op="device-managed" ...
+# result="success"`, and the field stays `no` after the restart -- so an operator
+# told to run the sequence on 22.04 runs it, watches it succeed, and concludes
+# the harness is wrong. Measured on this host, with a connection profile present:
+#
+#     nmcli 1.36.6  22.04  -> no       nmcli 1.44.2  23.10  -> yes
+#     nmcli 1.42.4  23.04  -> no       nmcli 1.46.0  24.04  -> yes
+#                                   nmcli 1.54.3  26.04  -> yes
+NM_OVERRIDE_MINIMUM = (1, 44)
+NM_OVERRIDE_MEASUREMENTS = {
+    "1.36.6": False,  # Ubuntu 22.04
+    "1.42.4": False,  # Ubuntu 23.04
+    "1.44.2": True,   # Ubuntu 23.10
+    "1.46.0": True,   # Ubuntu 24.04
+    "1.54.3": True,   # Ubuntu 26.04
+}
 NM_UNMANAGED_EXPLANATION = (
-    "A target's device is only managed after a connection profile exists for "
-    "it and then both steps, in that order, in the target container's own "
-    "init: the override is written under /run/NetworkManager/devices/ and "
-    "only the restart re-reads it, so the first command on its own returns "
-    "success and does not take effect. The device must also be a bridge "
-    "network's eth0 of type ethernet -- Podman's default rootless network "
-    "hands a container a tun/tap device, which NetworkManager refuses by "
-    f"design. Note also that {NM_PROFILE_STEP}."
+    "A target's device is managed by two mechanisms, and which one applies "
+    "depends on its NetworkManager version.\n"
+    "  1. the declaration the target image ships in "
+    "/etc/NetworkManager/conf.d/10-mosdns-target.conf, which narrows "
+    "NetworkManager's own shipped unmanaged-devices list with "
+    "'except:interface-name:eth0'. This is the baseline: it works on every "
+    "release this matrix runs, and on 22.04 it is the only one that does.\n"
+    "  2. 'nmcli device set eth0 managed yes' followed by "
+    "'systemctl restart NetworkManager', which work only where "
+    "NetworkManager has a "
+    f"persistent device override -- measured present from "
+    f"{NM_OVERRIDE_MINIMUM[0]}.{NM_OVERRIDE_MINIMUM[1]} and absent below it. On "
+    "nmcli 1.36.6 (22.04) and 1.42.4 (23.04), 'nmcli device set eth0 managed "
+    "yes' is accepted with result=\"success\" and changes nothing, and the field "
+    "stays 'no' after the restart.\n"
+    "The device must also be a bridge network's eth0 of type ethernet -- "
+    "Podman's default rootless network hands a container a tun/tap device, "
+    f"which NetworkManager refuses by design. Note also that {NM_PROFILE_STEP}."
 )
 
 
