@@ -1,9 +1,10 @@
 """The policed flag names are checked against *podman's own* vocabulary.
 
 `lib/podman.py` refuses a target container the host it runs on, and it does so by
-looking names up in a table. That is only sound while the table's names and
-podman's names are the same set, and the two drift: podman has aliases, and an
-alias is a second spelling of a policed flag that a name-keyed guard cannot see.
+comparing flag names against three policies. That is only sound while the policed
+names and podman's names are the same set, and the two drift: podman has aliases,
+and an alias is a second spelling of a policed flag that a name-keyed guard cannot
+see.
 
 **This is not hypothetical — it was the finding of a review.** `podman-run(1)`
 declares the pair in one heading:
@@ -16,7 +17,7 @@ declares the pair in one heading:
 and pflag accepts either spelling, so `extra_args=["--net", "host"]` reached the
 target through a name the policed table did not contain. It landed *after* the
 wrapper's own `--network <net>` and `--network` is a `stringArray`, so the target
-would have ended up on both the bridge and the host network. The other seven
+would have ended up on both the bridge and the host network. The other ten
 policed names were checked one at a time by hand; only this one has an alias.
 
 **The hand check does not scale**, which is the reason this file exists. A
@@ -65,6 +66,23 @@ $ for f in --privileged --cgroupns --network --net --pid --ipc --uts --userns \
 Run it against the new podman first and the documented set second, and a name
 that answers `ACCEPTED` in one and not the other is an alias nobody wrote down.
 
+## The eleven names, not the seven
+
+Both cases below iterate `POLICED_CONTAINER_FLAGS` — the value-keyed policed
+table, the families refused whatever their value, and `--cap-add` — rather than
+the value-keyed table alone. **The first version of this file iterated the
+latter**, and the claim it made, that it covered the policed names, was true of
+seven names out of eleven: `--device`, `--security-opt`, `--volumes-from` and
+`--cap-add` were policed by a name-keyed check that this file's derivation never
+looked at, so an alias of any of them would have reached the same position
+`--net` did and this file would have reported nothing. All eleven are policed by
+the same guard and all eleven are names podman has, so all eleven are checked
+against podman's own documentation here. The set is derived in
+`lib/podman.py` from the three constants that police it, and
+`test_policed_container_flags_covers_every_name_the_guard_refuses` in
+`test_command.py` holds that derivation to the guard's own body — this case
+iterates a set, and a set that stopped matching the code would still pass.
+
 ## It is a skipping case, and the skip says so
 
 Podman is not installed on every machine that checks out this repository, and
@@ -72,7 +90,7 @@ this harness refuses to install it (see `docs/testing.md`). So this case skips
 where podman is absent — loudly, with the one-line command a contributor runs by
 hand, rather than passing on an empty reading. A skip is not a pass: the case
 that does not depend on podman, the table-closure guard, is in
-`test_command.py` and always runs.
+`test_command.py` and always run.
 """
 
 import gzip
@@ -88,7 +106,12 @@ from pathlib import Path
 # be run on its own, which is how it is run when it fails.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
-from podman import FORBIDDEN_CONTAINER_FLAGS, PODMAN_FLAG_ALIASES  # noqa: E402
+from podman import (  # noqa: E402
+    FORBIDDEN_CONTAINER_FLAG_NAMES,
+    FORBIDDEN_CONTAINER_FLAGS,
+    PODMAN_FLAG_ALIASES,
+    POLICED_CONTAINER_FLAGS,
+)
 
 # The man page that documents a container's flags, and the directory searched
 # for it. Podman installs one page per subcommand, and the run page is the one
@@ -187,9 +210,21 @@ class PodmanVocabularyTest(unittest.TestCase):
         of. This is the check that fails when podman grows a second name for a
         policed flag, and it is derived from podman's documentation rather than
         from the table, so it cannot agree with itself.
+
+        Over `POLICED_CONTAINER_FLAGS` -- **all eleven policed names**, not the
+        seven in the value-keyed table. The four that were outside the first
+        version of this case are policed by a check keyed on the raw name, so
+        they were outside this case *and* outside the no-short-form case below:
+        a future alias of `--device` would have reached a name-keyed check that
+        could not see it, and this case would have said nothing. All eleven have
+        a heading in `podman-run(1)` (measured: `--cap-add`, `--cgroupns`,
+        `--device`, `--ipc`, `--network`, `--pid`, `--privileged`,
+        `--security-opt`, `--userns`, `--uts`, `--volumes-from`), and the
+        `undocumented` assertion below is what keeps that true.
         """
         aliases = documented_options(self.page)
-        undocumented = sorted(set(FORBIDDEN_CONTAINER_FLAGS) - set(aliases))
+        policed = set(POLICED_CONTAINER_FLAGS)
+        undocumented = sorted(policed - set(aliases))
         self.assertEqual(
             undocumented,
             [],
@@ -197,7 +232,7 @@ class PodmanVocabularyTest(unittest.TestCase):
             "their aliases -- the guard has gone blind rather than found nothing",
         )
         missing: list[str] = []
-        for name in sorted(FORBIDDEN_CONTAINER_FLAGS):
+        for name in sorted(policed):
             for other in sorted(aliases[name]):
                 if PODMAN_FLAG_ALIASES.get(other) != name:
                     missing.append(
@@ -220,8 +255,16 @@ class PodmanVocabularyTest(unittest.TestCase):
         So each entry is asked of pflag directly, and a misspelling of it is
         asked of pflag as well, which is what makes this a test of podman rather
         than of the check that `--netzzz` is not a flag.
+
+        The alias must also canonicalise to a name the policy governs **and** be
+        a name this file's own derivation covers: the first half is a table that
+        refuses something, the second is a name whose future aliases would be
+        checked. An alias of a family or of `--cap-add` is policed by a raw-name
+        check, which the closure in `test_command.py` now canonicalises, so both
+        halves are needed rather than one.
         """
         self.assertTrue(PODMAN_FLAG_ALIASES, "the alias table cannot be empty: --net is in it")
+        policed = set(POLICED_CONTAINER_FLAGS)
         for alias, canonical in sorted(PODMAN_FLAG_ALIASES.items()):
             with self.subTest(alias=alias):
                 self.assertTrue(
@@ -230,6 +273,16 @@ class PodmanVocabularyTest(unittest.TestCase):
                     f"entry that reads like coverage and provides none",
                 )
                 self.assertIn(canonical, FORBIDDEN_CONTAINER_FLAGS)
+                self.assertIn(
+                    alias,
+                    FORBIDDEN_CONTAINER_FLAG_NAMES,
+                    f"{alias!r} is a policed alias and so belongs in the set a refusal prints, "
+                    f"which is what the operator is told to avoid",
+                )
+        self.assertTrue(
+            policed >= set(FORBIDDEN_CONTAINER_FLAGS),
+            "the policed surface cannot be smaller than the table it is derived from",
+        )
 
     def test_no_policed_flag_has_a_short_form_the_name_lookup_would_miss(self):
         """The generalisation of the finding, derived rather than guessed.
@@ -238,14 +291,19 @@ class PodmanVocabularyTest(unittest.TestCase):
         same hazard by a different route: pflag registers `-v` and `--volume` as
         two names for one flag, so `-n`, if `--network` ever grew one, would be a
         host-namespace request the guard's name lookup would not see -- and
-        `canonical_flag_name` resolves only the names in its table, so it would
-        not help either.
+        `canonical_flag_name` resolves only the long names in its table, so it
+        would not help either.
 
         So this asserts the invariant over the documentation rather than trusting
         that nobody thought of it: **no policed flag may carry a short form.**
         Today none does, and a podman that added one fails here with the pair
         named, which is the point at which `PODMAN_FLAG_ALIASES` (or whatever
         mechanism the fix takes) has to learn about it.
+
+        Over all eleven policed names, for the reason the case above gives: a
+        short form of `--device` or of `--cap-add` defeats the name lookup exactly
+        as a long alias of it does, and neither was inside the first version of
+        this case.
         """
         shorts: dict[str, str] = {}
         for line in self.page.splitlines():
@@ -259,7 +317,7 @@ class PodmanVocabularyTest(unittest.TestCase):
             if found:
                 shorts[longs[0]] = found[0]
         with_short_form = sorted(
-            f"{name} / {shorts[name]}" for name in FORBIDDEN_CONTAINER_FLAGS if name in shorts
+            f"{name} / {shorts[name]}" for name in POLICED_CONTAINER_FLAGS if name in shorts
         )
         self.assertEqual(
             with_short_form,

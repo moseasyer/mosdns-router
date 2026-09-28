@@ -208,11 +208,17 @@ PODMAN_FLAG_ALIASES = {
     "--net": "--network",
 }
 
-# The flag names a caller can see are policed: the canonical names and every
-# alias of one. Used, in `ContainerPolicyError`'s message, so the person who has
-# just been refused is told the whole set rather than only the one token they
-# typed -- `extra_args` is the hatch every later task reaches for, so the refusal
-# is the documentation.
+# The flag names a caller can see are policed *by the table above*: the canonical
+# names and every alias of one. Used, in `ContainerPolicyError`'s message, so the
+# person who has just been refused is told the whole set rather than only the one
+# token they typed -- `extra_args` is the hatch every later task reaches for, so
+# the refusal is the documentation.
+#
+# Scoped to that table deliberately, and `POLICED_CONTAINER_FLAGS` below is the
+# whole policed surface. This set is what the value-keyed refusal prints, and the
+# other two policies print their own reasons (a family is refused whatever its
+# value; `--cap-add` is refused unless the value is one of three), so mixing the
+# families in here would print a set that is not what was checked against.
 FORBIDDEN_CONTAINER_FLAG_NAMES = tuple(
     sorted(set(FORBIDDEN_CONTAINER_FLAGS) | set(PODMAN_FLAG_ALIASES))
 )
@@ -226,6 +232,34 @@ FORBIDDEN_CONTAINER_FLAG_FAMILIES = (
     "--device",
     "--security-opt",
     "--volumes-from",
+)
+
+# The one flag policed by a value check against a ceiling rather than by a table
+# of forbidden values. Named, rather than written as a literal at the one place
+# that consults it, so the derived set below and the guard cannot disagree about
+# which name the cap policy is spelled with -- the shape of drift that left the
+# alias sweep covering seven names when the policy policed eleven.
+CAPABILITY_ADD_FLAG = "--cap-add"
+
+# **The whole policed surface, derived.** Every long flag name the container
+# guard refuses, from all three of the mechanisms that refuse one: the
+# value-keyed table, the families refused whatever their value, and the cap
+# ceiling. A case that checks one of those three and not the others is a case
+# that checked a policy rather than the policy -- which is how the alias and
+# no-short-form sweeps in `tests/podman/tests/test_podman_flags.py` came to
+# cover seven names while eleven were policed, and how a future alias of
+# `--device` would have reached the same position `--net` did.
+#
+# Derived here, once, so that a name added to any of the three is in this set
+# without anybody editing a second list. It is the set the vocabulary cases
+# iterate, and `test_policed_container_flags_covers_every_name_the_guard_refuses`
+# is what holds it to the guard's own body rather than to this comment.
+POLICED_CONTAINER_FLAGS = tuple(
+    sorted(
+        set(FORBIDDEN_CONTAINER_FLAGS)
+        | set(FORBIDDEN_CONTAINER_FLAG_FAMILIES)
+        | {CAPABILITY_ADD_FLAG}
+    )
 )
 
 # The cap ceiling. The measured target needs exactly these three, and
@@ -668,14 +702,20 @@ class Podman:
         `--cap-add=ALL` of its own would be caught by this case, and the flag
         set it is allowed to emit is asserted as literals in `ArgumentArrayTest`.
 
-        A flag's *name* is canonicalised before the table is consulted, so an
-        alias pflag accepts reaches the policy it belongs to. `--net` is the one
-        podman documents (`podman-run(1)`: `.SS --network=mode, --net`) and it is
-        the shape of the hazard: it lands after the wrapper's own
-        `--network <net>`, `--network` is a `stringArray`, and the target would end
-        up on the bridge *and* on the host network. `tests/podman/tests/
+        A flag's *name* is canonicalised before **any** of the three policies is
+        consulted, so an alias pflag accepts reaches the policy it belongs to.
+        That is a statement about all three, and it was not true of all three:
+        the canonicalisation used to happen after the family and cap branches,
+        which compared the raw name, so those two were a check on a spelling
+        again -- and `--net` is exactly that defect, one table over. `--net` is
+        the alias podman documents (`podman-run(1)`: `.SS --network=mode, --net`)
+        and it is the shape of the hazard: it lands after the wrapper's own
+        `--network <net>`, `--network` is a `stringArray`, and the target would
+        end up on the bridge *and* on the host network. `tests/podman/tests/
         test_podman_flags.py` derives the set of aliases from podman's own
-        documentation, so the next alias is a case failure rather than a review.
+        documentation, and it derives it over `POLICED_CONTAINER_FLAGS` -- all
+        eleven names, not the seven the value-keyed table holds -- so the next
+        alias is a case failure rather than a review.
 
         It also examines every token rather than skipping each flag's value, and
         that is the safe direction. Skipping a value means trusting that the
@@ -700,36 +740,44 @@ class Podman:
             # flag -- the safe direction, as the docstring says.
             value = inline if separator else (args[index] if index < len(args) else None)
 
-            if name in FORBIDDEN_CONTAINER_FLAG_FAMILIES:
+            # Canonicalised once, before **any** of the three policies is
+            # consulted -- not just before the table lookup. The family and cap
+            # branches used to compare the raw name, which meant an alias of
+            # `--device`, `--security-opt`, `--volumes-from` or `--cap-add` would
+            # have reached a name-keyed check those branches could not see. There
+            # is no such alias in podman 5.7.0 (the vocabulary case proves it
+            # from the documentation), so this closes a future podman rather than
+            # a live hole; the difference between the two is recorded rather than
+            # left to be rediscovered.
+            policed = canonical_flag_name(name)
+            alias_note = (
+                f" {name} is podman's alias for {policed}, so this is the same flag under the "
+                f"other name pflag accepts -- refusing it here is not a quirk of this harness."
+                if policed != name
+                else ""
+            )
+
+            if policed in FORBIDDEN_CONTAINER_FLAG_FAMILIES:
                 violations.append(
                     f"{token!r} (this harness has no opt-in for it: a device is host hardware, "
                     f"a seccomp or apparmor override removes a layer of the boundary, and "
-                    f"--volumes-from is another container's filesystems)"
+                    f"--volumes-from is another container's filesystems.{alias_note})"
                 )
                 continue
-            if name == "--cap-add":
+            if policed == CAPABILITY_ADD_FLAG:
                 if value not in ALLOWED_CAPABILITIES:
                     violations.append(
                         f"{token!r} (the cap ceiling is "
                         f"{', '.join(ALLOWED_CAPABILITIES)}; --cap-add=ALL is a one-word route "
-                        f"to every capability)"
+                        f"to every capability.{alias_note})"
                     )
                 continue
-            # Canonicalised before the lookup, so `--net` reaches the `--network`
-            # policy instead of missing it. Both value spellings are already
-            # covered -- `value` is the inline one or the next token -- and this
-            # is the part that covers the *other name* for the same flag.
-            policed = canonical_flag_name(name)
+            # Both value spellings are already covered -- `value` is the inline
+            # one or the next token -- and this is the part that covers the
+            # *other name* for the same flag.
             if policed in FORBIDDEN_CONTAINER_FLAGS:
                 forbidden_value = FORBIDDEN_CONTAINER_FLAGS[policed]
                 if forbidden_value is None or value == forbidden_value:
-                    alias_note = (
-                        f" {name} is podman's alias for {policed}, so this is the same flag "
-                        f"under the other name pflag accepts -- refusing it here is not a "
-                        f"quirk of this harness."
-                        if policed != name
-                        else ""
-                    )
                     violations.append(
                         f"{token!r} (a target container may not be given the host it runs on."
                         f"{alias_note} The measured flag set is --systemd=always "

@@ -36,6 +36,7 @@ the subprocess boundary itself is exercised -- and never against this host's
 Podman. Nothing in this file starts, stops or inspects anything real.
 """
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -56,10 +57,12 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
 
 from podman import (  # noqa: E402
+    CAPABILITY_ADD_FLAG,
     FORBIDDEN_CONTAINER_FLAG_FAMILIES,
     FORBIDDEN_CONTAINER_FLAG_NAMES,
     FORBIDDEN_CONTAINER_FLAGS,
     PODMAN_FLAG_ALIASES,
+    POLICED_CONTAINER_FLAGS,
     ALLOWED_CAPABILITIES as ALLOWED_CAPS,
     CleanupFailed,
     ContainerPolicyError,
@@ -1581,6 +1584,117 @@ FORBIDDEN_EXTRA_ARGS = (
     (["--hostname", "mosdns-target", "--net", "host"], "--net"),
 )
 
+# --- The closure between the policed names and the cases that check them -------
+#
+# A policed name is a name the guard refuses, and the guard refuses through three
+# mechanisms: a value-keyed table, a family refused whatever its value, and a cap
+# ceiling. The cases that check podman's *vocabulary* -- the alias gate and the
+# no-short-form gate in `test_podman_flags.py` -- have to cover all of them, and
+# the drift is what Fix Round 3 found: they iterated the value-keyed table alone,
+# so seven names were checked and eleven were policed. Four policed names sat
+# outside every vocabulary check, which is how a future alias of `--device`
+# would have reached a name-keyed check that could not see it.
+#
+# So the sweep set is derived in `lib/podman.py` from the three constants that
+# police it, and the functions below hold that derivation to **the guard's own
+# body** rather than to a second list of names. A name added to a policed table,
+# added to a family tuple, or written as a literal in the guard, is in the
+# derived set because the guard reads it -- and if a fourth mechanism ever appears
+# as a new module-level collection, it is in the derived set for the same reason.
+# This is the third time in this plan that a coverage claim and a coverage
+# implementation drifted apart (the dead
+# `test_exec_passes_the_command_as_separate_arguments`, the 48-vs-50 count in the
+# class docstring below, and the seven-vs-eleven sweep), so the guard reads the
+# code rather than being told what the code says.
+LONG_FLAG_LITERAL = re.compile(r"^--[a-z][a-z0-9-]*$")
+GUARD_METHOD = "_check_container_flags"
+PODMAN_SOURCE = REPO / "tests" / "podman" / "lib" / "podman.py"
+
+
+def long_flag_names(value) -> set[str]:
+    """Every long flag name in a module-level constant, whatever shape it has.
+
+    A policed set in this module is a dict (`name -> refused value`), a tuple or
+    frozenset of names, or a single string -- so the reader has to accept each
+    shape and return the same thing for all of them, and return nothing for a
+    constant that holds no flag names at all (`ALLOWED_CAPABILITIES` is a tuple of
+    capability names, and is not a policed *set*).
+    """
+    if isinstance(value, str):
+        return {value} if LONG_FLAG_LITERAL.match(value) else set()
+    if isinstance(value, dict):
+        return {key for key in value if isinstance(key, str) and LONG_FLAG_LITERAL.match(key)}
+    if isinstance(value, (set, frozenset, tuple, list)):
+        return {item for item in value if isinstance(item, str) and LONG_FLAG_LITERAL.match(item)}
+    return set()
+
+
+def module_level_constants(tree: ast.Module) -> dict[str, object]:
+    """Every module-level `NAME = <literal>` in `tree`, as `ast.literal_eval` sees it.
+
+    A constant the AST cannot evaluate as a literal is absent rather than guessed
+    at, so a policed set built by a function call would be invisible here -- which
+    is why every policed set in `lib/podman.py` is written as a literal, and why
+    the case below says so in its failure rather than passing on a partial read.
+    """
+    constants: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = getattr(node, "value", None)
+        if value is None:
+            continue
+        try:
+            evaluated = ast.literal_eval(value)
+        except (ValueError, SyntaxError, TypeError):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                constants[target.id] = evaluated
+    return constants
+
+
+def policed_names_the_guard_reads(source: str):
+    """What `_check_container_flags` compares flag names against, from the source.
+
+    Two shapes, because the guard names policed flags two ways: a **literal** in
+    the body (`name == "--cap-add"` was exactly that before
+    `CAPABILITY_ADD_FLAG`), and a **module-level collection** it reads by name
+    (`FORBIDDEN_CONTAINER_FLAG_FAMILIES`, `FORBIDDEN_CONTAINER_FLAGS`). Reading
+    the source rather than the imported module is the point: by the time a module
+    is imported, a name that was in a table and has been removed from it is gone,
+    and the comparison this exists for is between the *declared* policy and the
+    set the vocabulary cases iterate.
+    """
+    tree = ast.parse(source, filename=str(PODMAN_SOURCE))
+    constants = module_level_constants(tree)
+    guard = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == GUARD_METHOD
+        ),
+        None,
+    )
+    if guard is None:
+        raise AssertionError(
+            f"{PODMAN_SOURCE.name} has no {GUARD_METHOD}(self, args), so the policed names cannot "
+            f"be read from the guard; a rename that skips this case leaves the vocabulary sweep "
+            f"unchecked against anything"
+        )
+    literals: set[str] = set()
+    by_constant: dict[str, set[str]] = {}
+    for node in ast.walk(guard):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if LONG_FLAG_LITERAL.match(node.value):
+                literals.add(node.value)
+        elif isinstance(node, ast.Name) and node.id in constants:
+            names = long_flag_names(constants[node.id])
+            if names:
+                by_constant.setdefault(node.id, set()).update(names)
+    return literals, by_constant
+
 
 class ContainerPolicyTest(PodmanTestCase):
     """A target container may not be handed the host it runs on.
@@ -1622,6 +1736,95 @@ class ContainerPolicyTest(PodmanTestCase):
         for extra_args, named in FORBIDDEN_EXTRA_ARGS:
             with self.subTest(extra_args=extra_args):
                 self.assertIn(named, self.refused(extra_args))
+
+    def test_policed_container_flags_covers_every_name_the_guard_refuses(self):
+        """The closure, read from the guard's own body rather than from a list.
+
+        `test_podman_flags.py` iterates `POLICED_CONTAINER_FLAGS` to ask podman
+        whether any of the policed names has a second spelling, and iterates it to
+        ask whether any has a short one. **Those cases skip where podman is not
+        installed**, so on a machine without podman nothing at all checks that the
+        set they iterate is the set the guard polices -- and the previous version
+        of them iterated `FORBIDDEN_CONTAINER_FLAGS` alone, so even with podman
+        installed they covered seven names of eleven. Four policed names were
+        outside every vocabulary check.
+
+        So this reads `lib/podman.py`: every long flag name written as a literal
+        in `_check_container_flags`, and every long flag name in a module-level
+        collection that the method reads, must be in `POLICED_CONTAINER_FLAGS`.
+        A name added to the policed table, to a family tuple, to the cap
+        constant, or written into the guard's body, fails here if the derivation
+        missed it -- and it does not need this case edited, because the set is
+        derived from those same constants in `lib/podman.py`.
+
+        The second half is the same drift in the other file: every policed name
+        must appear in `FORBIDDEN_EXTRA_ARGS` too, so a policed name cannot be
+        absent from the hand-written refusal table while the count assertion
+        still passes. That assertion is a floor on a *number*; this is a check on
+        a *set*, and a number cannot tell a table that grew a row from a table
+        that lost one.
+        """
+        literals, by_constant = policed_names_the_guard_reads(
+            PODMAN_SOURCE.read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            literals or by_constant,
+            "the guard reads no policed name at all, so this case is satisfied by a parse that "
+            "read nothing -- the same vacuous pass the suite-shape guard exists to stop",
+        )
+        # The derivation is the union of the three mechanisms, recomputed here
+        # rather than imported, so a change to one of the three cannot quietly
+        # change what "derived" means.
+        self.assertEqual(
+            set(POLICED_CONTAINER_FLAGS),
+            set(FORBIDDEN_CONTAINER_FLAGS)
+            | set(FORBIDDEN_CONTAINER_FLAG_FAMILIES)
+            | {CAPABILITY_ADD_FLAG},
+            "POLICED_CONTAINER_FLAGS is no longer the union of the three things that police a "
+            "flag name, so a name it holds is policed by nothing and a name it misses is policed "
+            "by something the vocabulary sweep cannot see",
+        )
+        # An alias is a second *name* for a policed flag, not a policed name of
+        # its own: `--net` is policed through `--network`. So the alias table's
+        # keys are the one thing allowed to be outside the set, and its values
+        # are held to it.
+        aliases = set(PODMAN_FLAG_ALIASES)
+        for constant, names in sorted(by_constant.items()):
+            with self.subTest(constant=constant):
+                self.assertEqual(
+                    sorted((names - aliases) - set(POLICED_CONTAINER_FLAGS)),
+                    [],
+                    f"{constant} holds policed flag names that POLICED_CONTAINER_FLAGS does not, so "
+                    f"the alias and no-short-form sweeps in test_podman_flags.py never look at them",
+                )
+        self.assertEqual(
+            sorted(literals - set(POLICED_CONTAINER_FLAGS)),
+            [],
+            f"{GUARD_METHOD} compares against flag names written as literals that "
+            f"POLICED_CONTAINER_FLAGS does not hold, so they are outside every vocabulary sweep",
+        )
+        for alias, canonical in sorted(PODMAN_FLAG_ALIASES.items()):
+            with self.subTest(alias=alias):
+                self.assertIn(
+                    canonical,
+                    POLICED_CONTAINER_FLAGS,
+                    f"{alias!r} canonicalises to {canonical!r}, which no derived policed name "
+                    f"covers, so the closure cases would not see an alias of it",
+                )
+        swept = {named for _extra_args, named in FORBIDDEN_EXTRA_ARGS}
+        # `--net` is an alias, so the sweep rows name it where a row says so and
+        # name the canonical name where the row is about the value; both are policed.
+        missing = sorted(
+            name
+            for name in POLICED_CONTAINER_FLAGS
+            if name not in swept and name not in aliases
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "these policed names have no row in FORBIDDEN_EXTRA_ARGS, so the refusal sweep does "
+            "not exercise them and the count assertion cannot notice",
+        )
 
     def test_the_cap_ceiling_is_the_three_measured_capabilities(self):
         """`--cap-add` is allowlisted, not denylisted.
@@ -1744,6 +1947,75 @@ class ContainerPolicyTest(PodmanTestCase):
             extra_args=["--net", "mosdns-testnet"],
         )
         self.assertIn("mosdns-testnet", fake.only())
+
+    def test_an_alias_of_a_family_or_of_the_cap_flag_is_refused_too(self):
+        """Planted, because podman 5.7.0 has no such alias -- and that is the point.
+
+        The `--net` finding was that a policed flag has a second *name* pflag
+        accepts, and the fix canonicalises the name before the lookup. Two of the
+        three policies were not covered by it: `--device`, `--security-opt`,
+        `--volumes-from` and `--cap-add` were compared by their **raw** name, so
+        an alias of any of them would have reached a name-keyed check that could
+        not see it -- the same position `--net` was in, one table over.
+
+        There is no such alias today, and the case that says so is derived from
+        `podman-run(1)` in `test_podman_flags.py` over all eleven policed names
+        (it skips where podman is absent, which is why it cannot be the only
+        thing holding this). So this plants the aliases instead of waiting for
+        the podman release that introduces one, and asks the real `build_argv`
+        path -- not a copy of the guard -- whether each is refused.
+
+        The alias table is replaced and put back rather than patched, because a
+        case that left podman's vocabulary altered would poison every case after
+        it in the file; `addCleanup` restores it whatever the assertion does.
+        """
+        planted = dict(PODMAN_FLAG_ALIASES)
+        planted.update(
+            {
+                "--dev": "--device",
+                "--secopt": "--security-opt",
+                "--caps": CAPABILITY_ADD_FLAG,
+            }
+        )
+        import podman as podman_lib
+
+        original = podman_lib.PODMAN_FLAG_ALIASES
+
+        def restore():
+            podman_lib.PODMAN_FLAG_ALIASES = original
+
+        self.addCleanup(restore)
+        podman_lib.PODMAN_FLAG_ALIASES = planted
+        for extra_args, named, why in (
+            (["--dev=/dev/kvm"], "--device", "a device is host hardware"),
+            (["--dev", "/dev/net/tun"], "--device", "a device is host hardware"),
+            (["--secopt=seccomp=unconfined"], "--security-opt", "removes a layer"),
+            (["--secopt", "apparmor=unconfined"], "--security-opt", "removes a layer"),
+            (["--caps=ALL"], CAPABILITY_ADD_FLAG, "the cap ceiling"),
+            (["--caps", "ALL"], CAPABILITY_ADD_FLAG, "the cap ceiling"),
+        ):
+            with self.subTest(extra_args=extra_args):
+                message = self.refused(extra_args)
+                self.assertIn(named, message, f"the alias was not policed: {why}")
+                # And it says so, rather than refusing a name the operator cannot
+                # connect to the flag they are actually holding.
+                self.assertIn("alias", message)
+                self.assertIn("podman's alias for", message)
+        # The canonical name is still refused the same way, so the plant did not
+        # replace a policy with a spelling of one.
+        self.assertIn("--device", self.refused(["--device=/dev/kvm"]))
+        self.assertIn(CAPABILITY_ADD_FLAG, self.refused([f"{CAPABILITY_ADD_FLAG}=ALL"]))
+        # And a legal value for the alias is still legal, which is the half of the
+        # property a name-keyed guard gets wrong in the other direction.
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+            extra_args=[f"{CAPABILITY_ADD_FLAG}=SYS_ADMIN"],
+        )
+        self.assertIn(f"{CAPABILITY_ADD_FLAG}=SYS_ADMIN", fake.only())
+        restore()
 
     def test_a_flag_name_is_canonicalised_before_the_policed_lookup(self):
         """The normalisation is one function, and it is idempotent.
