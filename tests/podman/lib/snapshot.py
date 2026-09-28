@@ -55,7 +55,13 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+# `Mapping` is here because `SubprocessRunner.__init__` annotates `extra_env` with
+# it, and this module defers annotation evaluation, so the name is not resolved at
+# import time and its absence was invisible to every case in the suite -- and to
+# `make verify`, which runs no Python linter. It is not invisible to anything that
+# *does* resolve hints: `typing.get_type_hints` raised `NameError`, which is what
+# `PublicSurfaceTypeHintsTest` in `tests/podman/tests/test_snapshot.py` holds.
+from typing import Callable, Iterable, Mapping, Sequence
 
 # The harness's own run id, rather than a second format for the same identifier.
 # The run id names a result directory and a container prefix at once, so two

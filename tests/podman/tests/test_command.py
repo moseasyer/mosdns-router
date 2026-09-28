@@ -4035,6 +4035,66 @@ class MatrixProducesEvidenceTest(EntryPointTestCase):
         )
 
 
+    def test_the_after_snapshot_is_written_even_when_the_run_breaks(self):
+        """The `finally` is the property, and it had no case.
+
+        The 'after' snapshot is taken in a `finally` rather than after the report,
+        because the case where a contributor wants to know what the host looked
+        like afterwards is the case where the run broke. A reviewer confirmed that
+        by hand -- forcing `_run_cells` to raise and finding exit 2 with both files
+        on disk -- and nothing in the suite held it, so `try`/`finally` and
+        `try`/`except: pass` were the same test suite.
+
+        Driven by making `_run_cells` raise, which is the only seam for it: the run
+        is real up to the point of failure, so the 'before' snapshot is a real one
+        and the assertion below is about the file the `finally` wrote, not about a
+        fixture.
+
+        **The controls are what make this a case rather than a file listing.** With
+        the `finally` reverted to a plain call, the first assertion fails -- that is
+        the RED this was written against. And the `report.json` assertion is here
+        because the interesting half is *which* files appear: a `finally` that wrote
+        the 'after' snapshot and then wrote a report anyway would give Task 7 three
+        documents describing a run that did not finish.
+        """
+        def explode(*args, **kwargs):
+            raise run.PodmanError("the run broke, on purpose, for this case")
+
+        real = run._run_cells
+        run._run_cells = explode
+        try:
+            results = self.directory / "results"
+            code, output = self.invoke(
+                [
+                    "matrix", "--arch", "amd64", "--versions", "24.04",
+                    "--podman", str(self.fake([{"match": ["version"], "stdout": "5.7.0\n"}]).path),
+                    "--source-tree", str(self.source_tree), "--results-dir", str(results),
+                ]
+            )
+        finally:
+            run._run_cells = real
+
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        run_directory = self.run_directory(results)
+        self.assertTrue(
+            (run_directory / "host-before.json").is_file(),
+            "the run broke before it wrote a 'before' snapshot, so the case is not about "
+            f"the 'finally' at all: {sorted(q.name for q in run_directory.iterdir())}",
+        )
+        self.assertTrue(
+            (run_directory / "host-after.json").is_file(),
+            "a run that broke left no 'after' snapshot, which is the one case where the host "
+            "matters most -- there is nothing to compare the 'before' against, and the run "
+            "that broke is exactly the run a contributor needs the evidence for",
+        )
+        self.assertFalse(
+            (run_directory / "report.json").exists(),
+            "a run that broke still wrote a report, so a reader would find a document that "
+            "looks like a finished run's evidence next to a 'before' snapshot with no 'after' "
+            "to complete it",
+        )
+
+
 class ImageLockWiringTest(EntryPointTestCase):
     """A target is started from the locked digest, and the lock is read to find out.
 

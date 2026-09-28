@@ -34,6 +34,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -952,6 +953,153 @@ class RunnerEnvironmentTest(unittest.TestCase):
             "moved -- and the guarantee is the thing this class exists for",
         )
 
+
+
+    def test_the_runner_really_passes_that_environment_to_the_command(self):
+        """**The gap this class had: nothing called the runner.**
+
+        All three cases above read `child_environment()` or the class's source
+        text. Reverting `__call__` to `env=None` -- which is `subprocess.run` for
+        *inherit this process's environment* -- left the suite green, so the
+        guarantee the class exists for was a function nobody had checked was
+        connected to the call.
+
+        So this patches `subprocess.run`, calls the runner, and reads the keyword
+        argument the *call* passed. Asserting on the argument rather than on the
+        child process is deliberate: it needs no real command, and it is the exact
+        value `subprocess.run` would use, so a future `env=` in the same call
+        cannot slip past it either.
+        """
+        import unittest.mock
+
+        with unittest.mock.patch.object(snapshot.subprocess, "run") as run:
+            run.return_value = subprocess_result(0, "output\n")
+            snapshot.SubprocessRunner(extra_env={"LC_ALL": "C"})(["nmcli", "-t"])
+
+        self.assertEqual(run.call_count, 1)
+        keywords = run.call_args.kwargs
+        self.assertIn(
+            "env", keywords,
+            "the runner called subprocess.run without an env=, which is *inherit everything*, "
+            "so every variable the operator exported goes to nmcli, resolvectl and systemctl",
+        )
+        self.assertIsNotNone(
+            keywords["env"],
+            "the runner passed env=None, which is the same hole with a clearer name: "
+            "subprocess.run reads that as 'use the parent's environment'",
+        )
+        # The invariant is "the call passes what `child_environment` returns", not
+        # "the call passes only LC_ALL": `child_environment` merges the allowlist
+        # from *this* process, so the answer legitimately contains HOME and PATH on
+        # a machine that has them. Spelled out, because the first version of this
+        # assertion was `== {"LC_ALL": "C"}` and it failed on the very first run
+        # for exactly that reason -- a case that only passes on a machine with an
+        # empty environment is a case about the machine.
+        self.assertEqual(
+            keywords["env"],
+            snapshot.SubprocessRunner(extra_env={"LC_ALL": "C"}).child_environment(),
+            "the environment the runner passes to the command is not the one "
+            "child_environment() documents",
+        )
+        self.assertEqual(keywords["env"]["LC_ALL"], "C")
+        for name in keywords["env"]:
+            with self.subTest(variable=name):
+                self.assertIn(
+                    name, snapshot.SNAPSHOT_ENV_NAMES,
+                    "the runner forwarded a variable its own allowlist does not name",
+                )
+
+    def test_a_command_that_fails_without_output_names_itself(self):
+        """The other half of `__call__`, and it was unheld as well.
+
+        A snapshot command that is missing from the host -- `nmcli` on a container
+        with no NetworkManager, `resolvectl` on a host that does not run
+        systemd-resolved -- must be a *recorded field error* and not a crash, or
+        one absent command takes the whole snapshot down and the run's evidence
+        goes with it. This is the path a `finally` is most likely to be relying on.
+        """
+        import unittest.mock
+
+        with unittest.mock.patch.object(snapshot.subprocess, "run") as run:
+            run.return_value = subprocess_result(1, "", stderr="nmcli: not found\n")
+            with self.assertRaises(OSError) as raised:
+                snapshot.SubprocessRunner()(["nmcli", "-t", "-f", "NAME"])
+        message = str(raised.exception)
+        self.assertIn("nmcli", message)
+        self.assertIn("nmcli: not found", message)
+
+
+def subprocess_result(returncode: int, stdout: str, stderr: str = ""):
+    """A `subprocess.CompletedProcess` with only the fields the runner reads.
+
+    Built rather than imported so the case says what shape it is standing in for,
+    and so a change to `CompletedProcess`'s constructor does not reach three tests
+    at once.
+    """
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+class PublicSurfaceTypeHintsTest(unittest.TestCase):
+    """`from __future__ import annotations` defers a name the module never imports.
+
+    `SubprocessRunner.__init__` annotated `extra_env: Mapping[str, str] | None`
+    and `snapshot.py` imported `Callable, Iterable, Sequence` from `typing` but
+    not `Mapping`. Under deferred evaluation that is inert at runtime -- which is
+    why the suite stayed green and why `make verify` did not catch it: there is no
+    Python linter in the gate, and every case that read the annotation as a string
+    would have seen a perfectly ordinary-looking `Mapping[str, str] | None`.
+
+    It is not inert to a reader, and it is not inert to any tool that resolves
+    hints: `typing.get_type_hints` raises `NameError`, which takes out every
+    annotation-derived tool for the module -- dataclass-like introspection, a
+    documentation generator, a validator. The cost of the check is one call per
+    public callable.
+    """
+
+    def test_every_public_annotation_resolves(self):
+        import typing
+
+        unresolved: list[str] = []
+        for name in snapshot.__all__:
+            member = getattr(snapshot, name)
+            targets = [member]
+            if isinstance(member, type):
+                targets += [member.__init__, member.__call__]
+            for target in targets:
+                if target is object.__init__ or not callable(target):
+                    continue
+                try:
+                    typing.get_type_hints(target)
+                except NameError as error:
+                    unresolved.append(
+                        f"{name}{getattr(target, '__qualname__', '')}: {error}"
+                    )
+        self.assertEqual(
+            unresolved, [],
+            "a public annotation names something the module does not import, so anything that "
+            "resolves hints -- a validator, a doc generator, get_type_hints itself -- raises "
+            "NameError on this module:\n" + "\n".join(unresolved),
+        )
+
+    def test_the_control_the_check_is_not_vacuous(self):
+        """A hint that cannot resolve has to be found, or the case above proves nothing.
+
+        A local function annotated with a name that is not in scope is the smallest
+        thing that raises `NameError` from `get_type_hints`, and it is here so a
+        future edit that turns the check into a no-op -- a `try` that swallows, a
+        list that is empty, a target list that is empty -- is caught.
+        """
+        import typing
+
+        namespace: dict = {}
+        exec(  # noqa: S102 - the smallest possible unresolvable annotation
+            "def annotated(value: NotImportedAnywhere | None = None):\n    return value\n",
+            namespace,
+        )
+        with self.assertRaises(NameError):
+            typing.get_type_hints(namespace["annotated"])
 
 
 class ProjectUnitDerivationTest(unittest.TestCase):
