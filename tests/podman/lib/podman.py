@@ -435,6 +435,15 @@ class Podman:
         flags are inside the policy rather than beside it. A wrapper that grew a
         `--cap-add=ALL` of its own would be caught by this case, and the flag
         set it is allowed to emit is asserted as literals in `ArgumentArrayTest`.
+
+        It also examines every token rather than skipping each flag's value, and
+        that is the safe direction. Skipping a value means trusting that the
+        token after `--privileged` is a value; not skipping it means a token
+        that *is* `--privileged` is caught wherever it sits, including where the
+        caller meant it as a value. The cost is a false positive on an array
+        that puts a policed flag name in a value position, which no real podman
+        invocation does -- and a false positive here is a refusal with a readable
+        message, while the false negative is the host.
         """
         violations: list[str] = []
         index = 0
@@ -444,10 +453,10 @@ class Podman:
             if not token.startswith("-"):
                 continue
             name, separator, inline = token.partition("=")
-            # The space-separated form's value is the next token, and only for a
-            # flag this policy knows takes one. `--privileged` followed by a
-            # value-looking token is still a bare `--privileged`, which is
-            # already refused, so reading the successor is safe either way.
+            # The space-separated form's value is the next token. A token that
+            # is not a flag is skipped by the loop's own test, so the only extra
+            # cost of reading it here is for a value that itself looks like a
+            # flag -- the safe direction, as the docstring says.
             value = inline if separator else (args[index] if index < len(args) else None)
 
             if name in FORBIDDEN_CONTAINER_FLAG_FAMILIES:
