@@ -59,14 +59,24 @@ blind spots in the detector rather than in the equality: the equality can only
 compare the sets it is given, so a case in neither set satisfies it. `case_functions`
 therefore descends into function bodies *and* into `if`/`try`/`with`/`for`/`while`
 (and their `else`, `except` and `finally` clauses), and every one of those shapes is
-planted in a case below. The limit that remains is a class nested inside a function or
-a block: it is unreachable too, and `case_functions` does not report it, because a
-class is a *named* scope and inventing a qualifier for it would be worse than the
-gap is likely to be.
+planted in a case below. The limit that remains is a **class nested inside a
+function**, and it is a silent one: `unittest` collects a `TestCase` from a module's
+attributes, and a class defined inside a function never becomes one, so its cases are
+in neither set.
+
+The two halves were conflated until this round and both were wrong. A class under a
+**module-level block** is collected -- measured, `if` and `with` both, three of three
+-- and the previous text called it unreachable while the consequence was the opposite
+one: `loaded - declared` was non-empty, so a platform-conditional test class made the
+gate go **red**. Every other blind spot in this module made a real loss pass; that one
+made a correct file fail, which is how the next person learns to ignore a guard. The
+shape is now walked, qualified by the class's own name.
 """
 
 import ast
 import sys
+import textwrap
+import types
 import re
 import unittest
 from pathlib import Path
@@ -74,19 +84,32 @@ from typing import Iterable
 
 TESTS_DIR = Path(__file__).resolve().parent
 
-# Every `ast` node whose `body` holds statements that can contain a `def`. The one
-# that is not in it is a class, and it is not in it on purpose: a case inside a
-# *nested* class is not collected by unittest either, but a class is a named scope
-# and a report can name it, so that shape is the reader's to see rather than this
-# function's to guess at.
+# Every `ast` node that can hold a statement, and therefore a `def`.
+#
+# `ast.Match` and `ast.TryStar` are here because a case under a `match` arm or an
+# `except*` clause is exactly as unreachable as one under an `if`, and the module
+# docstring claims every shape is caught. They were missing -- the docstring said
+# "every one of those shapes is planted in a case below" and `match` was in neither
+# the list nor the plants -- and a claim of completeness that names no exception is
+# a claim that is false the first time somebody uses a keyword added in 3.10. Every
+# one of them is planted now, which is the only thing that keeps that claim honest.
+#
+# **A class is not in this list, and the reason is not that a class is unreachable.**
+# A class under a *module-level* block is a module attribute, so `unittest` collects
+# it and its cases; a class inside a *function* is not. The two halves are handled
+# in different places -- the block branch below walks a class's cases, and a class
+# inside a function is the stated gap -- and the old comment here claimed both were
+# unreachable, which is the opposite of what happens for the common one.
 BLOCKS = (
     ast.If,
     ast.Try,
+    ast.TryStar,
     ast.For,
     ast.AsyncFor,
     ast.While,
     ast.With,
     ast.AsyncWith,
+    ast.Match,
 )
 
 
@@ -144,6 +167,22 @@ def case_functions(body, *, nested: bool = False) -> list[tuple[str, int]]:
             for body in block_bodies(node):
                 for name, lineno in case_functions(body, nested=nested):
                     found.append((f"<block>.{name}", lineno))
+                # A class met *inside* a block, at a scope unittest collects from. It
+                # is a module attribute, so `loadTestsFromModule` finds it and its
+                # cases are in `loaded`; not declaring them put `loaded - declared`
+                # in the difference and failed the gate on a correct file. The
+                # qualifier is the class's own name -- `UnderIf.test_a` -- because that
+                # is the shape `loaded_case_ids` reports, and the two sides have to
+                # agree on the shape or the equality is red for a bad reason.
+                #
+                # Reached only from the block branch, so a class at module scope is not
+                # walked twice: `declared_case_ids_in` has its own loop for those, and
+                # a duplicate is harmless to a set but is one more place the two lists
+                # can disagree.
+                for member in body:
+                    if isinstance(member, ast.ClassDef):
+                        for method, _ in case_functions(member.body):
+                            found.append((f"{member.name}.{method}", member.lineno))
     return found
 
 
@@ -157,12 +196,16 @@ def block_bodies(node) -> list:
     complete -- the `else:` branch is where a case goes when someone writes it to run
     on the other platform, which is the most likely reason to write one at all.
     """
-    bodies = [node.body]
+    bodies = [node.body] if hasattr(node, "body") else []
     for attribute in ("orelse", "finalbody"):
         extra = getattr(node, attribute, None)
         if extra:
             bodies.append(extra)
     bodies += [handler.body for handler in getattr(node, "handlers", None) or []]
+    # `match` has no `body` of its own -- its statements are in each arm's `body`,
+    # which is why a `def` under a `case` clause was invisible while every other
+    # keyword was covered. Hence the `hasattr` above rather than `node.body`.
+    bodies += [arm.body for arm in getattr(node, "cases", None) or []]
     return bodies
 
 
@@ -491,6 +534,20 @@ while False:
     def test_a_case_orphaned_behind_a_while(self):
         assert True
 
+match 3:
+    case 1 | 2:
+        def test_a_case_orphaned_behind_a_match_case(self):
+            assert True
+    case _:
+        def test_another_case_behind_a_match_case(self):
+            assert True
+
+try:
+    pass
+except* ValueError:
+    def test_a_case_orphaned_behind_an_except_star(self):
+        assert True
+
 if True:
     if True:
         def test_a_case_two_compound_statements_deep(self):
@@ -539,6 +596,9 @@ class ResolverTest(unittest.TestCase):
             "test_a_case_orphaned_behind_a_loop",
             "test_a_case_orphaned_behind_a_while",
             "<block>.test_a_case_two_compound_statements_deep",
+            "test_a_case_orphaned_behind_a_match_case",
+            "test_another_case_behind_a_match_case",
+            "test_a_case_orphaned_behind_an_except_star",
         ):
             with self.subTest(case=name):
                 self.assertIn(
@@ -611,6 +671,75 @@ class RealCases(unittest.TestCase):
             "a case is defined where unittest cannot reach it -- inside a function, or under "
             "a block statement -- so the source declares a case that never runs:\n"
             + "\n".join(orphans),
+        )
+
+    def test_a_class_under_a_block_is_collected_and_therefore_declared(self):
+        """**A legitimate shape that made the gate go red.** The last round's residual.
+
+        `test_suite_shape.py` said the remaining limit was "a class nested inside a
+        function or a block -- it is unreachable too". Measured, that is backwards
+        for the common half: a class under a **module-level** `if`/`with` is a
+        module attribute, so `unittest` collects it, its cases are in `loaded`, and
+        `case_functions` did not put them in `declared`. So `loaded - declared` was
+        non-empty and `test_the_declared_cases_are_exactly_the_cases_that_run` failed
+        on a perfectly ordinary platform-conditional test class.
+
+        That is the opposite failure to the one this module was written for. Every
+        other blind spot here made a real loss pass; this one made a correct file
+        fail, and a guard that fails on correct code is how the next person learns to
+        ignore it.
+
+        **The shape is now handled, not merely described.** `case_functions` walks a
+        class's cases when it meets the class inside a block, and qualifies them by
+        the class's own name -- `UnderIf.test_a`, the same shape `loaded_case_ids`
+        reports -- so the two sides agree by construction rather than by luck.
+
+        The load side is `unittest`'s own collection, not a hand-written list, so the
+        case cannot assert a shape the runner does not actually collect. The `with`
+        arm is planted too, because `with` is a module-level block like `if` and the
+        two are not the same node type.
+        """
+        planted = textwrap.dedent(
+            """
+            import unittest
+
+            if True:
+                class UnderIf(unittest.TestCase):
+                    def test_a(self):
+                        assert True
+
+                    def test_b(self):
+                        assert True
+
+            with open("/dev/null") as handle:
+                class UnderWith(unittest.TestCase):
+                    def test_c(self):
+                        assert True
+            """
+        )
+        module = types.ModuleType("planted")
+        exec(compile(planted, "planted.py", "exec"), module.__dict__)  # noqa: S102
+        loaded = {
+            f"planted.{type(case).__name__}.{case._testMethodName}"
+            for case in _flatten(unittest.TestLoader().loadTestsFromModule(module))
+        }
+        self.assertEqual(
+            len(loaded), 3,
+            f"unittest did not collect the classes under the blocks, so this case is not "
+            f"about the shape it claims to be: it collected {sorted(loaded)}",
+        )
+        declared = declared_case_ids_in(
+            ast.parse(planted, filename="planted.py"), "planted"
+        )
+        self.assertEqual(
+            declared - loaded, set(),
+            "the declared side is missing cases the runner collects, so a correct file fails "
+            f"the gate: declared {sorted(declared - loaded)}, loaded {sorted(loaded)}",
+        )
+        self.assertEqual(
+            loaded - declared, set(),
+            "the runner collects cases the declared side does not have, so a legitimate "
+            f"class under a block fails the gate: {sorted(loaded - declared)}",
         )
 
     def test_a_class_carrying_cases_may_not_be_subclassed_without_a_deliberate_decision(self):
