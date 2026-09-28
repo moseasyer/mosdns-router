@@ -1944,9 +1944,12 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
         # impossible rather than corrected, and `assertIn` below makes a paraphrase a
         # failure instead of a silent substitution.
         # Anchored forward from the note itself, and closed at the end of the
-        # measured error rather than at the next sentence: both anchors occur in the
-        # note *above* this one as well, so a plain `index` for either finds line 17
-        # and slices an empty string.
+        # measured error rather than at the next sentence. The reason is the
+        # CLOSING anchor, not the opening one: "No such file or directory`."
+        # occurs twice in the plan -- once in the architecture note above this
+        # section, once in the Task 2 text -- so a plain `index` for it finds the
+        # earlier occurrence, which precedes the opening anchor, and the slice is
+        # backwards. The opening anchor occurs once, so it needs no such care.
         closing = "No such file or directory`."
         start = self.plan.index("Within Task 2 it belongs to")
         note_correct = self.plan[start : self.plan.index(closing, start) + len(closing)]
@@ -2122,8 +2125,12 @@ ENTRYPOINT_IS_THE_SUBJECT = re.compile(
 #     creates the eth0 connection profile" mentions no entrypoint at all. It was
 #     dead code with a false-positive future, and dropping it is the honest fix;
 #   * an `entrypoint <verb>` alternative that was **entirely redundant** with
-#     `ENTRYPOINT_IS_THE_SUBJECT` above and with the `must` in `ENTRYPOINT_MUST`,
-#     which between them cover every string it matched.
+#     `ENTRYPOINT_IS_THE_SUBJECT` above and with the `must` in `ENTRYPOINT_MUST`.
+#     The loss is nil in practice rather than nil in fact: that form also matched
+#     bare-infinitive phrasings -- "the entrypoint run the sequence", "execute the
+#     three steps" -- which are ungrammatical English and which the two surviving
+#     branches do not need, because each such sentence names the entrypoint as the
+#     subject of a verb. A grammatical variant is covered; a malformed one is not.
 #
 # What is left is the one thing the branch is for: a sentence that gives the
 # entrypoint an ordered set of actions. The head noun may carry an adjective --

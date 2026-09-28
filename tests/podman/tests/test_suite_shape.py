@@ -57,12 +57,31 @@ exists in the source and does not run. **In every shape that loss can take** --
 a case nested in a function, and a case defined under a block statement. Both were
 blind spots in the detector rather than in the equality: the equality can only
 compare the sets it is given, so a case in neither set satisfies it. `case_functions`
-therefore descends into function bodies *and* into `if`/`try`/`with`/`for`/`while`
-(and their `else`, `except` and `finally` clauses), and every one of those shapes is
-planted in a case below. The limit that remains is a **class nested inside a
-function**, and it is a silent one: `unittest` collects a `TestCase` from a module's
-attributes, and a class defined inside a function never becomes one, so its cases are
-in neither set.
+therefore descends into function bodies *and* into every `ast` node that can hold a
+statement list -- `if`/`try`/`except*`/`with`/`for`/`while` and their `else`,
+`except`/`except*` and `finally` clauses, and each `match` arm's own body -- and every
+one of those shapes is planted in a case below. A keyword node added by a future
+Python release needs adding to `BLOCKS` with a plant; that is a forward condition, not
+a recorded fact about 3.10.
+
+The limit that remains is a **class nested inside a function**, and it is a silent
+one: `unittest` collects a `TestCase` from a module's attributes, and a class defined
+inside a function never becomes one, so its cases are in neither set.
+
+Two further shapes are open obligations rather than claims, and neither is red on
+anything in the tree today:
+
+- A class under a **module-level block** that **inherits** cases from a case-carrying
+  base. The block branch walks the class's *own* methods, while `loaded_case_ids`
+  counts through the MRO and `declared_case_ids` unions inherited names only for
+  module-level classes -- so `loaded - declared` is non-empty and the gate goes red
+  on a **correct** file. A platform-conditional class subclassing a shared base is
+  the most plausible real instance. "The two sides agree by construction" below holds
+  only for a class with no inherited cases.
+- The `<block>` qualifier is wrong for anything inside a **class body**: a method
+  defined under an `if` in a class body *does* run, and is declared with a `<block>`
+  qualifier, so both differences go non-empty on a correct file. Pre-existing at
+  module-class scope, and newly reachable one level deeper by the block branch.
 
 The two halves were conflated until this round and both were wrong. A class under a
 **module-level block** is collected -- measured, `if` and `with` both, three of three
