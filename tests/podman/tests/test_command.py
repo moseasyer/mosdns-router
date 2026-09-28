@@ -1183,6 +1183,81 @@ class MountAllowlistTest(PodmanTestCase):
                     client.run(["run", "-v", f"{foreign}:{WORKSPACE}:ro", "localhost/img"])
                 self.assertIn(foreign, str(caught.exception))
 
+    def test_a_later_task_cannot_widen_the_allowlist_into_a_writable_host_root(self):
+        """The five-root set is a refusal, not a phrase in an error message.
+
+        This is the second instance of the defect Fix Round 1 called Critical 2:
+        `_check_mount` compares a mount's source against **the allowlist's own
+        entry**, so a check whose only evidence is that entry agrees with itself.
+        A later task that needs a third mount writes one line into
+        `allowed_mounts()` -- and if that line is `/etc/mosdns -> /mnt/extra` with
+        mode `rw`, the host's `/etc`, `/etc/resolv.conf` included, is bound
+        writable into a target holding `SYS_ADMIN` and running systemd.
+
+        `FORBIDDEN_HOST_ROOTS` did not stop it. The constant was consulted only to
+        *name* a root in a refusal message, so the comment claiming the writable
+        case "must stay closed there" was a claim about the code rather than a
+        property of it. The comment was wrong about the mechanism, so the
+        mechanism is what this fixes: a source inside any of the five roots is
+        refused **whatever the allowlist says**, unless the mount is read-only or
+        is the one measured exception.
+
+        The allowlist is extended the way a later task would extend it, by
+        overriding the method -- so the case is about the guard rather than about
+        a table nobody edits today.
+        """
+        for root, source, destination in (
+            ("/etc", "/etc/mosdns", "/mnt/extra"),
+            ("/run", "/run/mosdns", "/mnt/extra"),
+            ("/var", "/var/lib/mosdns", "/mnt/extra"),
+            ("/sys", "/sys/class/net", "/mnt/extra"),
+            ("/home", "/home/ubuntu/Documents", "/mnt/extra"),
+        ):
+            with self.subTest(root=root):
+                podman = Podman(executable="/bin/true")
+                podman.allowed_mounts = lambda source=source, destination=destination: {
+                    CGROUP: (CGROUP, "rw"),
+                    destination: (source, "rw"),
+                }
+                with self.assertRaises(MountPolicyError) as caught:
+                    podman.run(["run", "-v", f"{source}:{destination}:rw", "localhost/img"])
+                message = str(caught.exception)
+                self.assertIn(source, message)
+                self.assertIn(root, message)
+                # And nothing reached the binary: the refusal happens where every
+                # other mount refusal happens, before `run` starts podman.
+                self.assertIn("read-only", message)
+
+    def test_a_read_only_mount_of_a_host_root_stays_possible_so_the_rule_is_not_a_door(self):
+        """The new refusal is narrow on purpose, and the narrowness is held.
+
+        A guard that refused every path under a forbidden root would refuse this
+        host's own checkout -- the source tree is under `/home` and is bound
+        `:ro`, which is the whole of the read-only case's argument. So the rule is
+        "a forbidden root is never bound *writable*", and this holds the
+        read-only side, through the same overridden allowlist the case above uses,
+        so the two are visibly the same lever.
+        """
+        podman = Podman(executable="/bin/true")
+        podman.allowed_mounts = lambda: {
+            CGROUP: (CGROUP, "rw"),
+            "/mnt/extra": ("/home/ubuntu/Documents", "ro"),
+        }
+        self.assertEqual(
+            podman.build_argv(["run", "-v", "/home/ubuntu/Documents:/mnt/extra:ro", "localhost/img"])[-4:],
+            ["run", "-v", "/home/ubuntu/Documents:/mnt/extra:ro", "localhost/img"],
+        )
+        # The one measured exception is still the exception, and it is still the
+        # only *writable* mount of a forbidden root: a cgroup mount that is not
+        # `rw` is refused for being the wrong mode, which is a different refusal
+        # and is asserted elsewhere.
+        self.assertEqual(
+            Podman(executable="/bin/true").build_argv(
+                ["run", "-v", f"{CGROUP}:{CGROUP}:rw", "localhost/img"]
+            )[-3:],
+            ["-v", f"{CGROUP}:{CGROUP}:rw", "localhost/img"],
+        )
+
     def test_a_source_tree_at_a_legal_path_is_accepted_and_still_mounted_read_only(self):
         """The parameter stays parameterized; a refusal would end the harness.
 

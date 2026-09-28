@@ -26,14 +26,18 @@ that system's resolver are all properties of how a command line is built.
   rootless Podman, which is the acceptance path here. The shape is checked at
   construction, not documented: a bare word is refused.
 
-* **Two binds, and the source tree may be anywhere.** The workspace is
-  ``:ro`` and the cgroup filesystem is the one writable mount, because a
-  systemd container will not start without its cgroup hierarchy. ``/etc``,
-  ``/run``, ``/var`` and ``/sys`` are refused as a *source* everywhere, and
-  ``/home`` is refused as a *mount* -- but a read-only *source-tree* bind under
-  ``/home`` is permitted, because this host's checkout is under ``/home`` and
-  refusing it left no legal ``--source-tree`` at all. See
-  ``FORBIDDEN_SOURCE_TREE_ROOTS`` for the argument.
+* **Two binds, and the source tree may be anywhere.** The workspace is ``:ro``
+  and the cgroup filesystem is the one writable mount, because a systemd
+  container will not start without its cgroup hierarchy. **A source inside
+  ``/etc``, ``/run``, ``/var``, ``/sys`` or ``/home`` is never bound writable**,
+  and that check is by path, in ``_check_mount``, after the allowlist -- so a
+  later task that adds a mount to the allowlist cannot widen it by writing one
+  line into a table. The *read-only* case is where ``/home`` is permitted,
+  because this host's checkout is under ``/home`` and refusing it left no legal
+  ``--source-tree`` at all; the read-only source tree is still refused under
+  ``/etc``, ``/run``, ``/var`` and ``/sys``, which hold the host's resolver and
+  its systemd state. See ``FORBIDDEN_SOURCE_TREE_ROOTS`` for the argument and
+  ``FORBIDDEN_HOST_ROOTS`` for the writable rule.
 
 Nothing in this module installs, enables or starts anything on the host, reads
 the host's resolver, or mutates NetworkManager. The commands it builds are the
@@ -96,16 +100,25 @@ CGROUP_MOUNT_POINT = "/sys/fs/cgroup"
 # operator has a value to pass rather than only a flag to read about.
 REPO_ROOT = str(Path(__file__).resolve().parents[3])
 
-# The host roots whose *contents* this harness will not put in front of a target
-# container. The allowlist above is what enforces this; the list is kept because
-# a refusal that names the root it broke is a diagnosis and a refusal that says
-# "refused" is a shrug.
+# The host roots this harness will not put in front of a target container, and
+# -- this is the second of the two sets, not a copy of the first -- the one that
+# governs **writable** binds everywhere, with no path exception.
 #
-# This set governs every bind, whatever its mode: a mount of any of these is a
-# route to the host's resolver or its systemd state, so it is refused. `Podman`
-# emits exactly two of them (`/sys/fs/cgroup` read-write, and the source tree
-# read-only) and both are reached through the allowlist rather than through
-# this list.
+# `_check_mount` refuses a source inside any of these whose mode is not `ro`,
+# and it does so *after* every comparison against the mount allowlist, on
+# purpose. Every allowlist comparison agrees with the allowlist by construction,
+# so a later task that adds a third mount to `allowed_mounts()` widens all of
+# them at the same time; the refusal that is not a comparison is the one that
+# survives that edit. This is the second instance of the defect Fix Round 1 called
+# Critical 2, and it is closed the same way: the subject of the check is named
+# here and the caller cannot choose it.
+#
+# The list is also kept because a refusal that names the root it broke is a
+# diagnosis and a refusal that says "refused" is a shrug.
+#
+# `Podman` emits exactly two mounts, and this set is what governs them:
+# `/sys/fs/cgroup` read-write, which is the one measured exception, and the
+# source tree read-only, which is the read-only case the argument below covers.
 FORBIDDEN_HOST_ROOTS = ("/etc", "/run", "/var", "/sys", "/home")
 
 # The narrower set that governs the *source tree*, and the reason the two differ
@@ -136,8 +149,10 @@ FORBIDDEN_HOST_ROOTS = ("/etc", "/run", "/var", "/sys", "/home")
 # metadata are unchanged by this: they are enforced where they were, by the
 # snapshot, not by a path allowlist.
 #
-# `FORBIDDEN_HOST_ROOTS` above is deliberately *not* shortened, because that one
-# governs binds generally and the writable case must stay closed there.
+# `FORBIDDEN_HOST_ROOTS` above is deliberately *not* shortened, and the reason is
+# no longer a comment's promise: it is the set `_check_mount` refuses a writable
+# source against, so the writable case is closed there by a path check rather
+# than by whatever the mount allowlist happens to say.
 FORBIDDEN_SOURCE_TREE_ROOTS = ("/etc", "/run", "/var", "/sys")
 
 # Flags that would hand a target the host it runs on, and the value each one
@@ -731,6 +746,34 @@ class Podman:
             raise MountPolicyError(
                 f"refusing mount '{spec}': {destination} must be mounted {wanted} and this one "
                 f"is {effective_mode}"
+            )
+        # The last refusal, and the only one that is not a comparison against the
+        # allowlist. Everything above checks a mount against `allowed_mounts()`,
+        # which means every one of them agrees with the allowlist by
+        # construction -- so a later task that adds an entry to the allowlist
+        # widens every one of those checks at once. A source inside one of the
+        # five forbidden roots is therefore refused here, by path and regardless
+        # of what the allowlist says, so the widening is a decision somebody has
+        # to make in this function rather than a side effect of a table edit.
+        #
+        # The rule is *writable*, not *any*: a read-only bind of a directory under
+        # a forbidden root exposes that directory's bytes and nothing a target
+        # can change on the host, which is the whole argument for permitting this
+        # host's checkout under `/home` (see `FORBIDDEN_SOURCE_TREE_ROOTS`), and
+        # a blanket refusal here would leave no legal `--source-tree` on this
+        # machine. `/sys/fs/cgroup` is exempt because it is the one measured
+        # writable mount of a forbidden root that a systemd target cannot start
+        # without.
+        writable_root = _forbidden_root(source)
+        if writable_root and effective_mode != "ro":
+            raise MountPolicyError(
+                f"refusing mount '{spec}': {source} is inside the host root {writable_root}, "
+                f"which this plan forbids binding writable -- a mount of any of "
+                f"{', '.join(FORBIDDEN_HOST_ROOTS)} must be read-only, whatever the allowlist "
+                f"says, because a writable bind is a route to the host's resolver and its "
+                f"systemd state. (The one exception is {CGROUP_HOST_PATH}, which a systemd "
+                f"container cannot start without.) Read the source tree at {WORKSPACE_MOUNT_POINT} "
+                f"':ro' instead"
             )
 
     def run(self, args: Sequence[str], timeout: float | None = None) -> CommandResult:
