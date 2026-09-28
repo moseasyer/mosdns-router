@@ -2416,7 +2416,16 @@ class NetworkManagerDeviceTest(PodmanTestCase):
         # The exact command in NM_PROFILE_STEP is the entrypoint's first step.
         add = "nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto"
         self.assertIn(add, plan)
-        entrypoint = plan.index("The target's entrypoint must perform")
+        # The anchor moved with the ruling. This case used to look for "The
+        # target's entrypoint must perform" and asserted the plan's Task 3 step 4
+        # came after it -- which was the ordering the previous plan got wrong, and
+        # which Fix Round 1/5's review confirmed cannot be implemented: the
+        # sequence runs from a systemd unit because there is no D-Bus before
+        # `/sbin/init`. What the case still asserts is the *claim* it was written
+        # for: the plan names the `connection add` command as the one that creates
+        # the profile, and Task 3 step 4 modifies that profile rather than creating
+        # a second one. The anchor is now the sentence that says so.
+        entrypoint = plan.index("The sequence runs from")
         task_three_step_four = plan.index("**Step 4: Make target use NetworkManager**")
         self.assertLess(
             entrypoint, task_three_step_four,
