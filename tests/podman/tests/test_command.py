@@ -86,6 +86,38 @@ WORKSPACE = "/workspace"
 CGROUP = "/sys/fs/cgroup"
 
 
+def legal_temp_base() -> str:
+    """A directory the mount policy will accept, whatever `TMPDIR` says.
+
+    This suite's stand-in source tree is a temporary directory, and the wrapper
+    refuses a source tree inside a forbidden host root — so the suite's own
+    fixture depends on where `tempfile` puts things. That is not hypothetical:
+    pointing `TMPDIR` at a directory under `/home` (which the Go build on this
+    host requires, because `/tmp` is a small tmpfs) made 220 cases fail with
+    `refusing source tree '/home/…/source'`, every one of them for a reason that
+    had nothing to do with what they test.
+
+    So the fixture asks for a base that satisfies the policy it is testing, in
+    the order a developer would expect: `TMPDIR` if it is usable, then the
+    system default, then the first conventional location that is outside all
+    five roots. The policy is not relaxed to accommodate the test — the strict
+    refusal is correct, and this is the fixture conforming to it.
+    """
+    def outside_every_root(candidate: str) -> bool:
+        resolved = os.path.normpath(candidate)
+        return not any(
+            resolved == root or resolved.startswith(root + "/")
+            for root in FORBIDDEN_HOST_ROOTS
+        )
+
+    for candidate in (os.environ.get("TMPDIR"), tempfile.gettempdir(), "/tmp", "/opt", "/srv"):
+        if candidate and os.path.isdir(candidate) and outside_every_root(candidate):
+            return candidate
+    raise unittest.SkipTest(
+        "no writable directory outside " + ", ".join(FORBIDDEN_HOST_ROOTS) + " to build a fixture in"
+    )
+
+
 def volume_arguments(argv):
     """Every bind-mount specification in an argument array, as a raw string.
 
@@ -297,7 +329,7 @@ class PodmanTestCase(unittest.TestCase):
     """A temp directory, a fake podman, and a wrapper pointed at both."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(dir=legal_temp_base())
         self.addCleanup(self._tmp.cleanup)
         self.directory = Path(self._tmp.name)
         # A stand-in for the source tree. It is never read; the wrapper only
@@ -307,6 +339,17 @@ class PodmanTestCase(unittest.TestCase):
         # The wrapper resolves the path it was given, so the expected value in
         # these cases is the resolved one.
         self.source_tree = self.source_tree.resolve()
+
+    def extra_directory(self):
+        """A second directory of this case's own, for a second log.
+
+        `FakePodmanBinary` appends to one log beside itself, so two cases that
+        each expect exactly one invocation cannot share one. Returned rather
+        than created inline so every such directory is cleaned up.
+        """
+        directory = Path(tempfile.mkdtemp(dir=legal_temp_base()))
+        self.addCleanup(shutil.rmtree, directory, True)
+        return directory
 
     def fake(self, rules=None, directory=None):
         """A fake binary, in `directory` when a case needs its own log.
@@ -1003,7 +1046,9 @@ class MountAllowlistTest(PodmanTestCase):
         mount is emitted, and it is read-only -- the property the policy exists
         for, and one a case that only tested refusals would not hold.
         """
-        legal = Path(tempfile.mkdtemp())
+        # A base outside all five roots, chosen the same way the fixture's is,
+        # so this case does not depend on where `tempfile` happens to point.
+        legal = Path(tempfile.mkdtemp(dir=legal_temp_base()))
         self.addCleanup(shutil.rmtree, legal, True)
         podman = Podman(executable="/bin/true", source_tree=str(legal))
         self.assertEqual(
@@ -1268,8 +1313,7 @@ class ContainerPolicyTest(PodmanTestCase):
                 # A fresh fake per case: `FakePodmanBinary` keeps one log
                 # beside itself, so a shared one would accumulate three runs and
                 # `only()` would be asserting about the wrong one.
-                directory = Path(tempfile.mkdtemp())
-                self.addCleanup(shutil.rmtree, directory, True)
+                directory = self.extra_directory()
                 fake = self.fake(directory=directory)
                 self.client(fake).run_container(
                     image="localhost/mosdns-target:24.04",
@@ -2674,8 +2718,7 @@ class CommandLineTest(PodmanTestCase):
         # Its own directory, so its log is its own: `FakePodmanBinary` appends
         # to one file beside itself, and a refusal that shares a log with the
         # run above would be asserting about the run above.
-        directory = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, directory, True)
+        directory = self.extra_directory()
         refused = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}], directory=directory)
         code, output = self.invoke(
             self.base(refused, "--connection", "podman-machine-default", "preflight")
