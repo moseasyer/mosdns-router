@@ -61,6 +61,7 @@ from podman import (  # noqa: E402
     FORBIDDEN_CONTAINER_FLAG_FAMILIES,
     FORBIDDEN_CONTAINER_FLAG_NAMES,
     FORBIDDEN_CONTAINER_FLAGS,
+    HOST_MUTATING_MOUNT_KEYS,
     PODMAN_FLAG_ALIASES,
     POLICED_CONTAINER_FLAGS,
     ALLOWED_CAPABILITIES as ALLOWED_CAPS,
@@ -1288,6 +1289,26 @@ class MountAllowlistTest(PodmanTestCase):
         is the same rule the valueless options already followed and the same
         design as the capability ceiling -- an option nobody has thought of yet is
         refused too.
+
+        **Each row asserts the *reason*, not the key name.** The previous version
+        of this table asserted `assertIn(named, message)` with `named` the key --
+        and every message begins `refusing mount '<the specification>'`, which
+        echoes the key back, so the assertion was satisfied by the refusal text
+        alone and could not tell a host-mutating option from an unrecognised one.
+        That is the same shape as the fixture defect Fix Round 2 found, where a
+        comma in a value made the `context=` row pass on the pre-fix module. So
+        the reason from `HOST_MUTATING_MOUNT_KEYS` is asserted for the keys it
+        holds, the unrecognised-option sentence is asserted for the rest, and the
+        two are held to be mutually exclusive so neither can stand in for the
+        other.
+
+        Falsified by deleting the `HOST_MUTATING_MOUNT_KEYS` branch from the
+        guard, so every valued key falls through to the generic refusal that
+        echoes the key back: **eleven of the twelve pre-round rows pass against
+        a guard with no host-mutating check at all**, and the twelfth (`U=true`,
+        which asserted `chown` while the message quotes `'U') fails for the wrong
+        reason. The rows here fail all sixteen host-mutating sub-cases, each
+        naming the reason it should have found missing.
         """
         legal = Path(tempfile.mkdtemp(dir=legal_temp_base()))
         self.addCleanup(shutil.rmtree, legal, True)
@@ -1296,29 +1317,106 @@ class MountAllowlistTest(PodmanTestCase):
             ("relabel=shared", "relabel"),
             ("relabel=private", "relabel"),
             ("chown=true", "chown"),
-            ("U=true", "chown"),
+            ("U=true", "U"),
             ("idmap=true", "idmap"),
             ("bind-propagation=rshared", "bind-propagation"),
             ("bind-propagation=shared", "bind-propagation"),
             ("no-dereference=true", "no-dereference"),
             ("subpath=src", "subpath"),
-            # A real SELinux MCS context is `…:s0:c1,c2` and that comma splits
-            # the `--mount` specification into two fields, so the full context
-            # would be refused for an unrelated reason and the key under test
-            # would never be reached. The context is truncated at the MCS pair
-            # deliberately, and the reason is here rather than discovered later.
+            # A real SELinux MCS context is `…:s0:c1,c2`, and that comma splits
+            # the `--mount` specification into two fields -- so the full label is
+            # refused as an unrecognised option named `c2`, and the `context` key
+            # is never the thing that refused it. **The message names the trailing
+            # label component and nothing else**, which reads like a parser bug
+            # and is the shape a contributor with an SELinux-labelled mount would
+            # file. The row is here so that what actually happens is recorded
+            # rather than discovered: the label cannot be written in this syntax
+            # at all, so the truncation below is the only form this harness can
+            # be asked about, and it is refused too.
+            ("context=system_u:object_r:container_file_t:s0:c1,c2", "c2"),
             ("context=system_u:object_r:container_file_t:s0", "context"),
             ("tmpfs-size=4096", "tmpfs-size"),
             ("an-option-nobody-has-thought-of=yet", "an-option-nobody-has-thought-of"),
         )
-        for option, named in refused:
+        # The unrecognised-option reason, written out rather than read from the
+        # guard, so a change to the message fails here instead of being agreed
+        # with by both sides at once.
+        unrecognised = "is not a mount option this harness uses"
+        for option, key in refused:
+            expected = HOST_MUTATING_MOUNT_KEYS.get(key, unrecognised)
             for destination, mode in ((WORKSPACE, "ro"), (CGROUP, "rw")):
                 source = str(legal) if destination == WORKSPACE else CGROUP
                 with self.subTest(option=option, destination=destination):
                     spec = f"type=bind,src={source},dst={destination},{mode},{option}"
                     with self.assertRaises(MountPolicyError) as caught:
                         podman.run(["run", "--mount", spec, "localhost/img"])
-                    self.assertIn(named, str(caught.exception))
+                    message = str(caught.exception)
+                    self.assertIn(
+                        expected,
+                        message,
+                        f"the refusal for {option!r} does not give its reason, so this row cannot "
+                        f"tell it apart from any other refusal",
+                    )
+                    # The key name is in the message because the message echoes the
+                    # specification, which is why asserting it proved nothing.
+                    self.assertIn(key, message)
+                    # And the reason is *this row's*: no other key's reason may be in
+                    # it, so a guard that refused everything for one reason -- the
+                    # `:Z`/`:z` check, the unrecognised-option check -- would fail.
+                    for other, reason in HOST_MUTATING_MOUNT_KEYS.items():
+                        if other != key and reason != expected:
+                            with self.subTest(option=option, other=other):
+                                self.assertNotIn(
+                                    reason,
+                                    message,
+                                    f"{option!r} was refused for {other!r}'s reason as well, so "
+                                    f"this row does not identify which check refused it",
+                                )
+        # The reasons are genuinely different strings, which is what lets the
+        # cross-check above discriminate. If two ever converge, the cross-check is
+        # vacuous and says so here rather than passing quietly.
+        self.assertEqual(
+            len({*HOST_MUTATING_MOUNT_KEYS.values(), unrecognised}),
+            len(HOST_MUTATING_MOUNT_KEYS) + 1,
+            "two refusal reasons have become the same string, so asserting one no longer "
+            "distinguishes it from the other",
+        )
+
+    def test_a_legitimate_seluinux_label_is_refused_because_context_is(self):
+        """`context` is refused for what the key *is*, not for the value it carries.
+
+        The policy refuses `context` in `HOST_MUTATING_MOUNT_KEYS` because a keyed
+        `context=` applies an SELinux label to the source **on the host** -- the
+        same act `relabel` and `chown` are refused for, and the same act `:Z` and
+        `:z` are refused for in the colon form. **There is no legitimate value of
+        it that this harness supports**: a valid, harmless-looking SELinux label is
+        refused anyway, and refusing it regresses no supported case. SELinux-
+        labelled CI is unaffected, because the harness mounts a cgroup filesystem
+        and a read-only workspace and labels neither.
+
+        It is stated as a case rather than a comment because the *message* is
+        misleading. A contributor who wrote a real MCS label -- `…:s0:c1,c2`, and
+        whose comma splits the `--mount` specification -- is told that `c2` is not
+        a mount option, which reads like a parser bug rather than a policy and is
+        the shape somebody files. The full-label row in the case above records
+        what actually happens; this one records that no label is a way through.
+        """
+        legal = Path(tempfile.mkdtemp(dir=legal_temp_base()))
+        self.addCleanup(shutil.rmtree, legal, True)
+        podman = Podman(executable="/bin/true", source_tree=str(legal))
+        for label in (
+            "system_u:object_r:container_file_t:s0",
+            "system_u:object_r:container_t:s0:c1",
+            "unconfined_u:object_r:container_file_t:s0",
+        ):
+            with self.subTest(label=label):
+                # The MCS range's comma cannot be written in this syntax, so the
+                # truncated label is the most complete one expressible here; it is
+                # what the row above calls a legitimate label.
+                spec = f"type=bind,src={legal},dst={WORKSPACE},ro,context={label}"
+                with self.assertRaises(MountPolicyError) as caught:
+                    podman.run(["run", "--mount", spec, "localhost/img"])
+                self.assertIn(HOST_MUTATING_MOUNT_KEYS["context"], str(caught.exception))
 
     def test_a_keyed_mount_option_whose_value_is_a_mode_is_read_as_that_mode(self):
         """`ro=true` and `rw=false` are read as the mode they name, not ignored.
