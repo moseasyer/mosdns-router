@@ -175,9 +175,14 @@ NM_MANAGE_STEPS = (
 # Measured here, not assumed: with a profile for eth0 present, the two steps
 # above take the device to `yes` on three consecutive fresh containers, and
 # without one the two steps leave the field at `no` on every container tried.
-# The plan's Target task already creates an Ethernet profile for eth0 (Task 3,
-# step 4), so this is a fact the sequence depends on rather than a third step
-# added here.
+#
+# The profile is created by the target image's ENTRYPOINT, as its first step
+# (the plan's Task 2, Step 3), and not at scenario time: the entrypoint's two
+# steps are what need it, so creating it later would leave every target booting
+# unmanaged and every cell of the matrix incomplete with exit 3. The plan's
+# Task 3 step 4 modifies the profile the entrypoint created, post-boot, for
+# `ipv4.never-default yes`. This comment is the harness's copy of that
+# ordering, and the refusal below is where a reader learns it.
 NM_PROFILE_STEP = (
     "a connection profile must already exist for the device, e.g. "
     "'nmcli connection add type ethernet ifname eth0 con-name eth0-managed "

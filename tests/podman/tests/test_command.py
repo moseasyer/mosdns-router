@@ -1516,6 +1516,47 @@ class NetworkManagerDeviceTest(PodmanTestCase):
         self.assertIn("connection profile", message)
         self.assertIn("nmcli connection add type ethernet ifname eth0", message)
 
+    def test_the_plan_agrees_with_this_module_about_who_creates_the_profile(self):
+        """The ordering lives in two records, and this is what stops them drifting.
+
+        The harness refuses when a target boots unmanaged, and the plan's Task
+        2 and Task 3 are the two records that decide whether a target boots
+        managed at all. They disagreed: the plan's architecture note said "Task
+        3 step 4 already creates that profile" while Task 2's operative text
+        created nothing, so the profile would not exist when the entrypoint's
+        two steps ran, every boot check would fail, and every cell would be
+        `incomplete` with exit 3 — forever, and for a reason that looked like a
+        container limitation. A plan an implementer cannot run is a defect in
+        the same family as a test that does not run.
+
+        So the agreement is held here rather than left to review: the profile's
+        creating command is named in Task 2's entrypoint text, and Task 3's step
+        4 modifies that profile instead of creating one. The module's own
+        comment records which is which, and this case fails the day either half
+        moves.
+        """
+        plan = (REPO / "docs/superpowers/plans/2026-09-25-podman-integration-matrix.md").read_text(
+            encoding="utf-8"
+        )
+        # The exact command in NM_PROFILE_STEP is the entrypoint's first step.
+        add = "nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto"
+        self.assertIn(add, plan)
+        entrypoint = plan.index("The target's entrypoint must perform")
+        task_three_step_four = plan.index("**Step 4: Make target use NetworkManager**")
+        self.assertLess(
+            entrypoint, task_three_step_four,
+            "the entrypoint text must come before the step that works on its profile",
+        )
+        # Task 2 owns the creation, and says the profile comes first.
+        task_two_entrypoint = plan[entrypoint:task_three_step_four]
+        self.assertIn(add, task_two_entrypoint)
+        self.assertIn("ipv4.method auto", task_two_entrypoint)
+        # Task 3 modifies it, and says so rather than creating a second one.
+        task_three_step = plan[task_three_step_four:task_three_step_four + 2000]
+        self.assertIn("modify eth0-managed ipv4.never-default yes", task_three_step)
+        self.assertNotIn("connection add", task_three_step)
+        self.assertIn("post-boot", task_three_step)
+
     def test_the_refusal_reports_what_the_field_actually_said(self):
         """`no` and `yes` are one character apart, and the message must carry it.
 

@@ -10,7 +10,7 @@
 
 > **How NetworkManager is made to manage a device — measured, not assumed.** A container's default rootless network hands it a **tun/tap** device, and NetworkManager refuses that device type by design (`GENERAL.TYPE: tun`, activation fails with *device is strictly unmanaged*). Use a **netavark bridge network**, which gives the container a real `eth0` of type `ethernet`. Even then, `nmcli device set eth0 managed yes` returns success and does **not** take effect until NetworkManager is restarted: the override is written persistently under `/run/NetworkManager/devices/`, and only a restart re-reads it. The target image's entrypoint must therefore do **`nmcli device set eth0 managed yes` and then `systemctl restart NetworkManager`**, after which profiles activate and NM runs a real DHCP client on the device. This corrects a conclusion reached in the previous plan, where the container was believed to be incapable of this.
 
-> **A connection profile must exist for the device first — measured on this host, and not in the note above.** The two steps are necessary and, on their own, not sufficient: with **no** connection profile for `eth0`, both steps are accepted, `journalctl` records `op="device-managed" … result="success"`, the override is never written to `/run/NetworkManager/devices/`, and `GENERAL.NM-MANAGED` stays `no` — verified on every container tried. With a profile for `eth0` present, the same two steps take the field to `yes` and the device to `100 (connected)` — verified on three consecutive fresh containers. So the entrypoint order is: create the `eth0` connection profile, then `nmcli device set eth0 managed yes`, then `systemctl restart NetworkManager`. Task 3 step 4 already creates that profile, so the ordering constraint is real and the tasks must agree on it. `tests/podman/lib/podman.py` carries this as `NM_PROFILE_STEP` and its runtime device check names it in the refusal, because a message that named only the two steps would send an operator to run them, watch them succeed, and conclude the harness was wrong.
+> **A connection profile must exist for the device first — measured on this host, and not in the note above.** The two steps are necessary and, on their own, not sufficient: with **no** connection profile for `eth0`, both steps are accepted, `journalctl` records `op="device-managed" … result="success"`, the override is never written to `/run/NetworkManager/devices/`, and `GENERAL.NM-MANAGED` stays `no` — verified on every container tried. With a profile for `eth0` present, the same two steps take the field to `yes` and the device to `100 (connected)` — verified on three consecutive fresh containers. So the entrypoint order is: **create the `eth0` connection profile, then `nmcli device set eth0 managed yes`, then `systemctl restart NetworkManager`** — and the profile therefore belongs to **Task 2's image entrypoint, not to Task 3**. That was the first version's error and it is corrected here: the profile was to be created at scenario time in Task 3 step 4, which runs *after* the target has booted, so Task 2's image would have run the two steps with no profile at all, failed its own boot check, and left every cell of the matrix `incomplete` with exit 3 forever. Task 3 step 4 now **modifies** the profile the entrypoint created, and says so. `tests/podman/lib/podman.py` carries this as `NM_PROFILE_STEP` and its runtime device check names it in the refusal, because a message that named only the two steps would send an operator to run them, watch them succeed, and conclude the harness was wrong.
 
 **Tech Stack:** Python 3 standard library, rootless Podman container/network, Ubuntu official images, systemd, NetworkManager, systemd-resolved, dnsmasq mock router, local TLS server, Mozilla Firefox headless for live ECH verification.
 
@@ -21,7 +21,8 @@
 - The current development host is never a target; do not run installer/uninstaller there.
 - **No virtual machine, and no `podman machine`.** Containers only.
 - A requirement a container cannot close is recorded **SKIPPED with its exact wording**. It is never closed by substituting a different kind of test, and a skip is never reported as a pass.
-- Do not mount host `/etc`, `/run`, `/var`, `/sys`, or `/home` into target containers.
+- Do not mount host `/etc`, `/run`, `/var`, `/sys`, or `/home` into target containers. **This binds the checkout too:** the source tree is mounted at `/workspace`, so a checkout that *lives* under one of those five roots cannot be the source tree. `Podman(...)` refuses such a path at construction rather than mounting it, so a host whose checkout is under `/home` must pass `--source-tree` pointing at a checkout outside the five roots. The two constraints are otherwise in direct conflict, and the refusal is the honest resolution rather than widening the allowlist.
+- **Every resource this harness creates carries the `mosdns-` prefix followed by the run id.** `cleanup` sweeps by that prefix and `RunResources` anchors the filter with `^`, so a container, network or volume named by hand outside the prefix is invisible to the teardown: it is not removed, it is not reported, and the next run inherits it. A task that needs a name of its own composes it from `RunResources` (`container_name`, `volume_name`, `network_name`) rather than writing one out. This is a constraint on the tasks, not a note for the reader, because the failure it prevents is silent.
 - Source is mounted read-only; artifacts and mutable test data use container volumes.
 - All target containers run systemd as PID 1 and use fixed Ubuntu image digests.
 - Deterministic mock tests are mandatory; real-network tests are explicit opt-in.
@@ -78,7 +79,9 @@ python3 tests/podman/run.py live-ech --domain HOSTNAME
 python3 tests/podman/run.py cleanup
 ```
 
-`--connection` is **not** a machine name. It is an optional Podman connection URI for a remote or native (e.g. arm64) service; omitted means the local rootless Podman, which is the acceptance path on this host.
+`--connection` is **not** a machine name. It is an optional Podman connection URI for a remote or native (e.g. arm64) service; omitted means the local rootless Podman, which is the acceptance path on this host. A bare word is **refused**, not documented: a name is how a machine is spelled, and podman would resolve it through a shared `connections.conf`.
+
+Every option above is accepted **on either side of the subcommand** — `run.py --arch arm64 matrix` and `run.py matrix --arch arm64` are the same run — because a Make target and a CI variable each produce one of them.
 
 Exit codes: 0 all requested tests passed; 1 test failure; 2 harness/configuration error; 3 incomplete matrix or skipped required architecture.
 
@@ -114,7 +117,7 @@ podman rm -f NAME
 podman network rm mosdns-testnet
 ```
 
-Assert that **no** `podman machine` subcommand appears anywhere in the harness, and that the source tree is mounted **read-only** and never at `/etc`, `/run`, `/var`, `/sys` or `/home`. A test must fail if a host path outside the allowed set is ever mounted.
+Assert that **no** `podman machine` subcommand appears anywhere in the harness, and that the source tree is mounted **read-only** and never at `/etc`, `/run`, `/var`, `/sys` or `/home`. A test must fail if a host path outside the allowed set is ever mounted. The `podman run -d … --systemd=always …` array above is asserted **as a whole, as literals** — not as a subset — because it is the only place the measured flag set appears; and the suite carries a guard that fails on any two cases in the harness's own test files sharing a name, since `unittest` silently keeps the last of them and a shadowed case is invisible in its output.
 
 - [ ] **Step 2: Write failing report tests**
 
@@ -195,7 +198,17 @@ Sort output, redact environment-specific UUIDs only when they are not relevant t
 
 Target image installs `systemd-sysv`, `dbus`, `NetworkManager`, `systemd-resolved`, `python3`, `iproute2`, `dnsutils`, `curl`, `ca-certificates`, and test tools, but does not install the project package at build time. Mock router installs `dnsmasq`; mock CDN is built from the repository's Go module.
 
-**The target's entrypoint must perform the NetworkManager device sequence** described in the Architecture note — `nmcli device set eth0 managed yes` followed by `systemctl restart NetworkManager` — and must **fail loudly** if `nmcli -g GENERAL.NM-MANAGED device show eth0` is not `yes` afterwards. A target that boots with an unmanaged device produces a scenario failure that looks like an installer bug, so this is checked at boot and the check is part of the image, not of each scenario. Do **not** add a `NetworkManager.conf.d` entry to force this; the override-and-restart path is the measured one.
+**The target's entrypoint must perform the NetworkManager device sequence in this exact order, and the profile comes first:**
+
+```sh
+nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto
+nmcli device set eth0 managed yes
+systemctl restart NetworkManager
+```
+
+The first line is the same command as `NM_PROFILE_STEP` in `tests/podman/lib/podman.py`, which was measured on this host: with **no** profile for `eth0`, the two steps are accepted, the audit log records `op="device-managed" … result="success"`, the override is never written to `/run/NetworkManager/devices/`, and `GENERAL.NM-MANAGED` stays `no`. The profile is created **here, in the image's entrypoint**, and not at scenario time: an entrypoint that ran the two steps first would boot every target unmanaged, fail its own boot check, and leave every cell of the matrix `incomplete` with exit 3. Task 3 step 4 works on the profile this line creates.
+
+The entrypoint must then **fail loudly** if `nmcli -g GENERAL.NM-MANAGED device show eth0` is not `yes` afterwards. The check asserts the **ordering**, not just the final value: the profile must exist (`nmcli -g 802-3-ethernet.device connection show eth0-managed`, or `nmcli connection show eth0-managed`) *and* the field must be `yes`, so an entrypoint that reorders or drops the profile fails with the two facts it needs rather than a bare "unmanaged". A target that boots with an unmanaged device produces a scenario failure that looks like an installer bug, so this is checked at boot and the check is part of the image, not of each scenario. Do **not** add a `NetworkManager.conf.d` entry to force this; the override-and-restart path is the measured one.
 
 - [ ] **Step 4: Resolve and lock image digests**
 
@@ -265,7 +278,14 @@ Run dnsmasq with DHCP range `10.89.0.100-10.89.0.199`, router option `10.89.0.2`
 
 - [ ] **Step 4: Make target use NetworkManager**
 
-Inside the target container, create an Ethernet connection for `eth0` with `ipv4.method auto`, `ipv4.never-default yes`, and initially automatic DNS. Confirm `IP4.DNS` contains the mock address before running the package installer.
+The Ethernet connection for `eth0` **already exists**: Task 2's image entrypoint creates it (see its Step 3) because the measured device sequence does not take effect without it. So this step **modifies the profile the entrypoint created**, and must not create a second profile and must not race the entrypoint — by the time a scenario runs, the entrypoint has finished and the device is managed.
+
+```sh
+nmcli connection modify eth0-managed ipv4.never-default yes
+nmcli connection up eth0-managed
+```
+
+`ipv4.never-default yes` is a **post-boot scenario change**, not a boot precondition: it is set here, after the entrypoint's boot sequence has already made the device managed, and re-activating the profile re-runs DHCP. The boot profile is created with `ipv4.method auto` and automatic DNS; the `never-default` change belongs to the DHCP scenario, which confirms `IP4.DNS` contains the mock address after the change and before running the package installer.
 
 - [ ] **Step 5: Run the scenario in the target container**
 
@@ -273,7 +293,7 @@ Inside the target container, create an Ethernet connection for `eth0` with `ipv4
 python3 tests/podman/run.py matrix --arch amd64 --versions 22.04 --scenario dhcp
 ```
 
-Expected: PASS; host snapshot unchanged.
+Expected: PASS; host snapshot unchanged. Until the `dhcp` scenario is registered, this command is **refused** with exit 2 and the name in the message — `--scenario` is either run or refused, never parsed and ignored, because a silent no-op on the flag the plan's own acceptance command passes reads as "the harness looked and did not find it".
 
 - [ ] **Step 6: Commit**
 
@@ -297,7 +317,7 @@ git commit -m "test: drive NetworkManager DHCP in Podman"
 
 - [ ] **Step 1: Start the target systemd container**
 
-Use the locked image, `--systemd=always`, `--cgroupns=private`, `--cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE`, `-v /sys/fs/cgroup:/sys/fs/cgroup:rw`, and the private network's fixed IP. These are the exact flags measured to work on this host; `--cgroupns=host` and `--privileged` are **not** used — they were written for the machine architecture this plan no longer has, and the measured set is narrower. Do not mount host system directories. Copy the `.deb` with `podman cp`, then install it inside the container.
+Use the locked image, `--systemd=always`, `--cgroupns=private`, `--cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE`, `-v /sys/fs/cgroup:/sys/fs/cgroup:rw`, and the private network's fixed IP. These are the exact flags measured to work on this host; `--cgroupns=host` and `--privileged` are **not** used — they were written for the machine architecture this plan no longer has, and the measured set is narrower. Anything a scenario adds goes through the wrapper's `extra_args`, which refuses a privilege flag, a host namespace, a capability outside the three above, a device, a seccomp/apparmor override and `--volumes-from`, in both spellings pflag accepts. Do not mount host system directories. Copy the `.deb` with `podman cp`, then install it inside the container.
 
 - [ ] **Step 2: Validate packaged units**
 
