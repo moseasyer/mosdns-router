@@ -458,11 +458,76 @@ def _checked_source_tree(source_tree: str | None) -> str | None:
     return resolved
 
 
+# The keyed `--mount` options this harness will accept, and the keys that name
+# the two directions of a mode. An allowlist, because a keyed option is usually
+# `key=value` and the value is where the hazard is: `relabel=shared` is the
+# `--mount` spelling of the `:z` this module already refuses, `chown=true` is a
+# recursive ownership change on the **host**, and `bind-propagation=rshared` on
+# the cgroup filesystem makes a submount the target creates propagate back into
+# the host's own hierarchy. All three were accepted, because a parser that
+# collected only the *valueless* keys dropped every one of them before the policy
+# saw them.
+#
+# So the rule is the same as for the valueless options, and the same as the
+# capability ceiling: an option this harness does not recognise is refused, which
+# means an option nobody has thought of yet is refused too. `type`, the source
+# and destination spellings, and the two mode keys are all it needs -- the
+# wrapper emits the colon-separated `-v` form itself and never writes a `--mount`.
+ALLOWED_MOUNT_KEYS = frozenset(
+    {
+        "type",
+        "src",
+        "source",
+        "dst",
+        "dest",
+        "destination",
+        "target",
+        "ro",
+        "readonly",
+        "rw",
+        "readwrite",
+    }
+)
+READ_ONLY_MOUNT_KEYS = ("ro", "readonly")
+WRITABLE_MOUNT_KEYS = ("rw", "readwrite")
+
+# The keyed options whose *effect* is a change to this machine, refused with the
+# reason rather than with "unrecognised option", because they are recognisable
+# and an operator who wrote one deserves to be told what it does. Each is a
+# refusal the wrapper would have to make anyway -- `:Z` and `:z` are already
+# refused above, in the colon form, for the same reason.
+HOST_MUTATING_MOUNT_KEYS = {
+    "relabel": "relabels the files on the host, which is a change to this machine made by a "
+    "command whose job is to change nothing here -- it is `:z` under the keyed spelling",
+    "chown": "recursively changes the owner and group of the source **on the host**, which is "
+    "the same thing `:Z`/`:z` is refused for",
+    "U": "recursively changes the owner and group of the source **on the host**; it is podman's "
+    "abbreviation of chown",
+    "context": "applies an SELinux label to the source on the host, which relabels it by another "
+    "name",
+    "idmap": "creates an id-mapped mount, which rewrites how ownership is interpreted for the "
+    "host's own files",
+    "bind-propagation": "makes the mount shared, so a submount the target creates under it "
+    "propagates back into the host's own filesystem or cgroup hierarchy",
+}
+
+
+def _is_true(value: str) -> bool:
+    """Whether a keyed option's value means "yes", the way podman reads it."""
+    return value.strip().lower() in ("", "true", "1", "yes", "on")
+
+
 def _parse_mount_spec(spec: str) -> tuple[str | None, str | None, list[str]]:
     """Read one mount specification as (source, destination, options).
 
     Podman accepts a colon-separated `-v` value and a keyed `--mount` value, and
     a policy that read only one of them would be a policy on a spelling.
+
+    An option in the returned list is either a bare key (`ro`, `Z`) or a
+    `key=value` pair, and **both are returned**. A parser that kept only the
+    bare keys -- which is what this one used to do, because that is how the colon
+    form spells an option -- silently discarded every valued key of a `--mount`,
+    and in the keyed form nearly every option has a value.
     """
     if "," in spec and "=" in spec.split(",")[0]:
         fields: dict[str, str] = {}
@@ -471,7 +536,10 @@ def _parse_mount_spec(spec: str) -> tuple[str | None, str | None, list[str]]:
             fields[key.strip()] = value.strip() if separator else ""
         source = fields.get("src") or fields.get("source")
         destination = fields.get("dst") or fields.get("destination") or fields.get("target")
-        options = sorted(key for key, value in fields.items() if not value and key != "type")
+        options = sorted(
+            key if key == "type" else (key if not value else f"{key}={value}")
+            for key, value in fields.items()
+        )
         return source, destination, options
     parts = spec.split(":")
     if len(parts) == 1:
@@ -675,6 +743,35 @@ class Podman:
                 + "\n".join(f"  - {violation}" for violation in violations)
             )
 
+    @staticmethod
+    def _mount_mode(options: Sequence[str]) -> str:
+        """The mode a mount's options ask for: `ro`, `rw`, or `both`.
+
+        Read from the *value* where the option has one, because a keyed
+        `ro=false` asks for the opposite of a bare `ro` and a guard that only
+        looked at the key would judge a writable workspace from the mode it was
+        meant to be denied -- and because a keyed `rw=false` is how the keyed form
+        spells *read-only*, which a default-to-`rw` reading gets backwards. So
+        each direction is read as what it says and the two are reconciled: an
+        explicit statement in one direction is the other one's negation, and no
+        statement at all is podman's default, which is `rw`.
+        """
+        read_only: bool | None = None
+        writable: bool | None = None
+        for option in options:
+            key, _, value = option.partition("=")
+            if key in READ_ONLY_MOUNT_KEYS:
+                read_only = _is_true(value)
+            elif key in WRITABLE_MOUNT_KEYS:
+                writable = _is_true(value)
+        if read_only is None and writable is None:
+            return "rw"
+        wants_read_only = read_only if read_only is not None else not writable
+        wants_writable = writable if writable is not None else not read_only
+        if wants_read_only and wants_writable:
+            return "both"
+        return "ro" if wants_read_only else "rw"
+
     def _check_mount_arguments(self, args: Sequence[str]) -> None:
         index = 0
         while index < len(args):
@@ -698,19 +795,30 @@ class Podman:
                 f"refusing mount '{spec}': a bare token is an anonymous volume, and a volume "
                 f"this harness did not record is one cleanup cannot remove"
             )
+        # Every option is read, whether it was spelled bare (`ro`, `:Z`) or
+        # keyed (`ro=true`, `relabel=shared`). The two spellings are the same
+        # option and were once policed differently, which is how a keyed
+        # `relabel=shared` reached the host's resolver files while the colon
+        # `:z` in front of it was refused.
         for option in options:
-            if option in ("Z", "z"):
+            key, separator, value = option.partition("=")
+            if key in ("Z", "z"):
                 raise MountPolicyError(
-                    f"refusing mount '{spec}': ':{option}' relabels the file on the host, which "
+                    f"refusing mount '{spec}': '{option}' relabels the file on the host, which "
                     f"is a change to this machine made by a command whose job is to change "
                     f"nothing here"
                 )
-            if option not in ("ro", "rw"):
+            if key in HOST_MUTATING_MOUNT_KEYS:
                 raise MountPolicyError(
-                    f"refusing mount '{spec}': '{option}' is not a mount option this harness "
-                    f"uses, and an option it does not recognise is one it cannot vouch for"
+                    f"refusing mount '{spec}': '{key}{'=' + value if separator else ''}' "
+                    f"{HOST_MUTATING_MOUNT_KEYS[key]}"
                 )
-        if "ro" in options and "rw" in options:
+            if key not in ALLOWED_MOUNT_KEYS:
+                raise MountPolicyError(
+                    f"refusing mount '{spec}': '{key}' is not a mount option this harness uses, "
+                    f"and an option it does not recognise is one it cannot vouch for"
+                )
+        if self._mount_mode(options) == "both":
             raise MountPolicyError(f"refusing mount '{spec}': it is both read-only and writable")
         if not source.startswith("/"):
             raise MountPolicyError(
@@ -740,7 +848,7 @@ class Podman:
             raise MountPolicyError(
                 f"refusing mount '{spec}': {destination} may only be bound to {want_source}{detail}"
             )
-        effective_mode = "ro" if "ro" in options else "rw"  # podman's default is rw
+        effective_mode = self._mount_mode(options)  # podman's default is rw
         if effective_mode != want_mode:
             wanted = "read-only" if want_mode == "ro" else "writable"
             raise MountPolicyError(

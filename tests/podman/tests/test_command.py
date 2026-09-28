@@ -1258,6 +1258,96 @@ class MountAllowlistTest(PodmanTestCase):
             ["-v", f"{CGROUP}:{CGROUP}:rw", "localhost/img"],
         )
 
+    def test_a_keyed_mount_option_with_a_value_is_still_inspected(self):
+        """A valued `--mount` key was invisible, and three of them change the host.
+
+        `_parse_mount_spec` collected only the keys that had *no* value, because
+        that is how the colon-separated `-v` form spells an option. In the keyed
+        `--mount` form almost every option is `key=value`, so a valued key was
+        dropped before the policy ever saw it -- and measured on the two legal
+        mounts, these were all accepted before this case existed:
+
+        ```text
+        /workspace,ro,relabel=shared          ACCEPTED   <- the --mount spelling of `:z`
+        /workspace,ro,chown=true              ACCEPTED   <- chowns the host's source tree
+        /workspace,ro,U=true                  ACCEPTED   <- the same option, abbreviated
+        /sys/fs/cgroup,rw,bind-propagation=rshared   ACCEPTED   <- propagates to the host
+        ```
+
+        The first is the same host relabelling the guard already refuses as `:Z`
+        and `:z`, reached by the other spelling. The last is worse than a
+        relabel: a *shared* bind mount means a submount the target makes under
+        `/sys/fs/cgroup` propagates back into the host's own cgroup hierarchy, and
+        that is the harness's one writable mount.
+
+        So this is closed by an **allowlist of keys** rather than a denylist of
+        the three above: a key this harness does not recognise is refused, which
+        is the same rule the valueless options already followed and the same
+        design as the capability ceiling -- an option nobody has thought of yet is
+        refused too.
+        """
+        legal = Path(tempfile.mkdtemp(dir=legal_temp_base()))
+        self.addCleanup(shutil.rmtree, legal, True)
+        podman = Podman(executable="/bin/true", source_tree=str(legal))
+        refused = (
+            ("relabel=shared", "relabel"),
+            ("relabel=private", "relabel"),
+            ("chown=true", "chown"),
+            ("U=true", "chown"),
+            ("idmap=true", "idmap"),
+            ("bind-propagation=rshared", "bind-propagation"),
+            ("bind-propagation=shared", "bind-propagation"),
+            ("no-dereference=true", "no-dereference"),
+            ("subpath=src", "subpath"),
+            ("context=system_u:object_r:container_file_t:s0:c1,c2", "context"),
+            ("tmpfs-size=4096", "tmpfs-size"),
+            ("an-option-nobody-has-thought-of=yet", "an-option-nobody-has-thought-of"),
+        )
+        for option, named in refused:
+            for destination, mode in ((WORKSPACE, "ro"), (CGROUP, "rw")):
+                source = str(legal) if destination == WORKSPACE else CGROUP
+                with self.subTest(option=option, destination=destination):
+                    spec = f"type=bind,src={source},dst={destination},{mode},{option}"
+                    with self.assertRaises(MountPolicyError) as caught:
+                        podman.run(["run", "--mount", spec, "localhost/img"])
+                    self.assertIn(named, str(caught.exception))
+
+    def test_a_keyed_mount_option_whose_value_is_a_mode_is_read_as_that_mode(self):
+        """`ro=true` and `rw=false` are read as the mode they name, not ignored.
+
+        The valued form is the common way a later task would write a mount, so
+        dropping the value is not a conservative default: `ro=false` on the
+        workspace would otherwise be invisible and the mount would be judged from
+        the bare keys alone, which is how a writable workspace comes back. So the
+        value is read, both ways -- a false value is the opposite mode, and both
+        are refused for the same reason the bare-keyed form is.
+        """
+        legal = Path(tempfile.mkdtemp(dir=legal_temp_base()))
+        self.addCleanup(shutil.rmtree, legal, True)
+        podman = Podman(executable="/bin/true", source_tree=str(legal))
+        # `ro=false` on the read-only workspace: the mount is writable, refused.
+        with self.assertRaises(MountPolicyError) as caught:
+            podman.run(
+                ["run", "--mount", f"type=bind,src={legal},dst={WORKSPACE},ro=false", "localhost/img"]
+            )
+        self.assertIn("read-only", str(caught.exception))
+        # `rw=false` on the writable cgroup filesystem: the mount is read-only,
+        # and the message says which one it wanted, so the reader knows which
+        # mode to change.
+        with self.assertRaises(MountPolicyError) as caught:
+            podman.run(
+                ["run", "--mount", f"type=bind,src={CGROUP},dst={CGROUP},rw=false", "localhost/img"]
+            )
+        self.assertIn("writable", str(caught.exception))
+        # And the legal valued forms still work, so the reading is not a refusal
+        # of the keyed spelling itself.
+        self.assertEqual(
+            podman.build_argv(
+                ["run", "--mount", f"type=bind,src={legal},dst={WORKSPACE},ro=true", "localhost/img"]
+            )[-4:],
+            ["run", "--mount", f"type=bind,src={legal},dst={WORKSPACE},ro=true", "localhost/img"],
+        )
+
     def test_a_source_tree_at_a_legal_path_is_accepted_and_still_mounted_read_only(self):
         """The parameter stays parameterized; a refusal would end the harness.
 
