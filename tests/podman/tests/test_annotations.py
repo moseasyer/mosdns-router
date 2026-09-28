@@ -106,13 +106,27 @@ class PublicAnnotationTest(unittest.TestCase):
         )
 
     def test_the_check_actually_visits_the_modules_it_names(self):
-        """121 targets across five modules today; a check that visits nothing is green.
+        """A check that visits nothing is green, and that is the failure that counts.
 
-        The number is not the point and must not be held as a floor -- that is the
-        shape of check the previous round removed. The point is that each module
-        contributed *something*, so an import that silently failed cannot turn this
-        case into a no-op: `podman` is imported by name and `run` is loaded from its
-        path, and either can fail without raising.
+        **There is no number here, and there was a wrong one.** The first version of
+        this docstring asserted a target count as a present-tense fact. The measured
+        figure was well below it, and no variant of the rule reached it -- counting
+        module-level callables including privates, ignoring `__all__`, or the
+        snapshot-only rule this grew out of, all give different and smaller numbers.
+        The docstring therefore contradicted the failure message beside it, which
+        interpolates the true count, and a hardcoded count in the docstring of the
+        check whose sibling case exists to remove hardcoded counts is precisely the
+        kind of claim this project keeps being burned by.
+
+        So the number is **deleted rather than corrected**, and the correction is not
+        quoted either -- a figure in prose is a claim that decays silently whatever
+        its value. The assertion below is the instrument, and it says the thing that
+        actually matters -- that each named module contributed targets -- so an import
+        that silently failed cannot turn this case into a no-op. `podman` is imported
+        by name and `run` is loaded from its path, and either can fail without
+        raising.
+
+        If a future reader wants the count, the failure message above prints it.
         """
         import typing
 
