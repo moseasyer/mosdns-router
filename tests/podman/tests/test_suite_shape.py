@@ -53,7 +53,16 @@ fixed number that would. The guard that a fixed number was standing in for --
 names the file that read nothing.
 
 What the equality does hold is the loss that is *silent*: a case that still
-exists in the source and does not run.
+exists in the source and does not run. **In every shape that loss can take** --
+a case nested in a function, and a case defined under a block statement. Both were
+blind spots in the detector rather than in the equality: the equality can only
+compare the sets it is given, so a case in neither set satisfies it. `case_functions`
+therefore descends into function bodies *and* into `if`/`try`/`with`/`for`/`while`
+(and their `else`, `except` and `finally` clauses), and every one of those shapes is
+planted in a case below. The limit that remains is a class nested inside a function or
+a block: it is unreachable too, and `case_functions` does not report it, because a
+class is a *named* scope and inventing a qualifier for it would be worse than the
+gap is likely to be.
 """
 
 import ast
@@ -64,6 +73,21 @@ from pathlib import Path
 from typing import Iterable
 
 TESTS_DIR = Path(__file__).resolve().parent
+
+# Every `ast` node whose `body` holds statements that can contain a `def`. The one
+# that is not in it is a class, and it is not in it on purpose: a case inside a
+# *nested* class is not collected by unittest either, but a class is a named scope
+# and a report can name it, so that shape is the reader's to see rather than this
+# function's to guess at.
+BLOCKS = (
+    ast.If,
+    ast.Try,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+)
 
 
 def case_functions(body, *, nested: bool = False) -> list[tuple[str, int]]:
@@ -83,19 +107,63 @@ def case_functions(body, *, nested: bool = False) -> list[tuple[str, int]]:
     **name of the function it is inside**. That is what makes the report actionable:
     "containerfiles.test_x" says both what is wrong and where, where a bare name
     would send a reader looking for a case that does not exist anywhere.
+
+    **Compound-statement bodies are descended into as well, and that is the same
+    defect reached a different way.** This used to descend into a function body and
+    stop, so a `def test_*` inside an `if`, a `try`, a `with`, a `for`, a `while` --
+    or two of them nested -- was in neither the declared nor the loaded set, the
+    equality was satisfied, and the live check reported the tree clean. A reviewer
+    planted one in a real module and got green. A `def` is a `def`: `unittest` cannot
+    reach it, so the source declares a case that does not run, and the only question
+    is how deeply to look.
+
+    `<block>` is the qualifier for a case that has no enclosing *name* to report.
+    "containerfiles.test_x" points at a function; "`<block>`.test_x" says the case is
+    somewhere under a block and leaves the reader to find it, which is the honest
+    answer -- the alternative is inventing a path that does not exist in the source.
+    The case name and line are in the report either way, and the live check below
+    quotes the line it is on.
     """
     found: list[tuple[str, int]] = []
     for node in body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                found.append((node.name, node.lineno))
+                continue
+            if nested:
+                continue
+            for name, lineno in case_functions(node.body, nested=True):
+                found.append((f"{node.name}.{name}", lineno))
             continue
-        if node.name.startswith("test"):
-            found.append((node.name, node.lineno))
-            continue
-        if nested:
-            continue
-        for name, lineno in case_functions(node.body, nested=True):
-            found.append((f"{node.name}.{name}", lineno))
+        # A `def` under a block has no enclosing name; every block level shares one
+        # qualifier, so the qualifier says "under a block" rather than pretending to
+        # name a scope. A `case` found this way is unreachable either way -- the
+        # qualifier makes it a *difference* against `loaded`, which is what the
+        # equality needs, and it cannot be the name of a collected case.
+        if isinstance(node, BLOCKS):
+            for body in block_bodies(node):
+                for name, lineno in case_functions(body, nested=nested):
+                    found.append((f"<block>.{name}", lineno))
     return found
+
+
+def block_bodies(node) -> list:
+    """Every list of statements a block node can hold a `def` in.
+
+    Not just `node.body`. An `if` has an `orelse`, a `try` has `handlers`, an
+    `orelse` and a `finalbody`, a `for` and a `while` have an `orelse`, and a `def`
+    under any of them is exactly as unreachable as one under the `if`. Walking
+    `body` alone is the version of this that finds six of the seven forms and looks
+    complete -- the `else:` branch is where a case goes when someone writes it to run
+    on the other platform, which is the most likely reason to write one at all.
+    """
+    bodies = [node.body]
+    for attribute in ("orelse", "finalbody"):
+        extra = getattr(node, attribute, None)
+        if extra:
+            bodies.append(extra)
+    bodies += [handler.body for handler in getattr(node, "handlers", None) or []]
+    return bodies
 
 
 def duplicate_case_names(source: str, origin: str) -> list[str]:
@@ -378,11 +446,16 @@ class SuiteShapeTest(unittest.TestCase):
         stopped running, so the *declared - loaded* difference was empty and the
         guard was green.
 
-        Two halves, and the second is the one that would have caught it: the
-        detector **sees** the nested names, and the report **names the function they
-        are inside** -- a bare case name is a name a reader cannot find in the file.
+        Three halves, and the second is the one that would have caught the original:
+        the detector **sees** the nested names, and the report **names the function
+        they are inside** -- a bare case name is a name a reader cannot find in the
+        file. The third is the same loss behind a **compound statement**, which is a
+        different blind spot in the same function and was found by planting one.
         """
         planted = """
+import os
+
+
 def containerfiles(directory=None):
     return sorted(directory.glob("*.Containerfile"))
 
@@ -391,6 +464,37 @@ def containerfiles(directory=None):
 
     def test_another_one_orphaned_with_it(self):
         assert True
+
+
+if os.environ.get("ONLY_WINDOWS"):
+    def test_a_case_orphaned_behind_a_conditional(self):
+        assert True
+else:
+    def test_another_case_behind_the_else(self):
+        assert True
+
+try:
+    def test_a_case_orphaned_behind_a_try(self):
+        assert True
+except ImportError:
+    pass
+
+with open(__file__) as handle:
+    def test_a_case_orphaned_behind_a_with(self):
+        assert True
+
+for _ in range(1):
+    def test_a_case_orphaned_behind_a_loop(self):
+        assert True
+
+while False:
+    def test_a_case_orphaned_behind_a_while(self):
+        assert True
+
+if True:
+    if True:
+        def test_a_case_two_compound_statements_deep(self):
+            assert True
 
 
 class ResolverTest(unittest.TestCase):
@@ -412,6 +516,37 @@ class ResolverTest(unittest.TestCase):
         # and a case in a function come back in the same shape and one is a
         # difference rather than neither.
         self.assertIn("planted.ResolverTest.test_a_real_case", found)
+
+        # **And the same loss behind a compound statement, which is the shape the
+        # function-body branch does not reach.** `case_functions` descended into a
+        # non-`test_*` *function* and stopped there, so a `def test_*` inside an
+        # `if`, a `try`, a `with`, a `for`, a `while` -- or two blocks deep -- was in
+        # neither the declared nor the loaded set and the equality passed on it, and
+        # the live check below reported the tree clean while a reviewer had one
+        # planted in it. Every form is planted, and required by name, so a fix that
+        # descends into `if` but not `try` is a partial fix that looks complete.
+        # The qualifier is repeated once per block, so a case two blocks deep comes
+        # back as `<block>.<block>.test_x` and the report says how far down it is. That
+        # is the first version of the fix that got it right, and it is worth holding
+        # rather than flattening: a flat qualifier would find the case and hide the
+        # depth, and "how deep is the thing nobody can reach" is a question worth
+        # answering for free.
+        for name in (
+            "test_a_case_orphaned_behind_a_conditional",
+            "test_another_case_behind_the_else",
+            "test_a_case_orphaned_behind_a_try",
+            "test_a_case_orphaned_behind_a_with",
+            "test_a_case_orphaned_behind_a_loop",
+            "test_a_case_orphaned_behind_a_while",
+            "<block>.test_a_case_two_compound_statements_deep",
+        ):
+            with self.subTest(case=name):
+                self.assertIn(
+                    f"planted.<block>.{name}", found,
+                    f"a case defined behind a compound statement ({name}) is invisible to the "
+                    "detector, so declared-minus-loaded is empty on the loss and both this "
+                    "case and the equality pass on it",
+                )
 
     def test_the_equality_reports_a_nested_case_as_declared_but_not_loaded(self):
         """The same shape, through the equality the guard actually asserts.
@@ -462,9 +597,19 @@ class RealCases(unittest.TestCase):
                         f"{path.name}:{lineno} {name} is defined inside "
                         f"{owner.name}(), so unittest never collects it"
                     )
+            # And the block-shaped half, walked from the module's own statements: a
+            # `def test_*` under an `if`/`try`/`with`/`for`/`while` is in neither set
+            # and this is the only assertion that would say so.
+            for name, lineno in case_functions(tree.body):
+                if name.startswith("<block>."):
+                    orphans.append(
+                        f"{path.name}:{lineno} {name.split('.', 1)[1]} is defined under a "
+                        "block statement, so unittest never collects it"
+                    )
         self.assertEqual(
             orphans, [],
-            "a case is defined inside a function, where unittest cannot reach it:\n"
+            "a case is defined where unittest cannot reach it -- inside a function, or under "
+            "a block statement -- so the source declares a case that never runs:\n"
             + "\n".join(orphans),
         )
 
