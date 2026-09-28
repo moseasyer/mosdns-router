@@ -26,6 +26,15 @@ that system's resolver are all properties of how a command line is built.
   rootless Podman, which is the acceptance path here. The shape is checked at
   construction, not documented: a bare word is refused.
 
+* **Two binds, and the source tree may be anywhere.** The workspace is
+  ``:ro`` and the cgroup filesystem is the one writable mount, because a
+  systemd container will not start without its cgroup hierarchy. ``/etc``,
+  ``/run``, ``/var`` and ``/sys`` are refused as a *source* everywhere, and
+  ``/home`` is refused as a *mount* -- but a read-only *source-tree* bind under
+  ``/home`` is permitted, because this host's checkout is under ``/home`` and
+  refusing it left no legal ``--source-tree`` at all. See
+  ``FORBIDDEN_SOURCE_TREE_ROOTS`` for the argument.
+
 Nothing in this module installs, enables or starts anything on the host, reads
 the host's resolver, or mutates NetworkManager. The commands it builds are the
 commands a disposable container run needs.
@@ -83,10 +92,53 @@ WORKSPACE_MOUNT_POINT = "/workspace"
 CGROUP_HOST_PATH = "/sys/fs/cgroup"
 CGROUP_MOUNT_POINT = "/sys/fs/cgroup"
 
-# The host roots the plan forbids binding into a target container. The allowlist
-# above is what enforces this; the list is kept because a refusal that names the
-# root it broke is a diagnosis and a refusal that says "refused" is a shrug.
+# The repository the harness lives in, named in a source-tree refusal so the
+# operator has a value to pass rather than only a flag to read about.
+REPO_ROOT = str(Path(__file__).resolve().parents[3])
+
+# The host roots whose *contents* this harness will not put in front of a target
+# container. The allowlist above is what enforces this; the list is kept because
+# a refusal that names the root it broke is a diagnosis and a refusal that says
+# "refused" is a shrug.
+#
+# This set governs every bind, whatever its mode: a mount of any of these is a
+# route to the host's resolver or its systemd state, so it is refused. `Podman`
+# emits exactly two of them (`/sys/fs/cgroup` read-write, and the source tree
+# read-only) and both are reached through the allowlist rather than through
+# this list.
 FORBIDDEN_HOST_ROOTS = ("/etc", "/run", "/var", "/sys", "/home")
+
+# The narrower set that governs the *source tree*, and the reason the two differ
+# is the whole content of this amendment rather than a convenience.
+#
+# `/etc`, `/run`, `/var` and `/sys` hold the host's resolver and its systemd
+# state, so a bind of any of them is how a container comes to influence the
+# host's DNS. That rationale reaches a *writable* bind everywhere and a
+# read-only bind of those four roots, and nothing else.
+#
+# `/home` is in the list above for a different reason: the host-isolation
+# snapshot compares Firefox profile metadata, and a run must not perturb what it
+# compares. That is a rule about what the harness *writes* and what it *reads
+# back*, not about read-only visibility of a checkout — and this host's checkout
+# is under `/home`, so refusing it left no legal value at all for
+# `--source-tree` here and `run.py` could not run from a checkout at all.
+#
+# The security argument, so a later reviewer does not restore the old list: a
+# read-only bind of a directory under `/home` exposes exactly that directory's
+# bytes to a container, and a container that reads source it was given is not a
+# container that changed anything. Nothing a target does to a `:ro` mount
+# reaches the host. The `/home` entry protects the host by governing what the
+# harness *does* — the writable binds, the volumes, the artifacts copied in —
+# and every one of those is refused by the mount allowlist, which compares a
+# mount's source against its own entries and never consults a prefix. Widening
+# the read-only source-tree exemption to `/home` therefore adds no writable
+# path, and the host-isolation snapshot's rules about `/home` and Firefox
+# metadata are unchanged by this: they are enforced where they were, by the
+# snapshot, not by a path allowlist.
+#
+# `FORBIDDEN_HOST_ROOTS` above is deliberately *not* shortened, because that one
+# governs binds generally and the writable case must stay closed there.
+FORBIDDEN_SOURCE_TREE_ROOTS = ("/etc", "/run", "/var", "/sys")
 
 # Flags that would hand a target the host it runs on, and the value each one
 # is refused *with*. `--privileged` is the obvious one and takes no value;
@@ -133,6 +185,19 @@ FORBIDDEN_CONTAINER_FLAG_FAMILIES = (
 # for a target that does not need it. The ceiling is the three measured values
 # rather than a denylist of the dangerous ones, so a capability nobody has
 # thought of yet is refused too.
+#
+# **`--cap-drop` is deliberately outside this ceiling, and the asymmetry is the
+# design, not an oversight** -- so a later task that reaches for `--cap-add`
+# and finds it policed while `--cap-drop` is not is not looking at an
+# inconsistency. The ceiling's subject is *widening* a container's privilege, and
+# only `--cap-add` widens it. `--cap-drop` can only take privilege away, so a
+# guard that policed it would be removed the first time a scenario wanted a
+# narrower container -- and would have bought nothing while it stood, because a
+# drop cannot reach the host. The escape that *would* matter is a drop
+# combined with a wide add, and that is refused on the add side, where the
+# ceiling is (`--cap-drop=ALL --cap-add=ALL` is refused for the `--cap-add`).
+# If a future task finds a way to make a drop reach host state, that is a case
+# to add here -- not an argument for having policed the word.
 ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")
 
 
@@ -201,7 +266,11 @@ NM_UNMANAGED_EXPLANATION = (
 )
 
 
-def _forbidden_root(path: str, exempt_cgroup: bool = True) -> str | None:
+def _forbidden_root(
+    path: str,
+    exempt_cgroup: bool = True,
+    roots: Sequence[str] = FORBIDDEN_HOST_ROOTS,
+) -> str | None:
     """The forbidden host root `path` is inside, if any.
 
     `/sys/fs/cgroup` is inside `/sys`, and it is the measured exception, so a
@@ -210,11 +279,16 @@ def _forbidden_root(path: str, exempt_cgroup: bool = True) -> str | None:
     deciding whether a path may be the source tree passes
     `exempt_cgroup=False`: allowing `/sys/fs/cgroup` as the workspace would
     bind the host's cgroup hierarchy at `/workspace` instead of a checkout.
+
+    `roots` defaults to the full five because that is the set that governs
+    binds, and the source-tree caller passes the narrower four-root set: it is
+    a different question (may this be the read-only workspace) rather than a
+    loosened one.
     """
     if exempt_cgroup and (path == CGROUP_HOST_PATH or path.startswith(CGROUP_HOST_PATH + "/")):
         return None
     resolved = os.path.normpath(path) if path else ""
-    for root in FORBIDDEN_HOST_ROOTS:
+    for root in roots:
         if resolved == root or resolved.startswith(root + "/"):
             return root
     return None
@@ -267,29 +341,51 @@ def _checked_source_tree(source_tree: str | None) -> str | None:
     That is the defect this function exists to close: the parameter must be
     legal, not only the destinations.
 
+    The set consulted is `FORBIDDEN_SOURCE_TREE_ROOTS` -- the four roots that
+    hold the host's resolver and its systemd state -- and not the five that
+    govern binds generally. A checkout under `/home` is therefore accepted and
+    emitted `:ro`, because a read-only bind of a source directory exposes that
+    directory's bytes and nothing a target can change on the host, and because
+    `/home`'s place in the bind list is about what the harness writes and what
+    the host-isolation snapshot compares, neither of which a read-only mount
+    does. The security argument is written out at the constant, so a reviewer
+    inclined to restore the old list has to argue with it.
+
+    Every writable mount stays refused, and that is not this function: a caller
+    asking for `:rw` at `WORKSPACE_MOUNT_POINT` is refused by `_check_mount`,
+    which requires the source to equal the allowlist's own entry *and* the mode
+    to be `ro`. The exemption is for the read-only workspace, not for the path.
+
     Checked after resolution, so `/etc/../etc` and `//etc` are refused too --
     a check on the raw string is defeated by a relative component, and a
     relative component is what an operator types out of habit. `/` is refused
-    explicitly: it is not under any of the five roots in the sense the prefix
-    test uses, and it contains all five.
+    explicitly: it is not under any of the four roots in the sense the prefix
+    test uses, and it contains all four.
     """
     if not source_tree:
         return None
     resolved = str(Path(source_tree).resolve())
+    remedy = (
+        "Point --source-tree at the checkout directory -- e.g. "
+        f"--source-tree /home/$(whoami)/mosdns-router -- or omit it to use this "
+        f"repository ({REPO_ROOT})"
+    )
     if resolved == "/":
         raise MountPolicyError(
             f"refusing source tree {resolved!r}: it is the whole filesystem, which contains "
-            f"every forbidden host root ({', '.join(FORBIDDEN_HOST_ROOTS)}). The source tree is "
-            f"mounted read-only at {WORKSPACE_MOUNT_POINT}, and a mount of '/' would put the "
-            f"host's /etc, /run, /var, /sys and /home there instead of a checkout"
+            f"every forbidden host root ({', '.join(FORBIDDEN_SOURCE_TREE_ROOTS)}) and all of "
+            f"/home. The source tree is mounted read-only at {WORKSPACE_MOUNT_POINT}, and a "
+            f"mount of '/' would put the host's resolver and systemd state there instead of a "
+            f"checkout. {remedy}"
         )
-    root = _forbidden_root(resolved, exempt_cgroup=False)
+    root = _forbidden_root(resolved, exempt_cgroup=False, roots=FORBIDDEN_SOURCE_TREE_ROOTS)
     if root:
         raise MountPolicyError(
-            f"refusing source tree {resolved!r}: it would be bound at {WORKSPACE_MOUNT_POINT} "
-            f"read-only, and it is under the forbidden host root {root}, which this plan does "
-            f"not mount into a target container. Point --source-tree at a checkout outside "
-            f"{', '.join(FORBIDDEN_HOST_ROOTS)}"
+            f"refusing source tree {resolved!r}: it would be bound at "
+            f"{WORKSPACE_MOUNT_POINT} read-only, and it is under {root}, which holds the "
+            f"host's resolver and its systemd state -- the four roots a source tree may not be "
+            f"under are {', '.join(FORBIDDEN_SOURCE_TREE_ROOTS)}. A checkout under /home, or "
+            f"anywhere else, is fine and is still mounted read-only. {remedy}"
         )
     return resolved
 

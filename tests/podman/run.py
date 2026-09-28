@@ -25,9 +25,14 @@ mistaken for an installer bug.
 
 **Nothing here touches this machine's resolver.** The source tree is mounted
 read-only at `/workspace`, the only other mount is the cgroup filesystem, and
-no host `/etc`, `/run`, `/var`, `/sys` or `/home` is bound in. The podman
-executable, the connection URI and the source tree are the harness's whole
-input, and every argument array goes through `lib/podman.py`.
+no host `/etc`, `/run`, `/var` or `/sys` is bound in. The source tree itself
+may live anywhere, including under `/home` -- where this checkout is -- because
+it is bound read-only, and a read-only bind of a source directory exposes that
+directory's bytes and nothing a target can change on the host. What stays
+refused everywhere is a mount that could *influence* the host: a writable bind,
+`--volumes-from`, a device. The podman executable, the connection URI and the
+source tree are the harness's whole input, and every argument array goes
+through `lib/podman.py`.
 
 Exit codes are the interface: 0 all requested tests passed, 1 a test failure,
 2 a harness or configuration error, 3 an incomplete matrix or a skipped
@@ -172,7 +177,9 @@ def _require_podman(podman: Podman) -> None:
         raise PodmanError(
             f"podman was not found at {podman.executable!r}. It is a prerequisite that the "
             f"operator provides: this harness does not install Podman, and it does not need a "
-            f"virtual machine or qemu, because it runs rootless containers on the local host."
+            f"virtual machine or qemu, because it runs rootless containers on the local host. "
+            f"Install Podman with your package manager and re-run; there is nothing this "
+            f"harness can do about a missing binary, and it will not try"
         )
 
 

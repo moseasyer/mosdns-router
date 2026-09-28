@@ -7,10 +7,11 @@ this file is where they are held:
 
 * **The host is not a target.** The source tree is mounted read-only and only at
   ``/workspace``, the one other mount is the cgroup filesystem, and nothing under
-  ``/etc``, ``/run``, ``/var``, ``/sys`` or ``/home`` is ever bound in. These
-  cases read the *mount arguments the wrapper actually emits*, not a list of
-  strings somebody can reorder, and they hold the refusal itself: a validator
-  that cannot fail is not a validator.
+  ``/etc``, ``/run``, ``/var`` or ``/sys`` is ever bound in. The source tree
+  itself may be anywhere, ``/home`` included, because it is bound read-only.
+  These cases read the *mount arguments the wrapper actually emits*, not a list
+  of strings somebody can reorder, and they hold the refusal itself: a
+  validator that cannot fail is not a validator.
 * **There is no virtual machine.** ``podman machine`` needs qemu, this host has
   no qemu and must not get any, and the previous architecture of this plan was
   built on it. The wrapper is the only place that builds a Podman argument
@@ -82,39 +83,72 @@ _spec.loader.exec_module(run)
 # one mount of a forbidden root that is the measured, required exception: the
 # cgroup filesystem, which a systemd container cannot start without.
 FORBIDDEN_HOST_ROOTS = ("/etc", "/run", "/var", "/sys", "/home")
+# The *source tree* is policed by a narrower set, and the difference is the
+# point rather than an inconsistency. `/etc`, `/run`, `/var` and `/sys` hold the
+# host's resolver and its systemd state, so a bind of any of them is a route to
+# the host's DNS and is refused everywhere. `/home` is in the list above for a
+# different reason -- the host-isolation snapshot compares Firefox profile
+# metadata, and a run must not perturb what it compares -- which is a rule about
+# what the harness *writes* and *reads back*, not about read-only visibility of
+# a checkout. A checkout under `/home` bound `:ro` at `/workspace` exposes
+# project source and nothing else, so it is permitted; every writable mount is
+# still refused everywhere, which is the property the exemption is not for.
+FORBIDDEN_SOURCE_TREE_ROOTS = ("/etc", "/run", "/var", "/sys")
 WORKSPACE = "/workspace"
 CGROUP = "/sys/fs/cgroup"
 
 
+def home_source_tree(prefix: str = "mosdns-source-tree-") -> Path:
+    """A temporary directory genuinely under `/home`, for the `/home` cases.
+
+    Built from the operator's own home rather than from `TMPDIR` or from
+    `legal_temp_base()`, because the property under test is the *path* and a
+    fixture that quietly avoided `/home` would not be testing it. `/home` itself
+    is not writable, so the directory is created one level down, in whatever
+    `$HOME` is -- and a host whose home is not under `/home` skips rather than
+    pretending to have tested something.
+    """
+    home = os.path.expanduser("~")
+    if not (home == "/home" or home.startswith("/home/")):
+        raise unittest.SkipTest(f"$HOME is {home!r}, which is not under /home")
+    directory = Path(tempfile.mkdtemp(dir=home, prefix=prefix))
+    assert str(directory).startswith("/home/"), directory
+    return directory
+
+
 def legal_temp_base() -> str:
-    """A directory the mount policy will accept, whatever `TMPDIR` says.
+    """A directory the source-tree policy will accept, whatever `TMPDIR` says.
 
     This suite's stand-in source tree is a temporary directory, and the wrapper
-    refuses a source tree inside a forbidden host root — so the suite's own
-    fixture depends on where `tempfile` puts things. That is not hypothetical:
-    pointing `TMPDIR` at a directory under `/home` (which the Go build on this
-    host requires, because `/tmp` is a small tmpfs) made 220 cases fail with
-    `refusing source tree '/home/…/source'`, every one of them for a reason that
-    had nothing to do with what they test.
+    refuses a source tree inside one of `FORBIDDEN_SOURCE_TREE_ROOTS` — so the
+    suite's own fixture depends on where `tempfile` puts things. That is not
+    hypothetical: the Go build on this host requires `TMPDIR` off `/tmp` (a
+    small tmpfs), which puts it under `/home`, which under the original
+    five-root policy made 220 cases fail with
+    `refusing source tree '/home/…/source'` — every one of them for a reason
+    that had nothing to do with what they test. The two rules collided and the
+    policy was the wrong one, so the policy was amended and this fixture now
+    measures against the amended one.
 
     So the fixture asks for a base that satisfies the policy it is testing, in
     the order a developer would expect: `TMPDIR` if it is usable, then the
-    system default, then the first conventional location that is outside all
-    five roots. The policy is not relaxed to accommodate the test — the strict
-    refusal is correct, and this is the fixture conforming to it.
+    system default, then the first conventional location that is outside every
+    refused root. A `TMPDIR` under `/home` is the first candidate now, and it is
+    a legal one, so the suite builds its fixture where the developer asked.
     """
-    def outside_every_root(candidate: str) -> bool:
+    def outside_every_refused_root(candidate: str) -> bool:
         resolved = os.path.normpath(candidate)
         return not any(
             resolved == root or resolved.startswith(root + "/")
-            for root in FORBIDDEN_HOST_ROOTS
+            for root in FORBIDDEN_SOURCE_TREE_ROOTS
         )
 
     for candidate in (os.environ.get("TMPDIR"), tempfile.gettempdir(), "/tmp", "/opt", "/srv"):
-        if candidate and os.path.isdir(candidate) and outside_every_root(candidate):
+        if candidate and os.path.isdir(candidate) and outside_every_refused_root(candidate):
             return candidate
     raise unittest.SkipTest(
-        "no writable directory outside " + ", ".join(FORBIDDEN_HOST_ROOTS) + " to build a fixture in"
+        "no writable directory outside " + ", ".join(FORBIDDEN_SOURCE_TREE_ROOTS)
+        + " to build a fixture in"
     )
 
 
@@ -1002,10 +1036,14 @@ class MountAllowlistTest(PodmanTestCase):
         `_check_mount` can tell: it compares the source against the
         allowlist's own entry and the two agree.
 
+        The four roots are the ones that hold the host's resolver and systemd
+        state. `/home` is not among them and there is a case for that
+        (`test_a_source_tree_under_home_is_accepted_and_emitted_read_only`).
+
         Every case names the root it broke in the message -- a refusal that
         says "refused" without a path is a shrug.
         """
-        for root in FORBIDDEN_HOST_ROOTS:
+        for root in FORBIDDEN_SOURCE_TREE_ROOTS:
             for path in (root, os.path.join(root, "inside"), os.path.join(root, "a", "b")):
                 with self.subTest(source_tree=path):
                     with self.assertRaises(MountPolicyError) as caught:
@@ -1020,11 +1058,32 @@ class MountAllowlistTest(PodmanTestCase):
         It is also the one a prefix check gets wrong: no forbidden root is a
         prefix of `/` followed by a separator, so `"/" == root` is false and
         `"/".startswith("//")` is false, and a prefix comparison alone lets the
-        whole host through.
+        whole host through. Widening the source-tree allowlist to `/home` does
+        not widen it to `/` -- `/` is refused by its own branch, and this case
+        is what says so.
         """
         with self.assertRaises(MountPolicyError) as caught:
             Podman(executable="/bin/true", source_tree="/")
         self.assertIn("every forbidden host root", str(caught.exception))
+
+    def test_the_source_tree_refusal_names_a_remedy_an_operator_can_act_on(self):
+        """A refusal that does not say what to pass instead is a defect.
+
+        The operator who hit this wrote `--source-tree` to a path that was
+        refused, or inherited the default and was refused by it. In both cases
+        the only useful next action is to point `--source-tree` at the checkout
+        directory, and under the amended policy a checkout under `/home` is a
+        legal answer -- so the message has to name it. A message that said only
+        "not under /home, /etc, /run, /var, /sys" would have been correct and
+        useless once `/home` became legal.
+        """
+        with self.assertRaises(MountPolicyError) as caught:
+            Podman(executable="/bin/true", source_tree="/etc")
+        message = str(caught.exception)
+        self.assertIn("--source-tree", message)
+        self.assertIn("/workspace", message)
+        # A worked example, not just the flag: the remedy is a value to pass.
+        self.assertRegex(message, r"--source-tree\s+\S+")
 
     def test_a_source_tree_that_traverses_out_of_a_forbidden_root_is_refused(self):
         """`..` must not launder a path, and the wrapper resolves before it checks.
@@ -1033,21 +1092,104 @@ class MountAllowlistTest(PodmanTestCase):
         a relative component is a thing an operator types out of habit. Each
         spelling below resolves to a path the case above already refuses.
         """
-        for spelling in ("/etc/../etc", "/home/../home/ubuntu", "//etc", "/etc/"):
+        spellings = [spelling for root in FORBIDDEN_SOURCE_TREE_ROOTS
+                     for spelling in (f"{root}/../{root.lstrip('/')}", f"//{root.lstrip('/')}", f"{root}/")]
+        self.assertEqual(len(spellings), 12)
+        for spelling in spellings:
             with self.subTest(spelling=spelling):
                 with self.assertRaises(MountPolicyError):
                     Podman(executable="/bin/true", source_tree=spelling)
+
+    def test_a_source_tree_that_traverses_into_home_is_accepted(self):
+        """`/home/../home/<user>` is the same `/home` case, and it is legal.
+
+        Held next to the refusal it is the whole amendment in one line: the
+        traversal is still resolved rather than trusted, and what it resolves
+        to is judged against the amended set. A future tightening of the set
+        therefore shows up here as a failure rather than as a silent hole.
+        """
+        podman = Podman(executable="/bin/true", source_tree="/home/../home/ubuntu")
+        self.assertEqual(podman.source_tree, "/home/ubuntu")
+        self.assertEqual(podman.allowed_mounts()[WORKSPACE], ("/home/ubuntu", "ro"))
+
+    def test_a_source_tree_under_home_is_accepted_and_emitted_read_only(self):
+        """A checkout under `/home` is the normal case on this host, not a refusal.
+
+        The rationale for refusing `/etc`, `/run`, `/var` and `/sys` is that
+        they hold the host's resolver and its systemd state: a bind of any of
+        them is how a run reaches the host's DNS. A read-only bind of a source
+        checkout under `/home` does none of that -- it exposes project source
+        and nothing else -- and this host's checkout *is* under `/home`, so
+        refusing it left no legal value at all for `--source-tree` here and
+        `run.py` could not run from a checkout at all.
+
+        So `/home` is permitted for the read-only workspace, and the mount is
+        asserted `:ro` rather than merely accepted: the exemption is for the
+        read-only workspace, and a case that only checked acceptance would not
+        hold the property the exemption is granted on.
+        """
+        # Built under the real `/home` rather than under `legal_temp_base()`,
+        # because the point of the case is the path.
+        legal = home_source_tree()
+        self.addCleanup(shutil.rmtree, legal, True)
+        podman = Podman(executable="/bin/true", source_tree=str(legal))
+        self.assertEqual(podman.source_tree, str(legal))
+        self.assertEqual(
+            podman.allowed_mounts(),
+            {CGROUP: (CGROUP, "rw"), WORKSPACE: (str(legal), "ro")},
+        )
+        self.assertEqual(
+            podman.mount_arguments(),
+            ["-v", f"{CGROUP}:{CGROUP}:rw", "-v", f"{legal}:{WORKSPACE}:ro"],
+        )
+
+    def test_a_source_tree_under_home_is_still_may_not_be_mounted_writable(self):
+        """The exemption is for the read-only workspace, not for the path.
+
+        This is the case that keeps the amendment from being read as "bind the
+        checkout read-write too". A permitted source tree is still only ever
+        emitted `:ro`, and a caller that asks for `:rw` is refused -- including
+        one whose source tree is under `/home`, which is the spelling a later
+        task would reach for if it wrongly concluded the path was what made
+        `:rw` legal.
+        """
+        legal = home_source_tree()
+        self.addCleanup(shutil.rmtree, legal, True)
+        fake = self.fake()
+        podman = Podman(executable=str(fake.path), source_tree=str(legal))
+        with self.assertRaises(MountPolicyError) as caught:
+            podman.run(["run", "-v", f"{legal}:{WORKSPACE}:rw", "localhost/img"])
+        self.assertIn("read-only", str(caught.exception))
+        self.assertEqual(fake.invocations(), [])
+
+    def test_a_foreign_path_under_home_is_still_refused_as_a_mount(self):
+        """`/home` is not a hole in the *mount* policy, only in the source-tree one.
+
+        The mount policy is unchanged: a mount's source must equal the
+        allowlist's own entry, so a path under `/home` that is not the source
+        tree -- the operator's own home, an SSH key directory, a browser
+        profile -- is still refused. Permitting `/home` for the workspace must
+        not have permitted it as an argument.
+        """
+        legal = home_source_tree()
+        self.addCleanup(shutil.rmtree, legal, True)
+        client = Podman(executable="/bin/true", source_tree=str(legal))
+        for foreign in ("/home/ubuntu/.ssh", "/home/ubuntu/.mozilla/firefox", "/home/ubuntu/Documents"):
+            with self.subTest(foreign=foreign):
+                with self.assertRaises(MountPolicyError) as caught:
+                    client.run(["run", "-v", f"{foreign}:{WORKSPACE}:ro", "localhost/img"])
+                self.assertIn(foreign, str(caught.exception))
 
     def test_a_source_tree_at_a_legal_path_is_accepted_and_still_mounted_read_only(self):
         """The parameter stays parameterized; a refusal would end the harness.
 
         The whole point of `--source-tree` is that a checkout is wherever the
-        operator put it. So a path outside all five roots is accepted, the
-        mount is emitted, and it is read-only -- the property the policy exists
-        for, and one a case that only tested refusals would not hold.
+        operator put it. So a path outside the four refused roots is accepted,
+        the mount is emitted, and it is read-only -- the property the policy
+        exists for, and one a case that only tested refusals would not hold.
         """
-        # A base outside all five roots, chosen the same way the fixture's is,
-        # so this case does not depend on where `tempfile` happens to point.
+        # A base outside every refused root, chosen the same way the fixture's
+        # is, so this case does not depend on where `tempfile` points.
         legal = Path(tempfile.mkdtemp(dir=legal_temp_base()))
         self.addCleanup(shutil.rmtree, legal, True)
         podman = Podman(executable="/bin/true", source_tree=str(legal))
@@ -2601,16 +2743,17 @@ class CommandLineTest(PodmanTestCase):
         self.assertEqual(run.GLOBAL_DEFAULTS["source_tree"], str(REPO))
 
     def test_a_source_tree_the_policy_refuses_is_reported_as_such(self):
-        """A forbidden source tree is a refusal with a remedy, not a crash.
+        """A refused source tree is a refusal with a remedy, not a crash.
 
-        On a host whose checkout lives under a forbidden host root -- this one
-        does, under `/home` -- the default is not mountable, and the plan's own
-        global constraint ("do not mount host `/home`") is what forbids it. The
-        harness therefore cannot run from such a checkout, and the only
-        acceptable answer is to say so, name the root, and name the remedy:
-        the operator points `--source-tree` at a checkout outside the five
-        roots. Silently widening the allowlist, or mounting it anyway, would
-        trade a structural property for convenience.
+        `/etc` is a root this policy refuses for a reason that has nothing to do
+        with where a checkout lives -- it is the host's resolver and systemd
+        state -- so `--source-tree /etc` is refused at construction, before
+        podman is asked anything, and the operator is told what to pass instead.
+
+        (This host's own checkout is under `/home`, which the amended policy
+        permits, so the deadlock this case used to describe no longer exists.
+        `/etc` is the case that still holds: a refusal that is about the kind of
+        path, not about where the operator keeps their work.)
         """
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
         code, output = self.invoke(
@@ -2621,25 +2764,31 @@ class CommandLineTest(PodmanTestCase):
         self.assertIn("--source-tree", output)
         self.assertEqual(fake.invocations(), [])
 
-    def test_this_checkout_cannot_be_the_source_tree_on_this_host(self):
-        """Recorded, not asserted away: the constraint has a real consequence.
+    def test_this_checkout_is_the_source_tree_on_this_host(self):
+        """The deadlock, resolved: the default is now a legal parameter here.
 
-        The plan mounts "the source tree" and also forbids mounting host
-        `/home`. Those two are compatible only where the checkout is not under
-        a forbidden root. So the two facts are stated here as a test rather than
-        left as a surprise the first operator hits: if this checkout is inside
-        a forbidden root, the harness refuses to run from it, and the failure
-        mode is a named refusal rather than a host mount.
+        The plan mounts "the source tree" and also forbade mounting host
+        `/home`, and this checkout *is* under `/home` — so the two constraints
+        collided, there was no legal value at all for `--source-tree` on this
+        host, and `run.py` could not run from a checkout at all. That is a
+        collision between two rules that were each individually reasonable, and
+        the rule that gave way is the one whose rationale (resolver and systemd
+        state) does not reach a read-only source bind.
+
+        So the default source tree is asserted to be *accepted* here, and
+        emitted `:ro`. Had this checkout been under one of the four roots that
+        hold resolver state, the case would have to say so instead, so the
+        check is written as both: the default is accepted, and it is not under
+        a refused root.
         """
-        inside = None
-        for root in FORBIDDEN_HOST_ROOTS:
-            if str(REPO) == root or str(REPO).startswith(root + "/"):
-                inside = root
-        if inside is None:
-            self.skipTest(f"this checkout is at {REPO}, outside every forbidden host root")
-        with self.assertRaises(MountPolicyError) as caught:
-            Podman(executable="/bin/true", source_tree=str(REPO))
-        self.assertIn(inside, str(caught.exception))
+        for root in FORBIDDEN_SOURCE_TREE_ROOTS:
+            self.assertFalse(
+                str(REPO) == root or str(REPO).startswith(root + "/"),
+                f"this checkout is at {REPO}, which is under {root} and the policy refuses it",
+            )
+        podman = Podman(executable="/bin/true", source_tree=str(REPO))
+        self.assertEqual(podman.source_tree, str(REPO))
+        self.assertEqual(podman.allowed_mounts()[WORKSPACE], (str(REPO), "ro"))
 
     def test_preflight_reports_the_podman_facts_it_can_read(self):
         fake = self.fake([
