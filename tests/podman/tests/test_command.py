@@ -1299,7 +1299,12 @@ class MountAllowlistTest(PodmanTestCase):
             ("bind-propagation=shared", "bind-propagation"),
             ("no-dereference=true", "no-dereference"),
             ("subpath=src", "subpath"),
-            ("context=system_u:object_r:container_file_t:s0:c1,c2", "context"),
+            # A real SELinux MCS context is `…:s0:c1,c2` and that comma splits
+            # the `--mount` specification into two fields, so the full context
+            # would be refused for an unrelated reason and the key under test
+            # would never be reached. The context is truncated at the MCS pair
+            # deliberately, and the reason is here rather than discovered later.
+            ("context=system_u:object_r:container_file_t:s0", "context"),
             ("tmpfs-size=4096", "tmpfs-size"),
             ("an-option-nobody-has-thought-of=yet", "an-option-nobody-has-thought-of"),
         )

@@ -77,7 +77,6 @@ that does not depend on podman, the table-closure guard, is in
 
 import gzip
 import re
-import shutil
 import subprocess
 import sys
 import unittest
