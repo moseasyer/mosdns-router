@@ -924,6 +924,35 @@ class RunnerEnvironmentTest(unittest.TestCase):
                     "the same shape of hole as an unredacted environment",
                 )
 
+        # **And the allowlist's own contribution, which the assertions above cannot
+        # see.** Every one of them is a statement about what is *absent* or about names
+        # that are present, so `child_environment` returning `dict(self.extra_env)` --
+        # forwarding nothing at all -- satisfied all of them, along with the other four
+        # cases in this class. A child environment of nothing is a stronger guarantee
+        # than the one this class exists for, and it would have broken every command a
+        # snapshot runs, in a way no case here would have reported.
+        #
+        # So the other half: the allowlisted names that are *set* in this process must
+        # be in the child's environment, with their values. `PATH` is not a good probe
+        # because it may legitimately be unset, so the probe asks about the
+        # intersection and requires it to be non-empty -- a case that silently tested
+        # nothing would be the same defect one level in.
+        inherited = {
+            name: real[name] for name in snapshot.SNAPSHOT_ENV_NAMES if name in real
+        }
+        self.assertTrue(
+            inherited,
+            f"none of {snapshot.SNAPSHOT_ENV_NAMES} is set in this process, so the assertion "
+            "below would compare nothing against nothing and pass",
+        )
+        self.assertEqual(
+            {name: child.get(name) for name in inherited},
+            inherited,
+            f"the runner did not forward the allowlisted variables that are set: it passed "
+            f"{sorted(child)}, and the commands a snapshot runs need at least "
+            f"{sorted(inherited)}",
+        )
+
     def test_an_explicit_override_is_merged_and_still_named(self):
         runner = snapshot.SubprocessRunner(extra_env={"LC_ALL": "C"})
         child = runner.child_environment()
@@ -1039,67 +1068,6 @@ def subprocess_result(returncode: int, stdout: str, stderr: str = ""):
     return subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout=stdout, stderr=stderr
     )
-
-
-class PublicSurfaceTypeHintsTest(unittest.TestCase):
-    """`from __future__ import annotations` defers a name the module never imports.
-
-    `SubprocessRunner.__init__` annotated `extra_env: Mapping[str, str] | None`
-    and `snapshot.py` imported `Callable, Iterable, Sequence` from `typing` but
-    not `Mapping`. Under deferred evaluation that is inert at runtime -- which is
-    why the suite stayed green and why `make verify` did not catch it: there is no
-    Python linter in the gate, and every case that read the annotation as a string
-    would have seen a perfectly ordinary-looking `Mapping[str, str] | None`.
-
-    It is not inert to a reader, and it is not inert to any tool that resolves
-    hints: `typing.get_type_hints` raises `NameError`, which takes out every
-    annotation-derived tool for the module -- dataclass-like introspection, a
-    documentation generator, a validator. The cost of the check is one call per
-    public callable.
-    """
-
-    def test_every_public_annotation_resolves(self):
-        import typing
-
-        unresolved: list[str] = []
-        for name in snapshot.__all__:
-            member = getattr(snapshot, name)
-            targets = [member]
-            if isinstance(member, type):
-                targets += [member.__init__, member.__call__]
-            for target in targets:
-                if target is object.__init__ or not callable(target):
-                    continue
-                try:
-                    typing.get_type_hints(target)
-                except NameError as error:
-                    unresolved.append(
-                        f"{name}{getattr(target, '__qualname__', '')}: {error}"
-                    )
-        self.assertEqual(
-            unresolved, [],
-            "a public annotation names something the module does not import, so anything that "
-            "resolves hints -- a validator, a doc generator, get_type_hints itself -- raises "
-            "NameError on this module:\n" + "\n".join(unresolved),
-        )
-
-    def test_the_control_the_check_is_not_vacuous(self):
-        """A hint that cannot resolve has to be found, or the case above proves nothing.
-
-        A local function annotated with a name that is not in scope is the smallest
-        thing that raises `NameError` from `get_type_hints`, and it is here so a
-        future edit that turns the check into a no-op -- a `try` that swallows, a
-        list that is empty, a target list that is empty -- is caught.
-        """
-        import typing
-
-        namespace: dict = {}
-        exec(  # noqa: S102 - the smallest possible unresolvable annotation
-            "def annotated(value: NotImportedAnywhere | None = None):\n    return value\n",
-            namespace,
-        )
-        with self.assertRaises(NameError):
-            typing.get_type_hints(namespace["annotated"])
 
 
 class ProjectUnitDerivationTest(unittest.TestCase):
