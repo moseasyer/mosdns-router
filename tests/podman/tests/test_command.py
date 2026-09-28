@@ -623,6 +623,51 @@ class ConnectionFlagTest(PodmanTestCase):
             ],
         )
 
+    def test_a_machine_name_is_refused_rather_than_documented(self):
+        """A bare word is how a machine is spelled, so the shape is checked.
+
+        `podman --connection podman-machine-default` is a valid invocation, and
+        this harness's whole architecture is that there is no machine. Before
+        this case the rule was a sentence in the plan and a sentence in the
+        module docstring, which is the same class of thing as the `machine`
+        subcommand guard was before it was a guard: a comment where a refusal
+        belongs. Podman also resolves a bare name through `connections.conf`, a
+        shared configuration file, so even a name that is not a machine points
+        at a second piece of state on this machine.
+        """
+        for spelling in (
+            "podman-machine-default",
+            "arm64",
+            "local",
+            "./some/socket",
+            "podman-machine-default:",
+            "SSH://builder@arm64.example/run/podman/podman.sock",
+        ):
+            with self.subTest(connection=spelling):
+                with self.assertRaises(PodmanError) as caught:
+                    Podman(executable="/bin/true", connection=spelling)
+                message = str(caught.exception)
+                self.assertIn("service URI", message)
+                self.assertIn("machine", message)
+
+    def test_every_service_uri_scheme_the_plan_names_is_accepted(self):
+        """The refusal is on the shape, so the shapes the plan names must pass."""
+        for uri in (
+            "ssh://builder@arm64.example/run/user/1000/podman/podman.sock",
+            "unix:///run/podman/podman.sock",
+            "tcp://arm64.example:1234",
+        ):
+            with self.subTest(connection=uri):
+                self.assertEqual(Podman(executable="/bin/true", connection=uri).connection, uri)
+
+    def test_no_connection_is_the_local_rootless_podman(self):
+        """Omitted, or empty, is the acceptance path -- and stays legal."""
+        for absent in (None, ""):
+            with self.subTest(connection=absent):
+                podman = Podman(executable="/bin/true", connection=absent)
+                self.assertIsNone(podman.connection)
+                self.assertEqual(podman.build_argv(["version"]), ["/bin/true", "version"])
+
 
 class SubprocessSafetyTest(PodmanTestCase):
     """Argument arrays, check=True, timeouts, captured streams, redacted env.
@@ -2260,6 +2305,12 @@ class CommandLineTest(PodmanTestCase):
         is the service URI the operator supplied, on every invocation, with
         nothing written to a configuration file that other podman users on this
         machine would inherit.
+
+        And the refusal, through the entry point rather than through the
+        wrapper: a machine name on this command line is exit 2 with the reason
+        named, and no podman process is started at all. A preflight that echoed
+        a machine name back and carried on would be the one place an operator
+        learns this harness has a machine in it.
         """
         uri = "ssh://builder@arm64.example/run/podman/podman.sock"
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
@@ -2268,6 +2319,20 @@ class CommandLineTest(PodmanTestCase):
         self.assertTrue(fake.invocations())
         for argv in fake.invocations():
             self.assertEqual(argv[:2], ["--connection", uri])
+
+        # Its own directory, so its log is its own: `FakePodmanBinary` appends
+        # to one file beside itself, and a refusal that shares a log with the
+        # run above would be asserting about the run above.
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        refused = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}], directory=directory)
+        code, output = self.invoke(
+            self.base(refused, "--connection", "podman-machine-default", "preflight")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("podman-machine-default", output)
+        self.assertIn("machine", output)
+        self.assertEqual(refused.invocations(), [])
 
     def test_matrix_with_no_scenarios_is_incomplete_and_exits_three(self):
         """Task 1 registers no scenario, so the honest answer is incomplete.
