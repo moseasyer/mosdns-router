@@ -1708,8 +1708,19 @@ class ContainerPolicyTest(PodmanTestCase):
     The guard is spelling-independent, the way the mount guard already is: pflag
     accepts `--flag value` as well as `--flag=value`, and `run_container` emits
     `--network <net>` before `extra_args`, so a later occurrence of a repeated
-    flag is the one podman reads. The sweep below is the table, forty-eight cases,
-    and every one of them must be refused before the binary is started.
+    flag is the one podman reads. The sweep below is the table, **fifty** cases
+    -- the same number the table's own docstring states and the assertion in it
+    enforces -- and every one of them must be refused before the binary is
+    started.
+
+    **The policed surface is eleven names, not the seven in the value-keyed
+    table.** `--device`, `--security-opt`, `--volumes-from` and `--cap-add` are
+    policed by the same guard through the other two mechanisms, and a case that
+    derived its coverage from one table would have covered seven -- which is
+    exactly what happened to the vocabulary sweeps in `test_podman_flags.py`
+    until Fix Round 3. `POLICED_CONTAINER_FLAGS` is the union, it is derived
+    once, and `test_policed_container_flags_covers_every_name_the_guard_refuses`
+    holds it to this guard's own body.
     """
 
     def refused(self, extra_args):
@@ -1731,6 +1742,12 @@ class ContainerPolicyTest(PodmanTestCase):
         on a spelling, which is the defect this table exists to close. It is
         written in the same shape as the mount sweep: a table of cases, each
         one refusing, so a family added to the policy has to be added here too.
+
+        Fifty is what the table holds and what the assertion enforces; this
+        docstring and the class docstring above both said forty-eight while the
+        assertion said fifty, which is the same drift as a coverage claim and a
+        coverage implementation coming apart -- a reader had two numbers to
+        choose between and no way to tell which one the run had produced.
         """
         self.assertEqual(len(FORBIDDEN_EXTRA_ARGS), 50)
         for extra_args, named in FORBIDDEN_EXTRA_ARGS:
