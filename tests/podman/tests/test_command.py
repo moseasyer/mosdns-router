@@ -35,6 +35,9 @@ the subprocess boundary itself is exercised -- and never against this host's
 Podman. Nothing in this file starts, stops or inspects anything real.
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -63,6 +66,13 @@ from podman import (  # noqa: E402
     new_run_id,
     podman_session,
 )
+from report import ScenarioResult  # noqa: E402
+
+# `run.py` is a script rather than an installed module, and it is loaded by
+# path so that this file's own name cannot collide with it.
+_spec = importlib.util.spec_from_file_location("mosdns_podman_run", REPO / "tests" / "podman" / "run.py")
+run = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(run)
 
 # The five host roots the plan forbids binding into a target container, and the
 # one mount of a forbidden root that is the measured, required exception: the
@@ -132,11 +142,20 @@ It records the argument array it was given, answers from a scripted table, and
 exits with the scripted status. It is a real process so that the production
 runner -- the one boundary a substituted runner cannot test -- is exercised for
 real in every case in this file.
+
+The table, the log and the state live beside the executable rather than in the
+environment, so a case that points the harness at this binary needs nothing
+plumbed through the wrapper's environment allowlist.
 """
 import json
 import os
 import sys
 import time
+
+HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+LOG = os.path.join(HERE, "invocations.jsonl")
+TABLE = os.path.join(HERE, "table.json")
+STATE = os.path.join(HERE, "state.json")
 
 
 def contains(argv, match):
@@ -151,19 +170,15 @@ def contains(argv, match):
 
 def main():
     argv = sys.argv[1:]
-    log = os.environ.get("FAKE_PODMAN_LOG")
-    if log:
-        with open(log, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(argv) + "\\n")
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(argv) + "\\n")
     answer = {"returncode": 0, "stdout": "", "stderr": ""}
-    table = os.environ.get("FAKE_PODMAN_TABLE")
-    state_path = os.environ.get("FAKE_PODMAN_STATE")
     state = {}
-    if state_path and os.path.exists(state_path):
-        with open(state_path, encoding="utf-8") as handle:
+    if os.path.exists(STATE):
+        with open(STATE, encoding="utf-8") as handle:
             state = json.load(handle)
-    if table:
-        with open(table, encoding="utf-8") as handle:
+    if os.path.exists(TABLE):
+        with open(TABLE, encoding="utf-8") as handle:
             for index, rule in enumerate(json.load(handle).get("rules", [])):
                 if not contains(argv, rule["match"]):
                     continue
@@ -175,9 +190,8 @@ def main():
                     seen = state.get(str(index), 0)
                     answer = answers[min(seen, len(answers) - 1)]
                     state[str(index)] = seen + 1
-                    if state_path:
-                        with open(state_path, "w", encoding="utf-8") as handle:
-                            json.dump(state, handle)
+                    with open(STATE, "w", encoding="utf-8") as handle:
+                        json.dump(state, handle)
                 else:
                     answer = rule
                 break
@@ -244,13 +258,6 @@ class FakePodmanBinary:
         ordered = list(rules) + [dict(rule) for rule in self.DEFAULT_RULES]
         self.table.write_text(json.dumps({"rules": ordered}), encoding="utf-8")
 
-    def extra_env(self):
-        return {
-            "FAKE_PODMAN_LOG": str(self.log),
-            "FAKE_PODMAN_TABLE": str(self.table),
-            "FAKE_PODMAN_STATE": str(self.state),
-        }
-
     def invocations(self):
         """Every argument array the fake was called with, in order."""
         if not self.log.exists():
@@ -283,12 +290,12 @@ class PodmanTestCase(unittest.TestCase):
         return FakePodmanBinary(self.directory, rules)
 
     def client(self, fake, **kwargs):
-        extra_env = dict(fake.extra_env())
-        extra_env.update(kwargs.pop("extra_env", {}))
+        # Nothing is plumbed through the environment: the fake finds its own
+        # table beside itself, so the wrapper's allowlist is exercised exactly
+        # as a real run would exercise it.
         return Podman(
             executable=str(fake.path),
             source_tree=str(self.source_tree),
-            extra_env=extra_env,
             **kwargs,
         )
 
@@ -626,10 +633,7 @@ class SubprocessSafetyTest(PodmanTestCase):
             sorted(podman.forwarded_env_names()),
             sorted(FORWARDED_ENV_NAMES),
         )
-        # The fake's own plumbing is not forwarded by the wrapper; it is passed
-        # explicitly by the case that installed the fake.
-        unexpected = set(child_env) - set(FORWARDED_ENV_NAMES) - set(fake.extra_env())
-        self.assertEqual(unexpected, set())
+        self.assertEqual(set(child_env) - set(FORWARDED_ENV_NAMES), set())
 
     def test_an_explicitly_supplied_variable_is_the_only_other_way_in(self):
         fake = self.fake([{"match": ["version"], "dump_env": True}])
@@ -1433,6 +1437,397 @@ class RunNamingTest(PodmanTestCase):
         """Three versions run at once and a name has to say which it is."""
         run = RunResources(self.client(self.fake()), "20260928T101010Z")
         self.assertEqual(run.container_name("target", "26.04"), "mosdns-20260928T101010Z-target-26.04")
+
+
+class RunTargetTest(PodmanTestCase):
+    """A target's device is checked before a scenario runs, not after.
+
+    This is the wiring the ruling is really about. The check exists and is
+    tested, but a check nothing calls is a comment with a subprocess in it, so
+    the runner calls it between starting the target and running the first
+    scenario -- and these cases hold that order.
+    """
+
+    def scenario_results(self, fake, nmcli="yes\n"):
+        """Run one target with two scenarios and return the runner's result."""
+        fake.write_table([
+            {"match": ["nmcli"], "stdout": nmcli},
+            {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
+        ])
+        podman = self.client(fake)
+        ran: list[str] = []
+
+        def first():
+            ran.append("first")
+            return ScenarioResult(name="first", status="passed", log="logs/first.log")
+
+        def second():
+            ran.append("second")
+            return ScenarioResult(name="second", status="passed", log="logs/second.log")
+
+        result = run.run_target(
+            podman,
+            run_id="20260928T101010Z",
+            arch="amd64",
+            version="24.04",
+            image="localhost/mosdns-target:24.04",
+            scenarios=[("first", first), ("second", second)],
+        )
+        return result, ran
+
+    def test_a_managed_device_runs_every_scenario_in_order(self):
+        fake = self.fake()
+        result, ran = self.scenario_results(fake)
+        self.assertEqual(ran, ["first", "second"])
+        self.assertEqual(result.status, "passed")
+        self.assertEqual([s.name for s in result.scenarios], ["first", "second"])
+        self.assertEqual(result.version, "24.04")
+        self.assertEqual(result.arch, "amd64")
+
+    def test_an_unmanaged_device_stops_the_version_before_any_scenario_runs(self):
+        """The ordering, held: no scenario may run against a target NM ignores.
+
+        Every DNS assertion in a scenario would fail at once, for a reason that
+        has nothing to do with the package, and the resulting report would name
+        the installer.
+        """
+        fake = self.fake()
+        result, ran = self.scenario_results(fake, nmcli="no\n")
+        self.assertEqual(ran, [])
+        self.assertEqual(result.status, "incomplete")
+        self.assertEqual(result.scenarios, ())
+        self.assertIn("nmcli device set eth0 managed yes", result.detail)
+        self.assertIn("systemctl restart NetworkManager", result.detail)
+
+    def test_a_device_query_that_fails_stops_the_version_the_same_way(self):
+        fake = self.fake()
+        fake.write_table([
+            {"match": ["nmcli"], "returncode": 1, "stderr": "Error: unknown device 'eth0'.\n"},
+            {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
+        ])
+        podman = self.client(fake)
+        ran: list[str] = []
+        result = run.run_target(
+            podman,
+            run_id="20260928T101010Z",
+            arch="amd64",
+            version="24.04",
+            image="localhost/mosdns-target:24.04",
+            scenarios=[("first", lambda: ran.append("first"))],
+        )
+        self.assertEqual(ran, [])
+        self.assertIn("unknown device 'eth0'", result.detail)
+
+    def test_the_target_runs_on_a_bridge_network_with_the_measured_subnet(self):
+        """A tun/tap device would fail the check, and the check is not optional.
+
+        So the network the target is put on is the plan's fixed netavark bridge
+        rather than Podman's default, and that is asserted here because it is
+        the precondition the check depends on.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        self.scenario_results(fake)
+        created = [argv for argv in fake.invocations() if argv[:2] == ["network", "create"]]
+        self.assertEqual(created, [["network", "create", "--subnet", "10.89.0.0/24", "mosdns-20260928T101010Z-testnet"]])
+
+    def test_the_target_is_named_for_this_run_and_this_version(self):
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        self.scenario_results(fake)
+        started = [argv for argv in fake.invocations() if argv[:2] == ["run", "-d"]]
+        self.assertEqual(started[0][3], "mosdns-20260928T101010Z-target-24.04")
+
+    def test_a_scenario_that_raises_is_recorded_and_the_run_is_still_torn_down(self):
+        """A failing scenario is a result; a leaking run is not a result.
+
+        So the exception becomes a `failed` entry carrying its message, the
+        remaining scenarios for that version do not run against a target in a
+        known-bad state, and the teardown happens anyway.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        podman = self.client(fake)
+        ran: list[str] = []
+
+        def boom():
+            raise AssertionError("the installer's postinst exited 1")
+
+        def later():
+            ran.append("later")
+
+        result = run.run_target(
+            podman,
+            run_id="20260928T101010Z",
+            arch="amd64",
+            version="24.04",
+            image="localhost/mosdns-target:24.04",
+            scenarios=[("install", boom), ("routing", later)],
+        )
+        self.assertEqual(ran, [])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.scenarios[0].status, "failed")
+        self.assertIn("postinst exited 1", result.scenarios[0].detail)
+        self.assertIn(["rm", "-f", "mosdns-20260928T101010Z-target-24.04"], fake.invocations())
+        self.assertIn(["network", "rm", "mosdns-20260928T101010Z-testnet"], fake.invocations())
+
+    def test_a_version_with_no_scenarios_is_not_a_pass(self):
+        """Nothing ran, so nothing was proved.
+
+        The plan's rule is that a requirement which was not closed is recorded
+        and never counted as satisfied, and a version with an empty scenario
+        list is the shape that rule exists for.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        result = run.run_target(
+            self.client(fake),
+            run_id="20260928T101010Z",
+            arch="amd64",
+            version="24.04",
+            image="localhost/mosdns-target:24.04",
+            scenarios=[],
+        )
+        self.assertEqual(result.status, "incomplete")
+
+
+class CommandLineTest(PodmanTestCase):
+    """The exit codes are the interface a release gate reads.
+
+    0 all requested tests passed, 1 a test failure, 2 a harness or
+    configuration error, 3 an incomplete matrix or a skipped required
+    architecture. They are exercised through the real entry point rather than
+    through the report's properties alone, because the number a Make target
+    sees comes from `main` and not from the object it was derived on.
+    """
+
+    def invoke(self, argv):
+        """Run the entry point and return (exit code, everything it printed)."""
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+            code = run.main(argv)
+        return code, printed.getvalue()
+
+    def base(self, fake, *extra):
+        return ["--podman", str(fake.path), "--source-tree", str(self.source_tree), *extra]
+
+    def test_preflight_reports_a_missing_podman_and_installs_nothing(self):
+        """A preflight that installed Podman would break the host boundary.
+
+        Podman is a prerequisite the operator provides; the plan says the
+        harness never installs it, and a missing binary is reported rather than
+        solved.
+        """
+        code, output = self.invoke(
+            ["--podman", str(self.directory / "no-such-podman"), "preflight"]
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("not found", output)
+        self.assertIn("does not install", output)
+
+    def test_preflight_reports_the_podman_facts_it_can_read(self):
+        fake = self.fake([
+            {"match": ["version"], "stdout": "5.7.0\n"},
+            {"match": ["info"], "stdout": "overlay\n"},
+        ])
+        code, output = self.invoke(self.base(fake, "preflight"))
+        self.assertEqual(code, run.EXIT_OK)
+        self.assertIn("5.7.0", output)
+        self.assertIn("overlay", output)
+
+    def test_preflight_states_the_networkmanager_fact_it_depends_on(self):
+        """The first line, because it is the fact the whole plan turns on.
+
+        A preflight that reported a version and a store and then said nothing
+        about the device would let an operator conclude the harness is ready
+        when the thing it cannot do is the thing that matters.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(self.base(fake, "preflight"))
+        first = output.splitlines()[0]
+        self.assertIn("NetworkManager", first)
+        self.assertIn("eth0", first)
+
+    def test_preflight_says_it_cannot_check_the_device_here_rather_than_assuming_it(self):
+        """The plan's rule: a preflight that cannot check must say so.
+
+        Claiming the device would come up managed is the false claim the
+        previous plan's SKIPPED list was built on, and it is the one thing this
+        harness must not assert without a running target to ask.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(self.base(fake, "preflight"))
+        self.assertIn("cannot be checked", output)
+        self.assertIn("no target image is built yet", output)
+
+    def test_preflight_runs_no_command_that_changes_anything(self):
+        """A preflight is a read, and a read that mutates is not one.
+
+        It runs `version` and `info` and nothing else, so a preflight on a
+        machine with no Podman permission changes no Podman state either.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        self.invoke(self.base(fake, "preflight"))
+        for argv in fake.invocations():
+            self.assertIn(argv[0], ("version", "info"), f"preflight ran {argv!r}")
+
+    def test_preflight_names_the_local_rootless_podman_it_defaults_to(self):
+        """No `--connection` is the acceptance path, and the output says so."""
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(self.base(fake, "preflight"))
+        self.assertIn("local rootless", output)
+
+    def test_a_connection_reaches_every_command_as_a_service_uri(self):
+        """The connection is an argument, and it is a URI rather than a name.
+
+        A name would be a machine, and there is no machine. What reaches podman
+        is the service URI the operator supplied, on every invocation, with
+        nothing written to a configuration file that other podman users on this
+        machine would inherit.
+        """
+        uri = "ssh://builder@arm64.example/run/podman/podman.sock"
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(self.base(fake, "--connection", uri, "preflight"))
+        self.assertIn("service URI", output)
+        self.assertTrue(fake.invocations())
+        for argv in fake.invocations():
+            self.assertEqual(argv[:2], ["--connection", uri])
+
+    def test_matrix_with_no_scenarios_is_incomplete_and_exits_three(self):
+        """Task 1 registers no scenario, so the honest answer is incomplete.
+
+        Not zero, and not one: nothing failed and nothing was proved, and the
+        exit code is how a caller tells those apart.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "matrix", "--arch", "amd64", "--versions", "22.04,24.04,26.04")
+        )
+        self.assertEqual(code, run.EXIT_INCOMPLETE)
+        self.assertIn("incomplete", output)
+
+    def test_matrix_records_every_version_it_was_asked_for(self):
+        """A version that was requested and not reported is worse than a failure."""
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        results = self.directory / "results"
+        self.invoke(
+            self.base(fake, "--results-dir", str(results),
+                      "matrix", "--arch", "amd64", "--versions", "22.04,24.04,26.04")
+        )
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        self.assertEqual([r["version"] for r in document["results"]], ["22.04", "24.04", "26.04"])
+        self.assertEqual(document["status"], "incomplete")
+        self.assertEqual(document["arch"], "amd64")
+        self.assertEqual(document["harness_error"], None)
+
+    def test_matrix_writes_its_report_under_the_run_id_directory(self):
+        """A run's result is one directory, so two runs do not overwrite each other."""
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        results = self.directory / "results"
+        self.invoke(
+            self.base(fake, "--results-dir", str(results), "--run-id", "20260928T101010Z",
+                      "matrix", "--arch", "amd64", "--versions", "24.04")
+        )
+        self.assertTrue((results / "20260928T101010Z" / "report.json").is_file())
+
+    def test_matrix_creates_nothing_and_starts_nothing(self):
+        """With no scenario and no image, a matrix run must not touch Podman.
+
+        This case is what makes it safe to wire the command into a target later
+        without discovering that it was already mutating this machine.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "matrix", "--arch", "amd64", "--versions", "24.04")
+        )
+        for argv in fake.invocations():
+            self.assertNotIn(argv[0], ("run", "rm", "stop", "create", "cp"), f"matrix ran {argv!r}")
+
+    def test_a_missing_podman_makes_every_subcommand_a_harness_error(self):
+        """One place decides, so `preflight`, `matrix` and `cleanup` cannot disagree."""
+        for argv in (
+            ["preflight"],
+            ["matrix", "--arch", "amd64", "--versions", "24.04"],
+            ["cleanup"],
+        ):
+            with self.subTest(argv=argv):
+                code, _ = self.invoke(["--podman", str(self.directory / "no-such-podman"), *argv])
+                self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+
+    def test_cleanup_removes_a_leftover_run_and_exits_zero(self):
+        """`run.py cleanup` is the documented recovery after a killed run."""
+        fake = self.fake([
+            {"match": ["ps", "-a"], "answers": [
+                {"stdout": "mosdns-20260928T101010Z-target-24.04\n"},
+                {"stdout": ""},
+            ]},
+        ])
+        code, output = self.invoke(self.base(fake, "cleanup", "--run-id", "20260928T101010Z"))
+        self.assertEqual(code, run.EXIT_OK)
+        self.assertIn(["rm", "-f", "mosdns-20260928T101010Z-target-24.04"], fake.invocations())
+
+    def test_cleanup_with_nothing_to_remove_is_zero(self):
+        fake = self.fake()
+        code, _ = self.invoke(self.base(fake, "cleanup"))
+        self.assertEqual(code, run.EXIT_OK)
+
+    def test_cleanup_that_leaves_something_behind_is_a_harness_error(self):
+        """The harness could not do the job it was asked to do.
+
+        Exit 2 rather than 1 or 3: no test failed, and the matrix is not
+        incomplete -- the machine is dirty, and that is neither of those.
+        """
+        fake = self.fake([
+            {"match": ["rm", "-f"], "returncode": 125, "stderr": "device busy\n"},
+            {"match": ["ps", "-a"], "stdout": "mosdns-20260928T101010Z-target-24.04\n"},
+        ])
+        code, output = self.invoke(self.base(fake, "cleanup", "--run-id", "20260928T101010Z"))
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("mosdns-20260928T101010Z-target-24.04", output)
+
+    def test_cleanup_without_a_run_id_sweeps_the_whole_harness_namespace(self):
+        """The Make target calls it with no arguments, so it has to be useful.
+
+        Scoped to the harness's own prefix: a sweep that matched "mosdns"
+        loosely would remove resources it did not create.
+        """
+        fake = self.fake([
+            {"match": ["ps", "-a"], "answers": [
+                {"stdout": "mosdns-20260928T101010Z-target-24.04\nmosdns-20260928T101011Z-target-26.04\n"},
+                {"stdout": ""},
+            ]},
+        ])
+        code, _ = self.invoke(self.base(fake, "cleanup"))
+        self.assertEqual(code, run.EXIT_OK)
+        removed = [argv[-1] for argv in fake.invocations() if argv[:2] == ["rm", "-f"]]
+        self.assertEqual(
+            removed,
+            ["mosdns-20260928T101010Z-target-24.04", "mosdns-20260928T101011Z-target-26.04"],
+        )
+        self.assertNotIn("unrelated-container", removed)
+
+    def test_an_unknown_subcommand_is_a_harness_error(self):
+        code, _ = self.invoke(["install-everything"])
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+
+    def test_no_subcommand_runs_a_machine_subcommand(self):
+        """The sweep, through the entry point rather than through the wrapper.
+
+        Every subcommand was run against the fake and every recorded argument
+        array is inspected. A grep of the tree would pass the day a second code
+        path built its own command line; the wrapper is the only place that
+        builds one, and this is where its callers are exercised.
+        """
+        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        results = self.directory / "results"
+        for argv in (
+            self.base(fake, "preflight"),
+            self.base(fake, "--results-dir", str(results), "matrix", "--arch", "amd64", "--versions", "24.04"),
+            self.base(fake, "cleanup", "--run-id", "20260928T101010Z"),
+        ):
+            with self.subTest(argv=argv):
+                self.invoke(argv)
+        self.assertTrue(fake.invocations())
+        for recorded in fake.invocations():
+            self.assertNotIn("machine", recorded, f"a machine subcommand was emitted: {recorded!r}")
 
 
 if __name__ == "__main__":
