@@ -51,16 +51,42 @@ ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl health-check
 # package, and a second one in the health command would be a second answer to the
 # same question.
 #
-# It takes no root, reads no file, changes nothing, and opens one UDP socket to
-# loopback for at most two seconds -- so it runs here, as this unit's unprivileged
-# identity, inside the same sandbox as the health check above it.
+# WHAT IT READS, and why that answer is a CHANGE. It takes a root and reads the two
+# documents that decide whether its own answer means anything:
+# /etc/mosdns/policy.yaml, and the operator's /etc/mosdns/force-ech-domains.txt.
+# Those two reads are the reason the two force-ECH predicates are in it: when the
+# policy asks for strict ECH and the operator's list forces it for the probe name,
+# the router answers for that name ITSELF, so a resolved answer from 127.0.0.1:53 is
+# evidence of nothing and the verb FAILS rather than reporting a healthy machine.
+# Before those predicates the command read nothing at all, and the version of this
+# comment that said so was TRUE then and false the moment they were added. That
+# change was recorded in the verb's own docstring and this file was not updated with
+# it, which is the class of drift a test is the only real answer to: the check below
+# holds this file to the two documents it now names and to the absence of the
+# sentence it no longer earns, so neither half can go stale quietly again.
 #
-# WHAT A FAILED UNIT MEANS is not this package's decision. A unit that runs
-# `emergency-rollback` on a timer would mutate a machine's DNS unattended, at two
-# minutes' notice, with nobody watching; whether that should happen is an open
-# question for the operator who owns this machine, and it is recorded as open. What
-# an operator does today: this unit failing is the signal, and
-# `sudo mosdns-cdnctl emergency-rollback` is the action.
+# It changes nothing and issues no command. It opens one UDP socket to a loopback
+# address and waits two seconds, as this unit's unprivileged identity, inside the
+# same sandbox as the health check above it.
+#
+# WHAT A FAILED UNIT MEANS IS NOT ALWAYS THE SAME, and the difference is the
+# expensive one. A unit that runs `emergency-rollback` on a timer would mutate a
+# machine's DNS unattended, at two minutes' notice, with nobody watching; whether
+# that should happen is an open question for the operator who owns this machine, and
+# it is recorded as open. What an operator does today: this unit failing is the
+# signal, and `sudo mosdns-cdnctl emergency-rollback` is the action.
+#
+# THE ONE FAILURE THAT IS NOT THAT SIGNAL. The second command can fail for a reason
+# that has nothing to do with the router: the forced-ECH blind spot above, where it
+# refuses to give a verdict at all. Its own message says so -- THIS IS NOT A SIGN
+# THE ROUTER IS DOWN, nothing was probed and nothing was changed -- and so does
+# this, because the sentence above is the one an operator acts on. Reading the unit
+# as the signal and rolling back on that failure means undoing a working
+# installation over a line in a text file. The fix is a line: remove the probe name
+# from /etc/mosdns/force-ech-domains.txt, or accept that nothing on this machine can
+# prove the local resolver is answering. The `NOT A SIGN` wording is what the
+# installer's own message uses, and the test holds this file to the same string so
+# the two cannot drift apart.
 #
 # It is LAST so the CDN verdict is recorded in the health document before the
 # machine's own verdict is given -- a check that publishes its measurement and is

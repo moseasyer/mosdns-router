@@ -510,6 +510,27 @@ def one_directive(sections, section, key):
     return values[0]
 
 
+def unit_comments(name):
+    """Every comment line of one shipped unit, as ONE space-joined string.
+
+    A unit file is half prose, and the prose is what a reader -- and a reviewer --
+    reasons about when the directives are not enough. So a claim made in a comment is
+    a claim this suite can hold, and this reader is what makes that possible.
+
+    Space-joined rather than line-joined, and the reason is a rewrap: a claim that
+    happens to straddle a line break is the same claim, and a reader that reported the
+    file's line breaks would make every assertion about it a test of where somebody
+    pressed return. Empty comment lines are dropped, so the `#` on its own that
+    separates paragraphs does not become a run of spaces inside a phrase.
+    """
+    lines = [
+        line[1:].strip()
+        for line in unit_text(name).splitlines()
+        if line.lstrip().startswith("#")
+    ]
+    return " ".join(line for line in lines if line)
+
+
 def duration_seconds(value):
     """A systemd duration in seconds, for the two spellings this package uses.
 
@@ -970,6 +991,64 @@ class UnitTextTests(unittest.TestCase):
         )
         self.assertEqual(command.returncode, 2, "the installer no longer refuses a usage error")
         self.assertIn("verify-local", command.stderr, "the verb the health unit runs is not there")
+
+    def test_the_health_unit_says_what_its_second_command_now_reads(self):
+        """The unit's own header was corrected in the round that gave `verify-local` the
+        two force-ECH predicates; the verb's `main` docstring was corrected and the
+        unit's comment was not.
+
+        It said "It takes no root, reads no file, changes nothing", which became false
+        the moment the verb was given `_forced_ech_domains(root)` and
+        `_ech_may_answer_locally(root)`: it reads `/etc/mosdns/policy.yaml` and the
+        operator's `/etc/mosdns/force-ech-domains.txt` through the root, which is
+        what lets a test point it at a fake root. A unit file that says a command
+        reads nothing is read by whoever has to reason about its sandbox, and the
+        sandbox here is `ProtectSystem=strict` with no `ReadOnlyPaths` for /etc --
+        so the claim is the kind that makes a reader stop looking.
+
+        Held as a claim to be true rather than as a phrase to be present: the test
+        asserts the unit does NOT carry the old claim, and that it says what it reads
+        instead. A comment nobody checks is a comment a later edit deletes.
+        """
+        comments = unit_comments(HEALTH)
+        for stale in ("reads no file", "takes no root"):
+            with self.subTest(claim=stale):
+                self.assertNotIn(
+                    stale, comments,
+                    f"the health unit still says its second command {stale}, which stopped being "
+                    "true when verify-local was given the two force-ECH predicates and began "
+                    "reading the policy and the operator's force-ECH list through the root",
+                )
+        for said in (FORCE_ECH, POLICY):
+            with self.subTest(says=said):
+                self.assertIn(
+                    said, comments,
+                    f"the health unit does not name {said}, which the command it runs reads, so "
+                    "a reader reasoning about this unit's sandbox has to find that out elsewhere",
+                )
+
+    def test_the_health_unit_says_that_one_of_its_two_failure_modes_is_not_the_signal(self):
+        """The unit header still presented "this unit failing is the signal" with nothing
+        about the case where it is not one.
+
+        `verify-local` FAILS -- rather than warns -- when the operator's force-ECH list
+        makes the router answer the probe name itself, because then a resolved answer
+        from `127.0.0.1:53` is evidence of nothing. That is a real failure of this
+        unit and it is NOT a sign the router is down, and the health unit failing is
+        the signal an operator is told to act on with `emergency-rollback`. A machine
+        that was working perfectly would be rolled back over a line in a text file.
+        The verb's own message says so in as many words; the unit did not.
+        """
+        comments = unit_comments(HEALTH)
+        self.assertIn("this unit failing is the signal", comments)
+        self.assertIn(
+            "NOT A SIGN THE ROUTER IS DOWN", comments,
+            "the health unit says a failing unit is the signal and nothing about the one case "
+            "in which it is not one, so the sentence is false exactly where it is most costly",
+        )
+        # And the not-a-signal case names the entry, because the fix is a line in a
+        # file and an operator who is not told which file cannot act on it.
+        self.assertIn(FORCE_ECH, comments)
 
     def test_the_router_retry_burst_is_reachable_so_a_missing_prerequisite_ends_in_a_failed_unit(self):
         # The router's comment justifies `Restart=on-failure` by claiming the start

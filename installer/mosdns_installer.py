@@ -2889,15 +2889,28 @@ def _carried_forward(root: Path, document: dict) -> dict:
     recorded_uuid = str(recorded["connection"]["uuid"])
     fresh_uuid = str(document["connection"]["uuid"])
     if recorded_uuid != fresh_uuid:
+        # The advice this arm used to give was unachievable in the state it routes to,
+        # and the reason is the interaction with `_never_applied`. It said "remove this
+        # package (which restores … through the record that is already there) and
+        # install it again". But a record PRESENT with no marker -- which is where
+        # the marker-less retry lands, and the state Finding B exists for -- is
+        # exactly where `uninstall` REFUSES with exit 5, and `prerm` turns a
+        # non-zero uninstall into a dpkg abort. So the operator was told to run a
+        # command that could not succeed, and `dpkg --force-remove-reinstreq` -- the
+        # escape hatch the sibling refusal above already offers -- is the same way
+        # out of both. Offered here for the same reason and with the same wording, so
+        # an operator who has read one refusal has read the other's remedy.
         raise InstallRefused(
             f"{BACKUP_PATH} records what connection {recorded_uuid} was set to, and this install "
             f"is working on connection {fresh_uuid}; one record cannot describe two connections, "
             "and replacing the first would leave it pointed at the loopback address with nothing to "
             "put back. Nothing on this machine's DNS configuration has been changed; the DHCP lease "
             "this run published under /run/mosdns before it got here is this package's own state "
-            "and says nothing about the connection. Remove this package (which restores "
-            f"{recorded_uuid} through the record that is already there) and install it again to "
-            f"work on {fresh_uuid}"
+            "and says nothing about the connection. Put the connection back on the machine's own "
+            f"resolvers, then remove this package with `dpkg --force-remove-reinstreq` -- the "
+            f"forced removal is what makes {recorded_uuid} restorable through the record that is "
+            "already there, because a plain removal is refused while this record is present and "
+            f"the marker is not, and then install again to work on {fresh_uuid}"
         )
     carried = dict(recorded)
     for field in VOLATILE_BACKUP_FIELDS:
@@ -3088,17 +3101,41 @@ def _start(
     **Not running before** -- `start`, and a stop is registered, because this run
     is what made it run.
 
-    **Running before** -- `try-restart`, and a RESTART is registered as the undo,
-    because it was already running and the only way to put a unit back the way it
-    was found is to have it running again. `try-restart` rather than `start`
-    because `start` on an active unit is a no-op: this is the ordinary path of an
-    UPGRADE, where dpkg has just unpacked a new binary and a new generated
-    `/etc/mosdns/mosdns.yaml` over a machine that is already running the old
-    ones. Starting nothing would leave every check that follows -- the two waits,
-    the barrier, the device's verification, the exit-0 message about ports 53 and
-    15353 -- describing the processes that were there before the upgrade, and the
-    caller would be told it verified this release. The wait the caller does next
-    is what makes the restart observable rather than merely issued.
+    **Running before** -- `try-restart` for the forward action, and a `start` is
+    registered as the undo, because it was already running and the only way to put
+    a unit back the way it was found is to have it running again. `try-restart`
+    rather than `start` for the FORWARD action because `start` on an active unit
+    is a no-op: this is the ordinary path of an UPGRADE, where dpkg has just
+    unpacked a new binary and a new generated `/etc/mosdns/mosdns.yaml` over a
+    machine that is already running the old ones. Starting nothing would leave
+    every check that follows -- the two waits, the barrier, the device's
+    verification, the exit-0 message about ports 53 and 15353 -- describing the
+    processes that were there before the upgrade, and the caller would be told it
+    verified this release. The wait the caller does next is what makes the restart
+    observable rather than merely issued.
+
+    WHY THE UNDO IS `start` AND NOT `try-restart`. The two words are both correct,
+    in different places, and the asymmetry between them is the whole trap.
+
+    `systemctl --help` says of it: "try-restart UNIT... Restart one or more units
+    **if active**." On a unit that is not running it does NOTHING and exits ZERO.
+    Every state a failed restart leaves -- `failed`, `activating`, `inactive` -- is
+    outside the set it acts on. An undo that was another `try-restart` would
+    therefore have been a silent no-op returning success in exactly the case it
+    was written for: the forward `try-restart` stops the unit, its start fails, the
+    unit is down, and the undo looks at a stopped unit and does nothing. The
+    rollback would record no failure, `recovery` would be `None`, and the install
+    would exit 3 -- "every change this run made has been rolled back, and ...
+    nothing else is different about this machine" -- on a machine already pointed
+    at `127.0.0.1` with nothing listening on it. That is the sentence an operator
+    reads and then stops reading.
+
+    `start` is a no-op that SUCCEEDS when the unit is already running, a real
+    start when it is not, and a FAILURE when the unit cannot be brought up, and
+    the last of those is the only thing that can route this machine to exit 4 and
+    the `MAY HAVE NO RESOLVER` line. `restart` is the other correct word; `start`
+    is chosen over it because `restart` stops a unit that is already up, so an
+    undo built from it can take away the very resolver it is repairing.
 
     **State unreadable** -- `start` only, never `try-restart`, and no stop, and
     the transaction is told. `try-restart` STOPS the unit first, and the only
@@ -3121,11 +3158,12 @@ def _start(
     same shape, as `_reconnect`'s; the two are now the only two places in the
     transaction where the undo is registered first.
 
-    The price is recorded rather than hidden: a `try-restart` that fails twice --
-    the attempt and the rollback's own -- is a rollback FAILURE (exit 4), because
-    on that machine the unit really is down and no undo in this program can put
-    it back. :func:`_failed` says so in those words and names `emergency-rollback`
-    as the action, and the decision is recorded in the fix report.
+    The price is recorded rather than hidden: a restart that fails twice -- the
+    attempt and the rollback's own -- is a rollback FAILURE (exit 4), because on
+    that machine the unit really is down and no undo in this program can put it
+    back. :func:`_failed` says so in those words and names `emergency-rollback` as
+    the action, and the decision is recorded in the fix report. What the rollback
+    can no longer do is report a unit restored that it never started.
 
     Nothing about the FIRST case is asymmetric in the same way, and it is worth
     being explicit about why, because the two look identical in the command list.
@@ -3135,17 +3173,18 @@ def _start(
     """
     uncertain = unit in unreadable
     if states[unit][UNIT_ACTIVE] and not uncertain:
-        # Registered BEFORE the attempt, for the reason in the docstring. The
-        # undo is the same command because putting a running unit back the way it
-        # was IS restarting it, and it is idempotent in the way that matters: a
-        # rollback reaches the same state whether the restart succeeded or failed.
+        # Registered BEFORE the attempt, for the reason in the docstring. The undo
+        # is `start` and NOT the `try-restart` this case issues, and the docstring
+        # above says why in full: `try-restart` does nothing at all, and exits
+        # zero, on a unit that is not running -- which is the state a failed
+        # `try-restart` leaves behind.
         transaction.apply_unit(
             f"restarting {unit}, which was already running",
             lambda unit=unit: _checked(
                 runner,
-                ("systemctl", "try-restart", unit),
-                f"restarting {unit} again, because it was already running before this run and a "
-                "restart that failed may have left it down",
+                ("systemctl", "start", unit),
+                f"putting {unit} back, because it was already running before this run and the "
+                "restart that took it down may have left it stopped",
             ),
             unit,
             was_running=True,
@@ -3558,12 +3597,16 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
         ``systemctl stop`` finishes it.
 
     And the one arm that is not a housekeeping matter. A unit that was ALREADY
-    running when this run began is restarted, not started, and its undo is another
-    restart; a restart that fails twice leaves it DOWN, on a machine whose
-    connection this run may already have pointed at the loopback. That is not "a
-    unit is still running" and telling an operator to ``systemctl stop`` a resolver
-    that is already stopped would be the wrong instruction twice over. So it gets
-    its own sentence: the machine may have NO RESOLVER, and the action is
+    running when this run began is RESTARTED, not started, and its undo is a
+    ``start`` rather than another restart -- ``try-restart`` does nothing at all to
+    a unit that is not running, so a restart whose undo was another restart could
+    never have brought one back. An undo that fails leaves that unit DOWN, on a
+    machine whose connection this run may already have pointed at the loopback.
+    That is not "a unit is still running" and telling an operator to
+    ``systemctl stop`` a resolver that is already stopped would be the wrong
+    instruction twice over. So it gets its own sentence: the machine may have NO
+    RESOLVER, the first thing to try is named PER UNIT because a message that exists
+    to be pasted cannot carry a conjunction inside a command, and the action is
     ``emergency-rollback`` -- the one condition in this program where pointing at
     it matters most, because there is no unit left to start and no profile value
     left to write.
@@ -3585,7 +3628,7 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
     unit_failures = [failure for failure in failures if failure.group == Transaction.UNITS]
     # The two halves of the unit group, and they are opposites. `stop` is the undo
     # of a start, so a start whose stop did not run leaves a unit this program
-    # STARTED running. A restart's undo is a restart, so a restart whose undo did
+    # STARTED running. A restart's undo is a `start`, so a restart whose undo did
     # not run leaves a unit that was ALREADY running down. The second is the
     # dangerous one and it is a different sentence with a different action.
     stuck = sorted({failure.unit for failure in unit_failures if failure.unit and not failure.was_running})
@@ -3604,10 +3647,22 @@ def _failed(transaction: Transaction, report: Preflight, notes: List[str], error
             f"and the rollback could not put {pronoun} back up: this run RESTARTED {pronoun} rather "
             f"than starting {pronoun}, because the unit{'s' if plural else ''} "
             f"{'were' if plural else 'was'} already serving, and a restart that fails STOPS the "
-            f"unit first -- so there may now be nothing at all listening on {LOCAL_DNS}. `systemctl "
-            f"restart {subject}` is the first thing to try, and `sudo {CDNCTL} emergency-rollback` "
-            f"puts the recorded DNS settings back from {BACKUP_PATH} whether or not the unit comes "
-            "up"
+            f"unit first -- so there may now be nothing at all listening on {LOCAL_DNS}. "
+            # ONE COMMAND PER UNIT, and this is the reason the plural branch cannot
+            # reuse the singular's. `systemctl restart A and B` is not a command: an
+            # operator who pastes it gets a "unit A and B not found", and this whole
+            # sentence exists to be pasted. `systemctl restart` does take several
+            # units, so a single command naming both would work -- but only by
+            # accident of which verb, and the moment somebody changes the verb to
+            # one that does not the message becomes a lie that reads as a command.
+            # One command per unit is right for every verb, and it is also the shape
+            # an operator can run one of and see what happened.
+            + " ".join(f"`systemctl restart {unit}`" for unit in down)
+            + (" is" if len(down) == 1 else " are")
+            + " the first thing to try, and "
+            f"`sudo {CDNCTL} emergency-rollback` "
+            f"puts the recorded DNS settings back from {BACKUP_PATH} whether or not the unit"
+            f"{'s' if plural else ''} come{'s' if not plural else ''} up"
         )
     if len(stuck) == 1:
         steps.append(

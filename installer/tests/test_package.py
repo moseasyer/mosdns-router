@@ -797,6 +797,201 @@ def sandboxed_postinst_step(number, published, source_pair, text=None):
     return root, variables, completed
 
 
+def postinst_transaction_tail(text=None):
+    """`postinst` from its STEP 4 header to its last line, as the script's own text.
+
+    Cut at the header rather than at a line count, for the reason
+    `postinst_step_body` gives. Everything from the transaction onwards is
+    included, and that is the whole point: the status capture, the arms, the
+    `exit 1` a refusal ends on, the timer enable and the final `exit 0` are ONE
+    control-flow unit, and a harness that cut between any two of them is the
+    reason a `fi` in the wrong place went unseen -- the three substring tests this
+    replaced each asserted something true of a script that failed on every
+    install.
+    """
+    text = text if text is not None else POSTINST.read_text()
+    header = re.compile(r"^#\s*-{2,}\s*STEP\s+4\b", re.MULTILINE)
+    found = header.search(text)
+    if found is None:
+        raise AssertionError(
+            "postinst has no STEP 4 header, so its transaction cannot be cut out of it"
+        )
+    return text[found.start():]
+
+
+# The phase of the machine `postinst`'s own `set -e` is in. A maintainer script
+# has one, and whether a bare failing command ends the run is a property of the
+# script rather than of the shell that started it, so the harness below copies the
+# script's own line instead of assuming one.
+POSTINST_SET_OPTION = "set -e"
+
+# Where the tail asks whether systemd is running. Rewritten into the throwaway
+# tree by `postinst_transaction_run`, so the answer is the tree's and not the
+# build host's: a test that read this host's real answer would pass here and fail
+# on a machine without systemd, which is the machine-dependency the boundary
+# forbids.
+SYSTEMD_RUNTIME_DIRECTORY = "/run/systemd/system"
+
+
+def postinst_transaction_run(status, second_argument=None, systemd_running=True, text=None):
+    """Run `postinst`'s own transaction, its arms and its timer enable, and look.
+
+    Returns ``(completed, calls)``: the script's own ``CompletedProcess``, and the
+    argument arrays the `systemctl` shim was given.
+
+    WHAT IS SUBSTITUTED, and why each substitution is the one that cannot hide the
+    defect this exists to catch:
+
+    * ``$INSTALLER`` -- the only substitution that matters, and it is also what
+      makes the run safe. The real installer takes a machine's DNS over and
+      `NO-HOST-MUTATION.md` forbids running it on this host, so the stub is a
+      three-line `sh` program that prints its argument array and exits with the
+      status the test names. Its path comes from the script's OWN assignment
+      through `shell_assignments`, so a renamed variable fails the harness instead
+      of leaving it substituting nothing.
+    * ``/run/systemd/system`` -- the two `[ -d … ]` guards, rewritten to a
+      directory in the throwaway tree whose presence the test chooses.
+    * ``systemctl`` -- a `PATH` shim that appends its argument array to a log and
+      exits zero. The shim is first on `PATH`, so the host's systemd is not
+      reachable from the generated script and `daemon-reload` is a line in a file.
+    * the ``set`` option -- the script's own line, found rather than assumed.
+
+    WHAT IS NOT SUBSTITUTED: the status capture, the arms, every `exit`, the
+    `[ -d … ]` tests themselves, the ``${2:-}`` upgrade test and the timer's own
+    argument array. Those are the script's lines, cut out of the file on disk, and
+    the exit status and the messages this returns are the ones `dpkg` would see.
+    """
+    text = text if text is not None else POSTINST.read_text()
+    tail = postinst_transaction_tail(text)
+    variables = shell_assignments(text)
+    if "INSTALLER" not in variables:
+        raise AssertionError(
+            "postinst does not assign INSTALLER, so this run could not put a stub where the "
+            "transaction calls the installer"
+        )
+    if POSTINST_SET_OPTION not in text.splitlines():
+        raise AssertionError(
+            f"postinst has no {POSTINST_SET_OPTION!r} line, so the harness cannot know which "
+            "phase of the machine it is running the control flow in"
+        )
+    set_option = next(
+        line for line in text.splitlines() if line.strip() == POSTINST_SET_OPTION
+    )
+
+    root = Path(scratch_directory("mosdns-postinst-transaction."))
+    # The stub installer, in the throwaway tree and reachable only through the
+    # header below. It is never the real program and the real program's path is
+    # not on any PATH this harness builds.
+    stub = root / "installer-stub"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "# A stand-in for the installer. It changes nothing and exits with the status the\n"
+        "# test names, because what is under test is which arm postinst PRINTS for that\n"
+        "# status -- not whether an install can be performed on this machine, which the\n"
+        "# boundary in NO-HOST-MUTATION.md forbids here.\n"
+        'printf "stub-installer: %s\\n" "$*" >&2\n'
+        f"exit {int(status)}\n"
+    )
+    stub.chmod(0o755)
+
+    log = root / "systemctl.log"
+    shim = root / "shim"
+    shim.mkdir(parents=True, exist_ok=True)
+    systemctl = shim / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        "# A stand-in for systemctl that records its argument array and changes nothing.\n"
+        "# It is first on PATH, so the build host's systemd cannot be reached from the\n"
+        "# generated script: `daemon-reload` and `enable` are lines in a file.\n"
+        f'printf "%s\\n" "$*" >> {log}\n'
+        "exit 0\n"
+    )
+    systemctl.chmod(0o755)
+
+    runtime = root / "run-systemd-system"
+    runtime.mkdir(parents=True, exist_ok=True)
+    if not systemd_running:
+        runtime.rmdir()
+
+    # The two guards, and nothing else. Every other line is the script's own.
+    body = tail.replace(SYSTEMD_RUNTIME_DIRECTORY, str(runtime))
+    script = root / "postinst-tail.sh"
+    script.write_text(
+        set_option
+        + "\nINSTALLER="
+        + str(stub)
+        + "\n"
+        + body
+        + "\n"
+    )
+    environment = dict(os.environ)
+    environment["PATH"] = f"{shim}{os.pathsep}{environment.get('PATH', '')}"
+    completed = subprocess.run(
+        # dpkg's own two arguments: `postinst configure` and, on an upgrade, the
+        # version that was configured before. The `${2:-}` arm depends on them.
+        ["sh", str(script), "configure"] + ([second_argument] if second_argument else []),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    calls = [
+        line.split()
+        for line in log.read_text().splitlines()
+    ] if log.exists() else []
+    return completed, calls
+
+
+def postinst_status_arms(text=None):
+    """``{status: body}`` for `postinst`'s arms on the installer's exit status.
+
+    A `case` on an exit status, read with `numeric_case_arms` -- the reader built
+    for exactly that shape, which is why it refuses a word label. This is what
+    lets a test ask "does the arm for the installer's own EXIT_REFUSED stop calling
+    it unknown" as a question about a BODY rather than about a paragraph.
+
+    After the fix the arms live inside the `else` of `if "$INSTALLER" install`,
+    which is `prerm`'s shape and the only one in which a successful run cannot
+    reach them. `numeric_case_arms` does not care where they are, so neither does
+    this.
+    """
+    text = text if text is not None else POSTINST.read_text()
+    return numeric_case_arms(postinst_transaction_tail(text))
+
+
+def capture_closed_early(text):
+    """`postinst` with the `fi` that closed the status capture moved above the arms.
+
+    This is the Critical, manufactured, and it is manufactured by moving ONE line:
+    a `fi` immediately after `install_status=$?` and the removal of the `fi` that
+    closed the transaction. Everything else is the shipped script, and the result is
+    the shape `88bc2af` shipped -- a capture whose variable is unset on a successful
+    run, `${install_status:-1}` reading as 1, and an unconditional `exit 1` below.
+
+    It exists because the three substring checks that were in place instead were all
+    TRUE of that script: they asserted that `install_status=$?` was present, that
+    `if "$INSTALLER" install` was present, and that the status-4 body mentioned a
+    missing resolver, and none of those can see a `fi` in the wrong place. A control
+    that moved a line the checks never read would not have shown that, and one that
+    rewrote the whole tail would be a second implementation of the check.
+    """
+    lines = text.splitlines(keepends=True)
+    capture = next(
+        index for index, line in enumerate(lines) if line.strip() == "install_status=$?"
+    )
+    # The `fi` that closes the transaction is the LAST one at column zero after the
+    # capture; the two above it are the `[ -d /run/systemd/system ]` guard's and, for
+    # the arm on the installer's status 3, a nested `if [ -n "${2:-}" ]` -- which is
+    # indented, and is one of the reasons a reader that matched a stripped `fi` was
+    # reading a nested block and calling it the transaction.
+    closing = max(
+        index for index, line in enumerate(lines)
+        if index > capture and line.rstrip() == "fi"
+    )
+    mutated = lines[: capture + 1] + ["fi\n"] + lines[capture + 1 : closing] + lines[closing + 1 :]
+    return "".join(mutated)
+
+
 def unpinned_pair(list_body, commit="0000000000000000000000000000000000000000"):
     """A self-consistent China list and lock of an operator's own re-pin.
 
@@ -1435,16 +1630,23 @@ def timer_position_findings(text):
             "install leaves three enabled root timers behind while the failure message "
             "says nothing is enabled"
         )
-    # The failure arm: everything between the `if !` that guards the transaction and
+    # The failure arm: everything between the `if` that guards the transaction and
     # the `fi` that closes it. An enable in there is the same defect with an extra
-    # step of indirection.
+    # step of indirection. The closing `fi` has to be the one at COLUMN ZERO, and
+    # matching an indented one is a reader that cannot tell a nested `if` from the
+    # `if` it is nested in -- which the arm for the installer's status 3 now is,
+    # because that arm asks `[ -n "${2:-}" ]` of the upgrade argument.
     lines = text.splitlines()
     start = next(
         (number for number, line in enumerate(lines) if '"$INSTALLER" install' in line), None
     )
     if start is not None:
         closing = next(
-            (number for number in range(start + 1, len(lines)) if lines[number].strip() == "fi"),
+            (
+                number
+                for number in range(start + 1, len(lines))
+                if lines[number].rstrip() == "fi"
+            ),
             None,
         )
         if closing is not None:
@@ -2559,11 +2761,6 @@ class MaintainerScriptTests(_Staged):
         their resolver is fine on the one machine where it may not exist.
         """
         text = POSTINST.read_text()
-        self.assertIn("install_status=$?", text, "postinst no longer captures the installer's status")
-        body = text.split('-eq 4', 1)[1].split("elif", 1)[0]
-        self.assertIn("no resolver", body.lower())
-        self.assertIn("emergency-rollback", body)
-        self.assertIn("do not assume", body.lower())
         self.assertNotIn(
             "whatever was enabled and running is still",
             text,
@@ -2574,19 +2771,178 @@ class MaintainerScriptTests(_Staged):
         # installs, because that distinction is real; only the promise is gone.
         self.assertIn("configured before", text)
         self.assertIn("the transaction is the authority on that", text)
-        # And the rolled-back arm does not claim that nothing at all changed, because
-        # the transaction publishes a DHCP lease generation before it refuses.
-        rolled_back = text.split("-eq 3", 1)[1].split("else", 1)[0]
         self.assertNotIn("so nothing has been changed", text)
-        self.assertIn("DHCP lease generation", rolled_back)
+        # And the message each arm is about, read from the arm rather than from the
+        # paragraph, so a rewrap cannot make this pass. `postinst_transaction_run`
+        # below is the real gate; these two assertions are here because they say
+        # WHAT each arm has to say, and the run only says WHICH arm was reached.
+        arms = postinst_status_arms(text)
+        self.assertIn("no resolver", arms["4"].lower())
+        self.assertIn("emergency-rollback", arms["4"])
+        self.assertIn("do not assume", arms["4"].lower())
+        self.assertIn("DHCP lease generation", arms["3"])
+
+    def test_postinst_succeeds_on_a_successful_install_and_reaches_the_timer_enable(self):
+        """The install transaction SUCCEEDS and `postinst` exits 1, and STEP 5 -- the
+        `systemctl enable` of the three timers -- is dead code.
+
+        Both are one misplaced `fi`. `install_status` is captured in the `else` of
+        `if "$INSTALLER" install`, and the `fi` that closed the capture was moved
+        above the arms, so on a SUCCESSFUL run the variable was never assigned, the
+        `${install_status:-1}` default made every test read as 1, the default arm
+        printed "the install transaction exited 1, which is not a status this script
+        knows", and the script reached the `exit 1` unconditionally.
+
+        So `apt install mosdns-router` ran the whole transaction to success -- DNS
+        taken over, marker written, daemons enabled and started -- and then dpkg
+        recorded the package unpacked-but-unconfigured and told the operator the
+        transaction had exited 1, which it had not. The three timers were never
+        enabled on any install. `prerm` gets the same capture right, which is where
+        the shape came from.
+
+        This is behavioural on purpose. The three substring checks this replaced --
+        `install_status=$?` is present, `if "$INSTALLER" install` is present, the
+        status-4 body mentions "no resolver" -- were ALL TRUE of the broken script,
+        and a substring cannot see a `fi` in the wrong place, so the suite reported
+        green over a script that failed every configure. What it runs is the
+        script's own lines from its STEP 4 header to its last, against a stub
+        installer that changes nothing, and it reads the script's own exit status.
+        """
+        completed, calls = postinst_transaction_run(0)
+        self.assertEqual(
+            completed.returncode, 0,
+            "postinst exits non-zero on a SUCCESSFUL install, so dpkg records the package "
+            "unconfigured and the operator is told the transaction exited 1, which it did "
+            f"not. The messages it printed were:\n{completed.stderr}",
+        )
+        enabled = [call for call in calls if call[:1] == ["enable"]]
+        self.assertEqual(
+            [call for call in enabled for call in call[1:] if call.endswith(".timer")],
+            ["mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer", "mosdns-list-check.timer"],
+            "a successful install did not reach STEP 5, or reached it with a different set of "
+            f"timers. Every systemctl call it made was: {calls}",
+        )
+        # A successful install has nothing to try again, so the advice that follows a
+        # refusal is not printed on it.
+        self.assertNotIn("dpkg --configure mosdns-router", completed.stderr)
+        self.assertNotIn("which is not a status", completed.stderr)
+
+    def test_every_installers_status_reaches_its_own_arm_and_a_refusal_exits_non_zero(self):
+        """One arm per status, the arm that status actually names, and a non-zero exit.
+
+        A `fi` in the wrong place is invisible to a grep and visible to a run, so
+        this runs the script. Each status gets its own assertion and its own message
+        rather than one loop assertion, because a loop that failed would say which
+        loop.
+        """
+        # One marker per arm, each inside a SINGLE `echo` line. A marker that spans
+        # a wrap would make this test a test of where the file's text was broken,
+        # which is a property a rewrap changes and nothing else.
+        expectations = {
+            1: (
+                "refused this machine before it changed",
+                "the installer's own EXIT_REFUSED, and the one this script sees most often",
+            ),
+            3: ("refused this machine and rolled back", "a transaction that rolled back"),
+            4: ("did not finish AND its rollback did not", "a rollback that did not finish"),
+            5: ("the installer's OWNERSHIP", "the ownership refusal"),
+            6: ("RESTORE-INCOMPLETE", "a restore that did not finish"),
+            42: ("exited 42, which is not a", "a status nothing else claims"),
+        }
+        every_marker = [markers[0] for markers in expectations.values()]
+        for status, (marker, why) in expectations.items():
+            with self.subTest(status=status, why=why):
+                completed, calls = postinst_transaction_run(status)
+                self.assertNotEqual(
+                    completed.returncode, 0,
+                    f"postinst exits 0 on a transaction that exited {status} ({why}), so dpkg "
+                    "records a failed installation as configured",
+                )
+                others = [name for name in every_marker if name != marker]
+                self.assertIn(
+                    marker, completed.stderr,
+                    f"the installer's {status} reached the wrong arm, or no arm:\n"
+                    f"{completed.stderr}",
+                )
+                for other in others:
+                    self.assertFalse(
+                        other in completed.stderr,
+                        f"the installer's {status} was described by another status's arm, "
+                        "which tells the operator a different machine than the one they are on",
+                    )
+                # And it is not described as a status it did not exit. A capture that
+                # loses the status makes every run land in the default arm saying 1,
+                # which is how the Critical reported itself as a green suite. The
+                # boundary is a word boundary, so `exited 4` does not match
+                # `exited 42`.
+                for other_status in expectations:
+                    if other_status == status:
+                        continue
+                    self.assertIsNone(
+                        re.search(rf"exited {other_status}\b", completed.stderr),
+                        f"the installer's {status} was reported as having exited "
+                        f"{other_status}",
+                    )
+                # And a refusal enables nothing, which is the sentence each arm makes.
+                self.assertNotIn(
+                    ["enable", "mosdns-cdn-health.timer"], calls,
+                    f"a transaction that exited {status} still enabled the timers, and the arm "
+                    f"that printed promised otherwise. Every systemctl call: {calls}",
+                )
+                self.assertIn("dpkg --configure mosdns-router", completed.stderr)
+
+    def test_the_default_arm_keeps_the_promise_it_can_make_about_a_status_it_does_not_know(self):
+        """Status 1 is `EXIT_REFUSED` -- the ordinary preflight refusal, and the status
+        this script is most likely to see.
+
+        It was reaching the DEFAULT arm, which called it "a status this script
+        knows" nothing about: "the install transaction exited 1, which is not a
+        status this script knows". The refusal part of that sentence is right --
+        nothing about this machine's DNS can be promised from a transaction that
+        refused before it changed anything -- and the "this script knows" part was
+        false, which is the half an operator reads when they are trying to work out
+        whether anything is wrong.
+        """
+        arms = postinst_status_arms(POSTINST.read_text())
+        self.assertIn("1", arms, "postinst has no arm for the installer's own EXIT_REFUSED")
+        self.assertNotIn(
+            "not a status this script knows", arms["1"],
+            "the arm for the installer's own preflight refusal still calls it unknown",
+        )
+        # The arm has to say the thing that IS true of a refusal, or the reader who
+        # is told nothing can be promised learns nothing.
+        self.assertIn("nothing", arms["1"].lower())
+
+    def test_a_status_the_script_does_not_know_still_gets_the_unknown_arm(self):
+        """…and the unknown-status arm has to survive, because the installer is a
+        program this package does not own the whole exit table of. It also has to
+        print the status it was GIVEN, not a default."""
+        completed, _calls = postinst_transaction_run(42)
+        self.assertIn("exited 42, which is not a", completed.stderr)
+        self.assertNotEqual(completed.returncode, 0)
 
     def test_postinst_captures_the_installers_status_the_way_prerm_does(self):
-        # `if ! cmd` cannot capture a status: `$?` after a `!` is the status of the
-        # `!`, which is always zero, so every arm would be the default one.
+        """`if ! cmd` cannot capture a status: `$?` after a `!` is the status of the
+        `!`, which is always zero, so every arm would be the default one.
+
+        Held on the TEXT as well as on the run, and for a different reason: the
+        `${install_status:-1}` default is what made the misplaced `fi` a silent
+        failure rather than a loud one. A capture that cannot be a bare `${...:-}`
+        cannot default to 1, so the default cannot be reached with a status that
+        was never assigned.
+        """
         text = POSTINST.read_text()
         self.assertNotIn('if ! "$INSTALLER" install', text)
         self.assertIn('if "$INSTALLER" install', text)
         self.assertIn("install_status=$?", text)
+        # Read through `executed_lines` because the comment above the capture NAMES
+        # the default it is retiring, and a comment that names a construct is not a
+        # use of it. What is forbidden is RUNNING a default.
+        self.assertFalse(
+            any("${install_status:-" in line for line in executed_lines(text)),
+            "postinst still defaults the captured status, so a capture that never ran is "
+            "indistinguishable from a transaction that exited 1",
+        )
 
     def test_postrm_purges_only_when_purge_was_asked_for(self):
         """The data goes on `dpkg --purge` and not on `dpkg --remove`, and the
@@ -3631,6 +3987,48 @@ class ControlTests(unittest.TestCase):
             )
         self.assertIn(
             'install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"', broken
+        )
+
+    def test_a_capture_closed_before_the_arms_is_reported_by_the_method(self):
+        """The control for the Critical, and the reason that gate had to become a run.
+
+        `88bc2af` moved the `fi` that closed the status capture above the arms and
+        left the arms and the `exit 1` below it, so `postinst` exited 1 on EVERY
+        configure including a successful one and STEP 5's timer enable was dead
+        code. The three checks in place at the time were all TRUE of that script,
+        so the suite was green over a package that could not be installed. This
+        control moves the one line that caused it and asks the METHOD to fail.
+        """
+        broken = capture_closed_early(POSTINST.read_text())
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_postinst_succeeds_on_a_successful_install_and_reaches_the_timer_enable",
+            postinst=broken,
+        )
+        # The mutation is ONE line, and it is the line the three substring checks
+        # could not see: everything they read is still present.
+        self.assertIn("install_status=$?", broken)
+        self.assertIn('if "$INSTALLER" install', broken)
+        self.assertIn("no resolver", broken)
+        self.assertEqual(
+            broken.count("fi\n"), POSTINST.read_text().count("fi\n"),
+            "the control added or removed a `fi` beyond the one it moved",
+        )
+
+    def test_a_status_capture_that_never_reads_the_transactions_status_is_reported(self):
+        """The second control on the same gate, for the same class of defect.
+
+        Moving the `fi` is one way to make the arms read a status the transaction
+        never had. Hard-coding the captured value is another, it is the shape a
+        well-meaning edit takes when somebody wants the arm routing to be easier to
+        read, and it produces the same silence: every run lands in one arm.
+        """
+        broken = POSTINST.read_text().replace("install_status=$?", "install_status=1")
+        self.assertNotEqual(broken, POSTINST.read_text())
+        self.assertMethodFails(
+            MaintainerScriptTests,
+            "test_every_installers_status_reaches_its_own_arm_and_a_refusal_exits_non_zero",
+            postinst=broken,
         )
 
     def test_a_missing_staged_file_pattern_is_reported(self):

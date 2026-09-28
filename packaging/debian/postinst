@@ -216,8 +216,26 @@ fi
 
 # The argument array, never a shell string. A path an operator could influence
 # reaching a shell is the one thing this transaction exists to make impossible, and
-# a string here would undo that for the one command in this package that changes the
-# machine's DNS.
+# a string here would undo that for the one command in this package that changes
+# the machine's DNS.
+#
+# THE ARMS ARE INSIDE THE `else`, and that is not a style preference. It is
+# `prerm`'s shape, and it is the only shape in which a successful run cannot reach
+# a status arm at all. The version before this one put the `fi` that closed the
+# capture immediately after `install_status=$?` and left the arms below it, so on a
+# SUCCESSFUL run the variable was never assigned, the `${install_status:-1}`
+# default made every test read as 1, the default arm printed "the install
+# transaction exited 1, which is not a status this script knows" about a
+# transaction that had exited 0, and the unconditional `exit 1` ended EVERY
+# install. dpkg then recorded the package unpacked-but-unconfigured, told the
+# operator the transaction had failed, and offered `dpkg --configure` -- which
+# does the same thing again. The three timers in STEP 5, which is below this `fi`,
+# were never enabled on any install. The three tests that let that through
+# asserted that `install_status=$?` was present, that `if "$INSTALLER" install`
+# was present, and that the status-4 body mentioned a missing resolver: all three
+# were TRUE of the broken script, because a substring cannot see a `fi` in the
+# wrong place. So the gate in test_package.py RUNS the script from this header to
+# its last line with a stubbed installer and reads the script's own exit status.
 if "$INSTALLER" install; then
 	:
 else
@@ -226,65 +244,107 @@ else
 	# script that read it there would print the same sentence for every failure
 	# there is. The same trap `prerm`'s remove arm names, for the same reason.
 	install_status=$?
+	# The arms are on the installer's STATUS and not on a phrase, because there
+	# are five machines behind a non-zero exit and one sentence is false on four
+	# of them:
+	#
+	#   1  the installer's own EXIT_REFUSED: a machine its preflight will not
+	#      install onto, and the one this script sees most often. Nothing was
+	#      written to this machine's DNS configuration, so the messages above are
+	#      the whole of the report and the run can simply be repeated.
+	#   3  every change this run made has been rolled back. The one thing it
+	#      cannot claim is that nothing at all changed: the transaction captures
+	#      the current DHCP lease FIRST, which publishes a new lease generation
+	#      under /run/mosdns. That is this package's own state and says nothing
+	#      about this machine's DNS, so the sentence is about the DNS and not
+	#      about the disk.
+	#   4  the rollback itself did not finish, so what the run changed may still
+	#      be applied -- and the unit that matters is one that was ALREADY
+	#      RUNNING and could not be restarted, which leaves a machine with no
+	#      resolver at all. The installer's own message names it; this must not
+	#      contradict it by claiming everything is as it was.
+	#
+	# 5 and 6 are the two halves of the UNINSTALL verb -- nothing was changed
+	# because the claim on the DNS could not be proved, and a restore that did
+	# not finish -- and the install verb returns neither of them. They are
+	# armed anyway, and each arm says so rather than describing a machine this
+	# script cannot be in: an arm that describes a transaction that cannot
+	# happen is the same kind of false sentence the misplaced `fi` above
+	# produced. A status outside the installer's own table lands in `*`, which
+	# is the only arm that may claim to know nothing.
+	case "$install_status" in
+	1)
+		echo "postinst: the install transaction refused this machine before it changed" >&2
+		echo "postinst: anything. That is the installer's own refusal, and the list of" >&2
+		echo "postinst: what its preflight found is the messages above. Nothing was" >&2
+		echo "postinst: written to this machine's DNS configuration by this run, and" >&2
+		echo "postinst: nothing here has to be put back by hand: fix what was named" >&2
+		echo "postinst: and the install can simply be repeated." >&2
+		;;
+	3)
+		echo "postinst: the install transaction refused this machine and rolled back" >&2
+		echo "postinst: every change it made, so nothing on this machine's DNS" >&2
+		echo "postinst: configuration is different from how this script found it. (The" >&2
+		echo "postinst: transaction did publish a new DHCP lease generation under" >&2
+		echo "postinst: /run/mosdns before it got that far; that is this package's own" >&2
+		echo "postinst: state, not a change to this machine's resolver.) See" >&2
+		echo "postinst: /var/lib/mosdns/installer for what was recorded, and the" >&2
+		echo "postinst: messages above for why." >&2
+		if [ -n "${2:-}" ]; then
+			echo "postinst: This machine had this package configured before (it was at" >&2
+			echo "postinst: version $2), so this was an UPGRADE rather than a first" >&2
+			echo "postinst: install. This run enabled none of the three timers, because" >&2
+			echo "postinst: they are enabled only after this step succeeds. What was" >&2
+			echo "postinst: already enabled is what the installer's messages above say" >&2
+			echo "postinst: about -- the transaction is the authority on that, not this" >&2
+			echo "postinst: script, because it is the only thing that knows which units" >&2
+			echo "postinst: were running." >&2
+		else
+			echo "postinst: Nothing is enabled and nothing was started: this was a first" >&2
+			echo "postinst: install, and the three timers are enabled only after this step" >&2
+			echo "postinst: succeeds, so there is nothing here for them to run against." >&2
+		fi
+		;;
+	4)
+		echo "postinst: the install transaction did not finish AND its rollback did not" >&2
+		echo "postinst: either, so some of what it did may still be applied on this" >&2
+		echo "postinst: machine. The messages above say exactly what: read them before" >&2
+		echo "postinst: anything else, and in particular do not assume the two daemons" >&2
+		echo "postinst: are still running. A unit that was already running is RESTARTED" >&2
+		echo "postinst: rather than started, and a restart that fails leaves it down, so" >&2
+		echo "postinst: this machine may have no resolver at all right now." >&2
+		echo "postinst:   sudo mosdns-cdnctl emergency-rollback" >&2
+		echo "postinst: puts the recorded DNS settings back, and is the one action that" >&2
+		echo "postinst: does not depend on a unit coming up." >&2
+		;;
+	5)
+		echo "postinst: the install transaction exited 5, which is the installer's OWNERSHIP" >&2
+		echo "postinst: refusal: nothing was changed, because it could not prove the DNS on" >&2
+		echo "postinst: this machine is its own to change. The install verb does not" >&2
+		echo "postinst: return this status -- the uninstall verb does -- so the messages" >&2
+		echo "postinst: above are what this is, and nothing about this machine's DNS can" >&2
+		echo "postinst: be promised from here." >&2
+		;;
+	6)
+		echo "postinst: the install transaction exited 6, which is the installer's" >&2
+		echo "postinst: RESTORE-INCOMPLETE: a restore was attempted and did not finish, so" >&2
+		echo "postinst: some of this package's values may still be on the connection and" >&2
+		echo "postinst: the units this package installs have NOT been stopped. The install" >&2
+		echo "postinst: verb does not return this status -- the uninstall verb does -- so" >&2
+		echo "postinst: the messages above are what this is. It is the one status here" >&2
+		echo "postinst: that means something may still be applied, so read them." >&2
+		;;
+	*)
+		echo "postinst: the install transaction exited $install_status, which is not a" >&2
+		echo "postinst: status this script knows; the messages above say why, and nothing" >&2
+		echo "postinst: about this machine's DNS can be promised from here." >&2
+		;;
+	esac
+	echo "postinst: to try again after fixing what it named:" >&2
+	echo "postinst:   sudo $INSTALLER preflight --check-only" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
 fi
-
-# The arms below are on the installer's STATUS and not on a phrase, because there
-# are three different machines behind a non-zero exit and one sentence is false on
-# two of them:
-#
-#   3  every change this run made has been rolled back. The one thing it cannot
-#      claim is that nothing at all changed: the transaction captures the current
-#      DHCP lease FIRST, which publishes a new lease generation under
-#      /run/mosdns. That is this package's own state and says nothing about this
-#      machine's DNS, so the sentence is about the DNS and not about the disk.
-#   4  the rollback itself did not finish, so what the run changed may still be
-#      applied -- and the unit that matters is one that was ALREADY RUNNING and
-#      could not be restarted, which leaves a machine with no resolver at all.
-#      The installer's own message names it; this must not contradict it by
-#      claiming everything is as it was.
-if [ "${install_status:-1}" -eq 4 ]; then
-	echo "postinst: the install transaction did not finish AND its rollback did not" >&2
-	echo "postinst: either, so some of what it did may still be applied on this" >&2
-	echo "postinst: machine. The messages above say exactly what: read them before" >&2
-	echo "postinst: anything else, and in particular do not assume the two daemons" >&2
-	echo "postinst: are still running. A unit that was already running is RESTARTED" >&2
-	echo "postinst: rather than started, and a restart that fails leaves it down, so" >&2
-	echo "postinst: this machine may have no resolver at all right now." >&2
-	echo "postinst:   sudo mosdns-cdnctl emergency-rollback" >&2
-	echo "postinst: puts the recorded DNS settings back, and is the one action that" >&2
-	echo "postinst: does not depend on a unit coming up." >&2
-elif [ "${install_status:-1}" -eq 3 ]; then
-	echo "postinst: the install transaction refused this machine and rolled back" >&2
-	echo "postinst: every change it made, so nothing on this machine's DNS" >&2
-	echo "postinst: configuration is different from how this script found it. (The" >&2
-	echo "postinst: transaction did publish a new DHCP lease generation under" >&2
-	echo "postinst: /run/mosdns before it got that far; that is this package's own" >&2
-	echo "postinst: state, not a change to this machine's resolver.) See" >&2
-	echo "postinst: /var/lib/mosdns/installer for what was recorded, and the" >&2
-	echo "postinst: messages above for why." >&2
-	if [ -n "${2:-}" ]; then
-		echo "postinst: This machine had this package configured before (it was at" >&2
-		echo "postinst: version $2), so this was an UPGRADE rather than a first" >&2
-		echo "postinst: install. This run enabled none of the three timers, because" >&2
-		echo "postinst: they are enabled only after this step succeeds. What was" >&2
-		echo "postinst: already enabled is what the installer's messages above say" >&2
-		echo "postinst: about -- the transaction is the authority on that, not this" >&2
-		echo "postinst: script, because it is the only thing that knows which units" >&2
-		echo "postinst: were running." >&2
-	else
-		echo "postinst: Nothing is enabled and nothing was started: this was a first" >&2
-		echo "postinst: install, and the three timers are enabled only after this step" >&2
-		echo "postinst: succeeds, so there is nothing here for them to run against." >&2
-	fi
-else
-	echo "postinst: the install transaction exited ${install_status:-1}, which is not a" >&2
-	echo "postinst: status this script knows; the messages above say why, and nothing" >&2
-	echo "postinst: about this machine's DNS can be promised from here." >&2
-fi
-echo "postinst: to try again after fixing what it named:" >&2
-echo "postinst:   sudo $INSTALLER preflight --check-only" >&2
-echo "postinst:   sudo dpkg --configure mosdns-router" >&2
-exit 1
 
 # --- STEP 5: the three timers, and only now ----------------------------------
 

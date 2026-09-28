@@ -259,6 +259,17 @@ CONNECTION_UP = ("nmcli", "connection", "up")
 # for a machine that is already running would name a command the transaction never
 # issues there.
 TRY_RESTART = ("systemctl", "try-restart")
+START = ("systemctl", "start")
+
+# The three states of a unit that decide what `systemctl try-restart` does with it,
+# named here because the finding is ABOUT the difference between them. `try-restart`
+# acts on `active` and on nothing else: on `failed`, on `activating` and on
+# `inactive` it does nothing and exits zero. `failed` is the state a `try-restart`
+# leaves behind when the start half fails, so it is the one this suite's cases are
+# about.
+UNIT_RUNNING = "active"
+UNIT_STOPPED = "inactive"
+UNIT_FAILED = "failed"
 
 # What the four recorded properties hold on a machine THIS package has already
 # taken over. It is the state a second install reads, and the reason the value of
@@ -388,9 +399,41 @@ class FakeRunner:
     so the rollback runs the same command again, and a case about "the first
     ``connection up`` failed" wants the second one to succeed. ``fail`` would fail
     both, which is a different machine and has its own test.
+
+    ``unit_state`` is the model of a unit's state, and it exists because
+    ``systemctl --help`` says of ``try-restart``: "try-restart UNIT... Restart one
+    or more units **if active**". On a unit that is not running it does NOTHING and
+    exits ZERO. Every state a failed start leaves -- ``failed``, ``activating``,
+    ``inactive`` -- is outside the set it acts on, and a silent no-op that returns
+    success is the worst shape a rollback's undo can have: the command count goes
+    up, the record says the undo ran, and the unit is still down.
+
+    A runner that recorded argument arrays and returned success for everything
+    modelled that as a helpful tool, so a rollback whose undo was another
+    ``try-restart`` reported a unit restored on a machine where nothing had been
+    started at all. Every transition in ``_transition`` below is that manual's
+    sentence, and ``unit_state`` is what a test reads to ask what the machine ended
+    up as rather than how many commands it was sent.
+
+    Only a unit the test NAMED is modelled, and ``is-active`` on a modelled unit
+    answers from the model rather than from the canned output, so a test that
+    arranges a unit's state arranges what the transaction READS. A unit nobody
+    named keeps this runner's canned answers, so a test that does not care about
+    unit state is unchanged by this model existing.
+
+    THE RETURNCODE of ``is-active`` is deliberately NOT derived from the model, and
+    the incoherence is recorded rather than quietly fixed. The canned table gives
+    every project unit 3 -- "not active" -- including the two an upgrade's machine
+    has running, and ``check_foreign_services`` reads the STATUS to decide whether
+    the read succeeded, so those two are read as unreadable and the foreign-service
+    refusal is skipped. That is how the upgrade fixture reaches the transaction at
+    all: it models units running with no ownership marker, which on a real machine
+    is an installation this one did not make and would be REFUSED. Deriving the
+    status from the model turns that fiction into a real refusal and is a change to
+    what the upgrade machine is, not to the undo this model exists for.
     """
 
-    def __init__(self, outputs=None, returncodes=None, stderr="", fail=(), fail_after=None, fail_first=(), child_environment=None, record=None):
+    def __init__(self, outputs=None, returncodes=None, stderr="", fail=(), fail_after=None, fail_first=(), child_environment=None, record=None, unit_state=None):
         self.outputs = {tuple(key): value for key, value in (outputs or {}).items()}
         self.returncodes = {tuple(key): value for key, value in (returncodes or {}).items()}
         self.stderr = stderr
@@ -400,7 +443,48 @@ class FakeRunner:
         self.succeeded = {}
         self.child_environment = child_environment
         self.record = record
+        # SHARED, not copied: the fixture seeds it and the test reads the state the
+        # run ended in, and a copy would leave the test reading the machine as it
+        # was arranged rather than as it ended up -- which is the whole distinction
+        # the model exists for.
+        self.unit_state = {} if unit_state is None else unit_state
         self.calls = []
+
+    def running(self, unit):
+        """Whether ``unit`` is modelled AND modelled as running.
+
+        ``None`` for a unit this runner does not model, so a caller can tell "the
+        model says stopped" from "there is no model here" -- the same distinction
+        the module's own ``_unit_states`` draws with its ``unreadable`` list, and
+        the one a test that forgets to arrange a state has to be able to see.
+        """
+        state = self.unit_state.get(unit)
+        if state is None:
+            return None
+        return state == UNIT_RUNNING
+
+    def _transition(self, command, ok):
+        """One `systemctl` unit verb's effect on the modelled state, if any.
+
+        Three verbs, and the asymmetry between them IS the finding. `start` and
+        `stop` act on a unit whatever state it is in -- a `start` on a stopped unit
+        brings it up, and a `start` on a running one is a no-op that succeeds, so
+        `start` is both a correct undo and a loud one: it fails if the unit cannot
+        be brought up. `try-restart` acts only on an active unit, silently and
+        successfully, so it is the right word for the FORWARD action of a unit that
+        is known to be running and the wrong word for its UNDO.
+        """
+        if len(command) < 3 or command[0] != "systemctl":
+            return
+        action, unit = command[1], command[2]
+        if unit not in self.unit_state:
+            return
+        if action == "try-restart" and self.unit_state[unit] != UNIT_RUNNING:
+            return
+        if action in ("start", "try-restart", "restart"):
+            self.unit_state[unit] = UNIT_RUNNING if ok else UNIT_FAILED
+        elif action == "stop":
+            self.unit_state[unit] = UNIT_STOPPED if ok else UNIT_RUNNING
 
     def run(self, args, check=True):
         if isinstance(args, (str, bytes)):
@@ -415,20 +499,24 @@ class FakeRunner:
         if self.child_environment is not None:
             self.child_environment(command)
         if command in self.fail:
+            self._transition(command, ok=False)
             raise subprocess.CalledProcessError(
                 1, list(command), "", self.stderr or "injected failure"
             )
         if command in self.fail_first and not self.succeeded.get(command, 0):
             self.succeeded[command] = self.succeeded.get(command, 0) + 1
+            self._transition(command, ok=False)
             raise subprocess.CalledProcessError(
                 1, list(command), "", self.stderr or "injected failure"
             )
         allowed = self.fail_after.get(command)
         if allowed is not None and self.succeeded.get(command, 0) >= allowed:
+            self._transition(command, ok=False)
             raise subprocess.CalledProcessError(
                 1, list(command), "", self.stderr or "injected failure"
             )
         self.succeeded[command] = self.succeeded.get(command, 0) + 1
+        self._transition(command, ok=True)
         code = self.returncodes.get(command, 0)
         if code != 0 and check:
             # The prepared answer goes on BOTH sides, because a tool that reports
@@ -442,6 +530,8 @@ class FakeRunner:
         )
 
     def answer(self, command):
+        if command[:2] == ("systemctl", "is-active") and command[2:] and command[2] in self.unit_state:
+            return self.unit_state[command[2]] + "\n"
         if command in self.outputs:
             return self.outputs[command]
         if command[:2] == (GETFACL, "-c"):
@@ -487,6 +577,11 @@ class TransactionFixture(unittest.TestCase):
         self.answers = {}
         self.failing = set()
         self.returncodes = {}
+        # The machine's unit states, as a MODEL rather than as canned answers. Seeded
+        # by `already_running` and mutated by the runner as the transaction issues
+        # `start`/`try-restart`/`stop`, so a test can ask what the machine ended up
+        # as. See `FakeRunner.unit_state` for why `try-restart` needs one.
+        self.unit_state = {}
         self.captured_environment = []
         self.write("/etc/os-release", 'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="24.04"\n')
         self.stub_resolv_conf()
@@ -600,8 +695,12 @@ class TransactionFixture(unittest.TestCase):
         # only way to put a unit back the way it was found is to have it running
         # again. A `stop` here would be an undo that takes away a resolver the
         # machine had before this run began.
-        TRY_RESTART + (RESOLVER_UNIT,): TRY_RESTART + (RESOLVER_UNIT,),
-        TRY_RESTART + (ROUTER_UNIT,): TRY_RESTART + (ROUTER_UNIT,),
+        # The undo of a restart is a `start`, not another `try-restart`, and the
+        # reason is `FakeRunner.unit_state`: `try-restart` acts on an active unit
+        # and does nothing, successfully, to a stopped one, so it cannot be the
+        # undo of a forward action that STOPS the unit it issues.
+        TRY_RESTART + (RESOLVER_UNIT,): START + (RESOLVER_UNIT,),
+        TRY_RESTART + (ROUTER_UNIT,): START + (ROUTER_UNIT,),
         MODIFY + (UUID, "ipv4.ignore-auto-dns", "yes"): MODIFY + (UUID, "ipv4.ignore-auto-dns", "no"),
         MODIFY + (UUID, "ipv6.ignore-auto-dns", "yes"): MODIFY + (UUID, "ipv6.ignore-auto-dns", "no"),
         MODIFY + (UUID, "ipv4.dns", LOCAL_DNS): MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM),
@@ -812,6 +911,7 @@ class TransactionFixture(unittest.TestCase):
             fail_first=fail_first,
             child_environment=child_environment or self.record_child,
             record=lambda command: self.events.append(("run", command)),
+            unit_state=self.unit_state,
         )
         self.runner = runner
         return runner
@@ -825,12 +925,21 @@ class TransactionFixture(unittest.TestCase):
         undo -- a unit that was enabled before this run began must be enabled
         after a rollback too. A case that set only the first would compute a
         rollback tail with a `disable` in it and prove nothing about the restart.
+
+        It also seeds the runner's UNIT MODEL for the same units, and that is not a
+        convenience: `try-restart` acts on an active unit and does nothing to a
+        stopped one, so a case that arranges "this unit was running" only in a
+        canned string has not arranged the state the verb looks at. The model's
+        transitions then make the unit's state at the END of the run a thing a test
+        can read, which is the only way to tell a rollback that put a resolver back
+        from one that issued the right command twice.
         """
         for unit in units:
             self.answers[("systemctl", "is-active", unit)] = "active\n"
             self.answers[("systemctl", "is-enabled", unit)] = "enabled\n"
             self.returncodes[("systemctl", "is-active", unit)] = 0
             self.returncodes[("systemctl", "is-enabled", unit)] = 0
+            self.unit_state[unit] = UNIT_RUNNING
         return self
 
     def record_child(self, command):
@@ -2194,6 +2303,60 @@ class ReinstallTests(TransactionFixture):
         self.assertEqual(self.recorded(), before, "the record about the first connection was replaced")
         self.assertNothingChanged("a refused re-install onto a second connection")
 
+    def test_the_second_connection_refusal_offers_a_removal_that_can_actually_be_run(self):
+        """The advice this arm used to give could not be carried out in the state the arm
+        routes to.
+
+        It said "Remove this package (which restores … through the record that is
+        already there) and install it again". A record PRESENT with no MARKER is
+        exactly where `uninstall` refuses -- exit 5, `EXIT_OWNERSHIP_REFUSED` -- and
+        `prerm` turns a non-zero uninstall into a dpkg abort, so the removal the arm
+        names is the one operation that cannot happen. It is the state an install
+        that failed after `_apply_nm` leaves behind, which is why the sibling
+        refusal (a record that cannot be read) already offers
+        `dpkg --force-remove-reinstreq`: the forced removal skips the refusal and
+        takes the package's own advice about the connection with it.
+
+        Asserted as the command being NAMED rather than as prose around it, because
+        the command is the deliverable and the sentence is only how it is carried.
+        """
+        self.install_succeeds()
+        self.write(POLICY_CONFIG, POLICY_BODY + "# an operator edit\n")
+        second = {
+            NMCLI_CONNECTIONS: f"{CONNECTION_NAME}:{OTHER_UUID}:802-3-ethernet:{DEVICE}\n",
+            NMCLI_DEVICE_UUID: f"{OTHER_UUID}\n",
+        }
+        for prop, value in (
+            ("ipv4.ignore-auto-dns", "no"),
+            ("ipv6.ignore-auto-dns", "no"),
+            ("ipv4.dns", DHCP_UPSTREAM),
+            ("ipv6.dns", ""),
+        ):
+            second[DNS_UUID_PREFIX + (prop, "connection", "show", OTHER_UUID)] = value + "\n"
+        result = self.run_install(already_installed=True, outputs=second)
+        error = result.error or ""
+        self.assertIn("dpkg --force-remove-reinstreq", error)
+        # The plain removal it used to name is what this state cannot do, so saying
+        # "remove this package" without saying WHICH removal is the false advice.
+        self.assertNotIn(
+            "Remove this package (which restores", error,
+            "the refusal still tells the operator to remove the package, without naming the "
+            "forced removal the state requires",
+        )
+        # And the sibling refusal offers the same escape hatch, so an operator who
+        # has read one has read the other's remedy. It is reached by making the
+        # record present and the marker absent, which is what a failed install
+        # leaves behind; `RecordWithoutMarkerTests` builds that state for real and
+        # this only asks whether the two refusals agree about the way out.
+        self.install_succeeds()
+        self.setUp()
+        self.write(BACKUP_PATH, "{ not json")
+        self.write(MANAGED_BY, f"installed-by={MANAGED_BY_VALUE}\n", mode=0o644)
+        result = self.run_install(already_installed=True)
+        self.assertFalse(result.ok)
+        self.assertIn("not a record this program can read", result.error or "")
+        self.assertIn("dpkg --force-remove-reinstreq", result.error or "")
+
     def test_the_second_install_keeps_the_first_installs_recorded_values(self):
         first = self.install_succeeds()
         self.assertIsNotNone(first.backup)
@@ -2526,6 +2689,98 @@ class FailureMessageTests(TransactionFixture):
         self.assertIn("starting " + ROUTER_UNIT, result.error or "")
 
 
+class FakeUnitModelTests(unittest.TestCase):
+    """The FAKE's own fidelity, held against `systemctl`'s own description.
+
+    The whole of the Important is one sentence in `systemctl --help`: "try-restart
+    UNIT... Restart one or more units if active". A test that asserts the state a
+    rollback achieves is only as good as the fake's answer to that sentence, and
+    this fake had no state at all until this round -- so a suite that now depends
+    on the state has to hold the fake to the manual it is standing in for. A gate
+    on a fake that could not model the defect is a gate that could not have
+    failed.
+    """
+
+    def runner(self, **kwargs):
+        return FakeRunner(**kwargs)
+
+    def modelled(self, state, **kwargs):
+        return FakeRunner(unit_state={ROUTER_UNIT: state}, **kwargs)
+
+    def test_try_restart_stops_and_starts_a_unit_that_is_active(self):
+        runner = self.modelled(UNIT_RUNNING)
+        runner.run(list(TRY_RESTART + (ROUTER_UNIT,)))
+        self.assertEqual(runner.unit_state[ROUTER_UNIT], UNIT_RUNNING)
+        self.assertTrue(runner.running(ROUTER_UNIT))
+
+    def test_try_restart_on_a_unit_that_is_not_running_does_nothing_and_succeeds(self):
+        """The three states a failed start leaves, and the trap is in all three."""
+        for state in (UNIT_FAILED, UNIT_STOPPED, "activating"):
+            with self.subTest(state=state):
+                runner = self.modelled(state)
+                completed = runner.run(list(TRY_RESTART + (ROUTER_UNIT,)))
+                self.assertEqual(
+                    completed.returncode, 0,
+                    "try-restart on a unit that is not running exits non-zero, and the undo of a "
+                    "failed restart would then be a rollback FAILURE rather than a silent no-op",
+                )
+                self.assertEqual(
+                    runner.unit_state[ROUTER_UNIT], state,
+                    "try-restart did something to a unit that is not running, which is the one "
+                    "thing the manual says it does not do",
+                )
+
+    def test_start_brings_a_stopped_unit_up_and_its_failure_leaves_it_failed(self):
+        for state in (UNIT_FAILED, UNIT_STOPPED):
+            with self.subTest(state=state, action="succeeds"):
+                runner = self.modelled(state)
+                runner.run(list(START + (ROUTER_UNIT,)))
+                self.assertEqual(runner.unit_state[ROUTER_UNIT], UNIT_RUNNING)
+        for state in (UNIT_FAILED, UNIT_STOPPED, UNIT_RUNNING):
+            with self.subTest(state=state, action="fails"):
+                runner = self.modelled(state, fail=[START + (ROUTER_UNIT,)])
+                with self.assertRaises(subprocess.CalledProcessError):
+                    runner.run(list(START + (ROUTER_UNIT,)))
+                self.assertEqual(
+                    runner.unit_state[ROUTER_UNIT], UNIT_FAILED,
+                    "a start that failed did not leave the unit failed, so a rollback that could "
+                    "not bring it back would be reported as one that did",
+                )
+
+    def test_start_on_a_running_unit_is_a_no_op_that_does_not_stop_it(self):
+        """The reason `start` and not `restart`: an undo built from `restart` can stop
+        the very resolver it is repairing."""
+        runner = self.modelled(UNIT_RUNNING)
+        runner.run(list(START + (ROUTER_UNIT,)))
+        self.assertEqual(runner.unit_state[ROUTER_UNIT], UNIT_RUNNING)
+        restarted = self.modelled(UNIT_RUNNING)
+        restarted.run(list(("systemctl", "restart", ROUTER_UNIT)))
+        # `restart` also ends with the unit running, so the two are indistinguishable
+        # from the FINAL state and are told apart by the failure below.
+        self.assertEqual(restarted.unit_state[ROUTER_UNIT], UNIT_RUNNING)
+
+    def test_is_active_answers_from_the_model_and_a_unit_nobody_named_keeps_its_answer(self):
+        canned = ("systemctl", "is-active", ROUTER_UNIT)
+        modelled = self.runner(
+            outputs={canned: "inactive\n"}, unit_state={ROUTER_UNIT: UNIT_RUNNING}
+        )
+        self.assertEqual(
+            modelled.run(list(("systemctl", "is-active", ROUTER_UNIT))).stdout, "active\n",
+            "a modelled unit's state does not answer `is-active`, so a test that arranges a "
+            "state has not arranged what the transaction READS",
+        )
+        unmodelled = self.runner(outputs={canned: "inactive\n"})
+        self.assertEqual(
+            unmodelled.run(list(("systemctl", "is-active", ROUTER_UNIT))).stdout, "inactive\n",
+            "a unit nobody modelled stopped answering its canned answer",
+        )
+        self.assertIsNone(unmodelled.running(ROUTER_UNIT))
+
+    def test_a_string_is_still_refused(self):
+        with self.assertRaises(TypeError):
+            self.runner().run("systemctl start x")
+
+
 class FailureInjectionTests(TransactionFixture):
     """A failure after each mutation, and what the rollback put back."""
 
@@ -2676,49 +2931,99 @@ class FailureInjectionTests(TransactionFixture):
         # This is the state item 8's fix created and did not carry the safety
         # property across: before it, `start` on an active unit was a no-op, so a
         # bad new release left the OLD binary serving and the machine resolving.
+        #
+        # WHAT IS ASSERTED IS THE STATE, not the command count. The first version
+        # of this test counted the restarts, and a count is exactly what cannot
+        # tell a `try-restart` on a running unit from the same command on a stopped
+        # one -- `systemctl --help` says try-restart restarts a unit "if active",
+        # and on a unit a failed start has just left in `failed` it does nothing
+        # and exits ZERO. So the count went up, the record said the undo had run,
+        # and the resolver stayed down on any real machine. See
+        # `test_the_rollback_of_a_failed_restart_leaves_the_unit_running`.
         self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
-        result = self.run_install(fail_first=[TRY_RESTART + (ROUTER_UNIT,)])
-        self.assertFalse(result.ok)
-        restarts = [
-            index
-            for index, command in enumerate(self.commands)
-            if command == TRY_RESTART + (RESOLVER_UNIT,)
-        ]
-        self.assertEqual(
-            len(restarts), 2,
-            f"{RESOLVER_UNIT} was restarted {len(restarts)} time(s); this run restarted a unit "
-            "that was already serving, so a rollback that does not restart it again leaves a "
-            "resolver down on a machine already pointed at the loopback",
+        self.run_install(fail_first=[TRY_RESTART + (ROUTER_UNIT,)])
+        self.assertTrue(
+            self.runner.running(ROUTER_UNIT),
+            f"{ROUTER_UNIT} was running before this run and the rollback left it "
+            f"{self.unit_state[ROUTER_UNIT]!r}, so the machine has a resolver this run took "
+            "down and an exit status that says every change was rolled back",
         )
-        # The tail is taken from the FAILING command, not from the first restart: the
-        # router's own restart attempt sits between them, and it is a forward step of
-        # this run rather than part of the rollback.
-        reached = self.commands.index(TRY_RESTART + (ROUTER_UNIT,))
-        self.assertEqual(
-            self.commands[reached + 1 :],
-            self.expected_rollback(TRY_RESTART + (ROUTER_UNIT,), already_running=True),
-            "a failed restart was not followed by the restart that puts the unit back",
-        )
-        self.assertIsNone(result.rollback_error, "the rollback of a failed restart did not finish")
+        # The forward action is still `try-restart`, because that is right for a
+        # unit that IS running: restarting it is the whole point of an upgrade.
+        self.assertIn(TRY_RESTART + (ROUTER_UNIT,), self.commands)
         self.assertIn(
             "every change this run made has been rolled back",
             self.stderr_of_install(fail_first=[TRY_RESTART + (ROUTER_UNIT,)]),
             "the exit-3 sentence is the one this property is about, so it is asserted where it "
-            "is printed rather than reconstructed",
+            "is printed rather than reconstructed -- and with the unit back up, it is now true",
+        )
+        self.assertIsNone(
+            self.run_install(fail_first=[TRY_RESTART + (ROUTER_UNIT,)]).rollback_error,
+            "a failed restart whose unit was put back is not a rollback failure, so it cannot be "
+            "reported as one",
         )
 
-    def test_a_unit_that_could_not_be_restarted_back_is_a_rollback_failure(self):
+    def test_the_rollback_of_a_failed_restart_leaves_the_unit_running(self):
+        """The undo of a restart must be a verb that WORKS on a unit a failed restart
+        left stopped, and must FAIL LOUDLY when it cannot.
+
+        `try-restart` is the wrong word for an undo, and the asymmetry is the whole
+        trap: it is the RIGHT word for the forward action, because a unit that is
+        running should be restarted rather than left alone, and it is exactly wrong
+        for putting that unit back, because the unit the forward action leaves
+        behind after a failure is not running. The same word, chosen for its
+        forward-action sense, silently undoes nothing on the machine it is supposed
+        to be repairing.
+
+        The undo is `systemctl start`: a no-op that succeeds when the unit is
+        already running, a real start when it is not, and a FAILURE when the unit
+        cannot be brought up -- which is the only thing that can route this machine
+        to exit 4 and the `MAY HAVE NO RESOLVER` line. `systemctl restart` is the
+        other correct word; `start` is chosen because it does not stop a unit that
+        is already up, so an undo can never take away the resolver it is repairing.
+        """
+        for unit in (RESOLVER_UNIT, ROUTER_UNIT):
+            with self.subTest(unit=unit):
+                self.setUp()
+                self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+                self.run_install(fail_first=[TRY_RESTART + (unit,)])
+                self.assertTrue(
+                    self.runner.running(unit),
+                    f"the undo of a failed restart left {unit} "
+                    f"{self.unit_state[unit]!r}; a `try-restart` on a unit a failed start "
+                    "left in `failed` does nothing and exits zero, so the rollback reported a "
+                    "unit it had not started",
+                )
+                self.assertIn(
+                    ("systemctl", "start", unit), self.commands,
+                    f"the undo issued no `start` for {unit}, so the only way it could have "
+                    "restored the unit is a `try-restart`, which is a silent no-op on a "
+                    "stopped one",
+                )
+                # And a unit this run did NOT touch is still running, which is the
+                # property `start` was chosen over `restart` for.
+                self.assertTrue(self.runner.running(unit))
+
+    def test_a_unit_that_could_not_be_brought_back_is_a_rollback_failure(self):
         # The other machine, and the one the decision this round records is about.
-        # The unit was running, the restart failed, and the rollback's own restart
-        # failed too -- so the unit is DOWN, it was UP before this run, and no undo
-        # in the program can put it back. That has to be a rollback FAILURE (exit 4)
-        # and not a clean refusal, and the recovery line has to say the machine may
-        # have NO RESOLVER rather than "a unit this run started is still running",
-        # which is the opposite fact and would send an operator to `systemctl stop`
-        # on a machine that has nothing left listening.
+        # The unit was running, the restart failed, and the rollback's own attempt
+        # to bring it back failed too -- so the unit is DOWN, it was UP before this
+        # run, and no undo in the program can put it back. That has to be a rollback
+        # FAILURE (exit 4) and not a clean refusal, and the recovery line has to say
+        # the machine may have NO RESOLVER rather than "a unit this run started is
+        # still running", which is the opposite fact and would send an operator to
+        # `systemctl stop` on a machine that has nothing left listening.
+        #
+        # BOTH verbs are injected, and both have to be: the forward `try-restart` and
+        # the rollback's `start`. Before the undo was a `start`, this case injected
+        # only the restart and "passed" for the wrong reason -- the retry was a
+        # no-op, not a success, and nothing could tell the difference.
         self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
-        result = self.run_install(fail=[TRY_RESTART + (RESOLVER_UNIT,)])
+        result = self.run_install(
+            fail=[TRY_RESTART + (RESOLVER_UNIT,), START + (RESOLVER_UNIT,)]
+        )
         self.assertFalse(result.ok)
+        self.assertEqual(self.runner.running(RESOLVER_UNIT), False)
         self.assertIsNotNone(
             result.rollback_error,
             "a unit that was running and could not be restarted was reported as a clean "
@@ -2750,9 +3055,53 @@ class FailureInjectionTests(TransactionFixture):
         self.assertIn(f"this run started {ROUTER_UNIT}", result.recovery or "")
         self.assertNotIn("MAY HAVE NO RESOLVER", result.recovery or "")
 
+    def test_the_recovery_line_prints_one_runnable_command_per_unit_it_names(self):
+        """`systemctl restart A and B` is not a command. It is copy-pasteable text
+        whose whole purpose is to be copied, and an operator who pastes it gets
+        `Failed to restart ...: Unit a and b not found` -- or worse, a partial
+        success that looks like the whole of it.
+
+        The plural branch is reachable: both units were running, the transaction
+        got past both of them, and a later step failed so the rollback ran -- and
+        then both of the rollback's own `start`s failed, which is what a wedged
+        systemd looks like. The message then names both units, and the ONE command
+        it printed for them named both.
+        """
+        self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
+        result = self.run_install(
+            fail=[
+                MODIFY + (UUID, "ipv4.dns", LOCAL_DNS),
+                START + (RESOLVER_UNIT,),
+                START + (ROUTER_UNIT,),
+            ]
+        )
+        recovery = result.recovery or ""
+        self.assertIn("MAY HAVE NO RESOLVER", recovery)
+        for unit in (RESOLVER_UNIT, ROUTER_UNIT):
+            with self.subTest(unit=unit):
+                self.assertIn(f"`systemctl restart {unit}`", recovery)
+        self.assertNotIn(
+            f"`systemctl restart {RESOLVER_UNIT} and {ROUTER_UNIT}`", recovery,
+            "the message still prints one command naming two units, which is not a command",
+        )
+        # Nothing that is not a command is offered. The conjunction is fine in a
+        # sentence; it is not fine inside a command an operator is meant to paste.
+        for command in re.findall(r"`([^`]+)`", recovery):
+            if command.startswith("sudo ") or command.endswith(".json"):
+                continue
+            with self.subTest(command=command):
+                self.assertIsNone(
+                    re.search(r"^systemctl (\S+) .*\band\b", command),
+                    f"{command!r} names more than one unit in a single command",
+                )
+
     def test_the_exit_four_status_is_what_an_unrestartable_unit_gets(self):
         self.already_running(RESOLVER_UNIT, ROUTER_UNIT)
-        status, _out, err = self.install_cli(runner=self.good_runner(fail=[TRY_RESTART + (RESOLVER_UNIT,)]))
+        status, _out, err = self.install_cli(
+            runner=self.good_runner(
+                fail=[TRY_RESTART + (RESOLVER_UNIT,), START + (RESOLVER_UNIT,)]
+            )
+        )
         self.assertEqual(status, installer.EXIT_ROLLBACK_FAILED, err)
         self.assertIn("these changes are still applied", err)
         self.assertIn(
