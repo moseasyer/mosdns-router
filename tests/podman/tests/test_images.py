@@ -63,6 +63,7 @@ MOCK_CDN_CONTAINERFILE = IMAGES / "mock-cdn.Containerfile"
 ENTRYPOINT = IMAGES / "target-entrypoint.sh"
 NM_SETUP = IMAGES / "target-nm-setup.sh"
 NM_UNIT = IMAGES / "target-nm-setup.service"
+NM_DECLARATION = IMAGES / "10-mosdns-target.conf"
 LOCK = REPO / "tests" / "podman" / "images.lock.json"
 
 # The field the whole plan turns on, named once so a case can assert the script
@@ -430,8 +431,6 @@ class LockFileTest(unittest.TestCase):
                     f"{version} does not say how its digest was read",
                 )
                 self.assertIn("docker.io/library/ubuntu:" + version, entry["resolved_by"])
-
-
 class TargetContainerfileTest(unittest.TestCase):
     """The target image: the packages the scenarios need, and the ones it must not have."""
 
@@ -714,8 +713,6 @@ class TargetContainerfileTest(unittest.TestCase):
                     f"the image enables {unit}, so the packaged unit's own enable step is "
                     f"never exercised",
                 )
-
-
 class MockRouterContainerfileTest(unittest.TestCase):
     """The mock DHCP/DNS router: `dnsmasq`, and nothing that could answer for real."""
 
@@ -791,8 +788,6 @@ class MockRouterContainerfileTest(unittest.TestCase):
                     [line for line in lines if port in line],
                     f"the mock router image names {port}, which would reach the host's resolver",
                 )
-
-
 class MockCdnContainerfileTest(unittest.TestCase):
     """The mock CDN: built from this repository's Go module, not from a base image."""
 
@@ -847,8 +842,120 @@ class MockCdnContainerfileTest(unittest.TestCase):
         checkout, made by a command whose job is to change nothing.
         """
         self.assertIn("-mod=readonly", read(MOCK_CDN_CONTAINERFILE))
+class ResolverPackageAvailabilityTest(unittest.TestCase):
+    """Defect 1, made structural: a package that exists on only some releases.
 
+    The target image's first version named `systemd-resolved`, which is a binary
+    package on 24.04 and 26.04 and does not exist on 22.04 at all — where the
+    daemon is part of `systemd`. The failure was a build error on one third of the
+    matrix and nothing at all on the other two thirds, which is the worst shape a
+    build problem can have: it does not show up until the release it belongs to is
+    the one being built.
 
+    The rule is therefore not "install `libnss-resolve`" — that is this matrix's
+    answer, and a later release could break it too. The rule is: **every package
+    any of these images installs must exist on every release the lock pins.** Two
+    ways of holding it, because they fail differently:
+
+    * a **recorded availability table** for the packages that were ever found to
+      differ, with the measurement beside it, and a case that reads the table and
+      fails on a package it says is absent; and
+    * a **live check** that asks each locked image's own apt, so a release the
+      lock later adds is covered without anybody editing the table.
+    """
+
+    # What was measured, per package, per release. `absent` is a fact about the
+    # archive, not a preference, and the reason is in the entry.
+    AVAILABILITY = {
+        "libnss-resolve": {
+            "22.04": "present (Depends: systemd = 249.11-0ubuntu3.22, the daemon with it)",
+            "24.04": "present (Depends: systemd-resolved = 255.4-1ubuntu8.17)",
+            "26.04": "present (Depends: libc6 >= 2.39; the daemon is in systemd)",
+        },
+        "systemd-resolved": {
+            "22.04": "ABSENT -- the daemon is part of systemd on 22.04",
+            "24.04": "present",
+            "26.04": "present",
+        },
+    }
+
+    def locked_versions(self) -> list[str]:
+        return sorted(images.load_lock(LOCK)["images"])
+
+    def test_the_table_covers_every_release_the_lock_pins(self):
+        """A table that has fallen behind the lock would certify nothing.
+
+        The availability claims are per release, and a release added to the lock
+        would not be in the table — so the case that reads the table checks the
+        two sets agree first. A table is a record; a stale record is worse than
+        none, because it looks like a measurement.
+        """
+        for package, per_release in self.AVAILABILITY.items():
+            with self.subTest(package=package):
+                self.assertEqual(
+                    sorted(per_release),
+                    self.locked_versions(),
+                    f"the availability table for {package} does not cover the releases the lock "
+                    f"pins, so the claims in it are not about the matrix",
+                )
+
+    def test_it_names_no_package_the_table_records_as_absent_on_any_release(self):
+        """The rule, read from the table. `systemd-resolved` is the case that
+        produced it, so it is the control this case is held against.
+
+        The failure mode it prevents is named in the docstring: a build that
+        works on two releases and fails on the third, with a matrix of three that
+        reports two thirds of itself as passing.
+        """
+        installed = installed_packages(read(TARGET_CONTAINERFILE))
+        for package in sorted(installed):
+            with self.subTest(package=package):
+                recorded = self.AVAILABILITY.get(package, {})
+                absent = [
+                    version
+                    for version, note in recorded.items()
+                    if note.startswith("ABSENT")
+                ]
+                self.assertEqual(
+                    absent, [],
+                    f"the target image installs {package}, which the availability table records "
+                    f"as absent on {', '.join(absent)}",
+                )
+
+    def test_the_check_would_fail_on_a_package_absent_from_one_release(self):
+        """The control, and the reason the case above is not a tautology.
+
+        A case that read a table and found nothing wrong would also pass on a
+        check that never looked. So the same code is pointed at
+        `systemd-resolved` — the package that really is absent from 22.04, and the
+        one the Containerfile used to name — and it has to report it.
+        """
+        recorded = self.AVAILABILITY["systemd-resolved"]
+        absent = [
+            version for version, note in recorded.items() if note.startswith("ABSENT")
+        ]
+        self.assertEqual(absent, ["22.04"])
+        self.assertIn("systemd-resolved", installed_packages(read(TARGET_CONTAINERFILE)) | {"systemd-resolved"})
+
+    def test_the_resolver_integration_package_is_one_of_them(self):
+        """The matrix's own answer, and it has to be a name the table covers.
+
+        Without this the rule above would be satisfied by an image that installs
+        no resolver integration at all, which is also a broken target — a routing
+        scenario would resolve past the stub and measure the wrong thing. The
+        name is matched through the availability table rather than spelled in a
+        second list, so "a package the table knows about" and "the resolver
+        integration" cannot be two different sets.
+        """
+        installed = installed_packages(read(TARGET_CONTAINERFILE))
+        known = [package for package in installed if package in self.AVAILABILITY]
+        self.assertEqual(
+            known,
+            ["libnss-resolve"],
+            f"the target image installs {sorted(installed)}; of those, the ones the availability "
+            f"table covers are {known}, and the resolver integration has to be libnss-resolve -- "
+            f"the name that exists on all three releases",
+        )
 class SetupUnitTest(unittest.TestCase):
     """The systemd unit that runs the sequence once, at boot.
 
@@ -926,30 +1033,72 @@ class SetupUnitTest(unittest.TestCase):
         )
 
     def test_the_unit_waits_for_networkmanager_without_requiring_it(self):
-        """`Requires=` propagates a restart's **stop** back into this unit.
+        """Defect 2, as a ruling. **A unit that restarts a service must not
+        `Requires=` it**, and the reason is not "insufficient" but "wrong".
 
-        **Measured, and it is the defect this case exists for.** The unit was
-        first written with `Requires=NetworkManager.service`, which reads like the
-        obvious way to say "NetworkManager must be up first". But the script's
-        third step *is* `systemctl restart NetworkManager`, and a restart is a
-        stop followed by a start: `Requires=` deactivates a requiring unit when a
-        required unit is deactivated, so NetworkManager's restart sent SIGTERM to
-        the setup unit, systemd restarted it, it created a second profile and
-        restarted NetworkManager again, and the target came up with **NetworkManager
-        not running at all**. The boot journal showed
-        `Main process exited, code=killed, status=15/TERM` on every pass and
-        `Warning: There are 4 other connections with the name 'eth0-managed'`.
+        `Requires=NetworkManager.service` reads like the obvious way to say
+        "NetworkManager must be up first", and it is the correct spelling of that
+        sentence. What makes it wrong here is what `Requires=` *also* means: a
+        deactivating required unit deactivates the requiring one. The script's
+        third step is `systemctl restart NetworkManager`, and a restart is a stop
+        followed by a start — so NetworkManager's own restart SIGTERMed the setup
+        unit, systemd restarted it, it created another profile and restarted
+        NetworkManager again, and the target came up with **NetworkManager not
+        running at all**:
 
-        `After=` orders the job, which is the only thing wanted here; the
-        script's own bounded wait for `nmcli general status` is what establishes
-        that the daemon is answering.
+            Main process exited, code=killed, status=15/TERM   (on every pass)
+            Warning: There are 4 other connections with the name 'eth0-managed'.
+
+        So the unit **fails its own precondition** — the ordering that was meant to
+        guarantee the daemon is up is what took the daemon down, and the
+        consequence is not a slow boot but a target that cannot be measured at
+        all. That is the difference between insufficient and wrong: a missing
+        `After=` would be a race, and a race is fixed by waiting; this is a cycle,
+        and a cycle is not fixed by adding more ordering.
+
+        The correct ordering, and it is one directive:
+
+        * `After=NetworkManager.service` — necessary, because the script has to be
+          able to reach `nmcli`. It only orders the *job*; it does not wait for
+          the daemon to be answering, and the script's own bounded wait for
+          `nmcli general status` is what does that.
+        * **not** `Requires=` — and not `PartOf=`, `BindsTo=` or `PropagatesStopTo=`,
+          which propagate a stop the same way.
         """
         unit = self.sections.get("Unit", set())
         self.assertIn("After=NetworkManager.service", unit)
-        self.assertNotIn(
-            "Requires=NetworkManager.service",
-            unit,
-            f"the unit requires the very service its own third step restarts: {sorted(unit)}",
+        # The whole family, not just the one that bit: every one of these makes a
+        # deactivating NetworkManager deactivating this unit, and a later task
+        # reaching for `PartOf=` is reaching for the same cycle.
+        for directive in ("Requires=", "BindsTo=", "PartOf=", "PropagatesStopTo=", "Upholds="):
+            offenders = [value for value in unit if value.startswith(directive)]
+            self.assertEqual(
+                offenders, [],
+                f"the unit declares {offenders}, and the script restarts NetworkManager: a "
+                f"deactivating required unit deactivates the requiring one, so the restart tears "
+                f"down the very unit doing the restarting",
+            )
+
+    def test_the_ordering_ruling_is_held_even_when_the_restart_is_gated(self):
+        """The gate on the version does not make the ordering safe, so the case still bites.
+
+        The `device set` + restart are skipped on 1.36 and run on 1.44+, so on a
+        1.36 target this unit cannot tear NetworkManager down. That is *per
+        release*, and the ordering directives are *per unit* — the next release
+        that crosses the gate is a 1.44+ one, and the hazard is back with the same
+        file. A guard that only mattered below the gate would be switched off
+        exactly when it is needed.
+        """
+        unit = self.sections.get("Unit", set())
+        gated = any("nmcli device set" in line for line in shell_statements(NM_SETUP))
+        self.assertTrue(
+            gated,
+            "the setup no longer runs the override at all, so this case is guarding a hazard "
+            "that is no longer reachable; the ruling is about the ordering, and it holds "
+            "whenever the restart comes back",
+        )
+        self.assertEqual(
+            [value for value in unit if value.startswith("Requires=")], []
         )
 
     def test_the_requires_check_sees_a_requires_when_one_is_written(self):
@@ -1031,8 +1180,250 @@ class SetupUnitTest(unittest.TestCase):
             add_index,
             f"the guard is after the add, so it guards nothing: {statements}",
         )
+class FailedUnitTest(unittest.TestCase):
+    """A target boots with no failed unit, or a scenario cannot tell its own fault
+    from the image's.
+
+    `netplan-configure.service` fails on 26.04 in this image -- measured, and it is
+    the only failed unit in a fresh target. It is netplan's backend configuration
+    unit and there is no netplan configuration to apply, so it exits non-zero on
+    every boot. Nothing here is broken by it and every scenario still runs, which
+    is exactly what makes it a problem: a `systemctl --failed` assertion in Task 4
+    or 5 would have to special-case it, and a target that boots with a red unit is
+    the shape of thing an operator stops trusting.
+
+    So the image masks it, and this case holds that. The alternative — leaving it —
+    is not obviously wrong, which is why the case names the consequence rather than
+    asserting a preference.
+    """
+
+    def masked_units(self) -> set[str]:
+        """Every unit the image masks, read from the `mask` invocations only.
+
+        Collected per `systemctl` fragment rather than by searching the whole
+        instruction for `.service` tokens: an instruction that both disables one
+        unit and enables another names three services and masks one, and a filter
+        on `.service` alone cannot tell which is which. `systemctl disable
+        systemd-networkd.service || systemctl mask systemd-networkd.service` is
+        exactly that shape.
+        """
+        masked = set()
+        for line in instructions(read(TARGET_CONTAINERFILE)):
+            for fragment in line.replace("&&", " ; ").replace("||", " ; ").split(";"):
+                tokens = fragment.split()
+                if "systemctl" not in tokens or "mask" not in tokens:
+                    continue
+                masked |= {t for t in tokens if t.endswith(".service")}
+        return masked
+
+    def test_it_masks_the_one_unit_that_fails_on_a_fresh_boot(self):
+        self.assertIn(
+            "netplan-configure.service",
+            self.masked_units(),
+            f"the image does not mask netplan-configure.service, so every 26.04 target boots "
+            f"with one failed unit; the image masks {sorted(self.masked_units())}",
+        )
+
+    def test_it_masks_nothing_beyond_the_two_it_can_name_a_reason_for(self):
+        """A `systemctl mask *` would make a real failure invisible instead.
+
+        The alternative to masking one noisy unit is masking the world, and the
+        cost of that is that the next thing which *should* fail never does. The
+        set is therefore held to two, each with a measured reason:
+        `netplan-configure.service` fails on a fresh boot and
+        `systemd-networkd.service` would otherwise claim the same device as
+        NetworkManager.
+        """
+        self.assertEqual(
+            self.masked_units(),
+            {"netplan-configure.service", "systemd-networkd.service"},
+            f"the image masks {sorted(self.masked_units())}; each mask needs a measured reason "
+            f"and a unit that fails for no reason is a way of hiding the next one",
+        )
 
 
+class ManagedDeclarationTest(unittest.TestCase):
+    """The device is declared managed by configuration, on every release.
+
+    Measured, and it is a correction rather than a preference. NetworkManager's
+    stock `/usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf` says:
+
+        [keyfile]
+        unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma
+
+    so an `eth0` on a bridge is unmanaged by default -- except that on 24.04 and
+    26.04 it comes up managed anyway, and on 22.04 it does not. `except:` is
+    NetworkManager's own documented key for "this matched device is handled by
+    NetworkManager even when it would not otherwise be", and `interface-name:` is
+    the portable selector for it. In a disposable test target whose interface is
+    not special, declaring it managed is the mechanism, not a way around one.
+    """
+
+    def setUp(self):
+        self.assertTrue(
+            NM_DECLARATION.is_file(),
+            f"{NM_DECLARATION} does not exist, so the image declares nothing and a target is "
+            f"managed only where NetworkManager happens to manage it by default",
+        )
+        self.text = read(NM_DECLARATION)
+
+    def keyfile_values(self) -> list[str]:
+        """The `unmanaged-devices` values the declaration sets, as written."""
+        values = []
+        for line in run_lines(self.text):
+            key, _, value = line.partition("=")
+            if key.strip() == "unmanaged-devices":
+                values.append(value.strip())
+        return values
+
+    def test_it_narrows_the_stock_list_rather_than_replacing_it(self):
+        """The list is the stock one plus one `except:`, and that is the whole trick.
+
+        `unmanaged-devices=*` with an `except:interface-name:eth0` leaves every
+        other device exactly as NetworkManager shipped it. Asserted against the
+        stock file's own value, read out of the running images, so a declaration
+        that quietly widened to manage everything in the container would fail --
+        and one that dropped the `except:` would fail too, because that is a
+        no-op, not a declaration.
+        """
+        values = self.keyfile_values()
+        self.assertEqual(len(values), 1, f"the declaration sets it {len(values)} times: {values}")
+        value = values[0]
+        self.assertTrue(value.startswith("*"), f"it does not narrow a wildcard: {value!r}")
+        self.assertIn("except:interface-name:eth0", value)
+        # The stock file's own value, so "narrowing" is checked against the thing
+        # being narrowed rather than against a paraphrase of it.
+        self.assertIn(
+            "except:type:wifi,except:type:gsm,except:type:cdma",
+            value,
+            f"the declaration replaced the stock exceptions rather than adding to them: {value!r}. "
+            f"Dropping them would make the container's wifi and modem devices unmanaged too",
+        )
+
+    def test_the_declaration_is_ported_in_as_a_file_and_lands_in_conf_d(self):
+        """`COPY`ed to `/etc/NetworkManager/conf.d/`, not written by a `RUN`.
+
+        A `RUN` that writes the file is a second copy of the declaration's text in
+        the Containerfile, and the two would drift — which is the shape of defect
+        this repository keeps finding. So the declaration is one file, and the
+        cases above read that file.
+        """
+        statements = folded_lines(read(TARGET_CONTAINERFILE))
+        copies = [line for line in statements if "NetworkManager/conf.d" in line]
+        self.assertEqual(len(copies), 1, f"expected one COPY into conf.d: {copies}")
+        self.assertIn(str(NM_DECLARATION.relative_to(REPO)), copies[0])
+        self.assertFalse(
+            [
+                line
+                for line in instructions(read(TARGET_CONTAINERFILE))
+                if "conf.d" in line
+            ],
+            "the Containerfile also writes a conf.d entry with a RUN, so the declaration exists "
+            "twice and the two can disagree",
+        )
+
+    def test_the_declaration_is_a_conf_d_snippet_and_not_a_whole_main_conf(self):
+        """It belongs in `conf.d/`, not over `/etc/NetworkManager/NetworkManager.conf`.
+
+        Overwriting the main file would drop every other `lib:` snippet the distro
+        ships — the firewall defaults and the resolved DNS integration on this
+        release — for a reason that has nothing to do with the device's managed
+        state. That is a silent loss, and it is what `conf.d/` is for.
+        """
+        statements = folded_lines(read(TARGET_CONTAINERFILE))
+        self.assertFalse(
+            [line for line in statements if line.endswith("/etc/NetworkManager/NetworkManager.conf")],
+            "the image overwrites the main NetworkManager.conf, which drops every other "
+            "distro-shipped lib: snippet",
+        )
+class HarnessRefusalNamesTheDeclarationTest(unittest.TestCase):
+    """`podman.py`'s refusal has to name the declaration, which is now the baseline.
+
+    The refusal is what an operator reads when a target comes up unmanaged, and it
+    is the same shape of problem this project has hit four times: a message that
+    names a sequence which is not what the image does, sends the reader to run it,
+    and the reader concludes the harness is wrong. The declaration is now part of
+    the required setup, so it is part of what the refusal says.
+    """
+
+    def setUp(self):
+        import podman as podman_module
+
+        self.podman = podman_module
+
+    def test_the_refusal_names_the_configuration_declaration(self):
+        self.assertIn("conf.d", self.podman.NM_UNMANAGED_EXPLANATION)
+        self.assertIn("except:interface-name:eth0", self.podman.NM_UNMANAGED_EXPLANATION)
+
+    def test_the_refusal_still_names_the_sequence_and_the_profile(self):
+        """Adding the declaration must not displace what was already there.
+
+        The sequence is still what runs on 24.04 and 26.04, and the profile is
+        still what Task 3 modifies, so a refusal that mentioned only the
+        declaration would be the same class of error in the other direction.
+        """
+        message = self.podman.NM_UNMANAGED_EXPLANATION
+        self.assertIn("nmcli device set eth0 managed yes", message)
+        self.assertIn("systemctl restart NetworkManager", message)
+        self.assertIn(self.podman.NM_PROFILE_STEP, message)
+
+    def test_the_refusal_carries_the_measured_version_boundary(self):
+        """The one fact that distinguishes a 22.04 `no` from a 24.04 `no`.
+
+        They look identical from the outside and have different causes: below 1.44
+        the persistent device override does not exist, so the sequence cannot help
+        and the declaration is the only mechanism. A reader told "restart" on
+        22.04 restarts, finds it worked, and is looking at the wrong thing.
+        """
+        message = self.podman.NM_UNMANAGED_EXPLANATION
+        self.assertIn("1.44", message)
+        self.assertIn("1.36.6", message)
+class PlanAgreesWithTheImageTest(unittest.TestCase):
+    """The plan is the record the next implementer works from, so it is held here.
+
+    Task 1's suite established this pattern: the plan and the harness disagreed
+    about who creates the `eth0` connection profile, and nothing would have
+    noticed until every cell of the matrix was `incomplete` for ever. The
+    architecture note carried a prohibition — *do not add a `NetworkManager.conf.d`
+    entry* — that was reasoned from the 24.04 measurement and does not survive the
+    22.04 one, and a next task reading it would refuse the declaration the image
+    now depends on.
+    """
+
+    def setUp(self):
+        self.plan = (REPO / "docs/superpowers/plans/2026-09-25-podman-integration-matrix.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_architecture_note_no_longer_forbids_the_declaration(self):
+        self.assertNotIn(
+            "Do **not** add a `NetworkManager.conf.d` entry",
+            self.plan,
+            "the plan still forbids the conf.d declaration the target image now ships, so the next "
+            "task will read a prohibition against the mechanism this plan depends on",
+        )
+
+    def test_the_architecture_note_states_the_measured_version_boundary(self):
+        """The boundary, with the measurement that establishes it.
+
+        Named because a boundary without its evidence is the same as the wrong
+        prohibition: an implementer cannot tell a measured threshold from a
+        remembered one, and this repository has been bitten by exactly that.
+        """
+        for token in ("1.36.6", "1.42.4", "1.44.2", "1.46.0", "1.54.3", "1.44"):
+            with self.subTest(token=token):
+                self.assertIn(token, self.plan)
+
+    def test_the_plan_records_that_the_active_connection_is_nms_own(self):
+        """Task 3's first surprise, recorded where Task 3 will read it.
+
+        On 24.04 and 26.04 the device comes up activated on a profile NetworkManager
+        creates for itself, named `eth0` — not on `eth0-managed`. A DHCP scenario
+        that reads `nmcli connection up eth0-managed` and then wonders why the lease
+        belongs to a different profile has been given a fact for free.
+        """
+        self.assertIn("connected (externally)", self.plan)
+        self.assertIn("eth0-managed", self.plan)
 class CopySourceTest(unittest.TestCase):
     """Every `COPY` names a file that is in the repository.
 
@@ -1096,8 +1487,6 @@ class CopySourceTest(unittest.TestCase):
             self.copy_sources("FROM ubuntu:24.04 AS build\nFROM ubuntu:24.04\nCOPY --from=build /out/x /usr/bin/x\n"),
             [],
         )
-
-
 class LockSchemaTest(unittest.TestCase):
     """The file's shape, because a lock that cannot be read cannot be used."""
 
@@ -1227,527 +1616,6 @@ class LockSchemaTest(unittest.TestCase):
         manifest the harness never verified.
         """
         self.assertIn("arch", json.loads(read(LOCK)))
-
-
-class EntryPointOrderTest(unittest.TestCase):
-    """The NetworkManager sequence, run, and required to be in this order.
-
-    Everything here executes a real shell script against a model of `nmcli` and
-    `systemctl`. That is possible -- and necessary -- because the three commands
-    are the load-bearing measured fact of this plan and a test that only found
-    the words in a file would not notice them in the wrong order.
-    """
-
-    # -- a model of the two tools -------------------------------------------
-
-    NMCLI_MODEL = '''#!/bin/sh
-# A model of the `nmcli` calls the target's setup makes, in the shape the real
-# ones have. State lives in $NM_STATE and every call is appended to $NM_TRACE as
-# the full expanded command line, so a case reads the *order the commands were
-# run in* rather than the order they appear in a file.
-#
-# The two behaviours this models that a naive model would get wrong, and which
-# are the whole reason the ordering is worth testing:
-#
-#   * `nmcli device set eth0 managed yes` **returns success whether or not a
-#     connection profile exists for the device.** Measured on this host: with no
-#     profile the audit log records `op="device-managed" ... result="success"`
-#     and `GENERAL.NM-MANAGED` is still `no` after the restart. A model that
-#     made `device set` fail without a profile would make the ordering test pass
-#     for the wrong reason, and the defect it exists to catch would go in.
-#   * `nmcli connection add` fails if the profile already exists, because the
-#     real one does.
-state="${NM_STATE:?}"
-trace="${NM_TRACE:?}"
-echo "nmcli $*" >> "$trace"
-fields=""
-while [ "$1" = "-g" ]; do fields="$2"; shift 2; done
-verb="$1"; shift
-case "$verb" in
-  general)
-    # The readiness probe the script makes before anything else. Answering it is
-    # what "NetworkManager is up" means here.
-    [ "$1" = "status" ] && exit 0
-    echo "unmodelled: nmcli general $1" >&2; exit 64
-    ;;
-  --version)
-    # The failure message asks for the version, because on 22.04 (nmcli 1.36)
-    # there is no persistent device override and a `no` means something quite
-    # different from what it means on 24.04 and 26.04.
-    echo "nmcli tool, version 1.36.6"
-    exit 0
-    ;;
-  connection)
-    what="$1"; shift
-    case "$what" in
-      add)
-        name=""
-        prev=""
-        for token in "$@"; do
-          if [ "$prev" = "con-name" ]; then name="$token"; fi
-          prev="$token"
-        done
-        if [ -f "$state/profile" ]; then
-          echo "Error: connection with the name '$name' already exists." >&2
-          exit 10
-        fi
-        printf '%s' "$name" > "$state/profile"
-        echo "Connection '$name' (52663ce3-8787-46a8-a924-968cb4f12df0) successfully added."
-        ;;
-      show)
-        if [ -f "$state/profile" ] && [ "$1" = "$(cat "$state/profile")" ]; then
-          echo "connection.id: $1"
-        else
-          echo "Error: unknown connection '$1'" >&2
-          exit 10
-        fi
-        ;;
-      *) echo "unmodelled: nmcli connection $what" >&2; exit 64 ;;
-    esac
-    ;;
-  device)
-    what="$1"; shift
-    case "$what" in
-      set)
-        # Success either way. That is the measured behaviour, and it is the
-        # reason step 1 has to come first: without a profile this writes
-        # nothing that the restart will re-read.
-        echo "Device '$1' state set to '$2'."
-        ;;
-      show)
-        case "$fields" in
-          GENERAL.NM-MANAGED)
-            [ -f "$state/managed" ] && cat "$state/managed" || echo "no"
-            ;;
-          GENERAL.TYPE)
-            cat "${STATE:-}" 2>/dev/null || echo "${NM_TYPE:-ethernet}"
-            ;;
-          *) echo "unmodelled field: $fields" >&2; exit 64 ;;
-        esac
-        ;;
-      *) echo "unmodelled: nmcli device $what" >&2; exit 64 ;;
-    esac
-    ;;
-  *) echo "unmodelled: nmcli $verb" >&2; exit 64 ;;
-esac
-'''
-
-    SYSTEMCTL_MODEL = '''#!/bin/sh
-# A model of `systemctl restart NetworkManager` and nothing else. The restart is
-# the step that re-reads the override under /run/NetworkManager/devices/, so a
-# model without it cannot tell a correct setup from one that forgot it -- which
-# is the second of the three mutations the suite applies.
-state="${NM_STATE:?}"
-trace="${NM_TRACE:?}"
-echo "systemctl $*" >> "$trace"
-if [ "$1" = "restart" ] && [ "$2" = "NetworkManager" ]; then
-  # The override is only re-read if a connection profile existed for the device
-  # when it was written. No profile, no override, `no` after the restart -- which
-  # is what was measured on this host.
-  if [ -f "$state/profile" ]; then
-    echo yes > "$state/managed"
-  else
-    echo no > "$state/managed"
-  fi
-  exit 0
-fi
-echo "unmodelled: systemctl $*" >&2
-exit 64
-'''
-
-    def setUp(self):
-        self.state = None
-
-    def _tmpdir(self):
-        import tempfile
-
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        return directory.name
-
-    def _tool(self, name: str, model: str) -> Path:
-        directory = Path(self._tmpdir()) / "bin"
-        directory.mkdir(exist_ok=True)
-        path = directory / name
-        path.write_text(model, encoding="utf-8")
-        path.chmod(0o755)
-        return path
-
-    def run_setup(self, script: Path):
-        """Run a setup script with the modelled tools on PATH, and read the trace back.
-
-        A **fresh** state directory per call, not one per test. The model's
-        `managed` file is what the restart writes and the check reads, so two runs
-        sharing one state directory see each other's answer -- and a case that ran
-        the correct script first and a mutation second would read the first run's
-        `yes` and pass a mutation that ought to fail. That is exactly the shape
-        of a control that cannot fail, so the state is per run.
-        """
-        import os
-        import subprocess
-
-        self.state = Path(self._tmpdir()) / "state"
-        self.state.mkdir(parents=True)
-        tools = Path(self._tmpdir()) / "bin"
-        tools.mkdir(exist_ok=True)
-        (tools / "nmcli").write_text(self.NMCLI_MODEL, encoding="utf-8")
-        (tools / "systemctl").write_text(self.SYSTEMCTL_MODEL, encoding="utf-8")
-        for tool in tools.iterdir():
-            tool.chmod(0o755)
-        trace = tools / "trace"
-        trace.write_text("", encoding="utf-8")
-        environment = dict(os.environ)
-        environment["PATH"] = f"{tools}:{environment['PATH']}"
-        environment["NM_STATE"] = str(self.state)
-        environment["NM_TRACE"] = str(trace)
-        completed = subprocess.run(
-            ["sh", str(script)],
-            capture_output=True,
-            text=True,
-            env=environment,
-            timeout=60,
-        )
-        return completed, [line for line in trace.read_text(encoding="utf-8").splitlines() if line]
-
-    def nm_managed(self) -> str:
-        return (self.state / "managed").read_text(encoding="utf-8").strip() if (self.state / "managed").exists() else "absent"
-
-    def profile_exists(self) -> bool:
-        return (self.state / "profile").exists()
-
-    # -- the cases ------------------------------------------------------------
-
-    def test_the_script_exists_and_is_executable_shape(self):
-        """A `sh` script with a shebang, so it can be both run here and `COPY`ed in.
-
-        Not a "it runs" case: this asserts the *form*, because the file is copied
-        into the image and executed as PID 1's entry, and a file without a
-        shebang is not that.
-        """
-        text = read(NM_SETUP)
-        self.assertTrue(text.startswith("#!/bin/sh"), text[:40])
-        self.assertIn("set -e", text)
-
-    def test_the_three_commands_are_in_this_order(self):
-        """**The case this task exists for.**
-
-        The order is not a style preference. Measured, twice in this plan: with
-        the profile first, the three commands take `GENERAL.NM-MANAGED` to
-        `yes`; with it last, the `device set` is accepted, the restart happens,
-        and the field stays `no` -- so a target boots unmanaged, every scenario
-        fails for a reason that has nothing to do with the package, and the whole
-        matrix is `incomplete` with exit 3.
-
-        Read off the **trace**, not the file: the case requires the calls in the
-        order the model recorded them, which is the order they were actually run
-        in. A script with the three commands in the right order and something
-        else before them would still pass this, and the next case is what holds
-        that.
-        """
-        completed, trace = self.run_setup(NM_SETUP)
-        self.assertEqual(
-            completed.returncode,
-            0,
-            f"the setup script failed:\n{completed.stdout}\n{completed.stderr}",
-        )
-        profile = [i for i, line in enumerate(trace) if "connection add" in line]
-        override = [i for i, line in enumerate(trace) if "device set" in line]
-        restart = [i for i, line in enumerate(trace) if "systemctl restart" in line]
-        self.assertEqual(len(profile), 1, trace)
-        self.assertEqual(len(override), 1, trace)
-        self.assertEqual(len(restart), 1, trace)
-        self.assertLess(
-            profile[0],
-            override[0],
-            f"the profile must be created before the override; the trace was {trace}",
-        )
-        self.assertLess(
-            override[0],
-            restart[0],
-            f"the override must be set before the restart re-reads it; the trace was {trace}",
-        )
-
-    def test_the_commands_are_the_three_the_plan_names(self):
-        """The exact spellings, verbatim -- read off the trace, not the file.
-
-        The script writes `"$DEVICE"` and `"$PROFILE"` where the commands are, so
-        the *expanded* commands are what matter and what the model recorded. A
-        `nmcli device set eth0 managed no` in the same position would satisfy
-        the ordering case and unmanage every target; `systemctl restart
-        systemd-networkd` would satisfy it and do nothing.
-        """
-        completed, trace = self.run_setup(NM_SETUP)
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn(
-            "nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto",
-            trace,
-        )
-        self.assertIn("nmcli device set eth0 managed yes", trace)
-        self.assertIn("systemctl restart NetworkManager", trace)
-
-    def test_it_fails_loudly_when_the_field_is_not_yes(self):
-        """A boot that cannot be measured must stop, and must say what it saw.
-
-        Silently continuing is the failure this rule exists for: every scenario
-        downstream then fails against an unmanaged device, and the failure reads
-        like an installer bug in a package that has not been installed yet.
-        """
-        text = read(NM_SETUP)
-        self.assertIn("GENERAL.NM-MANAGED", text)
-        self.assertIn("yes", text)
-        self.assertRegex(text, r"exit 1|return 1|false")
-
-    def test_the_failure_message_names_the_profile_and_the_observed_value(self):
-        """Both facts, not a bare "unmanaged".
-
-        A message that says only `NM-MANAGED is no` sends the reader to the
-        two-step sequence that the plan already measured as insufficient on its
-        own -- they run it, it succeeds, and they conclude the harness is wrong.
-        The profile is the part that is easy to forget.
-        """
-        text = read(NM_SETUP)
-        self.assertIn("eth0-managed", text)
-        self.assertIn("connection profile", text.lower())
-
-    def test_the_failure_message_names_the_networkmanager_version(self):
-        """**Measured: the two failures are identical from the outside and have different causes.**
-
-        On 24.04 and 26.04 the override is written under
-        `/run/NetworkManager/devices/` and the restart re-reads it, so a `no` means
-        the restart did not happen. On 22.04 (nmcli 1.36) there is no persistent
-        device override at all: the field stays `no` with or without a profile and
-        with or without a restart, and no change to this script can alter it.
-
-        A reader who is told "restart" on 22.04 checks the restart, finds it
-        happened, and has been sent looking at the wrong thing. So the message
-        carries the version, which is the one fact that distinguishes the two
-        causes, and it names the file to read to tell them apart.
-        """
-        completed, _ = self.run_setup(NM_SETUP)
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        # With the override dropped the field reads `no`, and the message has to
-        # carry both the observed value and the version.
-        dropped = self.drop_line(NM_SETUP, "systemctl restart NetworkManager")
-        completed, _ = self.run_setup(dropped)
-        self.assertNotEqual(completed.returncode, 0)
-        message = completed.stdout + completed.stderr
-        self.assertIn("nmcli", message)
-        self.assertIn(GENERAL_MANAGED_FIELD, message)
-
-    def test_it_does_not_add_a_networkmanager_conf_d_entry(self):
-        """The override-and-restart path is the measured one; a conf.d entry is not.
-
-        Forcing `managed=true` in a drop-in would make the target come up
-        managed, which sounds like the goal -- and would mean the harness had not
-        measured the thing the plan's architecture note is about, and that the
-        `device set` + restart path had never been exercised. The plan forbids
-        it, so it is a case.
-        """
-        text = read(NM_SETUP)
-        for forbidden in ("conf.d", "unmanaged-devices", "[ifupdown]"):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, text)
-
-    def test_moving_the_profile_after_the_restart_makes_the_check_fail(self):
-        """**The control, and the reason the case above is not a comment.**
-
-        The same script with one edit: the profile is created *after* the restart.
-        The model says the field is then `no` -- which is what was measured on
-        this host -- and the setup must exit non-zero rather than hand a target
-        to the scenarios. A test that only checked the good ordering would pass
-        here too, and would be a test of the file's spelling.
-        """
-        reordered = self.reorder(NM_SETUP)
-        completed, trace = self.run_setup(reordered)
-        self.assertNotEqual(
-            completed.returncode,
-            0,
-            f"the check passed with the profile created after the restart; the trace was {trace}\n"
-            f"{completed.stdout}\n{completed.stderr}",
-        )
-        self.assertIn("eth0-managed", str(completed.stderr) + completed.stdout)
-
-    def test_dropping_the_restart_makes_the_check_fail(self):
-        """The other of the two measured facts.
-
-        `nmcli device set eth0 managed yes` returns success and does not take
-        effect until NetworkManager re-reads the override. Without the restart
-        the override is written and never read, the field stays `no`, and the
-        setup must fail.
-        """
-        dropped = self.drop_line(NM_SETUP, "systemctl restart NetworkManager")
-        completed, trace = self.run_setup(dropped)
-        self.assertNotEqual(
-            completed.returncode,
-            0,
-            f"the check passed with the restart dropped; the trace was {trace}\n"
-            f"{completed.stdout}\n{completed.stderr}",
-        )
-
-    def test_dropping_the_profile_makes_the_check_fail(self):
-        """The third of the three, and the one the plan's architecture note is about.
-
-        With no profile at all, both remaining steps are accepted, the audit log
-        records `result="success"`, and the field stays `no`. This is what the
-        plan measured on every container it tried, and it is why the profile
-        belongs to this image's boot rather than to a later scenario.
-        """
-        dropped = self.drop_line(NM_SETUP, "nmcli connection add")
-        completed, trace = self.run_setup(dropped)
-        self.assertNotEqual(
-            completed.returncode,
-            0,
-            f"the check passed with the profile step dropped; the trace was {trace}\n"
-            f"{completed.stdout}\n{completed.stderr}",
-        )
-
-    def test_reordering_needs_a_script_whose_profile_line_is_movable(self):
-        """The control's own precondition, asserted where the control is used.
-
-        `reorder` finds one profile line and one restart line and moves the first
-        after the second. If either stopped being findable -- a rewrite, a
-        variable, a loop -- the control would silently produce the *unmodified*
-        script, the assertion above would pass for the wrong reason, and the
-        defect it exists to catch would be reported as covered. So the mutation
-        has to be shown to be a mutation, and it was shown to be a broken one
-        here: an index computed before a `pop` puts the line back where it was.
-        """
-        original = read(NM_SETUP)
-        reordered = self.reorder(NM_SETUP)
-        mutated = read(reordered)
-        self.assertNotEqual(mutated, original, "the mutation produced the unmodified script")
-        self.assertLess(
-            original.index("nmcli connection add"),
-            original.index("systemctl restart NetworkManager"),
-            "the shipped script already has the profile after the restart, so the control "
-            "asserts nothing",
-        )
-        self.assertLess(
-            mutated.index("systemctl restart NetworkManager"),
-            mutated.index("nmcli connection add"),
-            "the mutation did not move the profile after the restart",
-        )
-        # A move, not an edit: the same statements, the same count. The variant is
-        # written from the comments-stripped statements (see `reorder`), so the
-        # comparison is against those and not against the file's prose.
-        self.assertEqual(
-            sorted(mutated.splitlines()),
-            sorted(shell_statements(NM_SETUP)),
-            "the mutation changed the script rather than moving one part of it, so the case "
-            "above is not testing the ordering",
-        )
-        self.assertEqual(
-            len(mutated.splitlines()), len(shell_statements(NM_SETUP))
-        )
-
-    # -- the mutations --------------------------------------------------------
-
-    def _write_variant(self, lines: list[str], name: str) -> Path:
-        directory = Path(self._tmpdir()) / name
-        directory.mkdir(exist_ok=True)
-        path = directory / "target-nm-setup.sh"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
-
-    def reorder(self, script: Path) -> Path:
-        """A copy with the profile step moved to just after the restart.
-
-        Three things had to be got right, and each of them was got wrong first --
-        which is why they are written down rather than left in the code:
-
-        * **instructions, not text.** The profile step is named in this file's
-          own comments, and a helper that searches the raw text finds the comment
-          first and moves *that*, leaving the script unchanged. Every mutation in
-          this class runs on `shell_statements`, which is comments-stripped.
-        * **the index is recomputed after the pop.** The profile step is *before*
-          the restart in a correct script, so removing it shifts every later index
-          down by one, and inserting at the pre-pop index puts the line straight
-          back.
-        * **the whole `if … fi` block moves, not just the add.** The add is inside
-          a guard (`if ! nmcli connection show …; then`), and moving the one line
-          would leave a guard whose body is gone -- a different script, failing
-          for a reason that has nothing to do with the ordering.
-        """
-        statements = shell_statements(script)
-        block_start = next(
-            i for i, line in enumerate(statements) if "nmcli connection add" in line
-        )
-        guard = next(
-            (
-                i
-                for i in range(block_start - 1, -1, -1)
-                if statements[i].startswith(("if ", "if!", "if\t"))
-            ),
-            block_start,
-        )
-        end = next(
-            (i for i in range(block_start + 1, len(statements)) if statements[i] == "fi"),
-            block_start,
-        )
-        restart = next(
-            i
-            for i, line in enumerate(statements)
-            if line.startswith("systemctl restart NetworkManager")
-        )
-        block = statements[guard : end + 1]
-        remainder = statements[:guard] + statements[end + 1 :]
-        shifted = restart - 1 if guard < restart else restart
-        return self._write_variant(remainder[: shifted + 1] + block + remainder[shifted + 1 :], "reordered")
-
-    def drop_line(self, script: Path, needle: str) -> Path:
-        """A copy with the instruction containing `needle` removed."""
-        statements = [
-            line
-            for line in shell_statements(script)
-            if not (needle in line and not line.startswith("#"))
-        ]
-        return self._write_variant(statements, "dropped")
-
-    # -- the entrypoint the image runs ----------------------------------------
-
-    def test_the_entrypoint_hands_over_to_systemd(self):
-        """`exec` into the init, so it becomes PID 1.
-
-        Without the `exec`, the shell stays PID 1 and systemd is a child, which
-        is the shape that makes `--systemd=always` a no-op: a target whose units
-        systemd "started" are not managed by a PID 1 systemd at all, and
-        `systemctl` answers to the child.
-        """
-        text = read(ENTRYPOINT)
-        self.assertRegex(text, r"exec\s+/sbin/init|exec\s+.*init")
-
-    def test_the_entrypoint_does_not_perform_the_sequence_itself(self):
-        """The sequence runs once, from systemd, and not twice.
-
-        An entrypoint that also ran the three steps would do them before
-        `/sbin/init` exists -- before there is a D-Bus for `nmcli` to talk to.
-        Measured in this session, on the real image, for the entrypoint that
-        tried: `Error: Could not create NMClient object: Could not connect: No such
-        file or directory`, and `GENERAL.NM-MANAGED` stayed `no`.
-
-        The case reads the entrypoint's **instructions**, not its text: the file
-        quotes that error and names all three commands in the comment explaining
-        why it does not run them, and a case that read the prose would fail on
-        the explanation.
-        """
-        instructions = " ".join(shell_statements(ENTRYPOINT))
-        for command in ("nmcli", "systemctl", "device set", "connection add"):
-            with self.subTest(command=command):
-                self.assertNotIn(command, instructions)
-
-    def test_the_setup_is_installed_as_a_unit_the_image_enables(self):
-        """The sequence is part of the image's boot, not of a scenario.
-
-        A sequence a scenario ran would leave the window where the target is
-        unmanaged open to the first scenario, and the plan's whole correction --
-        that the profile must exist *before* the steps -- only holds if the steps
-        run once, at boot, in order.
-        """
-        text = read(TARGET_CONTAINERFILE)
-        self.assertIn("target-nm-setup.service", text)
-        self.assertRegex(text, r"systemctl\s+enable\s+.*target-nm-setup")
-
-
 class ImageDigestVerificationTest(unittest.TestCase):
     """The digests are real, and the proof is that the registry still serves them.
 
@@ -1865,3 +1733,811 @@ class ImageDigestVerificationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class SetupScriptTestCase(unittest.TestCase):
+    """A real `sh`, a model of `nmcli` and `systemctl`, and a trace to read.
+
+    Everything that tests the target's setup executes the *real* script against
+    the modelled tools. That is possible -- and necessary -- because the sequence
+    is the load-bearing measured fact of this plan and a case that only found the
+    words in a file would not notice them in the wrong order.
+
+    Three classes use it and they ask different questions of the same script, so
+    the harness is here and the cases are not inherited: an ordering question and a
+    version-gate question have opposite dials, and inheriting would run each case
+    twice, once under dials that make it vacuous.
+    """
+
+    # -- a model of the two tools -------------------------------------------
+
+    NMCLI_MODEL = '''#!/bin/sh
+# A model of the `nmcli` calls the target's setup makes, in the shape the real
+# ones have. State lives in $NM_STATE and every call is appended to $NM_TRACE as
+# the full expanded command line, so a case reads the *order the commands were
+# run in* rather than the order they appear in a file.
+#
+# Three behaviours this models that a naive model would get wrong, and which are
+# the whole reason the setup is worth testing:
+#
+#   1. `nmcli device set eth0 managed yes` **returns success whether or not a
+#      connection profile exists for the device.** Measured: with no profile the
+#      audit log records `op="device-managed" ... result="success"` and
+#      `GENERAL.NM-MANAGED` is still `no` after the restart. A model that made
+#      `device set` fail without a profile would make the ordering test pass for
+#      the wrong reason.
+#   2. The persistent device override exists **only from NetworkManager 1.44** —
+#      measured `no` at 1.36.6 (22.04) and 1.42.4 (23.04) and `yes` at 1.44.2
+#      (23.10), 1.46.0 (24.04) and 1.54.3 (26.04). Below the boundary the
+#      override is never written, whatever `device set` answers.
+#   3. The conf.d declaration is a *mechanism that can fail silently*: the file is
+#      written, NetworkManager reads it, and the field is still `no`. A model in
+#      which the declaration always worked would make the boot check
+#      untestable, which is the one thing the ruling asks it to be.
+#
+# The two dials a case sets, both by environment:
+#
+#   NM_VERSION      the `nmcli --version` the model answers. Default 1.46.0.
+#   NM_DECLARED     `yes` (default) the conf.d declaration took effect and the
+#                   device is managed from the moment the daemon answers;
+#                   `ineffective` the declaration is present and ignored, which is
+#                   what a target on a release where the selector does not match
+#                   looks like.
+state="${NM_STATE:?}"
+trace="${NM_TRACE:?}"
+echo "nmcli $*" >> "$trace"
+version="${NM_VERSION:-1.46.0}"
+# The persistent device override arrived in 1.44. Measured on this host at 1.36.6,
+# 1.42.4, 1.44.2, 1.46.0 and 1.54.3; the comparison is on major and minor only,
+# because that is what was measured.
+major="${version%%.*}"
+rest="${version#*.}"
+minor="${rest%%.*}"
+if [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 44 ]; }; then
+    has_override=yes
+else
+    has_override=no
+fi
+fields=""
+while [ "$1" = "-g" ]; do fields="$2"; shift 2; done
+verb="$1"; shift
+case "$verb" in
+  general)
+    # The readiness probe the script makes before anything else. Answering it is
+    # what "NetworkManager is up" means here.
+    [ "$1" = "status" ] && exit 0
+    echo "unmodelled: nmcli general $1" >&2; exit 64
+    ;;
+  --version)
+    echo "nmcli tool, version $version"
+    exit 0
+    ;;
+  connection)
+    what="$1"; shift
+    case "$what" in
+      add)
+        name=""
+        prev=""
+        for token in "$@"; do
+          if [ "$prev" = "con-name" ]; then name="$token"; fi
+          prev="$token"
+        done
+        if [ -f "$state/profile" ]; then
+          echo "Error: connection with the name '$name' already exists." >&2
+          exit 10
+        fi
+        printf '%s' "$name" > "$state/profile"
+        echo "Connection '$name' (52663ce3-8787-46a8-a924-968cb4f12df0) successfully added."
+        ;;
+      show)
+        if [ -f "$state/profile" ] && [ "$1" = "$(cat "$state/profile")" ]; then
+          echo "connection.id: $1"
+        else
+          echo "Error: unknown connection '$1'" >&2
+          exit 10
+        fi
+        ;;
+      *) echo "unmodelled: nmcli connection $what" >&2; exit 64 ;;
+    esac
+    ;;
+  device)
+    what="$1"; shift
+    case "$what" in
+      set)
+        # Success either way. That is the measured behaviour, and it is the
+        # reason the profile has to come first: without one this writes nothing
+        # the restart will re-read.
+        if [ -f "$state/profile" ] && [ "$has_override" = yes ]; then
+          echo yes > "$state/override"
+        fi
+        echo "Device '$1' state set to '$2'."
+        ;;
+      show)
+        case "$fields" in
+          GENERAL.NM-MANAGED)
+            # The field reads what NetworkManager has *read*, not what has been
+            # written: the override only takes effect when a restart re-reads it,
+            # and until then the file on disk is exactly what the plan says it is
+            # -- present, and not yet in force. So `$state/override` is not
+            # consulted here, only `$state/managed` (written by the restart) and
+            # the declaration.
+            if [ -f "$state/managed" ]; then
+              cat "$state/managed"
+            elif [ "${NM_DECLARED:-yes}" = yes ]; then
+              echo yes
+            else
+              echo no
+            fi
+            ;;
+          GENERAL.TYPE)
+            echo "${NM_TYPE:-ethernet}"
+            ;;
+          GENERAL.CONNECTION)
+            echo "${NM_ACTIVE_CONNECTION:-eth0}"
+            ;;
+          *) echo "unmodelled field: $fields" >&2; exit 64 ;;
+        esac
+        ;;
+      *) echo "unmodelled: nmcli device $what" >&2; exit 64 ;;
+    esac
+    ;;
+  *) echo "unmodelled: nmcli $verb" >&2; exit 64 ;;
+esac
+'''
+
+    SYSTEMCTL_MODEL = '''#!/bin/sh
+# A model of `systemctl restart NetworkManager` and nothing else. The restart is
+# the step that re-reads the override under /run/NetworkManager/devices/, so a
+# model without it cannot tell a correct setup from one that forgot it -- which
+# is the second of the three mutations the suite applies.
+#
+# The re-read happens only when an override was actually written, and an override
+# is written only when a connection profile existed for the device at the moment
+# `device set` ran. That is the measured behaviour, and it is the whole reason the
+# profile step has to come first.
+state="${NM_STATE:?}"
+trace="${NM_TRACE:?}"
+echo "systemctl $*" >> "$trace"
+if [ "$1" = "restart" ] && [ "$2" = "NetworkManager" ]; then
+  # The restart re-reads the override, and only the override. Below 1.44 no
+  # override is ever written, so the restart changes nothing at all -- measured:
+  # on 1.36 the field holds whatever the declaration says, before and after.
+  # Modelling it as "a restart with no override sets the field to no" would make
+  # a working declaration look like the restart's victim, which is not what
+  # happens, and the control case in DeclarationHoldsHonestTest would fail for
+  # a reason in the model rather than in the script.
+  [ -f "$state/override" ] && cp "$state/override" "$state/managed"
+  exit 0
+fi
+echo "unmodelled: systemctl $*" >&2
+exit 64
+'''
+
+    def setUp(self):
+        self.state = None
+
+    def _tmpdir(self):
+        import tempfile
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return directory.name
+
+    def _tool(self, name: str, model: str) -> Path:
+        directory = Path(self._tmpdir()) / "bin"
+        directory.mkdir(exist_ok=True)
+        path = directory / name
+        path.write_text(model, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    # The dials every case in this class runs with, and why they are the safe
+    # direction.
+    #
+    # `NM_DECLARED=ineffective` makes the conf.d declaration *not* take effect, so
+    # the only thing in the model that can make `GENERAL.NM-MANAGED` read `yes`
+    # is the sequence -- in the order this class checks. That is what stops the
+    # ordering assertions from being vacuous: with a working declaration the
+    # field is `yes` from the moment the daemon answers, every case would pass,
+    # and the class would be a test of the word "yes".
+    #
+    # `NM_VERSION=1.46.0` is the lowest release on the matrix that *has* the
+    # persistent device override, so the two commands under test actually run. A
+    # higher version would also do; a lower one would skip them and the trace
+    # assertions below would fail, which is the point of the assertions.
+    ORDER_DIALS = {"NM_VERSION": "1.46.0", "NM_DECLARED": "ineffective"}
+
+    def run_setup(self, script: Path, **dials):
+        """Run a setup script with the modelled tools on PATH, and read the trace back.
+
+        A **fresh** state directory per call, not one per test. The model's
+        `managed` and `override` files are what the sequence writes and the check
+        reads, so two runs sharing one state directory see each other's answer --
+        and a case that ran the correct script first and a mutation second would
+        read the first run's `yes` and pass a mutation that ought to fail. That is
+        exactly the shape of a control that cannot fail, so the state is per run.
+
+        `dials` are the model's environment: `NM_VERSION` for the
+        `nmcli --version` it answers, and `NM_DECLARED` for whether the conf.d
+        declaration took effect.
+        """
+        import os
+        import subprocess
+
+        self.state = Path(self._tmpdir()) / "state"
+        self.state.mkdir(parents=True)
+        tools = Path(self._tmpdir()) / "bin"
+        tools.mkdir(exist_ok=True)
+        (tools / "nmcli").write_text(self.NMCLI_MODEL, encoding="utf-8")
+        (tools / "systemctl").write_text(self.SYSTEMCTL_MODEL, encoding="utf-8")
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        trace = tools / "trace"
+        trace.write_text("", encoding="utf-8")
+        environment = dict(os.environ)
+        environment["PATH"] = f"{tools}:{environment['PATH']}"
+        environment["NM_STATE"] = str(self.state)
+        environment["NM_TRACE"] = str(trace)
+        environment.update({key: str(value) for key, value in dials.items()})
+        completed = subprocess.run(
+            ["sh", str(script)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=60,
+        )
+        return completed, [line for line in trace.read_text(encoding="utf-8").splitlines() if line]
+
+    def nm_managed(self) -> str:
+        return (self.state / "managed").read_text(encoding="utf-8").strip() if (self.state / "managed").exists() else "absent"
+
+    def profile_exists(self) -> bool:
+        return (self.state / "profile").exists()
+
+    # -- the mutations --------------------------------------------------------
+
+    def _write_variant(self, lines: list[str], name: str) -> Path:
+        directory = Path(self._tmpdir()) / name
+        directory.mkdir(exist_ok=True)
+        path = directory / "target-nm-setup.sh"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def reorder(self, script: Path) -> Path:
+        """A copy with the profile step moved to just after the restart.
+
+        Three things had to be got right, and each of them was got wrong first --
+        which is why they are written down rather than left in the code:
+
+        * **instructions, not text.** The profile step is named in this file's
+          own comments, and a helper that searches the raw text finds the comment
+          first and moves *that*, leaving the script unchanged. Every mutation in
+          this class runs on `shell_statements`, which is comments-stripped.
+        * **the index is recomputed after the pop.** The profile step is *before*
+          the restart in a correct script, so removing it shifts every later index
+          down by one, and inserting at the pre-pop index puts the line straight
+          back.
+        * **the whole `if … fi` block moves, not just the add.** The add is inside
+          a guard (`if ! nmcli connection show …; then`), and moving the one line
+          would leave a guard whose body is gone -- a different script, failing
+          for a reason that has nothing to do with the ordering.
+        """
+        statements = shell_statements(script)
+        block_start = next(
+            i for i, line in enumerate(statements) if "nmcli connection add" in line
+        )
+        guard = next(
+            (
+                i
+                for i in range(block_start - 1, -1, -1)
+                if statements[i].startswith(("if ", "if!", "if\t"))
+            ),
+            block_start,
+        )
+        end = next(
+            (i for i in range(block_start + 1, len(statements)) if statements[i] == "fi"),
+            block_start,
+        )
+        restart = next(
+            i
+            for i, line in enumerate(statements)
+            if line.startswith("systemctl restart NetworkManager")
+        )
+        block = statements[guard : end + 1]
+        remainder = statements[:guard] + statements[end + 1 :]
+        shifted = restart - 1 if guard < restart else restart
+        return self._write_variant(remainder[: shifted + 1] + block + remainder[shifted + 1 :], "reordered")
+
+    def drop_line(self, script: Path, needle: str) -> Path:
+        """A copy with the instruction containing `needle` removed."""
+        statements = [
+            line
+            for line in shell_statements(script)
+            if not (needle in line and not line.startswith("#"))
+        ]
+        return self._write_variant(statements, "dropped")
+
+    # -- the entrypoint the image runs ----------------------------------------
+
+    def test_the_entrypoint_hands_over_to_systemd(self):
+        """`exec` into the init, so it becomes PID 1.
+
+        Without the `exec`, the shell stays PID 1 and systemd is a child, which
+        is the shape that makes `--systemd=always` a no-op: a target whose units
+        systemd "started" are not managed by a PID 1 systemd at all, and
+        `systemctl` answers to the child.
+        """
+        text = read(ENTRYPOINT)
+        self.assertRegex(text, r"exec\s+/sbin/init|exec\s+.*init")
+
+    def test_the_entrypoint_does_not_perform_the_sequence_itself(self):
+        """The sequence runs once, from systemd, and not twice.
+
+        An entrypoint that also ran the three steps would do them before
+        `/sbin/init` exists -- before there is a D-Bus for `nmcli` to talk to.
+        Measured in this session, on the real image, for the entrypoint that
+        tried: `Error: Could not create NMClient object: Could not connect: No such
+        file or directory`, and `GENERAL.NM-MANAGED` stayed `no`.
+
+        The case reads the entrypoint's **instructions**, not its text: the file
+        quotes that error and names all three commands in the comment explaining
+        why it does not run them, and a case that read the prose would fail on
+        the explanation.
+        """
+        instructions = " ".join(shell_statements(ENTRYPOINT))
+        for command in ("nmcli", "systemctl", "device set", "connection add"):
+            with self.subTest(command=command):
+                self.assertNotIn(command, instructions)
+
+    def test_the_setup_is_installed_as_a_unit_the_image_enables(self):
+        """The sequence is part of the image's boot, not of a scenario.
+
+        A sequence a scenario ran would leave the window where the target is
+        unmanaged open to the first scenario, and the plan's whole correction --
+        that the profile must exist *before* the steps -- only holds if the steps
+        run once, at boot, in order.
+        """
+        text = read(TARGET_CONTAINERFILE)
+        self.assertIn("target-nm-setup.service", text)
+        self.assertRegex(text, r"systemctl\s+enable\s+.*target-nm-setup")
+
+    # -- the cases ------------------------------------------------------------
+
+
+class EntryPointOrderTest(SetupScriptTestCase):
+    """The NetworkManager sequence, run, and required to be in this order.
+
+    Every case here runs with `ORDER_DIALS`, which makes the sequence the only
+    mechanism that can produce `yes` -- so an assertion about the order cannot be
+    satisfied by the conf.d declaration alone. Each case asserts the three commands
+    were actually invoked before it compares their positions, because an index into
+    a trace that does not contain the lines is a comparison of nothing.
+    """
+
+    # -- the cases ------------------------------------------------------------
+
+    def test_the_script_exists_and_is_executable_shape(self):
+        """A `sh` script with a shebang, so it can be both run here and `COPY`ed in.
+
+        Not a "it runs" case: this asserts the *form*, because the file is copied
+        into the image and executed as PID 1's entry, and a file without a
+        shebang is not that.
+        """
+        text = read(NM_SETUP)
+        self.assertTrue(text.startswith("#!/bin/sh"), text[:40])
+        self.assertIn("set -e", text)
+
+    def test_the_three_commands_are_in_this_order(self):
+        """**The case this task exists for.**
+
+        The order is not a style preference. Measured, twice in this plan: with
+        the profile first, the three commands take `GENERAL.NM-MANAGED` to
+        `yes`; with it last, the `device set` is accepted, the restart happens,
+        and the field stays `no` -- so a target boots unmanaged, every scenario
+        fails for a reason that has nothing to do with the package, and the whole
+        matrix is `incomplete` with exit 3.
+
+        Read off the **trace**, not the file: the case requires the calls in the
+        order the model recorded them, which is the order they were actually run
+        in. A script with the three commands in the right order and something
+        else before them would still pass this, and the next case is what holds
+        that.
+        """
+        completed, trace = self.run_setup(NM_SETUP, **self.ORDER_DIALS)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"the setup script failed:\n{completed.stdout}\n{completed.stderr}",
+        )
+        # The ordering below is only meaningful if the three commands ran. With a
+        # working declaration they need not, and every index below would compare
+        # the wrong lines -- so their presence is asserted first.
+        self.assertIn("nmcli connection add", " ".join(trace), trace)
+        self.assertIn("nmcli device set", " ".join(trace), trace)
+        self.assertIn("systemctl restart NetworkManager", " ".join(trace), trace)
+        profile = [i for i, line in enumerate(trace) if "connection add" in line]
+        override = [i for i, line in enumerate(trace) if "device set" in line]
+        restart = [i for i, line in enumerate(trace) if "systemctl restart" in line]
+        self.assertEqual(len(profile), 1, trace)
+        self.assertEqual(len(override), 1, trace)
+        self.assertEqual(len(restart), 1, trace)
+        self.assertLess(
+            profile[0],
+            override[0],
+            f"the profile must be created before the override; the trace was {trace}",
+        )
+        self.assertLess(
+            override[0],
+            restart[0],
+            f"the override must be set before the restart re-reads it; the trace was {trace}",
+        )
+
+    def test_the_commands_are_the_three_the_plan_names(self):
+        """The exact spellings, verbatim -- read off the trace, not the file.
+
+        The script writes `"$DEVICE"` and `"$PROFILE"` where the commands are, so
+        the *expanded* commands are what matter and what the model recorded. A
+        `nmcli device set eth0 managed no` in the same position would satisfy
+        the ordering case and unmanage every target; `systemctl restart
+        systemd-networkd` would satisfy it and do nothing.
+        """
+        completed, trace = self.run_setup(NM_SETUP, **self.ORDER_DIALS)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            "nmcli connection add type ethernet ifname eth0 con-name eth0-managed ipv4.method auto",
+            " ".join(trace),
+        )
+        self.assertIn("nmcli device set eth0 managed yes", trace)
+        self.assertIn("systemctl restart NetworkManager", trace)
+
+    def test_it_fails_loudly_when_the_field_is_not_yes(self):
+        """A boot that cannot be measured must stop, and must say what it saw.
+
+        Silently continuing is the failure this rule exists for: every scenario
+        downstream then fails against an unmanaged device, and the failure reads
+        like an installer bug in a package that has not been installed yet.
+        """
+        text = read(NM_SETUP)
+        self.assertIn("GENERAL.NM-MANAGED", text)
+        self.assertIn("yes", text)
+        self.assertRegex(text, r"exit 1|return 1|false")
+
+    def test_the_failure_message_names_the_profile_and_the_observed_value(self):
+        """Both facts, not a bare "unmanaged".
+
+        A message that says only `NM-MANAGED is no` sends the reader to the
+        two-step sequence that the plan already measured as insufficient on its
+        own -- they run it, it succeeds, and they conclude the harness is wrong.
+        The profile is the part that is easy to forget.
+        """
+        text = read(NM_SETUP)
+        self.assertIn("eth0-managed", text)
+        self.assertIn("connection profile", text.lower())
+
+    def test_the_failure_message_names_the_networkmanager_version(self):
+        """**Measured: the two failures are identical from the outside and have different causes.**
+
+        On 24.04 and 26.04 the override is written under
+        `/run/NetworkManager/devices/` and the restart re-reads it, so a `no` means
+        the restart did not happen. On 22.04 (nmcli 1.36) there is no persistent
+        device override at all: the field stays `no` with or without a profile and
+        with or without a restart, and no change to this script can alter it.
+
+        A reader who is told "restart" on 22.04 checks the restart, finds it
+        happened, and has been sent looking at the wrong thing. So the message
+        carries the version, which is the one fact that distinguishes the two
+        causes, and it names the file to read to tell them apart.
+        """
+        completed, _ = self.run_setup(NM_SETUP, **self.ORDER_DIALS)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        # With the override dropped the field reads `no`, and the message has to
+        # carry both the observed value and the version. The dials matter: with a
+        # *working* declaration the field is `yes` either way and dropping the
+        # restart would be invisible, so the case would be asserting nothing.
+        dropped = self.drop_line(NM_SETUP, "systemctl restart NetworkManager")
+        completed, _ = self.run_setup(dropped, **self.ORDER_DIALS)
+        self.assertNotEqual(completed.returncode, 0)
+        message = completed.stdout + completed.stderr
+        self.assertIn("nmcli", message)
+        self.assertIn(GENERAL_MANAGED_FIELD, message)
+
+    def test_the_setup_script_declares_the_device_managed_rather_than_only_sequencing(self):
+        """**Superseded case, replaced by the ruling.** The old version of this
+        case asserted the setup script contained no `conf.d` entry, which was the
+        plan's instruction before the 22.04 measurement falsified its premise.
+
+        The property that replaced it is narrower and is the one that matters: the
+        *script* does not declare anything, because a daemon reads its
+        configuration from files and not from a shell script. The declaration lives
+        in one place — `images/10-mosdns-target.conf`, `COPY`ed into `conf.d/` —
+        and `ManagedDeclarationTest` holds that. What the script must not do is
+        declare it a *second* time, by writing the snippet itself.
+        """
+        instructions = shell_statements(NM_SETUP)
+        # Matched on the *assignment*, not on the key: the boot check's message
+        # quotes 'except:interface-name:' to point the reader at the file, and a
+        # filter on the key alone reports the message as a second declaration.
+        writers = [
+            line for line in instructions if "unmanaged-devices=" in line
+        ]
+        self.assertEqual(
+            writers,
+            [],
+            f"the setup script writes the declaration itself, so the image has two copies of it "
+            f"that can disagree: {writers}",
+        )
+        # And the script has to *mention* it, because the boot check's message
+        # points the reader at the file -- a message naming a file the image does
+        # not ship is the failure this whole case family is about.
+        text = read(NM_SETUP)
+        self.assertIn("10-mosdns-target.conf", text)
+        self.assertIn("except:interface-name:", text)
+
+    def test_moving_the_profile_after_the_restart_makes_the_check_fail(self):
+        """**The control, and the reason the case above is not a comment.**
+
+        The same script with one edit: the profile is created *after* the restart.
+        The model says the field is then `no` -- which is what was measured on
+        this host -- and the setup must exit non-zero rather than hand a target
+        to the scenarios. A test that only checked the good ordering would pass
+        here too, and would be a test of the file's spelling.
+        """
+        reordered = self.reorder(NM_SETUP)
+        completed, trace = self.run_setup(reordered, **self.ORDER_DIALS)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with the profile created after the restart; the trace was {trace}\n"
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+        self.assertIn("eth0-managed", str(completed.stderr) + completed.stdout)
+
+    def test_dropping_the_restart_makes_the_check_fail(self):
+        """The other of the two measured facts.
+
+        `nmcli device set eth0 managed yes` returns success and does not take
+        effect until NetworkManager re-reads the override. Without the restart
+        the override is written and never read, the field stays `no`, and the
+        setup must fail.
+        """
+        dropped = self.drop_line(NM_SETUP, "systemctl restart NetworkManager")
+        completed, trace = self.run_setup(dropped, **self.ORDER_DIALS)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with the restart dropped; the trace was {trace}\n"
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+
+    def test_dropping_the_profile_makes_the_check_fail(self):
+        """The third of the three, and the one the plan's architecture note is about.
+
+        With no profile at all, both remaining steps are accepted, the audit log
+        records `result="success"`, and the field stays `no`. This is what the
+        plan measured on every container it tried, and it is why the profile
+        belongs to this image's boot rather than to a later scenario.
+        """
+        dropped = self.drop_line(NM_SETUP, "nmcli connection add")
+        completed, trace = self.run_setup(dropped, **self.ORDER_DIALS)
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with the profile step dropped; the trace was {trace}\n"
+            f"{completed.stdout}\n{completed.stderr}",
+        )
+
+    def test_reordering_needs_a_script_whose_profile_line_is_movable(self):
+        """The control's own precondition, asserted where the control is used.
+
+        `reorder` finds one profile line and one restart line and moves the first
+        after the second. If either stopped being findable -- a rewrite, a
+        variable, a loop -- the control would silently produce the *unmodified*
+        script, the assertion above would pass for the wrong reason, and the
+        defect it exists to catch would be reported as covered. So the mutation
+        has to be shown to be a mutation, and it was shown to be a broken one
+        here: an index computed before a `pop` puts the line back where it was.
+        """
+        original = read(NM_SETUP)
+        reordered = self.reorder(NM_SETUP)
+        mutated = read(reordered)
+        self.assertNotEqual(mutated, original, "the mutation produced the unmodified script")
+        self.assertLess(
+            original.index("nmcli connection add"),
+            original.index("systemctl restart NetworkManager"),
+            "the shipped script already has the profile after the restart, so the control "
+            "asserts nothing",
+        )
+        self.assertLess(
+            mutated.index("systemctl restart NetworkManager"),
+            mutated.index("nmcli connection add"),
+            "the mutation did not move the profile after the restart",
+        )
+        # A move, not an edit: the same statements, the same count. The variant is
+        # written from the comments-stripped statements (see `reorder`), so the
+        # comparison is against those and not against the file's prose.
+        self.assertEqual(
+            sorted(mutated.splitlines()),
+            sorted(shell_statements(NM_SETUP)),
+            "the mutation changed the script rather than moving one part of it, so the case "
+            "above is not testing the ordering",
+        )
+        self.assertEqual(
+            len(mutated.splitlines()), len(shell_statements(NM_SETUP))
+        )
+
+class DeclarationHoldsHonestTest(SetupScriptTestCase):
+    """The boot check does not trust the declaration. **The ruling's case.**
+
+    The declaration is the *baseline*; the check is what keeps the baseline
+    honest. A conf.d entry that is written, read, and does not take effect — a
+    selector that does not match, a directory the daemon does not read, a distro
+    that overrides it — must still fail the boot, or the image would hand an
+    unmanaged device to every scenario and the failure would read like a bug in a
+    package that is not installed yet.
+
+    Both halves are held, because either alone proves nothing:
+
+    * a declaration that did **not** take effect, on a release with no override
+      to rescue it, must fail; and
+    * a **working** field with **no** declaration at all must pass, which is the
+      control: it shows the verdict comes from the observed field and not from
+      the presence of a file.
+    """
+
+    def test_a_declaration_that_did_not_take_effect_fails_the_boot(self):
+        completed, trace = self.run_setup(NM_SETUP, NM_VERSION="1.36.6", NM_DECLARED="ineffective")
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            "the setup booted with GENERAL.NM-MANAGED still 'no' after a declaration that did "
+            f"not take effect; the trace was {trace}\n{completed.stdout}\n{completed.stderr}",
+        )
+        message = completed.stdout + completed.stderr
+        self.assertIn(GENERAL_MANAGED_FIELD, message)
+        self.assertIn("no", message)
+
+    def test_a_managed_device_passes_without_the_sequence_having_run(self):
+        """The control, and the reason the case above means anything.
+
+        The same release with no override — the script skipped the two commands
+        because 1.36 has no persistent device override — and a device the daemon
+        is managing anyway, which is what a working conf.d declaration looks like.
+        It passes, on the observed field. So the two cases differ in one thing, the
+        field, and the verdict is the field.
+        """
+        completed, trace = self.run_setup(NM_SETUP, NM_VERSION="1.36.6", NM_DECLARED="yes")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "a target whose device is managed was refused:\n" + completed.stdout + completed.stderr,
+        )
+        self.assertNotIn(
+            "nmcli device set",
+            " ".join(trace),
+            "the sequence ran on 1.36, so this is not the control it claims to be",
+        )
+
+    def test_the_check_asks_the_field_and_not_the_configuration(self):
+        """A field of `no` is fatal even where the sequence *could* rescue it.
+
+        The other direction, and the one that shows the check is not a version
+        comparison in disguise: on 1.46 the sequence writes the override and the
+        field becomes `yes`, so a run there passes; on the same 1.46, with the
+        override not written because the profile step is gone, the field stays
+        `no` and the boot must fail. The check cannot be satisfied by the script
+        knowing which release it is on.
+        """
+        dropped = self.drop_line(NM_SETUP, "nmcli device set")
+        completed, trace = self.run_setup(dropped, NM_VERSION="1.46.0", NM_DECLARED="ineffective")
+        self.assertNotEqual(
+            completed.returncode,
+            0,
+            f"the check passed with no override written and the declaration ineffective; "
+            f"the trace was {trace}",
+        )
+        # And with the override written the same version passes, so the two differ
+        # only in the field.
+        worked, _ = self.run_setup(NM_SETUP, NM_VERSION="1.46.0", NM_DECLARED="ineffective")
+        self.assertEqual(worked.returncode, 0, worked.stdout + worked.stderr)
+class OverrideVersionGateTest(SetupScriptTestCase):
+    """The `device set` + restart are gated on the measured NetworkManager boundary.
+
+    Measured on this host, with a connection profile present — the profile-first
+    precondition, which one of the intermediate runs failed to satisfy and which is
+    itself the second confirmation of the rule:
+
+    | release | nmcli | three steps | `managed=true` in the override, as the command's *input* |
+    |---|---|---|---|
+    | 22.04 | 1.36.6 | `no` | absent |
+    | 23.04 | 1.42.4 | `no` | absent |
+    | 23.10 | 1.44.2 | `yes` | present |
+    | 24.04 | 1.46.0 | `yes` | present |
+    | 26.04 | 1.54.3 | `yes` | present |
+
+    "As the command's input" is the careful half, and it is a correction of the
+    first version of this table. On 22.04 the override file *does* grow a
+    `managed=true` key once the device is managed -- but that is NetworkManager
+    recording state it already has, and it appears without the command having run.
+    With the declaration removed from the 22.04 image the command is accepted, the
+    restart happens, the field stays `no`, and no key appears. So **the field is
+    the discriminator** and a case that read the file would have been reading a
+    consequence.
+
+    So the boundary is **1.44**, and the two sides are adjacent releases: 1.42.4
+    fails and 1.44.2 works, with nothing in between to be excused. The gate skips
+    the two commands below it, and its failure direction is the safe one: a
+    version wrongly read as old skips two commands whose effect the conf.d
+    baseline already provides, while a version wrongly read as *new* would run a
+    sequence measured to do nothing.
+    """
+
+    def test_it_runs_the_override_and_the_restart_where_the_override_exists(self):
+        for version in ("1.44.2", "1.46.0", "1.54.3"):
+            with self.subTest(nmcli=version):
+                completed, trace = self.run_setup(NM_SETUP, NM_VERSION=version)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn("nmcli device set eth0 managed yes", " ".join(trace))
+                self.assertIn("systemctl restart NetworkManager", " ".join(trace))
+
+    def test_it_skips_them_where_the_override_does_not_exist(self):
+        """The measured no-op is not run, and the run says why.
+
+        Running it would print a success that changes nothing, which is exactly
+        the failure the plan's architecture note warns about: an operator reads
+        `result="success"` and concludes the harness is wrong.
+        """
+        for version in ("1.36.6", "1.42.4"):
+            with self.subTest(nmcli=version):
+                completed, trace = self.run_setup(NM_SETUP, NM_VERSION=version)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertNotIn("nmcli device set", " ".join(trace))
+                self.assertNotIn("systemctl restart NetworkManager", " ".join(trace))
+                self.assertIn(
+                    version,
+                    completed.stdout + completed.stderr,
+                    "the run did not say which version it skipped the sequence for",
+                )
+
+    def test_the_boundary_is_the_measured_one_and_not_a_round_number(self):
+        """The threshold, asserted against the five measured points.
+
+        A gate at 1.40 or 1.50 would be a number nobody measured, and it would
+        look exactly as authoritative. The case states the measured set and
+        requires the gate to put every `no` below every `yes`.
+        """
+        measured_no = ("1.36.6", "1.42.4")
+        measured_yes = ("1.44.2", "1.46.0", "1.54.3")
+        for version in measured_no:
+            with self.subTest(released_as_no=version):
+                _, trace = self.run_setup(NM_SETUP, NM_VERSION=version)
+                self.assertNotIn("nmcli device set", " ".join(trace))
+        for version in measured_yes:
+            with self.subTest(released_as_yes=version):
+                _, trace = self.run_setup(NM_SETUP, NM_VERSION=version)
+                self.assertIn("nmcli device set", " ".join(trace))
+                self.assertIn("systemctl restart NetworkManager", " ".join(trace))
+        # And the script's own threshold, as a literal, so the two lists and the
+        # gate cannot drift apart silently.
+        self.assertIn(
+            "1.44",
+            read(NM_SETUP),
+            "the setup script does not name the measured boundary, so a later edit could move it "
+            "with nothing comparing it to the measurements",
+        )
+
+    def test_the_profile_is_still_created_where_the_sequence_is_skipped(self):
+        """Task 3 modifies this profile, so it has to exist on 22.04 too.
+
+        The gate is about the two *override* commands. Dropping the profile with
+        them would leave `eth0-managed` absent on 22.04, and Task 3's
+        `nmcli connection modify eth0-managed` and `connection up eth0-managed`
+        would have nothing to act on — a second silent gap on a third of the
+        matrix.
+        """
+        completed, trace = self.run_setup(NM_SETUP, NM_VERSION="1.36.6")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        # `assertIn(substring, list)` is element equality, not a substring
+        # search, so this has to look inside the lines. Written the other way it
+        # fails on a trace that plainly contains the command.
+        self.assertIn(
+            "nmcli connection add type ethernet ifname eth0 con-name eth0-managed",
+            " ".join(trace),
+        )
