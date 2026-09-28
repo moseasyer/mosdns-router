@@ -833,7 +833,8 @@ POSTINST_SET_OPTION = "set -e"
 SYSTEMD_RUNTIME_DIRECTORY = "/run/systemd/system"
 
 
-def postinst_transaction_run(status, second_argument=None, systemd_running=True, text=None):
+def postinst_transaction_run(status, second_argument=None, systemd_running=True,
+                             failing_systemctl=None, text=None):
     """Run `postinst`'s own transaction, its arms and its timer enable, and look.
 
     Returns ``(completed, calls)``: the script's own ``CompletedProcess``, and the
@@ -853,7 +854,10 @@ def postinst_transaction_run(status, second_argument=None, systemd_running=True,
       directory in the throwaway tree whose presence the test chooses.
     * ``systemctl`` -- a `PATH` shim that appends its argument array to a log and
       exits zero. The shim is first on `PATH`, so the host's systemd is not
-      reachable from the generated script and `daemon-reload` is a line in a file.
+      reachable from the generated script and `daemon-reload` and `enable` are lines
+      in a file. `failing_systemctl=` names a VERB the shim fails, because a shim
+      that can only succeed cannot show what the script does when a command it
+      issued did not work.
     * the ``set`` option -- the script's own line, found rather than assumed.
 
     WHAT IS NOT SUBSTITUTED: the status capture, the arms, every `exit`, the
@@ -898,13 +902,26 @@ def postinst_transaction_run(status, second_argument=None, systemd_running=True,
     shim = root / "shim"
     shim.mkdir(parents=True, exist_ok=True)
     systemctl = shim / "systemctl"
+    # A failure is asked for BY VERB, matched on the shim's own `$1`, and it fails
+    # EVERY call of that verb rather than the first: a `systemctl enable` that fails
+    # once and then succeeds is not the machine this exists to model, and a shim
+    # that failed only the first call would let a script that retried look working.
+    # The call is LOGGED before it fails, because a test asking what the script did
+    # with a command that failed needs to see that it issued it.
+    fail_line = (
+        f'if [ "$1" = {shlex.quote(failing_systemctl)} ]; then\n'
+        '  echo "systemctl: stub failure for $1" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+    ) if failing_systemctl else ""
     systemctl.write_text(
         "#!/bin/sh\n"
         "# A stand-in for systemctl that records its argument array and changes nothing.\n"
         "# It is first on PATH, so the build host's systemd cannot be reached from the\n"
         "# generated script: `daemon-reload` and `enable` are lines in a file.\n"
-        f'printf "%s\\n" "$*" >> {log}\n'
-        "exit 0\n"
+        + f'printf "%s\\n" "$*" >> {log}\n'
+        + fail_line
+        + "exit 0\n"
     )
     systemctl.chmod(0o755)
 
@@ -2521,22 +2538,46 @@ class MaintainerScriptTests(_Staged):
         already running this package leaves whatever was already enabled, and saying
         "nothing is enabled" there would be the same kind of false claim this round is
         about. `postinst configure` is handed the previously configured version as its
-        second argument, and a null one means there was none."""
-        text = POSTINST.read_text()
+        second argument, and a null one means there was none.
+
+        BEHAVIOURAL, and the reason is that the two claims used to be SUBSTRINGS of
+        the script's text: `${2:-}`, "Nothing is enabled" and "configured before" are
+        all still present in a script whose `${2:-}` test is inverted, so the three
+        assertions could not see the arm they were about. This runs the script twice
+        with the same refusal and the two different second arguments dpkg passes, and
+        reads which sentence each run PRINTED. `postinst_transaction_run`'s
+        `second_argument=` existed for this and no test passed it, so the arm was held
+        by nothing at all.
+        """
+        first, _calls = postinst_transaction_run(3)
+        upgrade, _calls = postinst_transaction_run(3, second_argument="0.0.9")
+        # The fresh install. `dpkg --configure` on a first install passes no second
+        # argument, so `${2:-}` is empty and this is the arm a new machine takes.
         self.assertIn(
-            '${2:-}', text,
-            "the failure message cannot tell an upgrade from a fresh install",
+            "Nothing is enabled", first.stderr,
+            "a refusal on a FIRST install did not print the claim that is true there, so the "
+            "script told an operator with nothing enabled that it could not tell",
         )
-        # Two claims, one per case, and each a single line so that a rewrap does not
-        # change what the test is looking for. A refusal on an UPGRADE leaves whatever
-        # was already enabled, so the sentence "nothing is enabled" there would be
-        # false in the other direction.
-        for claim in ("Nothing is enabled", "configured before"):
-            with self.subTest(claim=claim):
-                self.assertIn(
-                    claim, text,
-                    "the failure arm does not distinguish a fresh install from an upgrade, so "
-                    "one of its two claims is false",
+        self.assertNotIn("configured before", first.stderr)
+        # The upgrade. dpkg passes the version that was configured before, and saying
+        # "nothing is enabled" here would be false in the other direction.
+        self.assertIn(
+            "configured before", upgrade.stderr,
+            "a refusal on an UPGRADE did not print the claim that is true there, so the script "
+            "promised nothing was enabled on a machine that was already running this package",
+        )
+        self.assertIn("version 0.0.9", upgrade.stderr,
+                      "the upgrade arm does not name the version dpkg handed it, so an operator "
+                      "cannot tell which install it is being told about")
+        self.assertNotIn("Nothing is enabled", upgrade.stderr)
+        # Both are refusals, so both exit non-zero; that is the other half of the
+        # branch and neither run may succeed.
+        for label, completed in (("first install", first), ("upgrade", upgrade)):
+            with self.subTest(install=label):
+                self.assertNotEqual(
+                    completed.returncode, 0,
+                    "a refused transaction exits 0, so dpkg records a failed installation as "
+                    "configured",
                 )
 
     def test_postinst_reports_a_service_account_it_did_not_create(self):
@@ -2726,6 +2767,84 @@ class MaintainerScriptTests(_Staged):
             with self.subTest(timer=timer):
                 self.assertIn(timer, text, f"{timer} is enabled by nothing")
         self.assertIn("daemon-reload", text)
+
+    def test_a_timer_enable_that_fails_is_reported_and_does_not_fail_the_package(self):
+        """STEP 5's `systemctl enable` is the one command in `postinst` that is not
+        guarded by `|| true` under the script's own `set -e`, and until this round it
+        was the one command that was never reachable: the misplaced `fi` above it
+        meant no install ever got there. So it became the only command in the script
+        with no evidence about what its failure does.
+
+        THE DECISION, and it is recorded in the script's own comment as well:
+        REPORTED, NOT FATAL. Reaching STEP 5 means the transaction succeeded -- the
+        machine's DNS was taken over, the daemons are serving and the marker is
+        written -- so a non-zero `postinst configure` would make dpkg record the
+        package unpacked-but-UNCONFIGURED on a machine whose resolver works, and
+        would offer `dpkg --configure`, which runs the whole transaction again.
+        That is the `88bc2af` defect wearing the opposite sign: a successful install
+        reported as a failure. Tolerant-and-silent is the other wrong answer, and
+        worse here than anywhere else in the script, because
+        `mosdns-cdn-health.timer` is the only thing on a machine that ever asks
+        whether `127.0.0.1:53` still resolves.
+
+        So: exit 0, and a warning that names all three timers, says the transaction
+        succeeded, and gives the command to run. The shim fails the verb on every
+        call, so a script that quietly retried and succeeded could not pass this.
+        """
+        completed, calls = postinst_transaction_run(0, failing_systemctl="enable")
+        self.assertIn(
+            ["enable", "mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer",
+             "mosdns-list-check.timer"], calls,
+            f"the enable never ran, so this case is not about a failing enable: {calls}",
+        )
+        self.assertEqual(
+            completed.returncode, 0,
+            "a failing timer enable failed the whole package, so dpkg records unconfigured a "
+            "machine whose DNS was taken over successfully and whose resolver is serving, and "
+            f"offers `dpkg --configure`, which runs the transaction again:\n{completed.stderr}",
+        )
+        for said in (
+            "WARNING",
+            "SUCCEEDED",
+            "mosdns-cdn-health.timer",
+            "the only thing on this machine that asks",
+            "127.0.0.1:53",
+            "sudo systemctl enable mosdns-cdn-health.timer",
+        ):
+            with self.subTest(said=said):
+                self.assertIn(
+                    said, completed.stderr,
+                    "the warning does not say what an operator needs to know: a machine whose "
+                    "health timer is not enabled has nothing watching its resolver, and this "
+                    f"message does not mention {said!r}:\n{completed.stderr}",
+                )
+        # And the warning must not claim the install failed, which is the mistake it
+        # exists to prevent.
+        self.assertNotIn("dpkg --configure mosdns-router", completed.stderr)
+        self.assertNotIn("which is not a", completed.stderr)
+
+    def test_postinst_enables_nothing_where_systemd_is_not_running(self):
+        """Both `[ -d /run/systemd/system ]` guards, read by RUNNING the script rather
+        than by finding the two tests in its text.
+
+        The harness's `systemd_running=` existed to ask this and no test passed it, so
+        the guards were held by a scan that could only confirm the spelling. In a
+        chroot, in a `dpkg --root` install, or on any machine where systemd is not
+        PID 1, `systemctl` is absent: a `daemon-reload` or an `enable` there is a
+        command not found, and under this script's `set -e` the first one would end
+        the configure. So the guards have to hold, and a test that cannot make
+        systemd absent cannot show that they do.
+        """
+        completed, calls = postinst_transaction_run(0, systemd_running=False)
+        self.assertEqual(
+            [call for call in calls if call[0] in ("daemon-reload", "enable")], [],
+            f"postinst asked systemd to do something where systemd is not running: {calls}",
+        )
+        self.assertEqual(
+            completed.returncode, 0,
+            f"a successful install fails where systemd is not running:\n{completed.stderr}",
+        )
+        self.assertNotIn("command not found", completed.stderr)
 
     def test_prerm_disables_what_the_uninstall_deliberately_does_not(self):
         """Task 5's handoff: a plain uninstall with no package removal must not

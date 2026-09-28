@@ -353,9 +353,44 @@ fi
 # daemons were enabled and started by the transaction above, which is the one thing
 # that knows whether they were already active -- an upgrade on a machine that is
 # already running this router is the normal case, not a conflict.
+#
+# A FAILING ENABLE IS REPORTED AND NOT FATAL, and that is a decision rather than an
+# oversight. This step is below the transaction, so reaching it means the machine's
+# DNS was taken over successfully, the daemons are serving, and the marker is
+# written: everything `postinst` is for has happened. Under this script's own `set
+# -e` a failing `enable` would end the script non-zero, and dpkg's answer to a
+# non-zero `postinst configure` is to record the package unpacked-but-UNCONFIGURED --
+# so a machine with a working resolver, a marker and a running transaction would be
+# reported as a broken install, `apt` would offer `dpkg --configure`, and that runs
+# the whole transaction again. Reporting a successful install as a failure is the
+# defect `88bc2af` shipped, and it is the same defect wearing the opposite sign.
+#
+# Silent tolerance is the other wrong answer, and worse for this step than for any
+# other: `mosdns-cdn-health.timer` is the only thing on a machine that ever asks
+# whether `127.0.0.1:53` still resolves, so an enable that fails quietly leaves a
+# machine whose resolver can stop answering with nothing watching for it. So the
+# failure is LOUD, names all three units and the consequence, and gives the command
+# to run -- and the script still exits 0, because dpkg's record should describe the
+# transaction that happened rather than a timer that did not.
 if [ -d /run/systemd/system ]; then
-	systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
-		mosdns-list-check.timer
+	if systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
+		mosdns-list-check.timer; then
+		:
+	else
+		echo "postinst: WARNING: the install transaction above SUCCEEDED, but these" >&2
+		echo "postinst: three timers were not enabled, so nothing will run them:" >&2
+		echo "postinst:   mosdns-cdn-optimizer.timer   the nightly optimization run" >&2
+		echo "postinst:   mosdns-cdn-health.timer       the two-minute health check" >&2
+		echo "postinst:   mosdns-list-check.timer       the daily list-drift check" >&2
+		echo "postinst: The health timer is the only thing on this machine that asks" >&2
+		echo "postinst: whether 127.0.0.1:53 is still being served, so this matters" >&2
+		echo "postinst: even though the resolver is up. Nothing about this machine's" >&2
+		echo "postinst: DNS was changed by the failure, and the two daemons are" >&2
+		echo "postinst: running. Enable them by hand with:" >&2
+		echo "postinst:   sudo systemctl enable mosdns-cdn-optimizer.timer" >&2
+		echo "postinst:   sudo systemctl enable mosdns-cdn-health.timer" >&2
+		echo "postinst:   sudo systemctl enable mosdns-list-check.timer" >&2
+	fi
 fi
 
 exit 0
