@@ -2,19 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove installation, NetworkManager integration, DNS routing, CDN/ECH behavior, failure isolation, upgrade, uninstall, and rollback for Ubuntu 22.04/24.04/26.04 entirely inside disposable Podman machines and containers.
+**Goal:** Prove installation, NetworkManager integration, DNS routing, CDN/ECH behavior, failure isolation, upgrade, uninstall, and rollback for Ubuntu 22.04/24.04/26.04 entirely inside disposable Podman containers.
 
-**Architecture:** A Python harness owns a rootful Podman machine, a private network, a mock DHCP/DNS router, target Ubuntu systemd containers, and a mock CDN. The development host is only used to build artifacts and read before/after snapshots; no project installer runs directly on it. amd64 uses an x86_64 Podman machine; arm64 acceptance requires a native arm64 Podman connection and is never mislabeled when skipped.
+**Architecture:** A Python harness owns a private Podman network, a mock DHCP/DNS router, target Ubuntu systemd containers, and a mock CDN. **There is no Podman machine and no virtual machine of any kind.** The development host runs rootless Podman directly; each target container has its own network namespace, so a test run that changes DNS changes only the container's DNS. The host is used to build artifacts and to read before/after snapshots; no project installer runs directly on it.
 
-**Tech Stack:** Python 3 standard library, Podman machine/container/network, Ubuntu official images, systemd, NetworkManager, systemd-resolved, dnsmasq mock router, local TLS server, Mozilla Firefox headless for live ECH verification.
+> **Why no Podman machine, and why it was not merely parked.** Podman machine requires `qemu-img` to create its disk image. On this host that binary, `qemu-system-x86_64`, `/dev/kvm` and any `vmx`/`svm` CPU flag are all absent, so `podman machine init` cannot create an image at all. It was built once, found to be unstartable, and removed together with the qemu packages; the user's decision is that no virtual machine is used. Rootless Podman containers are sufficient and are proven to work here.
+
+> **How NetworkManager is made to manage a device — measured, not assumed.** A container's default rootless network hands it a **tun/tap** device, and NetworkManager refuses that device type by design (`GENERAL.TYPE: tun`, activation fails with *device is strictly unmanaged*). Use a **netavark bridge network**, which gives the container a real `eth0` of type `ethernet`. Even then, `nmcli device set eth0 managed yes` returns success and does **not** take effect until NetworkManager is restarted: the override is written persistently under `/run/NetworkManager/devices/`, and only a restart re-reads it. The target image's entrypoint must therefore do **`nmcli device set eth0 managed yes` and then `systemctl restart NetworkManager`**, after which profiles activate and NM runs a real DHCP client on the device. This corrects a conclusion reached in the previous plan, where the container was believed to be incapable of this.
+
+**Tech Stack:** Python 3 standard library, rootless Podman container/network, Ubuntu official images, systemd, NetworkManager, systemd-resolved, dnsmasq mock router, local TLS server, Mozilla Firefox headless for live ECH verification.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`
 
 ## Global Constraints
 
 - The current development host is never a target; do not run installer/uninstaller there.
+- **No virtual machine, and no `podman machine`.** Containers only.
+- A requirement a container cannot close is recorded **SKIPPED with its exact wording**. It is never closed by substituting a different kind of test, and a skip is never reported as a pass.
 - Do not mount host `/etc`, `/run`, `/var`, `/sys`, or `/home` into target containers.
-- Source is mounted read-only; artifacts and mutable test data use VM/container volumes.
+- Source is mounted read-only; artifacts and mutable test data use container volumes.
 - All target containers run systemd as PID 1 and use fixed Ubuntu image digests.
 - Deterministic mock tests are mandatory; real-network tests are explicit opt-in.
 - Do not mark a skipped architecture or live ECH test as passed.
@@ -23,10 +29,13 @@
 
 ## Review Focus
 
-- A failed scenario must still tear down the VM/container and publish logs.
+- A failed scenario must still tear down the containers and network and publish logs.
+- Every SKIPPED item names the container's specific limitation, and a skip is never reported as a pass.
+- **The previous plan's central SKIPPED list came from a wrong conclusion** — that a container cannot make NetworkManager manage a device. It can; see the architecture note. Do not inherit that conclusion without re-measuring it.
 - Host before/after snapshots must be byte-stable except documented build/Podman tool data.
 - DHCP DNS changes must be driven through the mock router and observed by NetworkManager.
 - Killing dnscrypt-proxy must produce foreign SERVFAIL without a domestic fallback.
+- **The NetworkManager device sequence is asserted, not assumed** — the previous plan's largest SKIPPED list came from concluding a container could not do this, and it can.
 - A live ECH pass must verify encrypted ClientHello behavior without installing a CA or modifying Firefox DoH.
 
 ---
@@ -53,6 +62,7 @@ tests/podman/scenarios/upgrade_uninstall_test.py
 tests/podman/scenarios/firefox_live.py
 tests/podman/tests/test_command.py
 tests/podman/tests/test_report.py
+tests/podman/tests/test_target_entrypoint.py
 docs/testing.md
 Makefile
 ```
@@ -62,9 +72,11 @@ Makefile
 ```text
 python3 tests/podman/run.py preflight
 python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04
-python3 tests/podman/run.py live-ech --connection NAME --domain HOSTNAME
+python3 tests/podman/run.py live-ech --domain HOSTNAME
 python3 tests/podman/run.py cleanup
 ```
+
+`--connection` is **not** a machine name. It is an optional Podman connection URI for a remote or native (e.g. arm64) service; omitted means the local rootless Podman, which is the acceptance path on this host.
 
 Exit codes: 0 all requested tests passed; 1 test failure; 2 harness/configuration error; 3 incomplete matrix or skipped required architecture.
 
@@ -80,27 +92,37 @@ Exit codes: 0 all requested tests passed; 1 test failure; 2 harness/configuratio
 - Create: `tests/podman/run.py`
 
 **Interfaces:**
-- Consumes: Podman executable, machine name, connection socket, and test version list.
-- Produces: typed command results, lifecycle cleanup, and machine-readable reports.
+- Consumes: Podman executable, an optional connection URI, the source tree path, and a test version list.
+- Produces: typed command results, resource lifecycle/cleanup, and machine-readable reports.
 
 - [ ] **Step 1: Write failing subprocess tests**
 
 Use a fake executable to assert exact argument arrays for:
 
 ```text
-podman machine inspect NAME --format {{.ConnectionInfo.PodmanSocket.Path}}
-podman machine init --rootful --cpus 4 --memory 4096 --disk-size 30 --volume SOURCE:/workspace:ro,security_model=none NAME
-podman machine start NAME
-podman --remote --url unix://SOCKET ps --format json
-podman machine stop NAME
-podman machine rm -f NAME
+podman version --format {{.Client.Version}}
+podman info --format {{.Store.GraphDriverName}}
+podman network create --subnet 10.89.0.0/24 mosdns-testnet
+podman network inspect mosdns-testnet --format {{.Name}}
+podman run -d --name NAME --network mosdns-testnet --systemd=always --cgroupns=private --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v SOURCE:/workspace:ro IMAGE
+podman exec NAME sh -c ...
+podman cp ARTIFACT NAME:/tmp/ARTIFACT
+podman stop --time 30 NAME
+podman rm -f NAME
+podman network rm mosdns-testnet
 ```
+
+Assert that **no** `podman machine` subcommand appears anywhere in the harness, and that the source tree is mounted **read-only** and never at `/etc`, `/run`, `/var`, `/sys` or `/home`. A test must fail if a host path outside the allowed set is ever mounted.
 
 - [ ] **Step 2: Write failing report tests**
 
 Assert per-version status is `passed|failed|skipped|incomplete`; required skips make overall status `incomplete`; logs are attached; JSON output is stable; secrets and full command environments are not recorded.
 
-- [ ] **Step 3: Run tests and verify failure**
+- [ ] **Step 3: Write a failing test for the NetworkManager device sequence**
+
+The harness asserts, on a running target, that `nmcli -g GENERAL.NM-MANAGED device show eth0` is `yes` before any scenario runs, and fails with a message naming the two steps if it is not. This is the fact the previous plan got wrong, so it is checked at run time rather than assumed.
+
+- [ ] **Step 4: Run tests and verify failure**
 
 ```bash
 python3 -m unittest discover -s tests/podman/tests -v
@@ -108,15 +130,15 @@ python3 -m unittest discover -s tests/podman/tests -v
 
 Expected: import failure.
 
-- [ ] **Step 4: Implement safe subprocess execution**
+- [ ] **Step 5: Implement safe subprocess execution**
 
-Use argument arrays, `check=True`, explicit timeouts, captured stdout/stderr, and a redacted environment. Never invoke `shell=True`. A remote Podman URL is obtained from machine inspect rather than guessed.
+Use argument arrays, `check=True`, explicit timeouts, captured stdout/stderr, and a redacted environment. Never invoke `shell=True`. When a connection URI is supplied, pass it as `--connection` on every invocation rather than mutating global state.
 
-- [ ] **Step 5: Implement machine lifecycle**
+- [ ] **Step 6: Implement resource lifecycle**
 
-Refuse to reuse a machine with a different provider/rootful mode. `cleanup` removes containers, network, volume, then machine; it continues after individual teardown errors and returns a consolidated failure only if the machine remains.
+Name every container with a run-specific prefix. `cleanup` removes containers, then the network, then volumes; it continues after individual teardown errors, reports each, and returns a consolidated failure only if something of this run's remains. A failed scenario must still reach `cleanup` — hold that with a test where the scenario raises.
 
-- [ ] **Step 6: Run unit tests**
+- [ ] **Step 7: Run unit tests**
 
 ```bash
 python3 -m unittest discover -s tests/podman/tests -v
@@ -124,11 +146,11 @@ python3 -m unittest discover -s tests/podman/tests -v
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add tests/podman/run.py tests/podman/lib tests/podman/tests
-git commit -m "test: add isolated Podman harness"
+git commit -m "test: add isolated Podman container harness"
 ```
 
 ---
@@ -171,9 +193,11 @@ Sort output, redact environment-specific UUIDs only when they are not relevant t
 
 Target image installs `systemd-sysv`, `dbus`, `NetworkManager`, `systemd-resolved`, `python3`, `iproute2`, `dnsutils`, `curl`, `ca-certificates`, and test tools, but does not install the project package at build time. Mock router installs `dnsmasq`; mock CDN is built from the repository's Go module.
 
+**The target's entrypoint must perform the NetworkManager device sequence** described in the Architecture note — `nmcli device set eth0 managed yes` followed by `systemctl restart NetworkManager` — and must **fail loudly** if `nmcli -g GENERAL.NM-MANAGED device show eth0` is not `yes` afterwards. A target that boots with an unmanaged device produces a scenario failure that looks like an installer bug, so this is checked at boot and the check is part of the image, not of each scenario. Do **not** add a `NetworkManager.conf.d` entry to force this; the override-and-restart path is the measured one.
+
 - [ ] **Step 4: Resolve and lock image digests**
 
-Run inside the disposable machine:
+Run against the local rootless Podman:
 
 ```bash
 podman pull docker.io/library/ubuntu:22.04
@@ -185,7 +209,7 @@ Use `podman image inspect --format '{{.Digest}}'` and write the resulting full O
 
 - [ ] **Step 5: Document environment prerequisites**
 
-State that Podman must already exist, the harness never installs it automatically, arm64 requires a native arm64 Podman connection, and all test output lives under `build/test-results`.
+State that Podman must already exist, the harness never installs it automatically, that **no virtual machine is used or required**, that a target must be on a netavark bridge network so NetworkManager can manage its device, and that all test output lives under `build/test-results`.
 
 - [ ] **Step 6: Run static tests**
 
@@ -241,7 +265,7 @@ Run dnsmasq with DHCP range `10.89.0.100-10.89.0.199`, router option `10.89.0.2`
 
 Inside the target container, create an Ethernet connection for `eth0` with `ipv4.method auto`, `ipv4.never-default yes`, and initially automatic DNS. Confirm `IP4.DNS` contains the mock address before running the package installer.
 
-- [ ] **Step 5: Run the scenario in the VM**
+- [ ] **Step 5: Run the scenario in the target container**
 
 ```bash
 python3 tests/podman/run.py matrix --arch amd64 --versions 22.04 --scenario dhcp
@@ -271,7 +295,7 @@ git commit -m "test: drive NetworkManager DHCP in Podman"
 
 - [ ] **Step 1: Start the target systemd container**
 
-Use the locked image, `--systemd=always`, `--cgroupns=host`, `--privileged` only inside the disposable VM, and the private network fixed IP. Do not mount host system directories. Copy the `.deb` with `podman cp`, then install it inside the container.
+Use the locked image, `--systemd=always`, `--cgroupns=private`, `--cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE`, `-v /sys/fs/cgroup:/sys/fs/cgroup:rw`, and the private network's fixed IP. These are the exact flags measured to work on this host; `--cgroupns=host` and `--privileged` are **not** used — they were written for the machine architecture this plan no longer has, and the measured set is narrower. Do not mount host system directories. Copy the `.deb` with `podman cp`, then install it inside the container.
 
 - [ ] **Step 2: Validate packaged units**
 
@@ -360,6 +384,8 @@ Use test-only force-ECH `cloudflare.test`. Assert strict A/AAAA are empty, HTTPS
 
 Install version 0.1.0, create selector/ECH/user candidate state, rebuild/install the next test package version with preserved state, then uninstall. Assert state survives upgrade, ordinary uninstall preserves it, purge removes it, and NM settings restore only when ownership marker/current values match.
 
+**This scenario is the direct regression test for the previous plan's Critical.** The install must not overwrite the record of the machine's original DNS, so an upgrade followed by a removal must restore the **first** install's recorded values and must refuse to stop the resolver; and a `dpkg --configure` retry after a failed rollback must not rewrite that record either. Assert the recorded values before the upgrade, after the upgrade, and after the removal, and assert that the removal's exit status is not a success in the case where the device check refuses.
+
 - [ ] **Step 5: Add emergency rollback scenario**
 
 Change DNS to local, stop MOSDNS, run emergency rollback, and assert the original mock DHCP DNS is restored and the machine remains usable.
@@ -389,14 +415,14 @@ git commit -m "test: cover DNS failure and lifecycle matrix"
 - Modify: `docs/testing.md`
 
 **Interfaces:**
-- Consumes: an explicit native Podman connection and user-supplied live Cloudflare test hostname.
+- Consumes: an explicit Podman connection (a native arm64 one, when arm64 is the point) and a user-supplied live Cloudflare test hostname.
 - Produces: Firefox/packet evidence without changing Firefox DoH or trusting a custom CA.
 
 - [ ] **Step 1: Require explicit live-test inputs**
 
-Refuse to run unless both a Podman connection name and a hostname are supplied. Record only hostname, Firefox version, and pass/fail evidence. Do not query browsing history.
+Refuse to run unless a hostname is supplied. `--connection` is optional and means a Podman service URI, not a machine. Record only hostname, Firefox version, and pass/fail evidence. Do not query browsing history.
 
-- [ ] **Step 2: Install official Firefox inside the VM**
+- [ ] **Step 2: Install official Firefox inside the target container**
 
 Download the official Linux tarball inside the target container, record the actual version, and run headless under Xvfb. Do not enable snap, DoH, a local CA, or a proxy.
 
@@ -406,7 +432,7 @@ Resolve the current Cloudflare address through the foreign path, validate it wit
 
 - [ ] **Step 4: Verify ECH without MITM**
 
-Capture packets on the VM private interface and assert the target hostname does not appear in plaintext TLS ClientHello SNI while the expected outer SNI may appear. Also record Firefox `about:networking` diagnostic evidence where accessible. Packet capture is read-only and must not modify traffic.
+Capture packets on the target's private interface inside the container and assert the target hostname does not appear in plaintext TLS ClientHello SNI while the expected outer SNI may appear. Also record Firefox `about:networking` diagnostic evidence where accessible. Packet capture is read-only and must not modify traffic.
 
 - [ ] **Step 5: Classify live results honestly**
 
@@ -415,7 +441,9 @@ Return `passed`, `failed`, or `skipped` for network unavailability. A skip canno
 - [ ] **Step 6: Document the exact command**
 
 ```bash
-python3 tests/podman/run.py live-ech --connection mosdns-arm64-live --domain hostname-provided-by-operator
+python3 tests/podman/run.py live-ech --domain hostname-provided-by-operator
+# with a native arm64 service, additionally:
+python3 tests/podman/run.py live-ech --connection "$MOSDNS_ARM64_PODMAN_CONNECTION" --domain hostname-provided-by-operator
 ```
 
 The hostname is a runtime input, not a source placeholder.
@@ -447,11 +475,11 @@ Assert all three amd64 versions pass, any required version failure fails the run
 
 - [ ] **Step 2: Write failing host-isolation comparison**
 
-Ignore only documented build caches and Podman machine data. Any difference in NM summary, resolved state, resolv.conf link, project units, listeners, or Firefox profile metadata fails the run.
+Ignore only documented build caches and this harness's own Podman data (its network, volumes, and container names). Any difference in NM summary, resolved state, resolv.conf link, project units, listeners, or Firefox profile metadata fails the run. A host that ends a run with a different DNS configuration is a failed run, never a passed one.
 
 - [ ] **Step 3: Implement arm64 execution**
 
-Accept `MOSDNS_ARM64_PODMAN_CONNECTION` pointing to a native arm64 Podman service. Reject user-mode QEMU reports as native acceptance. Run the same version/scenario list and collect a separate report.
+Accept `MOSDNS_ARM64_PODMAN_CONNECTION` as a **native arm64 Podman service URI**. Reject an emulated service as native acceptance. On this host there is no `/dev/kvm` and no `vmx`/`svm` flag and no qemu is installed, so arm64 cannot run here; it is reported `skipped`, the run is `incomplete`, and exit code is 3. **Never** substitute a cross-built amd64 result for arm64, and never label a skip a pass.
 
 - [ ] **Step 4: Add Make targets**
 
@@ -466,6 +494,8 @@ test-system-clean:
 	python3 tests/podman/run.py cleanup
 ```
 
+`test-system` requires the built `.deb` and must **not** be wired into `make verify`, which stays fast and hermetic; a system-level run belongs to a release gate, not to a unit gate.
+
 - [ ] **Step 5: Run harness unit tests and preflight**
 
 ```bash
@@ -473,7 +503,7 @@ python3 -m unittest discover -s tests/podman/tests -v
 python3 tests/podman/run.py preflight
 ```
 
-Expected: unit tests pass; preflight reports missing Podman clearly on the current host rather than installing it.
+Expected: unit tests pass; preflight reports a missing Podman clearly rather than installing it. `preflight` must also report, as its first line, the NetworkManager device fact it depends on — that the local Podman exists, that a bridge network is required rather than the default tun/tap one, and whether a target container would come up with `GENERAL.NM-MANAGED: yes`. A preflight that cannot check that must say so rather than assume it.
 
 - [ ] **Step 6: Commit**
 
@@ -495,11 +525,18 @@ python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04
 python3 tests/podman/run.py cleanup
 ```
 
-Then run the same matrix on a native arm64 Podman connection and the explicit live Firefox ECH command when available.
+Then, when the operator supplies them, the same matrix on a native arm64 Podman connection and the explicit live Firefox ECH command.
 
 Expected:
 
 - all deterministic scenarios pass on each Ubuntu version;
 - no host network, resolver, service, or Firefox metadata changes;
 - arm64 and live ECH are reported honestly as pass/fail/incomplete;
-- teardown removes the disposable machine, containers, network, and volumes.
+- teardown removes this run's containers, network, and volumes.
+
+**On this host, two items are expected to be `skipped` rather than passed, and that is the correct outcome:**
+
+- **arm64** — no `/dev/kvm`, no `vmx`/`svm` flag, and qemu is not installed and must not be. Reported `skipped`; the run is `incomplete` with exit code 3. The cross-built arm64 `.deb` builds and is content-verified, which is not the same claim.
+- **live Firefox ECH** — requires a real network path and an operator-supplied production hostname. Not attempted unless both are given.
+
+Everything else on Ubuntu 22.04, 24.04 and 26.04 amd64 is expected to be closed in a container. The previous plan's SKIPPED list — every NetworkManager-managed-connection claim, the install and uninstall transaction, `resolvectl` layout on all three releases, `nmcli` field names and idempotency — is expected to be **closed here**, because the container limitation that produced it was measured and is false.
