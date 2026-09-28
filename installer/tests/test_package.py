@@ -3997,11 +3997,33 @@ class ControlTests(unittest.TestCase):
     A gate that cannot fail is not a gate, and this suite is the gate that decides
     whether a package may put a machine on somebody else's resolver. So each of
     the ways this package can be wrong is manufactured here and the corresponding
-    check is asserted to notice: a missing executable, a missing file, a loose
-    mode, a planted resolver address, a planted middlebox, an unreadable blob, a
-    shipped state file, a reversed provisioning order, a mode this plan itself
-    first named, a tmpfiles entry with no default ACL, and a routing document that
-    is not the render.
+    check is asserted to notice.
+
+    THE LIST, and it is a list of what this class HOLDS rather than a theme — thirty
+    cases, and the three groups are the three things a maintainer script, a staged
+    tree and a VERIFIER can each be wrong about. On the staged tree: a missing
+    executable, a missing file, a loose mode, a tight mode, a planted resolver address
+    on the denylist, an unlisted one the denylist could not have named, a planted
+    middlebox, a planted DoH endpoint, a compressed document, an unreadable blob, a
+    shipped state file, a reversed provisioning order, a directory created without its
+    group, the mode this plan itself first named, a missing tmpfiles reap pattern, a
+    reversed tmpfiles entry, a space-separated ACL, a reap pattern that matches too
+    much, a manifest entry that is not shipped, a routing document that is not the
+    render, and a provider-scan exemption that has grown. On the maintainer scripts: a
+    dpkg Policy 6.5 verb that is missing, a published pair an operator re-pinned, a
+    capture closed before its arms, a hard-coded capture, an `if`/`elif` chain in
+    place of the `case`, the timers enabled before the transaction, and prerm's two
+    refusals flattened into one sentence. And on the VERIFIERS themselves, because a
+    reader that cannot read a shape is also a gate that cannot fail.
+
+    That last group is the reason the list is a list. Four of the entries above existed
+    in some earlier form of this suite and every one of them was a control that could
+    not have failed, because the mutation it built was not the defect the gate was
+    written for: `assertMethodFails` dropped the script substitutions, the swap helper
+    matched a comment, `unconditional_publish` was asserted against a token it had
+    itself removed, and `capture_closed_early` moved a different `fi` than the one it
+    named. The rule those four make is the only thing this class is for, and it is the
+    fifth time this project has had to write it down.
     """
 
     @classmethod
