@@ -26,7 +26,8 @@ integration and the real resolver — inside containers that have their own
 
 ```bash
 python3 tests/podman/run.py preflight   # can this host run the matrix?
-python3 tests/podman/run.py matrix      # run the scenarios
+python3 tests/podman/run.py matrix      # run every registered scenario
+python3 tests/podman/run.py matrix --versions 24.04 --scenario dhcp
 python3 tests/podman/run.py cleanup     # remove anything a run left behind
 ```
 
@@ -34,22 +35,30 @@ Start with `preflight`. It reports the Podman client version, the store
 driver, the source tree it would mount, and the NetworkManager fact below.
 It changes nothing.
 
-**`matrix` exits 3 today**, with every version reported `incomplete` and the
-reason `no scenario is registered in this build of the harness`. That is the
-honest answer: the images, the image lock and the host snapshot ship with this
-repository, and the *scenarios* are built by later tasks — so until one is
-registered nothing ran, and no image was started. Exit 3 means
-*incomplete*, which is deliberately not a pass. Exit codes are the interface:
+**`matrix` runs the scenarios and exits 0 or 1.** The first scenario to exist
+is `dhcp`: a cell creates the private network, starts a mock DHCP/DNS router and
+a target on it, and proves NetworkManager obtained an address **by DHCP**,
+published the router's DNS, and then received a **new** DNS address after the
+router was reconfigured. Naming no scenario runs every registered one, which is
+what the plan's own acceptance command does. Exit codes are the interface:
 
 - `0` — everything requested passed
 - `1` — a test failed
-- `2` — a harness or configuration error
-- `3` — an incomplete matrix (nothing ran, or a required architecture was skipped)
+- `2` — a harness or configuration error (including asking for a scenario that
+  is not registered, which is refused with its name rather than ignored)
+- `3` — an incomplete matrix (a target that could not be brought up, or a
+  required architecture was skipped)
 
-Every run writes `build/test-results/<run-id>/report.json`. A requirement the
-containers could not close is recorded there as **SKIPPED with its exact
-wording**. It is never reported as a pass, and never closed by substituting a
-different kind of test.
+A scenario that fails is a `failed` row in the report with the reason beside
+it; a scenario the registry does not hold is exit 2. They are different claims:
+one means something was tried and did not work, the other means nothing was
+tried.
+
+Every run writes `build/test-results/<run-id>/report.json`, and every scenario
+writes its own evidence document under `build/test-results/<run-id>/logs/`. A
+requirement the containers could not close is recorded there as **SKIPPED with
+its exact wording**. It is never reported as a pass, and never closed by
+substituting a different kind of test.
 
 ## The images, and the digests they are built from
 
@@ -65,6 +74,8 @@ tests/podman/images/10-mosdns-target.conf        declares eth0 managed, on every
 tests/podman/images/mock-router.Containerfile   dnsmasq, serving DHCP and DNS
 tests/podman/images/mock-cdn.Containerfile      the CDN server, built from this module
 tests/podman/images.lock.json                   the three digests, and how each was read
+tests/podman/mock-router/dnsmasq.conf           the router's configuration
+tests/podman/scenarios/dhcp_test.py             the DHCP/DNS scenario
 ```
 
 **A tag is not a pin.** `ubuntu:24.04` is whatever the registry serves that day,
@@ -86,6 +97,14 @@ refuses three ways: a digest without the `sha256:` prefix, a version the lock ha
 no entry for, and a version recorded `unavailable`. **Falling back to a tag would
 be the worst of the three answers available** — the build would succeed against a
 floating image and the lock would be doing nothing.
+
+`matrix` builds what it needs itself, and the tag it uses is
+`mosdns-<role>:<version>-<12 hex>` where the hex is a hash of **the Containerfile
+and the base reference**. That makes the tag a cache key: edit the
+Containerfile and the tag changes and the image is rebuilt; change nothing and
+the tag is identical and the build is skipped. Without the Containerfile in the
+key a stale image is what the matrix runs, and a stale image here is a mock
+router whose dnsmasq has no configuration file to read.
 
 Each entry in `images.lock.json` carries the command its digest was read with, so
 a reader who doubts one can re-run that command. A digest with no provenance is a
@@ -246,6 +265,121 @@ but it is *not* the active connection until something activates it. A DHCP
 scenario that reads the active connection before that will report a lease
 belonging to a different profile.
 
+### And the hand-off is a wait, not a query
+
+`podman run -d` returns long before the target has finished booting, so the
+managed-device check is a **bounded wait**: the entrypoint has to `exec
+/sbin/init`, systemd has to reach multi-user, and `target-nm-setup.service` runs
+*after* NetworkManager — and on 22.04 the managed state comes from the `conf.d`
+declaration, which NetworkManager reads when it starts. A single query about two
+seconds after `podman run -d` returned answered
+
+```text
+Error: Could not create NMClient object: Could not connect: No such file or directory
+```
+
+which is *no NetworkManager yet*, and the single-shot check reported it with the
+same message it uses for "NetworkManager is running and refuses this device" —
+with the two `nmcli` steps printed under it, which fix neither. The wait's
+failure names the value it read, the budget and the number of reads, and says
+plainly that a target which has not booted answers the same way.
+
+## The DHCP/DNS scenario
+
+`python3 tests/podman/run.py matrix --arch amd64 --versions 22.04 --scenario dhcp`
+
+One cell creates the private bridge network and starts **two** containers on it —
+a mock DHCP/DNS router and a target — because a lease has to cross a network for
+the claim to be a DHCP claim:
+
+| role | address | who gives it |
+|---|---|---|
+| mock router | `10.89.0.2` | `--ip`, because podman hands out the first free address otherwise |
+| target | `10.89.0.10` | `--ip`, for the same reason |
+| *lease* | `10.89.0.100`–`10.89.0.199` | **dnsmasq**, and this is the evidence |
+
+The gap between the fixed addresses and the pool is the mechanism, not a
+detail: the target has an IPv4 address before a single DHCP packet crosses, so
+"the target has an address" proves nothing on its own. What makes it a lease is
+that the address is one the pool could have handed out, and the DNS it published
+is one **the lease carried** (`nmcli -g DHCP4.OPTION connection show
+eth0-managed`, `domain_name_servers = …`).
+
+The scenario then
+
+1. records the active connection, which is NM's own `eth0`;
+2. sets `ipv4.never-default yes` on the image's `eth0-managed` profile and
+   activates it — the hand-off, and the step that re-runs DHCP;
+3. waits for NetworkManager to *report* the lease, the DNS, and `resolvectl
+   dns eth0`;
+4. checks the route table for a default route through the router — dnsmasq
+   offers `option:router 10.89.0.2` and the target must not take it;
+5. reads the **router's own log** for the four DORA messages, because that log
+   is the process that owns the pool saying what it did;
+6. reloads the router (below), re-activates the profile, and waits again for a
+   **new** DNS address;
+7. records `/run/mosdns/dhcp-upstreams.json`, which is the *package's* state
+   document and is absent here — recorded as absence, with the reason, and never
+   as an empty document, which would read as "the bridge published nothing".
+
+### The reload is a SIGHUP of the *option file*, and the plan's sentence was wrong
+
+The plan said a control command "rewrites only the container-private dnsmasq
+config, sends HUP". **`dnsmasq(8)` says otherwise** (NOTES, measured here):
+
+```text
+When it receives a SIGHUP, dnsmasq clears its cache and then re-loads
+/etc/hosts and /etc/ethers and any file given by --dhcp-hostsfile,
+--dhcp-hostsdir, --dhcp-optsfile, --dhcp-optsdir, --addn-hosts or --hostsdir.
+…
+SIGHUP does NOT re-read the configuration file.
+```
+
+So the control command writes `/etc/dnsmasq-dhcp-opts` — the file the shipped
+config names with `dhcp-optsfile`, inside the container, absent from the
+checkout — and signals the daemon. An option found there takes precedence over
+`dhcp-option`, which is what makes a second DNS address possible without a
+restart. **Rewriting `/etc/dnsmasq.conf` and sending SIGHUP changes nothing**, and
+a scenario built that way reports the stale baseline it already had as a pass.
+
+Two things make the reload *observable* rather than asserted: the router's log
+records `read /etc/dnsmasq-dhcp-opts` after the signal, and the option it then
+sent is the new address. And the scenario **waits** for NetworkManager to report
+the new address with a bounded retry whose failure names the value it kept
+reading — a scenario that sends a signal and sleeps cannot fail.
+
+### DHCP needs `NET_RAW`, and it is not a bridge problem
+
+**A real DORA exchange crosses the podman bridge.** The original measurement said
+otherwise, and the cause was the container's capabilities, not the network. A
+target started with the plan's three `--cap-add` values reaches "getting IP
+configuration" and then:
+
+```text
+Error: Connection activation failed: IP configuration could not be reserved
+(no available address, timeout, etc.)
+…
+NetworkManager: dhcp4 (eth0): error -1 dispatching events
+```
+
+with, from `/proc/self/status` inside the container,
+
+```text
+CapEff: 00000000802c15fb
+```
+
+— bit 13, `NET_RAW`, absent, because podman's default bounding set for a
+rootless container does not carry it. NetworkManager's built-in DHCP client opens
+an `AF_PACKET` socket to send and receive DORA and cannot without the capability.
+With `--cap-add=NET_RAW` the same container against the same router leases
+`10.89.0.1xx` out of the pool and publishes the router's DNS. `NET_RAW` is in the
+harness's cap ceiling and in the emitted target array for that reason, and the
+plan's flag listing has been amended.
+
+The bridge was never the problem: the router's log records the DISCOVER
+(broadcast) arriving, so L2 broadcast crosses the netavark bridge, and the OFFER,
+REQUEST and ACK are ordinary unicast.
+
 ## Prerequisites
 
 **There is no virtual machine and no `podman machine`.** This is deliberate:
@@ -268,6 +402,41 @@ somebody's working machine is a different tool from this one.
 
 A target must be on a **netavark bridge network**, and this is not a
 preference — it is the fact the previous plan got wrong.
+
+### `resolvectl` exists on all three releases, and only because of a conditional
+
+`libnss-resolve` is what makes a lookup in a target go to 127.0.0.53. The
+**daemon** behind that stub is packaged differently on each release: part of
+`systemd` on 22.04, a hard `Depends` of `libnss-resolve` on 24.04, and on
+**26.04 a plain `Recommends`** — measured in the image the first version built:
+
+```text
+$ dpkg -s libnss-resolve | grep -E '^(Depends|Recommends)'
+Depends: libc6 (>= 2.39)
+Recommends: systemd-resolved
+$ command -v resolvectl
+NO_RESOLVECTL
+```
+
+The target image builds with `--no-install-recommends`, for a good reason
+written in the Containerfile, so 26.04 came out with the module and nothing
+behind it. The Containerfile therefore installs the daemon package where the
+release has it:
+
+```dockerfile
+RUN apt-get update \
+    && if apt-cache show systemd-resolved >/dev/null 2>&1; then \
+         apt-get install -y --no-install-recommends systemd-resolved; \
+       else \
+         echo "systemd-resolved is not a package on this release; the resolved daemon is part of systemd here"; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+The guard and the install name the same package deliberately, and the suite holds
+that, holds the package against the availability table, and counts every
+`apt-get install` in every Containerfile so a third spelling is a failure rather
+than a package no rule sees.
 
 ## Why a target needs a bridge network, and the `managed yes` sequence
 
@@ -309,10 +478,12 @@ the field stays `no` after the restart. The image therefore **skips them there**
 and gets `yes` from the `conf.d` declaration instead, which is why the table above
 shows 22.04 coming up managed. See "Two mechanisms, and which one applies".
 
-The harness **asserts** `nmcli -g GENERAL.NM-MANAGED device show eth0` is
+The harness **waits for** `nmcli -g GENERAL.NM-MANAGED device show eth0` to be
 `yes` on a running target before the first scenario runs, and refuses with a
-message naming these steps if it is not. A target that booted wrong is then an
-`incomplete` cell, not a failing scenario and not a pass.
+message naming these steps if it is not. It waits rather than asks, because
+`podman run -d` returns before the target has booted — see "And the hand-off is a
+wait, not a query" above. A target that booted wrong is then an `incomplete`
+cell, not a failing scenario and not a pass.
 
 ## What a run does and does not change
 
@@ -374,4 +545,30 @@ so a failed teardown is reported as a failure, not a warning.
 Scenarios are registered, not discovered. A scenario that is asked for by name
 and is not registered is a **configuration error** (exit 2), not a silently
 ignored flag: the run must not report a pass for something it never looked for.
-`tests/podman/scenarios/` is where they go; `run.py` is where the registry is.
+`tests/podman/scenarios/` is where they go; `run.py` is where the registry is,
+in `build_scenarios()`.
+
+A scenario module gets:
+
+- `build_scenario(...)` — a builder the runner calls with the cell's `podman`
+  client, its two container names, the version, the run id and the results
+  directory, returning a **zero-argument** callable the runner invokes. Bound
+  rather than global, because a cell has its own containers and a global name
+  would measure whichever container happened to be running.
+- a `ScenarioResult` with `status="passed"` or `status="failed"`, and a `log`
+  path **relative** to the run's own result directory.
+- its own exception type for a failed assertion. `PodmanError` means a harness
+  fault (exit 2); a scenario that raises it for "the DNS did not change" is
+  reporting a broken matrix as a broken harness.
+- a **bounded** wait for anything NetworkManager has to report, with the
+  failure naming what it saw. `nmcli connection up` returns before the device
+  has an address.
+- the two clocks, `now` and `sleep`, as parameters defaulting to
+  `time.monotonic` and `time.sleep`. `run.scenario_clock()` is the seam that
+  supplies them, so a case can run the whole scenario without sitting out a real
+  ninety-second bound.
+
+Put the cases in `tests/podman/tests/`, not in the scenario file: discovery is
+pointed at `tests/podman/tests`, so a `TestCase` in `scenarios/` would be read by
+everybody and collected by nothing. `tests/podman/tests/test_suite_shape.py`
+fails on a case that ends up there.
