@@ -115,8 +115,17 @@ MOCK_CDN_ADDRESS = PLAN_ADDRESSES["MOCK_CDN_ADDRESS"]
 # dnsmasq's log, as the scenario reads it: a DORA and the option lines that make
 # the DNS attributable to the router rather than to a coincidence, then the
 # post-reload read.
+#
+# **`read <optsfile>` is in the *first* log, not only the second.** dnsmasq opens
+# `--dhcp-optsfile` when it starts, so the line is in the log the scenario
+# captures *before* it writes the new address and signals -- measured on a live
+# 22.04 cell, where the pre-reload `podman logs` already carried it. A fixture
+# that put it only in the second log would make a presence test on that line look
+# like it proved a reload, which is the defect
+# `test_the_startup_read_on_its_own_is_not_a_reload` is written about.
 DORA_LOG = "\n".join([
     "dnsmasq[1]: started, version 2.91 cachesize 150",
+    f"dnsmasq-dhcp[1]: read {DNS_OPTION_FILE}",
     f"dnsmasq-dhcp[1]: DHCP, IP range {POOL_FIRST} -- {POOL_LAST}, lease time 5m",
     "dnsmasq-dhcp[1]: DHCPDISCOVER(eth0) c2:c6:42:81:9d:6d",
     f"dnsmasq-dhcp[1]: DHCPOFFER(eth0) {LEASE_ADDRESS} c2:c6:42:81:9d:6d",
@@ -125,13 +134,18 @@ DORA_LOG = "\n".join([
     f"dnsmasq-dhcp[1]: sent size:  4 option: 6 dns-server  {MOCK_ROUTER_ADDRESS}",
     f"dnsmasq-dhcp[1]: sent size:  4 option: 3 router  {MOCK_ROUTER_ADDRESS}",
 ])
+# **Cumulative, because `podman logs` is.** The second read of the router's log
+# returns everything the first returned *plus* what the reload added -- a
+# `podman logs` is a container's whole output since it started, not a delta. The
+# first fixture modelled it as a replacement, which is not what podman does, and
+# a count across the two reads is wrong against a log that forgets its own
+# start-up. So the second answer is the first one and then the reload.
 RELOADED_LOG = "\n".join([
+    DORA_LOG,
     "dnsmasq[1]: cleared cache",
     f"dnsmasq-dhcp[1]: read {DNS_OPTION_FILE}",
-    "dnsmasq-dhcp[1]: DHCPDISCOVER(eth0) c2:c6:42:81:9d:6d",
-    f"dnsmasq-dhcp[1]: DHCPOFFER(eth0) {LEASE_ADDRESS} c2:c6:42:81:9d:6d",
-    f"dnsmasq-dhcp[1]: DHCPREQUEST(eth0) {LEASE_ADDRESS} c2:c6:42:81:9d:6d",
-    f"dnsmasq-dhcp[1]: DHCPACK(eth0) {LEASE_ADDRESS} c2:c6:42:81:9d:6d",
+    f"dnsmasq-dhcp[1]: DHCPREQUEST(eth0) {LEASE_ADDRESS} 32:83:9e:e1:11:3c",
+    f"dnsmasq-dhcp[1]: DHCPACK(eth0) {LEASE_ADDRESS} 32:83:9e:e1:11:3c",
     f"dnsmasq-dhcp[1]: sent size:  4 option: 6 dns-server  {MOCK_CDN_ADDRESS}",
 ])
 
@@ -839,6 +853,65 @@ class ScenarioRunsThePlanTest(ScenarioHarness):
             self.assertEqual(argv[-1], ROUTER)
         for argv in fake.invocations():
             self.assertNotEqual(argv[:1], ["cp"], f"the scenario copied a file: {argv!r}")
+
+    def test_a_router_that_never_re_read_the_option_file_fails_the_reload(self):
+        """**The reload assertion, made able to fail.**
+
+        The log handed back after the signal is the one dnsmasq wrote at *start*,
+        with the new option 6 already in it and **no second `read` line**. So
+        every other property of a reloaded router holds -- the router's log names
+        the new resolver, the target's `IP4.DNS` and its lease's own option 6
+        changed, `resolvectl` reports the new address -- and the one thing missing
+        is the only thing a re-read can produce.
+
+        That is the shape the old check could not see. It asked whether the log
+        contained `read <optsfile>` **at all**, and dnsmasq logs that line when it
+        *starts* -- so a pre-reload log, which is what this fixture's first answer
+        is, already satisfied it. The check therefore passed whether or not the
+        SIGHUP ever reached dnsmasq, and the evidence document would claim a
+        reload the log says did not happen. The count is the difference between the
+        two logs, and that difference is the only thing in the log that can tell a
+        re-read from a start-up.
+        """
+        never_re_read = DORA_LOG.replace(
+            f"option: 6 dns-server  {MOCK_ROUTER_ADDRESS}",
+            f"option: 6 dns-server  {MOCK_CDN_ADDRESS}",
+        )
+        rules = [
+            rule for rule in cell_rules() if rule["match"] != ["logs", ROUTER]
+        ] + [{"match": ["logs", ROUTER], "answers": [
+            {"stdout": DORA_LOG + "\n"},
+            {"stdout": never_re_read + "\n"},
+        ]}]
+        _fake, result = self.run_scenario(rules=rules)
+        self.assertEqual(result.status, "failed", result.detail)
+        self.assertIn(DNS_OPTION_FILE, result.detail)
+        # The message names both counts, or the reader is back to guessing which
+        # half of the comparison says the reload did not happen.
+        self.assertIn("re-read", result.detail)
+        self.assertIn(
+            "1 time(s) before the reload and 1 time(s) after", result.detail,
+            "the failure does not carry the two counts, so the reader cannot see which half "
+            "of the comparison says the reload did not happen",
+        )
+
+    def test_a_reload_that_happened_is_the_one_that_passes(self):
+        """The other side of the check above, and it is the side that has to pass.
+
+        A check that only ever fails is not a check. This is the log a router
+        produces when the signal did reach it: the option file is read a *second*
+        time, after the line the start-up read wrote. So the case that fails
+        without the reload and passes with it is the same assertion read twice,
+        and the difference between them is one number.
+        """
+        _fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        record = self.record(result)
+        self.assertNotEqual(
+            record["router_log"], record["router_log_after_reload"],
+            "the two logs are identical, so this case is not exercising the "
+            "difference the reload assertion is about",
+        )
 
     def test_the_baseline_is_read_before_the_router_is_reloaded(self):
         """The order is the claim: baseline first, then the change, then the re-ask.

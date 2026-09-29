@@ -571,13 +571,35 @@ def build_scenario(
 
             # -- 9. the router's account of the reload -----------------------
             document["router_log_after_reload"] = podman.container_logs(router)
+            # **A count, and not a presence test.** dnsmasq logs
+            # `read <optsfile>` when it *starts* as well as when it re-reads the
+            # file on SIGHUP -- measured on a live 22.04 cell, where the log
+            # captured before the signal already carried the line. So asking
+            # whether the log contains it at all is satisfied by the log this
+            # scenario read *before* the reload, and a check that passes on that
+            # is a reload assertion that cannot fail. What distinguishes a
+            # re-read from a start-up is that the line appears again, so the two
+            # logs are compared rather than searched.
+            reads_before = _option_file_reads(document["router_log"])
+            reads_after = _option_file_reads(document["router_log_after_reload"])
+            document["option_file_reads_before_reload"] = reads_before
+            document["option_file_reads_after_reload"] = reads_after
             _require(
-                f"read {DNS_OPTION_FILE}" in document["router_log_after_reload"],
-                f"dnsmasq did not report re-reading {DNS_OPTION_FILE} after the SIGHUP, so the "
-                f"option file the control command wrote was never consulted and any change in the "
-                f"target's DNS came from somewhere else. The log is:\n"
+                reads_after > reads_before,
+                f"dnsmasq did not report re-reading {DNS_OPTION_FILE} after the SIGHUP: the log "
+                f"recorded it {reads_before} time(s) before the reload and {reads_after} time(s) "
+                f"after it, so the option file the control command wrote was not consulted again "
+                f"and any change in the target's DNS came from somewhere else. The line is in the "
+                f"log from start-up as well, so the counts are the only thing in it that can tell "
+                f"a re-read from a start. The log is:\n"
                 f"{document['router_log_after_reload'][-2000:]}",
             )
+            # The sibling, and it carries the property the count above was
+            # carrying badly: an `option: 6 dns-server 10.89.0.20` line can only be
+            # emitted in a reply *after* the file held the new address, so it
+            # cannot be in a log written before the write. It is kept because it
+            # is the claim that matters -- the router offered the new address --
+            # where the count above is only the claim that it re-read to find out.
             _require(
                 re.search(rf"option:\s*\d+\s+dns-server\s+{re.escape(MOCK_CDN_ADDRESS)}\b",
                           document["router_log_after_reload"]) is not None,
@@ -607,6 +629,21 @@ def build_scenario(
         return ScenarioResult(name=SCENARIO_NAME, status="passed", log=log_name)
 
     return run
+
+
+def _option_file_reads(router_log: str) -> int:
+    """How many times the router's log says dnsmasq read the option file.
+
+    A **count**, because the line is not exclusive to a reload: dnsmasq opens
+    `--dhcp-optsfile` at start-up and logs the same `read` line it logs when
+    SIGHUP makes it re-read the file. So `read /etc/dnsmasq-dhcp-opts in log` is
+    true of a log captured before any reload happened, and a reload assertion
+    built on it passes when the reload did not occur -- which is the one thing a
+    reload assertion has to be able to do. What a reload adds is a second
+    occurrence, so the callers compare this across the two logs rather than
+    testing it for presence.
+    """
+    return len(re.findall(rf"read {re.escape(DNS_OPTION_FILE)}\b", router_log or ""))
 
 
 def _dhcp_events(router_log: str) -> list[str]:
