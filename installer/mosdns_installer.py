@@ -6142,10 +6142,15 @@ def write_watchdog_record(root: Path, record: WatchdogRecord) -> Optional[str]:
 
     A same-directory temporary and a rename, like every other publisher in this
     project, so a reader never sees half a document -- and the staged name is
-    `.watchdog.json.<pid>.tmp` because the tmpfiles entry reaps `/run/mosdns/
-    .*.tmp` and nothing else would collect it. The mode is 0640 rather than
-    whatever the umask left, for the same reason the backup is 0600: this record
-    is not for the world and not for the other service identities either.
+    `.watchdog.json.<pid>.tmp` because the tmpfiles entry reaps
+    `/run/mosdns/watchdog/.*.tmp` and nothing else would collect it. Those reap
+    lines are in the entry for the record's OWN directory, and had to be added
+    when the record moved there: the two patterns for `/run/mosdns` name it
+    directly and a tmpfiles `r` line is not recursive, so they never reached a
+    file one level down. The mode is 0600 rather than whatever the umask left,
+    for the same reason the backup is 0600: nothing in this package but the root
+    watchdog reads this record, so it is not for the world and not for the other
+    service identities either.
 
     The returned string is a reason rather than an exception, because the caller
     has to do something *different* when this fails: it must not act. A record
@@ -6700,6 +6705,21 @@ def _deferred(verdict: LocalVerdict, refusal: str) -> WatchdogOutcome:
     then a streak the upgrade manufactured, and the first probe after it could
     tear the machine down.
 
+    **The record is not read and not written, and it is left EXACTLY as it was.**
+    That is what this path does -- it returns before `read_watchdog_record` --
+    and it is the property the message has to describe. The failures a machine
+    already had are its own, they were counted before the transaction arrived,
+    and a transaction does not make them untrue. So the streak RESUMES where it
+    left off, and a machine that already held N-1 of N failures acts on the first
+    free probe.
+
+    An earlier version of this message said "the count restarts from one on the
+    first run after the lock is free", which is the opposite of what happens, and
+    it was wrong in the direction of claiming more caution than the machine has
+    -- on the one path an operator reads while an upgrade runs. The only covering
+    case then started from no record at all, so the false sentence survived a
+    green suite; the case beside it starts from a real record now.
+
     The status is this program's `EXIT_REFUSED` and not zero, and that is the
     opposite of the `NO_VERDICT` case above -- which exits 0 while
     `verify-local` exits 1 on the same condition, deliberately, because a
@@ -6722,8 +6742,12 @@ def _deferred(verdict: LocalVerdict, refusal: str) -> WatchdogOutcome:
             "and no action was taken, and the failure record was not read and not written. That is "
             "not a machine with no DNS -- it is a machine somebody is deliberately changing, and "
             "the resolver not answering while a unit restarts is the change rather than a fault in "
-            "it. The count restarts from one on the first run after the lock is free, so nothing "
-            "this transaction does can reach this mechanism's window.\n"
+            "it.\n"
+            "watchdog: the failure record was left exactly as it was, so the count this machine "
+            "had before the transaction started is the count it still has, and the first probe "
+            "after the lock is free carries on from there. What this transaction does cannot "
+            "reach this mechanism's window: it is not counted while the lock is held, which is "
+            "the whole of the exclusion.\n"
             "watchdog: if that lock is held on a machine that is doing nothing, the process "
             f"holding it is still running: `fuser -v {CONTROL_LOCK}`. An advisory lock is not "
             "held by anything that has exited.\n"
