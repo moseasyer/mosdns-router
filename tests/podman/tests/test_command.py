@@ -76,6 +76,7 @@ from podman import (  # noqa: E402
     Podman,
     PodmanError,
     PodmanTimeout,
+    PodmanUnitStateUnavailable,
     RunResources,
     assert_networkmanager_manages_device,
     canonical_flag_name,
@@ -4500,27 +4501,80 @@ class SetupUnitStateTest(PodmanTestCase):
                     f"did not return it as a word",
                 )
 
-    def test_a_query_that_genuinely_fails_still_raises(self):
-        """`check=False` is for this command's contract, not a blanket amnesty.
+    def test_the_two_ways_the_read_can_fail_are_told_apart(self):
+        """**`check=False` is for this command's contract, not a blanket amnesty.**
 
-        A wrapper that swallowed every non-zero exit would make a *missing* unit --
-        `systemctl is-active` on a target whose image has no such unit exits
-        non-zero with an error on stderr -- look like a unit that is merely not
-        running yet, and the gate would sit out its 120s budget reporting a slow
-        target when the truth is that the image is wrong. So the narrow case is
-        asserted as well as the broad one: only the states systemd *means* come
-        back as words.
+        A wrapper that swallowed every non-zero exit would collapse two failures
+        that mean opposite things to a caller. Measured, on a real target and
+        against a container that is not running:
+
+        ```text
+        the image has no such unit   exit=4   stdout=inactive   -> a broken image, report now
+        the container is not up yet  exit=255  stdout=''         -> transient, retry
+        ```
+
+        So the read classifies by **whether a state word was printed**, not by the
+        exit code, and the two raise different things: the first is terminal and
+        the wait stops on the first read, the second is ordinary and the wait's
+        existing retry handles it. Both still raise -- and "it raises" is the only
+        property they share, so it is not the one a caller branches on.
+
+        The second row is not hypothetical. A first version discriminated on the
+        exit code alone and called a not-running container a missing unit, and
+        **two consecutive live 24.04 cells then failed as `incomplete` on a
+        healthy image**, before any scenario ran.
         """
-        fake = self.fake(directory=self.extra_directory())
-        fake.write_table([
-            {"match": ["systemctl", "is-active", "target-nm-setup.service"],
-             "returncode": 4, "stdout": "",
-             "stderr": "Failed to get unit file state: No such file or directory\n"},
-        ])
-        client = self.client(fake)
-        with self.assertRaises(PodmanError) as caught:
-            client.setup_unit_state("mosdns-x-target-24.04")
-        self.assertIn("exited 4", str(caught.exception))
+        for label, answer, expected, needle in (
+            (
+                "a unit the image does not have",
+                {"returncode": 4, "stdout": "inactive\n"},
+                PodmanUnitStateUnavailable,
+                "no such unit",
+            ),
+            (
+                "a container that is not running yet",
+                {"returncode": 255, "stdout": "",
+                 "stderr": "Error: can only create exec sessions on running containers\n"},
+                PodmanError,
+                "no state at all",
+            ),
+        ):
+            with self.subTest(label=label):
+                fake = self.fake(directory=self.extra_directory())
+                fake.write_table([
+                    {"match": ["systemctl", "is-active", "target-nm-setup.service"], **answer},
+                ])
+                client = self.client(fake)
+                with self.assertRaises(expected) as caught:
+                    client.setup_unit_state("mosdns-x-target-24.04")
+                self.assertIn(needle, str(caught.exception))
+
+    def test_a_state_word_is_never_swallowed_by_the_watch_for_a_missing_unit(self):
+        """The word decides, and this pins which way.
+
+        `inactive` printed with exit 4 is a *missing* unit; `inactive` printed
+        with exit 3 is a unit that has not started. Identical output, opposite
+        conclusions, and the only thing separating them is the exit code -- so a
+        wrapper keyed on the output alone would report every healthy booting target
+        as a broken image, which is the failure mode this whole fix walks near.
+        """
+        for exit_code in (3, 4):
+            with self.subTest(exit=exit_code):
+                fake = self.fake(directory=self.extra_directory())
+                fake.write_table([
+                    {"match": ["systemctl", "is-active", "target-nm-setup.service"],
+                     "returncode": exit_code, "stdout": "inactive\n"},
+                ])
+                client = self.client(fake)
+                if exit_code == 4:
+                    with self.assertRaises(PodmanUnitStateUnavailable):
+                        client.setup_unit_state("mosdns-x-target-24.04")
+                else:
+                    self.assertEqual(
+                        client.setup_unit_state("mosdns-x-target-24.04"), "inactive",
+                        "a unit that has not started yet is a state, so the read must return it "
+                        "rather than refuse the target",
+                    )
 
     def test_the_read_is_the_only_one_that_opts_out_of_checking(self):
         """`check` defaults to `True`, so every other caller is unchanged.

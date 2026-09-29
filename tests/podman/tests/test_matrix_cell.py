@@ -542,6 +542,56 @@ class TargetReadinessTest(EntryPoint):
             "not being made",
         )
 
+    def test_a_container_that_is_not_running_yet_is_waited_for_not_called_a_broken_image(self):
+        """**The opposite of the case below, and the one a live run found first.**
+
+        `podman run -d` returns before the container exists, so the cell's *first*
+        read of the setup unit is a `podman exec` against a container that has not
+        started. Measured, that answers with **no state word at all**:
+
+        ```text
+        $ podman exec <not-running> sh -c 'systemctl is-active x'
+        Error: can only create exec sessions on running containers: container state improper
+        ```
+
+        which is a *transient* and must be retried. A first version of the read
+        discriminated on the exit code alone and called it a missing unit instead,
+        and the consequence was not subtle: **two consecutive live 24.04 cells
+        both went `incomplete` with the gate refusing on its first read**, on a
+        perfectly healthy image, before any scenario ran.
+
+        So this case is the control for the discrimination: a query that produced
+        no word is retried, and a cell that gets one is still waiting rather than
+        already refusing. A gate that refused here would make every run fail, and
+        the fake could not have shown it -- a fake whose `exec` always succeeds is
+        exactly the fake that hides it.
+        """
+        # Two answers: the first read finds the container not running yet, and the
+        # second finds it up. The `is-active` rule is built here rather than
+        # through `is_active_answer`, because "no word" is not a state.
+        rules = [
+            {"match": ["systemctl", "is-active", NM_SETUP_UNIT],
+             "answers": [
+                 {"stdout": "", "returncode": 255,
+                  "stderr": "Error: can only create exec sessions on running containers\n"},
+                 {"returncode": 0, "stdout": "active\n"},
+             ]},
+        ] + [
+            rule for rule in self.rules_for(unit_answers=["active"], managed_answers=["yes"])
+            if rule["match"] != ["systemctl", "is-active", NM_SETUP_UNIT]
+        ]
+        fake = self.fake(rules)
+        code, output, _ = self.cell(fake)
+        self.assertEqual(code, run.EXIT_OK, output)
+        self.assertGreaterEqual(
+            len([argv for argv in fake.invocations()
+                 if argv[:4] == ["exec", TARGET, "systemctl", "is-active"]
+                 and NM_SETUP_UNIT in argv]),
+            2,
+            "the cell did not read the unit again after the container refused an exec, so a "
+            "container that had not started yet would be called a broken image",
+        )
+
     def test_a_unit_that_does_not_exist_is_reported_as_a_broken_image_not_a_slow_target(self):
         """**Why the fake has to model the exit code at all.**
 

@@ -1667,23 +1667,60 @@ class Podman:
         a unit that does not exist exit=4  stdout=inactive
         ```
 
-        The last line is the one that matters: a **missing** unit prints
-        `inactive`, the same word a unit that has not started yet prints, and only
-        the exit code separates them. So exit 4 -- a target whose image has no such
-        unit -- raises `PodmanUnitStateUnavailable`, which the wait treats as
-        terminal rather than retrying: it will never become ready, and retrying it
-        would spend the whole budget and then report a broken image as a slow
-        target.
+        The last line is the one that matters, and it is why the discriminator is
+        **whether a state word was printed at all**, not a particular exit code.
+        Measured, and the two failures are opposite in *retry* as well as in
+        meaning:
+
+        ```text
+        the unit is active                 exit=0    stdout=active
+        the unit is in some state          exit=3    stdout=<that state>
+        the image has no such unit         exit=4    stdout=inactive
+        the container is not running yet   exit!=0   stdout=''   (255 through a shell, and
+                                                                  other values through other
+                                                                  layers -- so not a number
+                                                                  to match on)
+        ```
+
+        A **missing** unit prints a word, and a query that never ran prints none.
+        That is the invariant across all four rows, and it is what separates "a
+        broken image, report it at once" from "a target that has not started, keep
+        waiting": the first raises `PodmanUnitStateUnavailable` and the wait stops
+        on the first read, the second raises a plain `PodmanError` and the wait
+        retries.
+
+        Getting that backwards is not hypothetical. A first version keyed on the
+        exit code alone, and the first live run of it failed **both** of two
+        consecutive cells as `incomplete` -- because `podman run -d` returns
+        before the container exists, so the very first read is a query that never
+        ran, and that was being reported as a missing unit. Keying on the *word*
+        is what makes the two cases separable; there is no exit code that is.
         """
         result = self.exec_container(container, "systemctl", "is-active", unit, check=False)
-        word = (result.output or "").strip().splitlines()[-1].strip() if result.output.strip() else NM_SETUP_UNKNOWN
+        word = (
+            result.output.strip().splitlines()[-1].strip()
+            if result.output.strip()
+            else NM_SETUP_UNKNOWN
+        )
+        if not word:
+            # No state word, so the command did not answer about a unit at all --
+            # most often the container is not running yet. Transient, and the
+            # wait's existing retry is the right response.
+            raise PodmanError(
+                f"'systemctl is-active {unit}' in {container} answered with no state at all "
+                f"(exit {result.returncode}), so the query did not reach systemd -- a container "
+                f"that is not running yet answers like this"
+            )
         if result.returncode not in (NM_IS_ACTIVE_EXIT_ACTIVE, NM_IS_ACTIVE_EXIT_STATE):
+            # A word *and* an exit systemd does not use for a state. It named a
+            # unit and then said it has none, which no amount of waiting changes.
             raise PodmanUnitStateUnavailable(
-                f"'systemctl is-active {unit}' in {container} exited {result.returncode}, which is "
-                f"neither {NM_IS_ACTIVE_EXIT_ACTIVE} (the unit is active) nor "
-                f"{NM_IS_ACTIVE_EXIT_STATE} (the unit is in a state systemd reports). It printed "
-                f"{word!r}, and the most likely reason is that the target's image has no such "
-                f"unit -- which is a broken image, not a target that is slow"
+                f"'systemctl is-active {unit}' in {container} printed the state {word!r} and then "
+                f"exited {result.returncode}, which is neither "
+                f"{NM_IS_ACTIVE_EXIT_ACTIVE} (active) nor {NM_IS_ACTIVE_EXIT_STATE} (a state "
+                f"systemd reports). It answered about a unit and said there is none, so the most "
+                f"likely reason is that the target's image has no such unit -- which is a broken "
+                f"image, not a target that is slow"
             )
         return word
 
