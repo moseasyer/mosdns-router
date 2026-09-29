@@ -77,6 +77,32 @@ are in
 .IR /etc/mosdns/watchdog.yaml ,
 because the false\-positive rate has never been measured and a number nobody
 measured does not get baked in as a constant.
+.PP
+The ten minutes are measured on the machine's **boot clock**, not on the wall
+clock. A machine whose clock steps \- a cold boot before NTP has synchronised, a
+hypervisor adjusting it, a person running
+.B hwclock
+\- must not be able to satisfy the window by having had its clock moved, and a
+cold boot with a wrong clock is exactly the case the first sentence of this
+section names. The boot clock cannot be stepped and it keeps counting across a
+suspend, which is the case the elapsed half exists for.
+.PP
+An **empty** setting file is a refusal, and an **absent** one is not. A file
+that is not there is a deletion, and a deletion is not a decision, so the
+shipped default stands; a file that is there and says nothing is a statement
+this program will not act on, because a truncated file, a
+.B "sed \-i"
+that matched every line and a deployment that wrote a placeholder all leave one.
+.SS While something else is changing the machine
+An install transaction restarts the two units that serve
+.BR 127.0.0.1:53 ,
+so during an upgrade the local resolver is not answering by construction \- the
+transaction creates that failure deliberately. The watchdog therefore takes the
+shared control lock before it counts or acts, and while anything else holds that
+lock it counts nothing, acts on nothing, and says which lock and who holds it.
+The transaction holds the same lock for the window in which it moves the
+machine's DNS, and for its rollback. The first run after a boot is also three
+minutes after boot, for the same underlying reason.
 .SS Turning it off
 Set
 .B automatic: false

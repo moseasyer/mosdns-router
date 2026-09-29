@@ -178,7 +178,14 @@ elapsed half of the window is measured on the machine's boot clock, so a wall
 clock that steps cannot satisfy it.
 .TP
 .I /var/lib/mosdns/runtime/control.lock
-The shared control lock, mode 0640, created on first acquire.
+The shared control lock, mode 0640, created on first acquire. It is also taken,
+for the window in which a machine's DNS is being moved, by the install
+transaction and by its rollback, and read by the resolver watchdog before it
+counts or acts: while anything else is changing this machine, a failure of
+.B 127.0.0.1:53
+is the change rather than a fault in it. The watchdog opens it read-only and
+treats its absence as free, because every holder creates it first; the
+transaction and the rollback create it.
 .TP
 .I /var/lib/mosdns/lists/cn\-domains.txt
 The pinned China domain list, published by
@@ -199,6 +206,12 @@ The command produced no report at all, or refused to publish.
 .B 4
 The shared control lock was held by another process, or a state could not be
 published.
+.PP
+The resolver watchdog has its own statuses and they are not this verb's. It
+exits 0 when the action finished or when there was nothing to do, its own 1 when
+it declined, and otherwise the action's own status passed through unchanged.
+Its 1 includes the control lock being held, in which case no failure was
+counted and no action taken.
 .SH SEE ALSO
 .BR mosdns\-router (8),
 .BR dnscrypt\-proxy (8),

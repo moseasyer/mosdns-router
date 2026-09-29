@@ -440,13 +440,16 @@ The evidence document says all of this, and says explicitly that the router was
 not successfully started by the cell. A cell that claimed a working install here
 would be claiming something it did not achieve.
 
-### The cell's package state is `unpacked`, and the cell says so
+### The cell's package state is NOT configured, and the cell says so
 
 `postinst` exits 1 when the transaction refuses, and it refuses in every cell of
-this matrix, so `dpkg -i` records **`install ok unpacked`** and never reaches
-STEP 5. The scenario asserts that state rather than only recording it: a fixture
-answering `installed` fails the cell, and a fixture answering `half-installed`
-fails it too, so a cell that did not complete cannot read as one that did.
+this matrix, so `dpkg -i` never reaches STEP 5. dpkg records
+**`install ok half-configured`** — measured on 24.04, and *not* the `unpacked`
+this document claimed before the review's finding 5, because the state was
+recorded and never asserted. The scenario asserts the **property** rather than
+the literal: `package_configured` must be false, so a fixture answering
+`installed` fails the cell and so does one answering `half-installed`, while the
+exact word dpkg picks is free to change without the assertion lying.
 
 What that means, in the evidence document's own
 `package_state_explained` field and in this file:
@@ -454,7 +457,12 @@ What that means, in the evidence document's own
 * **Every file the watchdog needs is unpacked and present.** The unit, the timer,
   the setting, the installer and `mosdns-cdnctl` are all on disk, which is why
   the scenario can start `mosdns-watchdog.service` by hand and observe the
-  mechanism.
+  mechanism. `dpkg -i` exits 1 because `postinst` does.
+* **The word dpkg records is `half-configured`, measured** — not the `unpacked`
+  an earlier draft of this document said. dpkg picks the word depending on how
+  far its state machine got before `postinst` exited, and the scenario asserts
+  the *property* (`package_configured` is false) rather than the literal, so the
+  literal can change without the assertion lying.
 * **`postinst`'s timer-enable path is NOT exercised.** The timer is `disabled` in
   the cell, and the scenario reads that through
   `show --property=UnitFileState` rather than `is-enabled` — the latter exits 1
@@ -466,6 +474,12 @@ What that means, in the evidence document's own
 * **The timer actually elapsing is also unexercised**, for the same reason: the
   scenario starts the service by hand at its own cadence. `OnBootSec=3min` and
   `OnUnitActiveSec=1min` are asserted from the unit file, not watched.
+* **The record's cross-boot guard does not fire.** The unit carries the packaged
+  `ProcSubset=pid`, which hides `/proc/sys`, so `/proc/sys/kernel/random/boot_id`
+  is not readable inside it and the cell's record reads
+  `first_failure_boot_id: null`. The tmpfs under `/run` is the guard that does.
+  The installer's message says so on every run rather than leaving a guard that
+  looks armed and cannot fire.
 
 ### The journal is read through a cursor, and that is not a detail
 

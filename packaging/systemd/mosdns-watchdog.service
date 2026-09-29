@@ -128,6 +128,14 @@ CapabilityBoundingSet=
 # a timer, and blocking on it would mean sitting for the length of a transaction
 # and then acting anyway.
 #
+# AND IT IS OPENED READ-ONLY, WITHOUT O_CREAT, which is not a detail. The mount
+# namespace above makes /var/lib/mosdns/runtime read-only, so creating the lock
+# here fails with EROFS -- measured, on a live cell, and the symptom was this
+# unit declining to do anything at all on every machine whose optimizer had not
+# yet run. Absence is free: every holder creates the lock first, so a lock that
+# is not there is a lock nobody holds. That is the same discipline as the DHCP
+# bridge's own publication lock.
+#
 # 0007, inherited from the health check's, and it does NOT describe this record:
 # the record is 0600 and its directory is 0700 root:root, because nothing in this
 # package but this unit reads it. The umask is the packaged one -- a per-unit
