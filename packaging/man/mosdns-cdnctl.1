@@ -169,11 +169,28 @@ that identity. Nothing but the watchdog reads this record.
 .PP
 It is on a tmpfs and does not survive a reboot, deliberately: the first minutes
 after a boot are when the router is still coming up, and a machine that has just
-been rebooted gets its window again. The record also names the boot it belongs
-to, so a machine whose
+been rebooted gets its window again. That tmpfs is the guard in force, and it is
+the real one.
+.PP
+The record also names the boot it belongs to, which is a second answer to the
+same question for a machine whose
 .B /run
-is a disk rather than a tmpfs treats a carried-over streak as not its own. An
-absent record never means "healthy"; it means nothing has failed yet. The
+is a disk rather than a tmpfs \-\- and it does **not** fire in this package's own
+unit.
+.BR mosdns\-watchdog.service (5)
+carries the packaged
+.BR ProcSubset=pid ,
+which mounts a reduced
+.B /proc
+with no
+.BR /proc/sys ,
+so the kernel's
+.I boot_id
+cannot be read inside it and the record carries no boot id. Each run says so.
+Run the verb by hand, where
+.B /proc/sys
+is readable, and the boot id is recorded and a carried\-over streak re\-seeded.
+An absent record never means "healthy"; it means nothing has failed yet. The
 elapsed half of the window is measured on the machine's boot clock, so a wall
 clock that steps cannot satisfy it.
 .TP

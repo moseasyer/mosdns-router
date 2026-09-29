@@ -196,6 +196,33 @@ above could still be deleted, or replaced with a streak that has already reached
 its window, by
 .BR mosdns\-cdn .
 No other identity in this package reads the record.
+.PP
+The record is on a tmpfs, so it does not survive a reboot, and a machine that has
+just been rebooted gets its window again rather than inheriting one. That tmpfs
+is the guard in force.
+.PP
+The record also names the boot it belongs to, which is a second answer to the same
+question for a machine whose
+.B /run
+is a disk rather than a tmpfs \- and it does
+.B not
+fire in this package's own unit.
+.BR mosdns\-watchdog.service (5)
+carries the packaged
+.BR ProcSubset=pid ,
+which mounts a reduced
+.B /proc
+with no
+.BR /proc/sys ,
+so the kernel's
+.I boot_id
+cannot be read inside it and the record carries no boot id. Each run says so.
+Run
+.B "mosdns_installer.py watchdog"
+by hand, where
+.B /proc/sys
+is readable, and the boot id is recorded and a carried\-over streak re\-seeded
+rather than acted on.
 .SH ACCOUNTS AND REMOVAL
 A purge removes
 .BR /var/lib/mosdns ,

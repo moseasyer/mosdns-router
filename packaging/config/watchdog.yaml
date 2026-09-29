@@ -81,11 +81,18 @@
 #
 # The record is on a tmpfs, so it does not survive a reboot: the first minutes
 # after a boot are when the router is still coming up, and a machine that has just
-# been rebooted gets its window again rather than inheriting one. The record also
-# names the boot it belongs to, so a machine whose /run is a disk rather than a
-# tmpfs treats a carried-over streak as not its own rather than acting on a
-# window that was measured against a clock that no longer exists. An absent record
-# never means "healthy"; it means nothing has failed yet.
+# been rebooted gets its window again rather than inheriting one. That tmpfs is
+# the guard in force, and it is the real one.
+#
+# The record ALSO names the boot it belongs to, which is a second answer to the
+# same question for a machine whose /run is a disk rather than a tmpfs -- and you
+# should know that it does not fire in this package's own unit. The unit carries
+# the packaged ProcSubset=pid, which mounts a reduced /proc with no /proc/sys, so
+# the kernel's boot_id cannot be read inside it and the record carries no boot id
+# at all. A run says so, naming this, rather than leaving a protection that looks
+# armed and is not. If you run the verb by hand, where /proc/sys is readable, the
+# boot id IS recorded and a carried-over streak is then re-seeded instead of acted
+# on. An absent record never means "healthy"; it means nothing has failed yet.
 #
 # The window's elapsed half is measured on the machine's BOOT clock, not on the
 # wall clock, so a machine whose clock steps -- a cold boot before NTP has
