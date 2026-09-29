@@ -92,8 +92,12 @@ CONFIG_DIRECTORY = "/etc/mosdns"
 MAN_ROOT = "/usr/share/man"
 DEBIAN = "/DEBIAN"
 
-# The six documents an operator edits, and the two generated ones among them. All
-# six are conffiles, so an upgrade asks before replacing any of them.
+# The seven documents an operator edits, and the two generated ones among them. All
+# seven are conffiles, so an upgrade asks before replacing any of them. The
+# seventh is the watchdog's setting, and it is a conffile for that reason twice
+# over: an upgrade that silently replaced `automatic: false` with the shipped
+# `true` would hand a machine with a working resolver to the one unattended action
+# in this package, on the upgrade that was meant to be uneventful.
 EDITABLE_DOCUMENTS = (
     CONFIG_DIRECTORY + "/mosdns.yaml",
     CONFIG_DIRECTORY + "/dnscrypt-proxy.toml",
@@ -101,6 +105,7 @@ EDITABLE_DOCUMENTS = (
     CONFIG_DIRECTORY + "/force-ech-domains.txt",
     CONFIG_DIRECTORY + "/cloudflare.txt",
     CONFIG_DIRECTORY + "/cloudfront-domains.yaml",
+    CONFIG_DIRECTORY + "/watchdog.yaml",
 )
 ROUTING_DOCUMENTS = (
     CONFIG_DIRECTORY + "/mosdns.yaml",
@@ -2850,6 +2855,10 @@ class MaintainerScriptTests(_Staged):
             "mosdns-cdn-optimizer.timer",
             "mosdns-cdn-health.timer",
             "mosdns-list-check.timer",
+            # The watchdog's timer, and the one whose absence is the failure the
+            # previous plan recorded as an open decision: a machine whose resolver
+            # can stop answering with nothing that will put it back.
+            "mosdns-watchdog.timer",
         ):
             with self.subTest(timer=timer):
                 self.assertIn(timer, text, f"{timer} is enabled by nothing")
@@ -2883,7 +2892,7 @@ class MaintainerScriptTests(_Staged):
         completed, calls = postinst_transaction_run(0, failing_systemctl="enable")
         self.assertIn(
             ["enable", "mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer",
-             "mosdns-list-check.timer"], calls,
+             "mosdns-list-check.timer", "mosdns-watchdog.timer"], calls,
             f"the enable never ran, so this case is not about a failing enable: {calls}",
         )
         self.assertEqual(
@@ -2959,6 +2968,7 @@ class MaintainerScriptTests(_Staged):
             "mosdns-cdn-optimizer.timer",
             "mosdns-cdn-health.timer",
             "mosdns-list-check.timer",
+            "mosdns-watchdog.timer",
         ):
             with self.subTest(timer=timer):
                 self.assertIn(timer, text)
@@ -3134,7 +3144,8 @@ class MaintainerScriptTests(_Staged):
         enabled = [call for call in calls if call[:1] == ["enable"]]
         self.assertEqual(
             [call for call in enabled for call in call[1:] if call.endswith(".timer")],
-            ["mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer", "mosdns-list-check.timer"],
+            ["mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer",
+             "mosdns-list-check.timer", "mosdns-watchdog.timer"],
             "a successful install did not reach STEP 5, or reached it with a different set of "
             f"timers. Every systemctl call it made was: {calls}",
         )
@@ -4796,7 +4807,12 @@ def _swap_the_timer_enable_before_the_transaction(text):
     while cursor < len(lines) and not lines[cursor].lstrip().startswith("#"):
         moved.append(lines[cursor])
         cursor += 1
-        if lines[cursor - 1].rstrip().endswith("mosdns-list-check.timer"):
+        # The last timer in the list, which is the one this control stops on. It
+        # was `mosdns-list-check.timer` before the watchdog was added and is now
+        # the last line of the enable, so naming the OLD last name would have
+        # stopped after the third of four and moved half the command -- which is
+        # the shape of control that cannot fail for the reason it is written for.
+        if lines[cursor - 1].rstrip().endswith("mosdns-watchdog.timer"):
             break
     guard = next(
         index for index, line in enumerate(lines)

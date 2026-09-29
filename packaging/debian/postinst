@@ -46,7 +46,7 @@
 # which on the only resolver this machine has is an outage rather than a failed
 # installation. The transaction rolls itself back on any failure.
 #
-# STEP 5 is the three timers, and it is LAST and not next to the transaction on
+# STEP 5 is the four timers, and it is LAST and not next to the transaction on
 # purpose. The first version of this script enabled them immediately before the
 # transaction, and then said, in the arm that runs when the transaction refuses, that
 # nothing was enabled and running. That was false, and the difference was three
@@ -293,7 +293,7 @@ else
 		if [ -n "${2:-}" ]; then
 			echo "postinst: This machine had this package configured before (it was at" >&2
 			echo "postinst: version $2), so this was an UPGRADE rather than a first" >&2
-			echo "postinst: install. This run enabled none of the three timers, because" >&2
+			echo "postinst: install. This run enabled none of the four timers, because" >&2
 			echo "postinst: they are enabled only after this step succeeds. What was" >&2
 			echo "postinst: already enabled is what the installer's messages above say" >&2
 			echo "postinst: about -- the transaction is the authority on that, not this" >&2
@@ -301,7 +301,7 @@ else
 			echo "postinst: were running." >&2
 		else
 			echo "postinst: Nothing is enabled and nothing was started: this was a first" >&2
-			echo "postinst: install, and the three timers are enabled only after this step" >&2
+			echo "postinst: install, and the four timers are enabled only after this step" >&2
 			echo "postinst: succeeds, so there is nothing here for them to run against." >&2
 		fi
 		;;
@@ -366,29 +366,42 @@ fi
 #
 # Silent tolerance is the other wrong answer, and worse for this step than for any
 # other: `mosdns-cdn-health.timer` is the only thing on a machine that ever asks
-# whether `127.0.0.1:53` still resolves, so an enable that fails quietly leaves a
-# machine whose resolver can stop answering with nothing watching for it. So the
-# failure is LOUD, names all three units and the consequence, and gives the command
-# to run -- and the script still exits 0, because dpkg's record should describe the
-# transaction that happened rather than a timer that did not.
+# whether `127.0.0.1:53` still resolves, and `mosdns-watchdog.timer` is the only
+# thing on it that will put the machine's own resolvers back when it does not, so
+# an enable that fails quietly leaves a machine whose resolver can stop answering
+# with nothing watching for it. So the failure is LOUD, names all four units and
+# the consequence, and gives the command to run -- and the script still exits 0,
+# because dpkg's record should describe the transaction that happened rather than
+# a timer that did not.
+#
+# `mosdns-watchdog.timer` is here for the same reason the transaction is above
+# rather than after it: reaching this step means the machine's DNS was taken over
+# and the daemons are serving, which is exactly the state in which the watchdog
+# has something to protect. Enabling it on a machine whose transaction was refused
+# would put an unattended DNS-restoring mechanism on a machine that is already
+# back where it was.
 if [ -d /run/systemd/system ]; then
 	if systemctl enable mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
-		mosdns-list-check.timer; then
+		mosdns-list-check.timer mosdns-watchdog.timer; then
 		:
 	else
 		echo "postinst: WARNING: the install transaction above SUCCEEDED, but these" >&2
-		echo "postinst: three timers were not enabled, so nothing will run them:" >&2
+		echo "postinst: four timers were not enabled, so nothing will run them:" >&2
 		echo "postinst:   mosdns-cdn-optimizer.timer   the nightly optimization run" >&2
 		echo "postinst:   mosdns-cdn-health.timer       the two-minute health check" >&2
 		echo "postinst:   mosdns-list-check.timer       the daily list-drift check" >&2
+		echo "postinst:   mosdns-watchdog.timer         the resolver watchdog" >&2
 		echo "postinst: The health timer is the only thing on this machine that asks" >&2
-		echo "postinst: whether 127.0.0.1:53 is still being served, so this matters" >&2
-		echo "postinst: even though the resolver is up. Nothing about this machine's" >&2
-		echo "postinst: DNS was changed by the failure, and the two daemons are" >&2
-		echo "postinst: running. Enable them by hand with:" >&2
+		echo "postinst: whether 127.0.0.1:53 is still being served, and the watchdog is" >&2
+		echo "postinst: the only thing on it that will PUT THE MACHINE'S OWN RESOLVERS" >&2
+		echo "postinst: BACK when it is not, so these two matter even though the" >&2
+		echo "postinst: resolver is up right now. Nothing about this machine's DNS was" >&2
+		echo "postinst: changed by the failure, and the two daemons are running." >&2
+		echo "postinst: Enable them by hand with:" >&2
 		echo "postinst:   sudo systemctl enable mosdns-cdn-optimizer.timer" >&2
 		echo "postinst:   sudo systemctl enable mosdns-cdn-health.timer" >&2
 		echo "postinst:   sudo systemctl enable mosdns-list-check.timer" >&2
+		echo "postinst:   sudo systemctl enable mosdns-watchdog.timer" >&2
 	fi
 fi
 

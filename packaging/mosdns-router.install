@@ -51,6 +51,12 @@ packaging/systemd/mosdns-cdn-health.service      /usr/lib/systemd/system/mosdns-
 packaging/systemd/mosdns-cdn-health.timer        /usr/lib/systemd/system/mosdns-cdn-health.timer
 packaging/systemd/mosdns-list-check.service      /usr/lib/systemd/system/mosdns-list-check.service
 packaging/systemd/mosdns-list-check.timer        /usr/lib/systemd/system/mosdns-list-check.timer
+# The watchdog, a service and a timer, and the timer's absence from a machine
+# with a dead resolver is the failure the previous plan recorded as an open
+# decision. `postinst` enables it in the same step as the other three timers,
+# and `prerm` disables it with them.
+packaging/systemd/mosdns-watchdog.service        /usr/lib/systemd/system/mosdns-watchdog.service
+packaging/systemd/mosdns-watchdog.timer          /usr/lib/systemd/system/mosdns-watchdog.timer
 
 # --- the documents an operator edits ------------------------------------------
 # policy.yaml is the committed output of config.Marshal(config.Defaults()) and the
@@ -61,6 +67,11 @@ configs/policy.yaml                            /etc/mosdns/policy.yaml
 packaging/config/force-ech-domains.txt          /etc/mosdns/force-ech-domains.txt
 packaging/config/cloudflare.txt                 /etc/mosdns/cloudflare.txt
 packaging/config/cloudfront-domains.yaml        /etc/mosdns/cloudfront-domains.yaml
+# The watchdog's setting: the switch for the one unattended action in this
+# package, and the two numbers in its window. 0644 root, a conffile, and the same
+# directory and rules as the documents above -- an operator can find it, an
+# unprivileged process cannot change it, and an upgrade asks before replacing it.
+packaging/config/watchdog.yaml                  /etc/mosdns/watchdog.yaml
 
 # --- the NetworkManager hook --------------------------------------------------
 # The ONLY file outside /var/lib/mosdns that this package installs and owns outright.

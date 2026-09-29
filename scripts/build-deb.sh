@@ -370,6 +370,12 @@ place configs/policy.yaml /etc/mosdns/policy.yaml 644
 place packaging/config/force-ech-domains.txt /etc/mosdns/force-ech-domains.txt 644
 place packaging/config/cloudflare.txt /etc/mosdns/cloudflare.txt 644
 place packaging/config/cloudfront-domains.yaml /etc/mosdns/cloudfront-domains.yaml 644
+# The watchdog's setting, at 0644 like the four above and a conffile like all of
+# them. It is placed here rather than generated, and the two numbers in it are
+# the shipped defaults the program also holds: a case reads this file and the
+# program's constants and requires them equal, because a switch whose default
+# exists in two places is a switch whose default is one of them.
+place packaging/config/watchdog.yaml /etc/mosdns/watchdog.yaml 644
 
 # The NetworkManager hook, executable, because NetworkManager runs it.
 place packaging/networkmanager/10-mosdns-dhcp-bridge \

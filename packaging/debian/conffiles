@@ -1,11 +1,17 @@
 # The documents an operator may edit, and the two of them that are GENERATED.
 #
-# All six are conffiles, and all six for the same reason: an upgrade must not
+# All seven are conffiles, and all seven for the same reason: an upgrade must not
 # replace a file a person changed without dpkg asking. The two generated documents
 # are here rather than left to dpkg's defaults because an operator is EXPECTED to
 # edit one of them -- a custom DNSCrypt stamp set lives in dnscrypt-proxy.toml --
 # and a generated file that dpkg silently overwrote would be a configuration the
 # operator had and then lost.
+#
+# The seventh is watchdog.yaml, and it is here for that reason twice over. It is
+# the switch for the only unattended action this package takes, and a switch that
+# an upgrade could silently replace is not a switch: the operator who wrote
+# `automatic: false` would get `true` back on the next upgrade of a machine whose
+# resolver was working.
 #
 # The dispatcher hook under /etc/NetworkManager is deliberately NOT a conffile.
 # It is the one file under /etc this package installs that is not a document, it
@@ -17,3 +23,4 @@
 /etc/mosdns/force-ech-domains.txt
 /etc/mosdns/cloudflare.txt
 /etc/mosdns/cloudfront-domains.yaml
+/etc/mosdns/watchdog.yaml

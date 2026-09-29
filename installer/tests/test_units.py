@@ -52,6 +52,8 @@ HEALTH = "mosdns-cdn-health.service"
 HEALTH_TIMER = "mosdns-cdn-health.timer"
 LIST_CHECK = "mosdns-list-check.service"
 LIST_CHECK_TIMER = "mosdns-list-check.timer"
+WATCHDOG = "mosdns-watchdog.service"
+WATCHDOG_TIMER = "mosdns-watchdog.timer"
 
 SHIPPED_UNITS = (
     ROUTER,
@@ -62,10 +64,12 @@ SHIPPED_UNITS = (
     HEALTH_TIMER,
     LIST_CHECK,
     LIST_CHECK_TIMER,
+    WATCHDOG,
+    WATCHDOG_TIMER,
 )
 
-SERVICES = (ROUTER, DNSCRYPT, OPTIMIZER, HEALTH, LIST_CHECK)
-TIMERS = (OPTIMIZER_TIMER, HEALTH_TIMER, LIST_CHECK_TIMER)
+SERVICES = (ROUTER, DNSCRYPT, OPTIMIZER, HEALTH, LIST_CHECK, WATCHDOG)
+TIMERS = (OPTIMIZER_TIMER, HEALTH_TIMER, LIST_CHECK_TIMER, WATCHDOG_TIMER)
 
 # The installed layout every ExecStart names. The two documents are the renderer's
 # own output file names, which is why `test_the_units_name_the_files_the_renderer_publishes`
@@ -98,13 +102,39 @@ RUNTIME_DIR = "/var/lib/mosdns/runtime"
 LISTS_DIR = "/var/lib/mosdns/lists"
 RUN_DIR = "/run/mosdns"
 
+
+def _watchdog_record_path() -> str:
+    """The watchdog's one written file, read out of the program that writes it.
+
+    Imported rather than restated, and the reason is this project's own subject:
+    a table row that repeats a path constant is a second answer to the question
+    the constant answers, and the whole defect this plan's rulings keep naming is
+    two definitions of one fact. A moved `WATCHDOG_RECORD` has to be a failure
+    of the unit's writable set, not a row here that quietly stops matching.
+    """
+    sys.path.insert(0, str(REPO / "installer"))
+    import mosdns_installer
+
+    return mosdns_installer.WATCHDOG_RECORD
+
+
+WATCHDOG_RECORD = _watchdog_record_path()
+
 # The sandbox every service in this package gets, as (key, value) pairs. It is one
-# list for all five services on purpose: five short-lived or long-lived Go
-# programs that read documents, write state and open sockets, with no use for /tmp,
-# for devices, for kernel knobs or for anything under /home. A per-service subset
-# would be a privilege decision nobody can review at a glance, and the only
-# per-identity differences in this package are the ones the tables below name: the
-# user, the capability set and the writable paths.
+# list for all six services on purpose: short-lived or long-lived programs that
+# read documents, write state and open sockets, with no use for /tmp, for devices,
+# for kernel knobs or for anything under /home. A per-service subset would be a
+# privilege decision nobody can review at a glance, and the only per-identity
+# differences in this package are the ones the tables below name: the user, the
+# capability set and the writable paths.
+#
+# The watchdog is in this list on the strength of the ruling that a unit beside
+# another one inherits the packaged hardening rather than inventing its own: it
+# reads two documents, writes one file and opens one loopback socket, and a
+# subset would be a second hardening shape to review. What it does NOT inherit is
+# the identity -- `mosdns-cdnctl emergency-rollback` refuses a non-root uid, so
+# `mosdns-watchdog.service` runs as root with an empty bounding set, and that is
+# the only per-identity difference in the table below.
 SANDBOX = (
     ("NoNewPrivileges", "true"),
     ("PrivateTmp", "true"),
@@ -159,10 +189,20 @@ WRITE_TABLE = {
     HEALTH: (RUNTIME_DIR,),
     LIST_CHECK: (),
     DNSCRYPT: (),
+    # One file, on the tmpfs: the consecutive-failure record at
+    # /run/mosdns/watchdog.json. The row is derived from `WATCHDOG_RECORD` below
+    # rather than written out, because a table row that restates a constant is a
+    # second answer to the question the constant already answers.
+    WATCHDOG: (RUN_DIR,),
 }
 # The bridge's row: it has no unit, so it appears in no table above, and the only
 # thing a test can say about it is where it writes.
 BRIDGE_WRITES = (RUN_DIR,)
+
+# The watchdog's one written file, read out of the program that writes it rather
+# than written here: a table that restated the path would be a second place to
+# change it, and this is exactly the defect the two-definition ruling is about.
+WATCHDOG_RECORD = _watchdog_record_path()
 
 # The directories this package provisions, and so the only ones a ReadWritePaths
 # entry may name without the `-` prefix. /var/lib/mosdns/runtime and
@@ -187,6 +227,13 @@ IDENTITIES = {
     HEALTH: ("mosdns-cdn", "mosdns"),
     LIST_CHECK: ("mosdns-cdn", "mosdns"),
     DNSCRYPT: ("dnscrypt-proxy", "dnscrypt-proxy"),
+    # root, explicitly and with an empty bounding set. The verb this unit runs
+    # execs `mosdns-cdnctl emergency-rollback`, which refuses a non-root uid, so
+    # a unit that ran it as a service identity would fail at the action every time
+    # with a message about privileges rather than about DNS. It needs no
+    # capability: the action reaches NetworkManager over D-Bus and the daemon at
+    # the other end does the writing.
+    WATCHDOG: ("root", "root"),
 }
 
 # Only the router binds a privileged port, and only the router gets a capability.
@@ -201,19 +248,24 @@ CAPABILITIES = {
     OPTIMIZER: (),
     HEALTH: (),
     LIST_CHECK: (),
+    WATCHDOG: (),
 }
 
-# The three schedules, pinned. The optimizer is 03:00 local time and catches up
+# The four schedules, pinned. The optimizer is 03:00 local time and catches up
 # after a machine that was off; the health check is every two minutes and must not
 # be persistent, because a two-minute cadence with Persistent=true replays a
 # backlog of every check the machine missed; the list check is daily after the
 # optimizer's window and is report-only, and it is persistent for the opposite
 # reason the health timer is not -- a report nobody will ever be shown is not a
-# report.
+# report; and the watchdog is every minute, NOT persistent for the health timer's
+# measured reason at a cadence that is thirty times worse, and three minutes after
+# boot rather than immediately, because at boot the router is still coming up and
+# a probe before then fails by construction.
 SCHEDULES = {
     OPTIMIZER_TIMER: (("OnCalendar", "*-*-* 03:00:00"), ("Persistent", "true")),
     HEALTH_TIMER: (("OnBootSec", "2min"), ("OnUnitActiveSec", "2min")),
     LIST_CHECK_TIMER: (("OnCalendar", "*-*-* 03:30:00"), ("Persistent", "true")),
+    WATCHDOG_TIMER: (("OnBootSec", "3min"), ("OnUnitActiveSec", "1min")),
 }
 
 # Every directive of every shipped unit, except Description=.
@@ -415,6 +467,65 @@ UNIT_DIRECTIVES = {
         "Timer": (("Unit", LIST_CHECK),) + SCHEDULES[LIST_CHECK_TIMER],
         "Install": (("WantedBy", "timers.target"),),
     },
+    WATCHDOG: {
+        "Unit": (
+            # The installer's own page: the watchdog is a verb of the program
+            # that also does the install, and the page is where the action it
+            # runs and the setting it reads are described.
+            ("Documentation", "man:mosdns-router(8)"),
+            # `After=` NetworkManager, and none of Requires=, BindsTo=, PartOf=,
+            # PropagatesStopTo= or Upholds=. Measured rather than preferred: the
+            # watchdog reaches NetworkManager over D-Bus through the action, and
+            # `Requires=` on a unit a service only talks to is a cycle, not a
+            # race -- NetworkManager's own restart would take this unit down with
+            # it, and a machine whose resolver is already dead is the worst place
+            # to lose the thing that is watching for it.
+            ("After", "network.target NetworkManager.service"),
+        ),
+        "Service": (
+            ("Type", "oneshot"),
+            # root, because the verb execs `mosdns-cdnctl emergency-rollback`,
+            # which refuses a non-root uid. No capability: the action talks to
+            # NetworkManager over D-Bus.
+            ("User", "root"),
+            ("Group", "root"),
+            ("ExecStart", f"{INSTALLER} watchdog"),
+            # Above the action's own 150-second budget, on purpose: a watchdog
+            # killed part way through a restore prints nothing, and a rollback
+            # killed mid-restore is the worst thing this package can do
+            # unattended. The budget itself is `WATCHDOG_ACTION_TIMEOUT_SECONDS`
+            # in the program, and a case holds the two in that order.
+            ("TimeoutStartSec", "180"),
+            # No SuccessExitStatus, and that is the difference from the health
+            # check's exit 4. Every non-zero exit here is something an operator
+            # has to read: this program's own 1 (not resolving and the window not
+            # reached, the setting unreadable, or the record unwritable) and the
+            # ACTION's own status passed through unchanged, so a caller can tell a
+            # rollback that did not finish from one that changed nothing without
+            # parsing a sentence.
+            ("CapabilityBoundingSet", ""),
+            ("UMask", "0007"),
+        )
+        + SANDBOX
+        + (
+            # AF_UNIX for the D-Bus connection the action makes to
+            # NetworkManager, AF_INET for the probe. The health check's list
+            # exactly: no interface is enumerated and no netlink socket is
+            # opened.
+            ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"),
+            # Exactly one directory, and the `-` prefix is load-bearing: /run is
+            # a tmpfs, so this directory is gone after a reboot, and an
+            # unprefixed entry naming a path that is not there fails the unit's
+            # mount-namespace setup -- so the machine's only automatic DNS
+            # protection would be the retry loop.
+            ("ReadWritePaths", f"-{RUN_DIR}"),
+        ),
+    },
+    WATCHDOG_TIMER: {
+        "Unit": (("Documentation", "man:mosdns-router(8)"),),
+        "Timer": (("Unit", WATCHDOG),) + SCHEDULES[WATCHDOG_TIMER],
+        "Install": (("WantedBy", "timers.target"),),
+    },
 }
 
 # Prose, and prose only. See the module docstring for why neither is pinned.
@@ -605,11 +716,25 @@ def capability_problems(name, sections, expected):
     return problems
 
 
+def tolerant(path: str) -> str:
+    """A `ReadWritePaths` entry with systemd's `-` prefix removed, if it carries one.
+
+    The prefix is a **start-time tolerance marker** and not part of the path: it
+    tells systemd to ignore the entry when the directory is absent, which is what
+    every entry naming a volatile path has to say. So the write set is a table of
+    directories and the marker is a property of the unit's spelling, and mixing
+    the two would put `-/run/mosdns` in a table whose other rows are plain paths
+    -- where it would read as a fourth directory rather than as a flag on the
+    third.
+    """
+    return path[1:] if path.startswith("-") else path
+
+
 def write_path_problems(name, sections, expected):
     """How a unit's writable paths differ from the identity's write set."""
     values = directive_value(sections, "Service", "ReadWritePaths")
     declared = tuple(
-        part for value in values for part in value.split() if part
+        tolerant(part) for value in values for part in value.split() if part
     )
     problems = []
     granted = set(declared)
@@ -754,11 +879,18 @@ class UnitTextTests(unittest.TestCase):
                 self.assertEqual(one_directive(sections, "Service", "Group"), group)
                 self.assertEqual(
                     group,
-                    "mosdns" if name != DNSCRYPT else "dnscrypt-proxy",
-                    "the two mosdns service users share the group the state directories' default "
-                    "ACL names, because an ACL grants by group and per-service groups would let "
-                    "only one of them replace the other's files; the resolver shares no state "
-                    "with either, so it has a group of its own",
+                    # root is the third answer, and the reason is a refusal in
+                    # another program: `mosdns-cdnctl emergency-rollback` exits
+                    # non-zero for a non-root uid, so the watchdog has to be root
+                    # to run the action at all. The two mosdns service users share
+                    # the group the state directories' default ACL names, because
+                    # an ACL grants by group and per-service groups would let only
+                    # one of them replace the other's files; the resolver shares no
+                    # state with either, so it has a group of its own.
+                    "root" if name == WATCHDOG
+                    else ("mosdns" if name != DNSCRYPT else "dnscrypt-proxy"),
+                    "the identity table is what says which of this package's three "
+                    "identities a unit runs as, and each of the three has a reason",
                 )
 
     def test_each_timer_triggers_exactly_its_own_service(self):
@@ -1892,7 +2024,7 @@ class WriteSetEvidenceTests(unittest.TestCase):
     def _writable(self, name):
         sections = parsed(name)
         return [
-            path
+            tolerant(path)
             for value in directive_value(sections, "Service", "ReadWritePaths")
             for path in value.split()
         ]

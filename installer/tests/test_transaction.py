@@ -178,12 +178,21 @@ STATE_DIRECTORIES = (
     "/var/lib/mosdns/lists",
     "/run/mosdns",
 )
+# The units whose states the preflight reads, and the fixture's own list rather
+# than the module's: this suite asserts the exact sequence of commands a
+# transaction issues, and a sequence derived from the constant under test would
+# be a sequence that cannot fail. The watchdog's timer is here for the same
+# reason the other three are -- preflight reads whether a unit this package
+# installed is running, because one that is already running changes what the
+# transaction must undo -- and its ABSENCE from this list is what the case below
+# would have caught.
 PROJECT_UNITS = (
     ROUTER_UNIT,
     RESOLVER_UNIT,
     "mosdns-cdn-optimizer.timer",
     "mosdns-cdn-health.timer",
     "mosdns-list-check.timer",
+    "mosdns-watchdog.timer",
 )
 # The command that publishes the Cloudflare prefix list, which the response
 # rewriter refuses to CONSTRUCT without (plugin/executable/cdn_rewrite calls

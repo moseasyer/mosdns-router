@@ -66,13 +66,20 @@ INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
 
 case "$1" in
 remove|deconfigure)
-	# The two daemons and the three timers, and nothing else: a unit that is
+	# The two daemons and the four timers, and nothing else: a unit that is
 	# already stopped is left stopped, and one that was never enabled is not
 	# touched, so this is cheap on a machine where the transaction refused.
+	#
+	# The watchdog is in this list and the reason is not tidiness. It is the only
+	# unit in this package that changes the machine by itself, and a removal that
+	# left its timer enabled would leave a mechanism running
+	# `emergency-rollback` against a connection whose record the uninstaller is
+	# about to delete -- unattended, on a timer, on the machine somebody is
+	# trying to put back.
 	if [ -d /run/systemd/system ]; then
 		systemctl disable mosdns-router.service dnscrypt-proxy.service \
 			mosdns-cdn-optimizer.timer mosdns-cdn-health.timer \
-			mosdns-list-check.timer
+			mosdns-list-check.timer mosdns-watchdog.timer
 	fi
 
 	if "$INSTALLER" uninstall; then

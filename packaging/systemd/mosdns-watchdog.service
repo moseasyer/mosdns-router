@@ -1,0 +1,126 @@
+# The resolver watchdog: put the machine's own resolvers back when the local one
+# has stopped answering, unattended, once a window of failures has been reached.
+#
+# ## This is the only unit in the package that changes the machine by itself
+#
+# Every other service here reads, measures and publishes. This one runs
+# `emergency-rollback`, which rewrites a NetworkManager connection, on a timer,
+# with nobody watching. The operator who owns the machine decided that: automatic
+# rollback is the DEFAULT and it must be possible to switch it off, and
+# /etc/mosdns/watchdog.yaml is the switch.
+#
+# So this unit's job is to be as narrow as the decision allows, and the three
+# facts below are the whole of it.
+#
+# ## 1. It acts only on a WINDOW, and the window is a setting
+#
+# One failed probe is not evidence: a slow upstream, a cold boot before NTP has
+# synchronised and a loaded machine each produce one. With automatic rollback as
+# the default, a single-probe trigger is a mechanism that can tear down a working
+# configuration while somebody is using it, and a self-inflicted outage is worse
+# than a false alarm. So it acts on the Nth consecutive failure or once M minutes
+# have passed since the first, and both numbers are in
+# /etc/mosdns/watchdog.yaml because the false-positive rate has never been
+# measured and a number nobody measured does not get baked in.
+#
+# ## 2. It runs the OPERATOR'S command, not one of its own
+#
+# `mosdns-cdnctl emergency-rollback` is exactly what a person types. The watchdog
+# execs that argument array and reports the status it comes back with. A watchdog
+# with its own rollback path would be a second implementation of the most
+# deliberate code in this package, and the two would disagree eventually.
+#
+# That verb refuses to run as a non-root uid, which is the only reason this unit
+# runs as root where every other service in the package runs as its own
+# unprivileged identity. It grants no capability: the action talks to
+# NetworkManager over D-Bus, and the daemon on the other end does the writing.
+#
+# ## 3. It is a TIMER, so it inherits the packaged hardening
+#
+# The same sandbox as mosdns-cdn-health.service, the same bounding set, the same
+# umask, and one writable directory: /run/mosdns, for the failure record at
+# /run/mosdns/watchdog.json and nothing else. A per-unit subset would be a
+# privilege decision nobody can review at a glance.
+#
+# ## What it does NOT claim
+#
+# A successful rollback restores the machine's own DHCP-provided resolvers, so
+# basic name resolution works again. **Foreign-name resolution through DNSCrypt
+# does not work afterwards**, and that is the condition this package was
+# installed to fix. The success message says both, every time, because a message
+# that said only the first would be true and useless at 3am.
+#
+# And the ordering: this unit is `After=` NetworkManager because it runs `nmcli`
+# against it, and carries none of Requires=, BindsTo=, PartOf=, PropagatesStopTo=
+# or Upholds=. That is measured, not preferred: `Requires=` on a unit a service
+# only talks to through D-Bus is a cycle, and NetworkManager's own restart would
+# take this unit down with it.
+#
+# VERSION FLOOR: systemd 249, the oldest supported release (Ubuntu 22.04). The
+# newest directive in this file is ProtectProc= and ProcSubset=, both 247.
+
+[Unit]
+Description=Resolver watchdog: restore the machine's own resolvers when the local one stops answering
+Documentation=man:mosdns-router(8)
+After=network.target NetworkManager.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/lib/mosdns-router/mosdns_installer.py watchdog
+# The probe is one 2-second query. The action is not: it reactivates a
+# NetworkManager connection, which re-runs DHCP, and it gets its own 150-second
+# budget inside the verb -- `COMMAND_TIMEOUT_SECONDS` is 30 and is right for the
+# read-only questions the rest of this package asks a running manager. This
+# budget is above the action's on purpose, so that the watchdog prints its own
+# report rather than being killed part way through a restore. A rollback killed
+# mid-restore is the worst thing this package can do unattended.
+TimeoutStartSec=180
+# No SuccessExitStatus. Every non-zero exit is something an operator has to
+# read: 1 is this program's own refusal (the resolver is not answering and the
+# window has not been reached, or the setting could not be read, or the record
+# could not be written), and anything else is the ACTION's own status, passed
+# through unchanged so a caller can tell a rollback that did not finish from one
+# that changed nothing. A watchdog that reported success on a run where it did
+# not act would be the defect this package keeps correcting.
+CapabilityBoundingSet=
+# 0007 for the same reason as the health check's: the record is a document the
+# other service identities may have to read, and 0640 is its mode.
+UMask=0007
+
+# The same sandbox the router and the health check get. This verb reads two
+# documents under /etc, writes one file under /run, opens one loopback UDP
+# socket, and execs a program that talks to NetworkManager over D-Bus. It uses no
+# temporary file, no device, no kernel setting, no process list and no namespace.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# AF_UNIX for the D-Bus connection to NetworkManager that `emergency-rollback`
+# makes, AF_INET for the probe. No interface is enumerated and no netlink socket
+# is opened, so this is the health check's list exactly.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Exactly one directory, and it is the one the failure record lives in. The `-`
+# prefix is what makes a missing path tolerated: /run is a tmpfs, so this
+# directory is gone after a reboot and an unprefixed entry naming it would fail
+# this unit's mount-namespace setup on a host that has not created it yet -- and
+# the retry that follows would be the machine's only automatic DNS protection
+# coming up and going down.
+ReadWritePaths=-/run/mosdns

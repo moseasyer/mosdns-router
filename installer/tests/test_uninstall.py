@@ -92,7 +92,14 @@ ROUTER_UNIT = "mosdns-router.service"
 OPTIMIZER_TIMER = "mosdns-cdn-optimizer.timer"
 HEALTH_TIMER = "mosdns-cdn-health.timer"
 LIST_TIMER = "mosdns-list-check.timer"
-PROJECT_TIMERS = (OPTIMIZER_TIMER, HEALTH_TIMER, LIST_TIMER)
+# The watchdog's timer is here for a reason the other three do not share, and the
+# cases below exercise it as one of the four: it is the only unit in this package
+# that CHANGES the machine by itself, so an uninstall that stopped three timers
+# and left it running would leave an unattended `emergency-rollback` on a machine
+# whose connection no longer carries the record it restores. It is stopped first
+# for the same reason `emergency_rollback` refuses to guess at a value.
+WATCHDOG_TIMER = "mosdns-watchdog.timer"
+PROJECT_TIMERS = (OPTIMIZER_TIMER, HEALTH_TIMER, LIST_TIMER, WATCHDOG_TIMER)
 # The two units are stopped router first. At this point in an uninstall the
 # machine's DNS is not ours any more, so neither order opens a window; the reason
 # to name one is that it is the order the install's own rollback uses, and two

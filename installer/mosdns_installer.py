@@ -194,14 +194,24 @@ DNS_PORT = 53
 RESOLVER_PORT = 15353
 RESOLVER_UNIT = "dnscrypt-proxy.service"
 ROUTER_UNIT = "mosdns-router.service"
-# The three timers, named on their own because an uninstall stops them first and
+# The four timers, named on their own because an uninstall stops them first and
 # on their own: they are the only units that WRITE, so they are the reason a
 # purge can be safe without taking the control lock. One list rather than two,
-# because two lists of the same three names is one more thing to get out of step.
+# because two lists of the same four names is one more thing to get out of step.
+#
+# The watchdog is in it for a reason the other three are not, and the reason is
+# what leaving it out would mean: this is the only timer in the package that
+# changes the machine. An uninstall that left `mosdns-watchdog.timer` running
+# would leave a mechanism that runs `emergency-rollback` on a machine whose
+# package was just removed and whose connection no longer carries the record the
+# rollback restores -- so it would fail every time, on a timer, on a machine
+# somebody is trying to put back. It is stopped first for the same reason
+# `emergency_rollback` refuses to guess at a value.
 PROJECT_TIMERS = (
     "mosdns-cdn-optimizer.timer",
     "mosdns-cdn-health.timer",
     "mosdns-list-check.timer",
+    "mosdns-watchdog.timer",
 )
 PROJECT_UNITS = (ROUTER_UNIT, RESOLVER_UNIT) + PROJECT_TIMERS
 # The unit whose stub listener already holds port 53 on a stock Ubuntu, and the
@@ -368,7 +378,22 @@ class RealCommandRunner(CommandRunner):
     importing this module starts nothing and reads nothing. A module that
     imported its process boundary at load time would make every test that imports
     it a test of that import.
+
+    The timeout is a constructor argument and not a constant for the one caller
+    that needs a different one: ``COMMAND_TIMEOUT_SECONDS`` is the budget for the
+    read-only questions this program asks a running manager, and the watchdog's
+    action reactivates a NetworkManager connection, which can take a DHCP
+    transaction. Killing a rollback part way through a restore is the worst thing
+    this package can do unattended, so that one verb builds its runner with
+    :data:`WATCHDOG_ACTION_TIMEOUT_SECONDS` and every other verb gets the default.
+    The default is written out in the signature rather than read from the module
+    constant, because a default argument is evaluated once and a test that
+    changed the constant afterwards would be testing something the signature no
+    longer says.
     """
+
+    def __init__(self, timeout: float = COMMAND_TIMEOUT_SECONDS):
+        self.timeout = timeout
 
     def run(self, args: Sequence[str], check: bool = True) -> Completed:
         import subprocess
@@ -381,7 +406,7 @@ class RealCommandRunner(CommandRunner):
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=COMMAND_TIMEOUT_SECONDS,
+                timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
             # A command that did not answer is a failed read, not a crash. Every
@@ -395,7 +420,7 @@ class RealCommandRunner(CommandRunner):
             return Completed(
                 124,
                 "",
-                f"{command[0]} did not answer within {COMMAND_TIMEOUT_SECONDS}s",
+                f"{command[0]} did not answer within {self.timeout}s",
             )
         if check and completed.returncode != 0:
             raise subprocess.CalledProcessError(
@@ -1773,6 +1798,13 @@ PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--r
 # the rollback's recovery line -- and a hand-rolled path in two of three would be
 # wrong on a build where the prefix is not the one above.
 CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
+
+# This program, at the path the package installs it to and the path its own units
+# and `mosdns-cdnctl` name. Named for the same reason as `CDNCTL` above: the
+# watchdog's messages tell an operator which command to run next, and a message
+# that names this program by a hand-written path is a message that is wrong on a
+# build with a different prefix.
+INSTALLER = "/usr/lib/mosdns-router/mosdns_installer.py"
 
 # The operator's force-ECH list -- read by :func:`_forced_ech_domains` above, which
 # is shared with the preflight on purpose -- and the one entry in it that would
@@ -5090,7 +5122,898 @@ def _usage() -> str:
         "       mosdns_installer.py uninstall [--purge]\n"
         "       mosdns_installer.py emergency-rollback\n"
         "       mosdns_installer.py verify-local\n"
+        "       mosdns_installer.py watchdog\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# The resolver watchdog
+# ---------------------------------------------------------------------------
+#
+# **This is the first thing in this package that changes a machine with nobody
+# watching**, and the previous plan deliberately left the decision open; the
+# operator who owns the machine has made it, and it is: automatic rollback is the
+# DEFAULT and it must be possible to switch it off. Everything below is that, and
+# the two facts a reader needs before the rest are these.
+#
+# WHAT THE ACTION RESTORES, AND WHAT IT DOES NOT. `emergency-rollback` puts the
+# DNS settings the install RECORDED back on the connection, which on a machine
+# this package took over are the resolvers its own DHCP lease published. So basic
+# name resolution comes back. **Foreign-name resolution through DNSCrypt does
+# not**, and that is the condition this project exists to fix: the rollback
+# leaves the fault exactly where it was and only stops it being in the way. A
+# watchdog that reported "the machine is back" would be lying about the one thing
+# the operator cares about, so the success message names both halves and the
+# limitation is in the product rather than only in this file and in the manual.
+#
+# WHY THE WINDOW IS PART OF THE DEFAULT RATHER THAN AN OPT-IN. A single failed
+# probe is not evidence: a slow upstream, a cold boot before NTP has
+# synchronised and a loaded machine each produce one. With automatic rollback as
+# the default, a single-probe trigger is a mechanism that can tear down a working
+# configuration while somebody is using it, and a self-inflicted outage is worse
+# than a false alarm. So the default acts on the Nth CONSECUTIVE failure, or once
+# M minutes have passed since the first, whichever comes first -- and both numbers
+# are settings, because the false-positive rate has never been measured and a
+# number nobody measured does not get baked in as a constant.
+#
+# WHY THE ACTION IS A SUBPROCESS AND NOT A CALL. It is the argument array an
+# operator types, run as a process, so the watchdog cannot take a path a human
+# would not, and the status it comes back with is a fact about the real action
+# rather than about a private re-implementation of it. `mosdns-cdnctl
+# emergency-rollback` refuses a non-root uid, which is why the unit runs as root.
+
+# The operator's setting, beside the other documents under /etc/mosdns and with
+# the same ownership and mode: root, 0644, and a conffile, so an upgrade asks
+# before replacing something a person wrote and no service identity can rewrite
+# it. It is a flat table of three keys and the parser is deliberately strict --
+# an unknown key, a value that is not the shape it claims, a key twice, or an
+# indented key are all refusals, because a setting that cannot be read exactly is
+# a setting this program would have to guess at, and guessing here decides
+# whether a working machine is taken apart.
+WATCHDOG_SETTING = "/etc/mosdns/watchdog.yaml"
+WATCHDOG_SETTING_KEYS = ("automatic", "consecutive_failures", "minimum_minutes")
+
+# The shipped values. `automatic: true` is the decision; the two numbers are a
+# judgement about how much evidence is worth acting on, and they are stated as
+# settings because they were never measured. At the shipped cadence of one probe
+# a minute, three consecutive failures is about two minutes and a half of notice,
+# and the ten-minute arm is the case a count cannot see: a machine that was
+# suspended, or whose timer was stopped, comes back with one recorded failure and
+# ten minutes of unavailability behind it.
+WATCHDOG_DEFAULT_AUTOMATIC = True
+WATCHDOG_DEFAULT_CONSECUTIVE_FAILURES = 3
+WATCHDOG_DEFAULT_MINIMUM_MINUTES = 10
+
+# WHERE THE CONSECUTIVE-FAILURE RECORD LIVES, and why it is here and not
+# anywhere else. Three candidates were available and the other two are wrong in
+# ways this project has already been bitten by:
+#
+#   * **A systemd state** -- `StateChangeTimestamp`, `NRestarts` -- is per
+#     activation and counts RESTARTS, not failed runs, and a oneshot that failed
+#     three times has one state and no history to read.
+#   * **The unit's journal** -- counting `verify-local`-shaped lines -- is a
+#     count over a log that is volatile by configuration (`Storage=auto` means
+#     /var/log/journal on some hosts and a tmpfs on others) and that rotation
+#     truncates, so a machine whose journal was rotated would silently start
+#     again from one.
+#   * **A file on disk** under /var/lib/mosdns/runtime would survive a reboot,
+#     which is precisely what is NOT wanted: the first minutes after a boot are
+#     when the router is still coming up and the machine is most likely to produce
+#     a failure that is not a fault, and a record carried across that reboot would
+#     spend the window before it.
+#
+# So the record is a file, and it is on the tmpfs at /run/mosdns: it is gone at
+# boot, it survives a restarted timer, a stopped timer and a service that is
+# restarted, and the window is a property of one boot's uptime. **And an absent
+# record never means "healthy".** It means "no failure has been recorded", every
+# run probes before it reads anything, and the two facts that make that true are
+# asserted in `installer/tests/test_watchdog.py`: the first failure is stamped by
+# the run that observed it, and the record carries no field that could be read as
+# a verdict.
+WATCHDOG_RECORD = "/run/mosdns/watchdog.json"
+WATCHDOG_RECORD_MODE = 0o640
+WATCHDOG_RECORD_SCHEMA_VERSION = 1
+
+# The action, as the operator types it, and the budget it gets.
+# `COMMAND_TIMEOUT_SECONDS` is 30 and that is right for the read-only questions
+# this program asks a running manager; it is wrong here, because
+# `nmcli connection up` inside the rollback re-runs DHCP and a rollback killed
+# half way through a restore is the worst thing this mechanism could do. So the
+# action runs through a runner built with its own budget, and the unit's
+# `TimeoutStartSec` is above that budget so this program prints its own report
+# rather than being killed inside the restore.
+WATCHDOG_ACTION = (CDNCTL, "emergency-rollback")
+WATCHDOG_ACTION_TIMEOUT_SECONDS = 150
+
+# The three verdicts. They are a separate type from `Answer` because the answer
+# is a fact about a packet and the verdict is a fact about the MACHINE, and the
+# third verdict -- no verdict at all -- has no packet behind it.
+RESOLVES = "resolves"
+NOT_RESOLVING = "not_resolving"
+NO_VERDICT = "no_verdict"
+VERDICT_PHRASES = {
+    RESOLVES: "the machine's own resolver is answering",
+    NOT_RESOLVING: "the machine's own resolver did not resolve",
+    NO_VERDICT: "this run could not give a verdict at all",
+}
+
+# What each status the ACTION can come back with means, in a sentence. The action
+# is a process, so the number is chosen by a program that runs on its own terms,
+# and a bare number at 3am is not a report. The table is closed over the statuses
+# this file defines -- a case holds that -- with a refusal for anything else,
+# because an undefined status is not a status and saying so is better than
+# describing it as one of the known failures.
+WATCHDOG_ACTION_STATUSES = {
+    0: "the emergency rollback completed, which is the success case and not the one this "
+       "sentence is written for",
+    1: "this package's own refusal: a machine it will not act on, and the action's own output "
+       "is what says which",
+    2: "a usage error: the action was called wrongly, which this run did not do, so the action's "
+       "own output is the only thing that explains it",
+    3: "the action rolled back every change it made and still returned a failure, so this status "
+       "alone does not say what state this machine is in",
+    4: "a restore was attempted and did not finish, so some of this package's settings may still "
+       "be on this machine's connection",
+    5: "the action's own ownership refusal: it would not write to a connection it could not prove "
+       "this package set, so it changed nothing",
+    6: "a restore was attempted and did not finish: the values the backup recorded may still be on "
+       "the connection and the units this package installs have NOT been stopped",
+}
+WATCHDOG_ACTION_STATUS_UNKNOWN = (
+    "not a status this package defines, so nothing can be said about what it means"
+)
+
+
+class LocalVerdict(NamedTuple):
+    """The one answer to "is this machine's own resolver resolving", and its text.
+
+    ``detail`` is the sentence for a person and it is the SAME sentence whichever
+    verb asked: the health unit's second command and the watchdog must not be able
+    to describe the same packet in two different ways, because the two are read by
+    the same operator and only one of them can be right.
+    """
+
+    verdict: str
+    answer: Optional[Answer]
+    detail: str
+
+
+class WatchdogSetting(NamedTuple):
+    """The three keys, after they have been proved to be exactly those three."""
+
+    automatic: bool
+    consecutive_failures: int
+    minimum_minutes: int
+
+
+class WatchdogRecord(NamedTuple):
+    """The consecutive-failure record, and the latch on the action.
+
+    ``action_utc`` is written BEFORE the action runs, with ``action_status`` still
+    ``None``. That ordering is the whole of the latch: an action that ran and
+    could not be recorded afterwards would otherwise be run again a minute later,
+    and for ever, which is the one behaviour of this mechanism that could make a
+    machine steadily worse rather than once.
+    """
+
+    consecutive_failures: int
+    first_failure_utc: Optional[str]
+    last_failure_utc: Optional[str]
+    action_utc: Optional[str]
+    action_status: Optional[int]
+
+    @classmethod
+    def empty(cls) -> "WatchdogRecord":
+        return cls(0, None, None, None, None)
+
+    def as_document(self) -> dict:
+        return {
+            "schema_version": WATCHDOG_RECORD_SCHEMA_VERSION,
+            "consecutive_failures": self.consecutive_failures,
+            "first_failure_utc": self.first_failure_utc,
+            "last_failure_utc": self.last_failure_utc,
+            "action_utc": self.action_utc,
+            "action_status": self.action_status,
+        }
+
+
+class Window(NamedTuple):
+    """Whether the window is reached, and -- in the reasons -- why it is.
+
+    ``elapsed_seconds`` is clamped at zero and ``clock_note`` says so when it was,
+    because "10m have passed since the first failure" is a lie on a machine whose
+    clock has moved backwards and the record is the only memory of when the first
+    failure was.
+    """
+
+    reached: bool
+    reasons: List[str]
+    elapsed_seconds: float
+    clock_note: str
+
+
+class WatchdogOutcome(NamedTuple):
+    """What one watchdog run decided, and the two streams it decided it with.
+
+    The messages are carried rather than printed so that the cases in
+    `installer/tests/test_watchdog.py` read the product's own text, and
+    `_run_watchdog` writes exactly these two strings.
+    """
+
+    status: int
+    verdict: str
+    acted: bool
+    reason: str
+    stdout: str
+    stderr: str
+
+
+def _utc(moment: datetime.datetime) -> str:
+    return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _duration(seconds: float) -> str:
+    """A span as `45s`, `1m12s` or `10m0s`, the way a person says it out loud."""
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m{total % 60}s"
+
+
+def _parse_utc(text: Optional[str]) -> Optional[datetime.datetime]:
+    if not text:
+        return None
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def local_resolvability(root: Path, probe=None) -> LocalVerdict:
+    """Ask the machine's own resolver one question, and report the answer.
+
+    **This is the one function in the package that answers "is this machine's own
+    resolver resolving".** Two verbs ask it -- `verify-local`, which the health
+    timer runs every two minutes, and the watchdog -- and they ask it through
+    here, with the installer's own `probe_dns` and its own `response_resolves`
+    predicate, so "resolvable" has one definition: a NOERROR or an NXDOMAIN, and
+    not a SERVFAIL, a REFUSED or silence. A second definition is how two programs
+    end up disagreeing about whether a machine has DNS, and the disagreement would
+    be invisible until a watchdog acted on one answer while the health check
+    reported the other.
+
+    The third verdict is the one that has no packet behind it. When the operator's
+    force-ECH list makes the router answer the probe name itself, an answer from
+    127.0.0.1:53 is evidence of nothing, so this refuses to give a verdict rather
+    than reporting a healthy machine -- and it says in as many words that this is
+    NOT a sign the router is down. The install refuses such a machine for the same
+    reason; the verb has no install to refuse, so it has to refuse the verdict
+    itself.
+    """
+    blind = next(
+        (
+            name
+            for name in _forced_ech_domains(root)
+            if _forces_ech((name,), INSTALL_PROBE_NAME)
+        ),
+        None,
+    )
+    if blind is not None and _ech_may_answer_locally(root):
+        return LocalVerdict(
+            NO_VERDICT,
+            None,
+            f"{FORCE_ECH_DOMAINS} lists {blind!r} and the policy asks for strict ECH, so the "
+            f"router answers A queries for {INSTALL_PROBE_NAME} itself without asking anything "
+            f"upstream. A resolved answer from {LOCAL_DNS}:{DNS_PORT} for that name is therefore "
+            "evidence of nothing, so this verb cannot report a verdict at all rather than report a "
+            "healthy one. THIS IS NOT A SIGN THE ROUTER IS DOWN: nothing was probed and nothing "
+            f"was changed. An install refuses this machine for the same reason, so the entry is out "
+            f"of step with what this package will install. Either remove {blind!r} from "
+            f"{FORCE_ECH_DOMAINS} so this check can see the router, or accept that nothing on this "
+            "machine can prove the local resolver is answering.",
+        )
+    ask = probe or (lambda address, port: probe_dns(address, port))
+    answer = ask(LOCAL_DNS, DNS_PORT)
+    if answer.resolves:
+        return LocalVerdict(
+            RESOLVES,
+            answer,
+            f"{LOCAL_DNS}:{DNS_PORT} resolved {INSTALL_PROBE_NAME}, so this machine's resolver is "
+            "answering and the health check's verdict is about a working machine",
+        )
+    if answer.answered:
+        return LocalVerdict(
+            NOT_RESOLVING,
+            answer,
+            f"{LOCAL_DNS}:{DNS_PORT} ANSWERED a query for {INSTALL_PROBE_NAME} and did not resolve "
+            "it -- a SERVFAIL is a confident answer from a chain that reached nobody, and reading it "
+            "as health is how a machine with no DNS is called healthy. The router or the resolver "
+            "it forwards to is not working.",
+        )
+    return LocalVerdict(
+        NOT_RESOLVING,
+        answer,
+        f"nothing at all answered a query for {INSTALL_PROBE_NAME} at {LOCAL_DNS}:{DNS_PORT} within "
+        f"{PROBE_TIMEOUT_SECONDS:g}s, so the machine's own resolver is not answering",
+    )
+
+
+def default_watchdog_setting() -> WatchdogSetting:
+    """The shipped setting, which is also the answer to a missing file."""
+    return WatchdogSetting(
+        automatic=WATCHDOG_DEFAULT_AUTOMATIC,
+        consecutive_failures=WATCHDOG_DEFAULT_CONSECUTIVE_FAILURES,
+        minimum_minutes=WATCHDOG_DEFAULT_MINIMUM_MINUTES,
+    )
+
+
+def parse_watchdog_setting(contents: str, source: str) -> tuple:
+    """The three keys, or a refusal naming what was read instead.
+
+    A refusal rather than a default, which is the OPPOSITE of `_ech_is_strict`
+    and is deliberate. There, an unparseable policy answers "not strict" because
+    the alternative refuses an install; here the alternative is a machine whose
+    working DNS configuration is torn down, and a self-inflicted outage is worse
+    than a machine that is merely not being watched. So a setting this program
+    cannot read exactly means it does nothing, loudly.
+
+    A key that is ABSENT takes its default, and that is not a contradiction: an
+    operator who wants to switch the mechanism off should be able to write one
+    line, and the two numbers are documented in the file the package ships.
+    """
+    values = {}
+
+    def refuse(reason: str):
+        return None, (
+            f"{source}: {reason} This file has exactly three keys -- "
+            f"{', '.join(WATCHDOG_SETTING_KEYS)} -- each at the top level and each written once, "
+            "and a key this program cannot read exactly is a setting it would have to guess at."
+        )
+
+    for number, line in enumerate(contents.splitlines(), start=1):
+        if not line.strip() or line.lstrip().startswith(FORCE_ECH_COMMENT):
+            continue
+        if line[0] in " \t":
+            return refuse(
+                f"line {number} is indented ({line.strip()!r}), and every key in this file belongs "
+                "at the top level: an indented key is a section heading, and there are no sections."
+            )
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        if not separator:
+            return refuse(f"line {number} ({line.strip()!r}) is not a `key: value` line.")
+        if key not in WATCHDOG_SETTING_KEYS:
+            return refuse(f"line {number} names the key {key!r}, which is not one of them.")
+        if key in values:
+            return refuse(
+                f"line {number} names {key!r} again, and the file already answered it on an "
+                "earlier line: two answers to one question is not a setting."
+            )
+        token = value.strip()
+        if key == "automatic":
+            if token not in ("true", "false"):
+                return refuse(
+                    f"line {number} sets automatic to {token!r}, and the only two values it takes "
+                    "are `true` and `false`."
+                )
+            values[key] = token == "true"
+            continue
+        if not re.fullmatch(r"[0-9]+", token) or int(token) < 1:
+            return refuse(
+                f"line {number} sets {key} to {token!r}, and it takes a whole number of at "
+                "least 1: a window of zero failures or zero minutes is the single-probe trigger "
+                "this setting exists not to be."
+            )
+        values[key] = int(token)
+    shipped = default_watchdog_setting()
+    return (
+        WatchdogSetting(
+            automatic=values.get("automatic", shipped.automatic),
+            consecutive_failures=values.get(
+                "consecutive_failures", shipped.consecutive_failures
+            ),
+            minimum_minutes=values.get("minimum_minutes", shipped.minimum_minutes),
+        ),
+        "",
+    )
+
+
+def read_watchdog_setting(root: Path) -> tuple:
+    """The operator's setting at `root`, or a refusal.
+
+    A file that is not there is NOT a refusal and is NOT a switch: it is the
+    shipped default, which is `automatic: true`, because a file somebody deleted
+    is not a decision and the alternative is a mechanism that turns itself off
+    quietly.
+    """
+    path = root / WATCHDOG_SETTING.lstrip("/")
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default_watchdog_setting(), ""
+    except (OSError, UnicodeDecodeError) as error:
+        return None, (
+            f"{WATCHDOG_SETTING} could not be read ({error}), and the shipped default is in force "
+            "only for a file that is absent: a file that is there and cannot be read is a machine "
+            "whose watchdog cannot know what it is allowed to do."
+        )
+    return parse_watchdog_setting(contents, WATCHDOG_SETTING)
+
+
+def read_watchdog_record(root: Path) -> tuple:
+    """The record as it is on disk, and a note when it is not what it should be.
+
+    An absent record is the normal state of a machine on which nothing has failed
+    yet, and an unreadable one is treated as the same thing -- with the difference
+    said out loud. Both re-seed the count at one, which is the patient direction:
+    a record nothing can vouch for must not be able to make the next failure look
+    like the Nth. What neither can do is skip a probe, because the probe has
+    already happened by the time this is called.
+    """
+    path = root / WATCHDOG_RECORD.lstrip("/")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return WatchdogRecord.empty(), ""
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return WatchdogRecord.empty(), (
+            f"the failure record at {WATCHDOG_RECORD} could not be read ({error}), so the count "
+            "starts again from this failure rather than continuing a streak that nothing can vouch "
+            "for. A run that cannot read its own record is not a healthy machine; it is an "
+            "unmeasured one."
+        )
+    if not isinstance(document, dict):
+        return WatchdogRecord.empty(), (
+            f"the failure record at {WATCHDOG_RECORD} is not a JSON object, so the count starts "
+            "again from this failure."
+        )
+    count = document.get("consecutive_failures")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return WatchdogRecord.empty(), (
+            f"the failure record at {WATCHDOG_RECORD} carries no usable count, so the count starts "
+            "again from this failure."
+        )
+    status = document.get("action_status")
+    if status is not None and (not isinstance(status, int) or isinstance(status, bool)):
+        status = None
+    return (
+        WatchdogRecord(
+            consecutive_failures=count,
+            first_failure_utc=_as_text(document.get("first_failure_utc")),
+            last_failure_utc=_as_text(document.get("last_failure_utc")),
+            action_utc=_as_text(document.get("action_utc")),
+            action_status=status,
+        ),
+        "",
+    )
+
+
+def _as_text(value) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
+
+
+def write_watchdog_record(root: Path, record: WatchdogRecord) -> Optional[str]:
+    """Publish the record beside its target and rename it in, or say why not.
+
+    A same-directory temporary and a rename, like every other publisher in this
+    project, so a reader never sees half a document -- and the staged name is
+    `.watchdog.json.<pid>.tmp` because the tmpfiles entry reaps `/run/mosdns/
+    .*.tmp` and nothing else would collect it. The mode is 0640 rather than
+    whatever the umask left, for the same reason the backup is 0600: this record
+    is not for the world and not for the other service identities either.
+
+    The returned string is a reason rather than an exception, because the caller
+    has to do something *different* when this fails: it must not act. A record
+    that cannot be written is a count that cannot be kept, and a mechanism that
+    acts anyway is a mechanism with no window in it.
+    """
+    path = root / WATCHDOG_RECORD.lstrip("/")
+    staged = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(record.as_document(), indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(staged, WATCHDOG_RECORD_MODE)
+        os.replace(staged, path)
+    except OSError as error:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+        return f"{WATCHDOG_RECORD} could not be written ({error})"
+    return None
+
+
+def clear_watchdog_record(root: Path) -> Optional[str]:
+    """Remove the record, or say why it could not be removed."""
+    path = root / WATCHDOG_RECORD.lstrip("/")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"the failure record at {WATCHDOG_RECORD} could not be removed ({error})"
+    return None
+
+
+def window_reached(record: WatchdogRecord, now: datetime.datetime, setting: WatchdogSetting) -> Window:
+    """Whether the window is reached, and the two conditions that can reach it.
+
+    `>=` in both comparisons, so at exactly N the action runs and at exactly M it
+    runs: a window that needed one more failure than it said would be a window an
+    operator could tune into uselessness by reading it as a minimum. Both reasons
+    are returned, not just the one that fired first, because a run that met both
+    has to be able to say so.
+    """
+    reasons = []
+    if record.consecutive_failures >= setting.consecutive_failures:
+        reasons.append(
+            f"{record.consecutive_failures} consecutive failures, and the threshold is "
+            f"{setting.consecutive_failures}"
+        )
+    elapsed = 0.0
+    note = ""
+    first = _parse_utc(record.first_failure_utc)
+    if record.first_failure_utc and first is None:
+        note = (
+            f"the recorded first failure ({record.first_failure_utc}) is not a UTC timestamp this "
+            "program can read, so no time has elapsed since it"
+        )
+    elif first is not None:
+        raw = (now - first).total_seconds()
+        if raw < 0:
+            note = (
+                f"the recorded first failure ({record.first_failure_utc}) is LATER than now "
+                f"({_utc(now)}), so no time has elapsed since it and this machine's clock has moved"
+            )
+        else:
+            elapsed = raw
+            if elapsed >= setting.minimum_minutes * 60:
+                reasons.append(
+                    f"{_duration(elapsed)} have passed since the first failure at "
+                    f"{record.first_failure_utc}, and the window is {setting.minimum_minutes}m"
+                )
+    return Window(bool(reasons), reasons, elapsed, note)
+
+
+def _watchdog_action_line() -> str:
+    return f"sudo {WATCHDOG_ACTION[0]} {WATCHDOG_ACTION[1]}"
+
+
+def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOutcome:
+    """One watchdog run: probe, count, and act only when the window says so.
+
+    The order of this function is the safety argument, and each step is a
+    precondition of the one after it:
+
+    1. **read the setting**, and stop if it cannot be read -- a mechanism that
+       does not know what it is allowed to do does nothing;
+    2. **probe**, through :func:`local_resolvability`, before anything else is
+       believed, so no path through this function reaches a conclusion about the
+       machine without having asked it;
+    3. **read the record**, treating an absent or unreadable one as no failures
+       recorded and saying so;
+    4. **stop there** if the resolver answered, or if the switch is off (which
+       also clears a record, so re-enabling the mechanism starts its window
+       again rather than resuming a streak somebody interrupted on purpose);
+    5. **count the failure** and write the record, and refuse to go further if it
+       cannot be written;
+    6. **stop** below the window, naming the count, the threshold, the elapsed
+       time and the first failure;
+    7. **stamp the attempt into the record**, and stop without acting if that
+       cannot be written -- write-ahead, so an action that ran and could not be
+       recorded is not repeated;
+    8. **run the action** the operator runs, and report what it said, its status,
+       and -- on success -- exactly what came back and what did not.
+    """
+    moment = now or datetime.datetime.now(datetime.timezone.utc)
+    setting, refusal = read_watchdog_setting(root)
+    if setting is None:
+        return WatchdogOutcome(
+            status=EXIT_REFUSED,
+            verdict=NO_VERDICT,
+            acted=False,
+            reason="the setting could not be read",
+            stdout="",
+            stderr=(
+                f"watchdog: {refusal} No action was taken and no failure was counted, and this "
+                f"machine's resolver is not being watched by anything automatic: the health check "
+                f"(`{INSTALLER} verify-local`) still reports it and "
+                f"`{_watchdog_action_line()}` is still the action, by hand. Fix the file and the "
+                "next run counts from one again.\n"
+            ),
+        )
+
+    verdict = local_resolvability(root, probe)
+    record, note = read_watchdog_record(root)
+    problems = [note] if note else []
+
+    if not setting.automatic:
+        cleared = clear_watchdog_record(root)
+        if cleared:
+            problems.append(cleared)
+        out = [
+            f"watchdog: {WATCHDOG_SETTING} says automatic: false, so this run took no action and "
+            f"advanced no count. The probe found: {VERDICT_PHRASES[verdict.verdict]} -- "
+            f"{verdict.detail}. Nothing has been changed by this run, and the health check and "
+            f"`{_watchdog_action_line()}` are unaffected: a switch that stopped the action would "
+            f"also stop the operator's. To put the mechanism back, set automatic: true in "
+            f"{WATCHDOG_SETTING}."
+        ]
+        if record.consecutive_failures or record.action_utc:
+            out.append(
+                f"watchdog: the failure record at {WATCHDOG_RECORD} has been cleared, so switching "
+                "the mechanism back on starts its window again rather than resuming a streak that "
+                "was interrupted on purpose."
+            )
+        return WatchdogOutcome(
+            status=EXIT_OK,
+            verdict=verdict.verdict,
+            acted=False,
+            reason="the switch is off",
+            stdout="\n".join(out) + "\n",
+            stderr="\n".join(f"watchdog: {problem}" for problem in problems) + ("\n" if problems else ""),
+        )
+
+    if verdict.verdict == NO_VERDICT:
+        return WatchdogOutcome(
+            status=EXIT_OK,
+            verdict=NO_VERDICT,
+            acted=False,
+            reason="there is no verdict to count",
+            stdout=(
+                f"watchdog: {verdict.detail}\n"
+                "watchdog: nothing has been changed by this run and no failure has been counted: a "
+                "probe whose answer is meaningless is not a failure, and a watchdog that counted "
+                f"it would undo a working machine over a line in {FORCE_ECH_DOMAINS}.\n"
+            ),
+            stderr="\n".join(f"watchdog: {problem}" for problem in problems) + ("\n" if problems else ""),
+        )
+
+    if verdict.verdict == RESOLVES:
+        cleared = clear_watchdog_record(root)
+        if cleared:
+            problems.append(cleared)
+        out = [
+            f"watchdog: {verdict.detail}.",
+        ]
+        if record.consecutive_failures or record.action_utc:
+            out.append(
+                f"watchdog: the failure record at {WATCHDOG_RECORD} has been cleared: it held "
+                f"{record.consecutive_failures} consecutive failure(s)"
+                + (
+                    f" and an emergency rollback performed at {record.action_utc}"
+                    f" which exited {record.action_status}.\n"
+                    if record.action_utc
+                    else ".\n"
+                )
+            )
+        else:
+            out.append(f"watchdog: there was no failure record at {WATCHDOG_RECORD} to clear.\n")
+        return WatchdogOutcome(
+            status=EXIT_OK,
+            verdict=RESOLVES,
+            acted=False,
+            reason="the machine's own resolver answered",
+            stdout="\n".join(out),
+            stderr="\n".join(f"watchdog: {problem}" for problem in problems) + ("\n" if problems else ""),
+        )
+
+    if record.action_utc:
+        # The latch. A failure streak gets ONE unattended rollback, whatever the
+        # outcome was, and a machine that is still not resolving after it needs a
+        # person: repeating a mutating action every minute is how this mechanism
+        # would make a machine worse than it found it.
+        status_text = (
+            f"and exited {record.action_status}"
+            if record.action_status is not None
+            else "and its exit status was not recorded, which means the record could not be "
+            "written after it ran, so nothing about that action's outcome can be said from here"
+        )
+        return WatchdogOutcome(
+            status=EXIT_REFUSED,
+            verdict=NOT_RESOLVING,
+            acted=False,
+            reason="the action was already performed in this failure streak",
+            stdout="",
+            stderr="\n".join(
+                [
+                    f"watchdog: {verdict.detail}.",
+                    f"watchdog: the emergency rollback was already performed at {record.action_utc} "
+                    f"{status_text}, so this run did not perform it again: one unattended rollback "
+                    "per failure streak is the whole of this mechanism, and a rollback repeated "
+                    "every minute is how it would make a machine worse than it found it. Nothing "
+                    "has been changed by this run. Run the action by hand, and read what it says:",
+                    f"watchdog:   {_watchdog_action_line()}",
+                ]
+                + [f"watchdog: {problem}" for problem in problems]
+            )
+            + "\n",
+        )
+
+    first = record.first_failure_utc or _utc(moment)
+    counted = WatchdogRecord(
+        consecutive_failures=record.consecutive_failures + 1,
+        first_failure_utc=first,
+        last_failure_utc=_utc(moment),
+        action_utc=None,
+        action_status=None,
+    )
+    window = window_reached(counted, moment, setting)
+
+    if not window.reached:
+        problem = write_watchdog_record(root, counted)
+        if problem is not None:
+            return _unwatched(verdict, problems + [problem])
+        reasons = []
+        if window.clock_note:
+            reasons.append(window.clock_note)
+        reasons.append(
+            f"this is consecutive failure {counted.consecutive_failures} of the "
+            f"{setting.consecutive_failures} this machine is configured to act on"
+        )
+        reasons.append(
+            f"{_duration(window.elapsed_seconds)} of the {setting.minimum_minutes}m window has "
+            f"passed since the first failure at {counted.first_failure_utc}"
+        )
+        return WatchdogOutcome(
+            status=EXIT_REFUSED,
+            verdict=NOT_RESOLVING,
+            acted=False,
+            reason="the window has not been reached",
+            stdout="",
+            stderr="\n".join(
+                [
+                    f"watchdog: {verdict.detail}.",
+                    f"watchdog: {'; '.join(reasons)}. Nothing has been changed by this run, and "
+                    f"nothing will be until the count reaches {setting.consecutive_failures} or "
+                    f"{setting.minimum_minutes}m have passed since that first failure, whichever "
+                    f"comes first. When it does, this run performs the emergency rollback "
+                    f"unattended -- `{_watchdog_action_line()}` -- and that is the default: "
+                    f"{WATCHDOG_SETTING} is where it is switched off.",
+                ]
+                + [f"watchdog: {problem}" for problem in problems]
+            )
+            + "\n",
+        )
+
+    # Write-ahead. The attempt is on disk before the machine is handed over, so
+    # an action whose outcome cannot be recorded afterwards is still only ever
+    # performed once.
+    attempted = counted._replace(action_utc=_utc(moment), action_status=None)
+    problem = write_watchdog_record(root, attempted)
+    if problem is not None:
+        return _unwatched(verdict, problems + [problem], window=window)
+
+    reach = "; ".join(window.reasons)
+    try:
+        completed = run.run(list(WATCHDOG_ACTION), check=False)
+        ran = True
+    except (OSError, ValueError) as error:
+        completed = None
+        ran = False
+        problems = problems + [f"{WATCHDOG_ACTION[0]} could not be run at all ({error})"]
+
+    if ran and completed is not None:
+        recorded = write_watchdog_record(
+            root, attempted._replace(action_status=completed.returncode)
+        )
+        if recorded is not None:
+            problems = problems + [recorded]
+    status = completed.returncode if ran and completed is not None else None
+
+    if status == 0:
+        out = [
+            f"watchdog: {verdict.detail}.",
+            f"watchdog: the window was reached: {reach}. This run performed the emergency "
+            f"rollback unattended and it exited 0.",
+            f"watchdog: WHAT IS BACK: the DNS settings recorded in {BACKUP_PATH} are on this "
+            "machine's connection again -- on a machine this package has taken over, those are "
+            "the resolvers its own DHCP lease published -- so ordinary name resolution goes "
+            "through the machine's own resolvers again.",
+            "watchdog: WHAT IS NOT BACK: foreign-name resolution through DNSCrypt does not work, "
+            "and that is the condition this package was installed to fix. The rollback stops "
+            "nothing, removes nothing and starts nothing: the router, the resolver and the "
+            "configuration are all still installed, and the local resolver is not serving, so "
+            "every name outside the domestic list still does not resolve. The fault is no longer "
+            "in the way; it is not fixed.",
+            f"watchdog: the health check asks {LOCAL_DNS}:{DNS_PORT} the same question this run "
+            f"asked (`{INSTALLER} verify-local`), so it will report that the local resolver is "
+            "not answering from now on. That is expected after a rollback, and it is not a second "
+            "fault.",
+            f"watchdog: to put the router back in service once the cause is dealt with: "
+            f"`sudo {INSTALLER} install` -- it takes the machine's DNS over again and rolls "
+            "itself back if the router will not come up.",
+        ]
+        return WatchdogOutcome(
+            status=EXIT_OK,
+            verdict=NOT_RESOLVING,
+            acted=True,
+            reason=reach,
+            stdout="\n".join(out) + "\n",
+            stderr="\n".join(f"watchdog: {problem}" for problem in problems) + ("\n" if problems else ""),
+        )
+
+    said = WATCHDOG_ACTION_STATUSES.get(
+        status if status is not None else -1, WATCHDOG_ACTION_STATUS_UNKNOWN
+    )
+    status_text = (
+        f"exited {status}, which is {said}"
+        if status is not None
+        else f"could not be started at all, so nothing is known about what it would have done ({said})"
+    )
+    err = [
+        f"watchdog: {verdict.detail}.",
+        f"watchdog: the window was reached: {reach}. This run performed the emergency rollback "
+        f"unattended and IT FAILED: `{_watchdog_action_line()}` {status_text}. Nothing about this "
+        "machine's DNS can be promised from here, and this run has proved nothing about the "
+        "machine beyond what the action said.",
+        "watchdog: run the action by hand, and read what it says:",
+        f"watchdog:   {_watchdog_action_line()}",
+        "watchdog: the watchdog will not try again until a probe succeeds: one unattended "
+        "rollback per failure streak is the whole of this mechanism, and repeating it every "
+        "minute is how it would make a machine worse than it found it.",
+    ]
+    if completed is not None:
+        words = [
+            f"watchdog: the action's own words follow, because they are the report: {line}"
+            for line in (completed.stdout + completed.stderr).splitlines()
+            if line.strip()
+        ]
+        err.extend(words or [f"watchdog: the action printed nothing on either stream."])
+    err.extend(f"watchdog: {problem}" for problem in problems)
+    return WatchdogOutcome(
+        status=EXIT_ROLLBACK_FAILED if status is None else status,
+        verdict=NOT_RESOLVING,
+        acted=True,
+        reason=reach,
+        stdout="",
+        stderr="\n".join(err) + "\n",
+    )
+
+
+def _unwatched(verdict: LocalVerdict, problems: Sequence[str], window: Window = None) -> WatchdogOutcome:
+    """A run that could not keep count, and must not act on a count it does not have."""
+    extra = f" ({'; '.join(window.reasons)})" if window is not None and window.reasons else ""
+    return WatchdogOutcome(
+        status=EXIT_REFUSED,
+        verdict=verdict.verdict,
+        acted=False,
+        reason="the failure record could not be written",
+        stdout="",
+        stderr="\n".join(
+            [
+                f"watchdog: {verdict.detail}.",
+                f"watchdog: the failure could not be recorded{extra}. No action was taken and the "
+                "failure was not counted, because a record this run cannot write is a record the "
+                "next run would read as no failures at all: an unwritable count is no count, and "
+                "acting on it is a mechanism with no window in it. This machine's resolver is not "
+                f"being watched by anything automatic until {WATCHDOG_RECORD} is writable.",
+            ]
+            + [f"watchdog: {problem}" for problem in problems]
+        )
+        + "\n",
+    )
+
+
+def _run_watchdog(root: Path, run: CommandRunner, probe, now=None) -> int:
+    """The verb as a unit runs it, and the status it exits with.
+
+    The status is the operator's second signal, after the message: 0 when there
+    was nothing to do or when the action finished, this program's own
+    ``EXIT_REFUSED`` when the machine's resolver is not answering and the watchdog
+    did not act, and **the action's own status** when the action ran and failed,
+    because a caller that can tell a rollback that did not finish from a rollback
+    that changed nothing should not have to parse a sentence to do it.
+    """
+    outcome = watchdog(root, run, probe=probe, now=now)
+    sys.stdout.write(outcome.stdout)
+    sys.stderr.write(outcome.stderr)
+    return outcome.status
 
 
 def _run_verify_local(root: Path, probe) -> int:
@@ -5138,52 +6061,21 @@ def _run_verify_local(root: Path, probe) -> int:
     signal and a person: the health unit failing is the signal, `sudo mosdns-cdnctl
     emergency-rollback` is the action.
     """
-    blind = next(
-        (
-            name
-            for name in _forced_ech_domains(root)
-            if _forces_ech((name,), INSTALL_PROBE_NAME)
-        ),
-        None,
-    )
-    if blind is not None and _ech_may_answer_locally(root):
-        sys.stderr.write(
-            f"verify-local: {FORCE_ECH_DOMAINS} lists {blind!r} and the policy asks for strict "
-            f"ECH, so the router answers A queries for {INSTALL_PROBE_NAME} itself without asking "
-            f"anything upstream. A resolved answer from {LOCAL_DNS}:{DNS_PORT} for that name is "
-            "therefore evidence of nothing, so this verb cannot report a verdict at all rather "
-            "than report a healthy one. THIS IS NOT A SIGN THE ROUTER IS DOWN: nothing was "
-            f"probed and nothing was changed. An install refuses this machine for the same "
-            f"reason, so the entry is out of step with what this package will install. Either "
-            f"remove {blind!r} from {FORCE_ECH_DOMAINS} so this check can see the router, or "
-            "accept that nothing on this machine can prove the local resolver is answering.\n"
-        )
+    verdict = local_resolvability(root, probe)
+    if verdict.verdict == NO_VERDICT:
+        sys.stderr.write(f"verify-local: {verdict.detail}\n")
         return EXIT_REFUSED
-    ask = probe or (lambda address, port: probe_dns(address, port))
-    answer = ask(LOCAL_DNS, DNS_PORT)
-    if answer.resolves:
-        sys.stdout.write(
-            f"verify-local: {LOCAL_DNS}:{DNS_PORT} resolved {INSTALL_PROBE_NAME}, so this machine's "
-            "resolver is answering and the health check's verdict is about a working machine\n"
-        )
+    if verdict.verdict == RESOLVES:
+        sys.stdout.write(f"verify-local: {verdict.detail}\n")
         return EXIT_OK
-    if answer.answered:
-        sys.stderr.write(
-            f"verify-local: {LOCAL_DNS}:{DNS_PORT} ANSWERED a query for {INSTALL_PROBE_NAME} and did "
-            "not resolve it -- a SERVFAIL is a confident answer from a chain that reached nobody, "
-            "and reading it as health is how a machine with no DNS is called healthy. The router or "
-            "the resolver it forwards to is not working.\n"
-        )
-        sys.stderr.write(
-            "verify-local: nothing has been changed by this command. The action is yours: "
-            "`sudo mosdns-cdnctl emergency-rollback` puts the recorded DNS settings back.\n"
-        )
-        return EXIT_REFUSED
+    # The sentence the two not-resolving details end on, and it is the one an
+    # operator acts on: this command changed nothing and here is what to run
+    # instead. Its capital N is load-bearing for the same reason every other
+    # sentence's first word is -- it starts a sentence, and the refusal is the
+    # second half of a message that has to be read at a glance.
     sys.stderr.write(
-        f"verify-local: nothing at all answered a query for {INSTALL_PROBE_NAME} at "
-        f"{LOCAL_DNS}:{DNS_PORT} within {PROBE_TIMEOUT_SECONDS:g}s, so the machine's own resolver is "
-        "not answering. Nothing has been changed by this command. The action is yours: "
-        "`sudo mosdns-cdnctl emergency-rollback` puts the recorded DNS settings back.\n"
+        f"verify-local: {verdict.detail}. Nothing has been changed by this command. The action is "
+        f"yours: `sudo {CDNCTL} emergency-rollback` puts the recorded DNS settings back.\n"
     )
     return EXIT_REFUSED
 
@@ -5314,6 +6206,7 @@ def main(
     run: Optional[CommandRunner] = None,
     root: Path = Path("/"),
     probe=None,
+    now=None,
 ) -> int:
     """Run ``preflight`` to report, or one of the verbs that change the machine.
 
@@ -5333,17 +6226,25 @@ def main(
     rather than a second permission.
 
     ``run``, ``root`` and ``probe`` are the three seams :func:`preflight`,
-    :func:`install`, :func:`uninstall` and :func:`emergency_rollback` have, and they
-    are named here in the other order from :func:`preflight`, which takes
-    ``(root, run)``. A command whose root could not be pointed elsewhere could only
-    be tested against the machine it ran on, and a test here that read the host's
-    NetworkManager, ports and ``/etc/resolv.conf`` would be a test of the host
-    wearing a test's name. ``probe`` is here for the same reason and one more: a
-    DNS query is a real request to a real resolver, and the last three verbs ask
-    one. ``verify-local`` needs no runner -- it issues no command at all -- but it
-    does read the policy and the operator's force-ECH list through ``root``, so
-    that a test can point it at a fake root and a test that could not inject the
-    probe into it would still be a test that queried a real resolver.
+    :func:`install`, :func:`uninstall`, :func:`emergency_rollback` and
+    :func:`watchdog` have, and they are named here in the other order from
+    :func:`preflight`, which takes ``(root, run)``. A command whose root could not
+    be pointed elsewhere could only be tested against the machine it ran on, and a
+    test here that read the host's NetworkManager, ports and ``/etc/resolv.conf``
+    would be a test of the host wearing a test's name. ``probe`` is here for the
+    same reason and one more: a DNS query is a real request to a real resolver,
+    and the last four verbs ask one. ``verify-local`` needs no runner -- it issues
+    no command at all -- but it does read the policy and the operator's force-ECH
+    list through ``root``, so that a test can point it at a fake root and a test
+    that could not inject the probe into it would still be a test that queried a
+    real resolver.
+
+    ``now`` is the fourth seam, and it exists for the watchdog alone: its window
+    is a comparison against a recorded timestamp, so a case that could not supply
+    the clock could only test it by sleeping, and a window tested by sleeping is a
+    window whose boundaries are never asserted. It is a keyword the other verbs
+    ignore rather than a flag, because a caller who passes it to ``install`` has
+    misunderstood what install is for.
     """
     arguments = list(argv)
     if arguments[:1] == ["preflight"]:
@@ -5365,6 +6266,20 @@ def main(
         return _run_emergency_rollback(root, run or RealCommandRunner(), probe)
     if arguments == ["verify-local"]:
         return _run_verify_local(root, probe)
+    if arguments == ["watchdog"]:
+        # The only verb that starts a process with a budget of its own, and the
+        # reason is in `WATCHDOG_ACTION_TIMEOUT_SECONDS`: the action it runs
+        # reactivates a NetworkManager connection, which can take a DHCP
+        # transaction, and `COMMAND_TIMEOUT_SECONDS` is the budget for the
+        # read-only questions this program asks a running manager. A rollback
+        # killed part way through a restore is the worst thing this package can
+        # do unattended.
+        return _run_watchdog(
+            root,
+            run or RealCommandRunner(timeout=WATCHDOG_ACTION_TIMEOUT_SECONDS),
+            probe,
+            now=now,
+        )
     sys.stderr.write(f"{_usage()}\n")
     return EXIT_USAGE
 

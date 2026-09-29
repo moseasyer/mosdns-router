@@ -1,0 +1,49 @@
+# The watchdog's cadence: once a minute.
+#
+# Faster than the health check's two minutes, and the reason is the window
+# rather than the probe. The watchdog's default is to act on the Nth consecutive
+# failure, and at a two-minute cadence three failures is six minutes of a machine
+# with no resolver before anything is done about it; at one minute the same three
+# failures are about two. The probe is one two-second UDP query to loopback and
+# no transfer, so the cost of the cadence is a socket and a journal line.
+#
+# It is a separate timer from the health check rather than a second ExecStart
+# line in mosdns-cdn-health.service, for a reason that is about what the two
+# commands are: `verify-local` FAILS when the local resolver is not answering,
+# and a service with two ExecStart lines and no SuccessExitStatus for that would
+# be a failed unit every time a machine was in the state this watchdog exists to
+# be in. Its own timer means its own exit status is its own story.
+#
+# Deliberately NOT Persistent, and that is the same decision as the health
+# timer's: a calendar timer with Persistent=true replays every elapse the machine
+# missed, and at a one-minute cadence a laptop that was closed for a day comes
+# back and runs 1440 watchdog runs in a row. A watchdog that runs 1440 times
+# after a resume is not a watchdog; it is a loop. A run that is a minute late is
+# still a run.
+#
+# The first run is three minutes after boot, not immediately. At boot the router
+# is still coming up -- the install starts it after dnscrypt-proxy, and a cold
+# machine may still be settling -- so a probe before then fails by construction.
+# The window would absorb it, but a first probe that is guaranteed to fail is not
+# evidence, and it does not belong in the record that says when this machine
+# stopped resolving. Three minutes is a judgement and not a measurement: it is
+# the point after which a machine that is going to serve DNS normally is serving
+# it on every release this package supports.
+#
+# To move the cadence, drop in over this timer and reload it -- the commands are
+# the ones in mosdns-cdn-optimizer.timer, with this timer's name. The count and
+# the elapsed window are not here: they are /etc/mosdns/watchdog.yaml, and moving
+# them must not mean editing a unit file on a machine that may be the one with no
+# resolver.
+
+[Unit]
+Description=One-minute resolver watchdog schedule
+Documentation=man:mosdns-router(8)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+Unit=mosdns-watchdog.service
+
+[Install]
+WantedBy=timers.target

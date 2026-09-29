@@ -1,0 +1,93 @@
+# The resolver watchdog: when this machine's own resolver stops answering, put
+# the machine's own resolvers back.
+#
+# ## What this file is
+#
+# Three keys, all at the top level, each written once, and read by
+# `mosdns_installer.py watchdog` -- the command `mosdns-watchdog.timer` runs
+# every minute. It is a conffile at mode 0644, owned by root, like the other
+# documents in /etc/mosdns, so no service identity can change it and an upgrade
+# asks before replacing something you wrote.
+#
+# ## The default is ON, and that is a decision
+#
+#   automatic: true
+#
+# `true` means this machine performs the emergency rollback **by itself**, with
+# nobody watching, once the window below has been reached. That restores the
+# machine's own DNS settings -- on a machine this package has taken over, the
+# resolvers its own DHCP lease published -- so ordinary name resolution works
+# again.
+#
+# Set it to `false` to turn the mechanism off. The probe keeps running, the
+# messages keep appearing in the journal, and the action is still available to
+# you by hand; what stops is the unattended part. Nothing else changes, and
+# `sudo mosdns-cdnctl emergency-rollback` is the same command it would have run.
+#
+# ## What the rollback does NOT fix, and this is the important part
+#
+# It restores **basic connectivity only**. Foreign-name resolution through DNSCrypt
+# does not work after a rollback, and that is the condition this package was
+# installed to fix. The rollback stops nothing, removes nothing and starts
+# nothing: the router, the resolver and this configuration all stay installed, so
+# the fault is no longer in the way and it is not fixed. If you have to read one
+# line at 3am, read the one the watchdog prints when it acts: it says what came
+# back and what did not, every time, and it says them in the journal as well as
+# here.
+#
+# To put the router back in service once the cause is dealt with:
+#
+#   sudo /usr/lib/mosdns-router/mosdns_installer.py install
+#
+# which takes the machine's DNS over again and rolls itself back if the router
+# will not come up.
+#
+# ## Why there is a window at all
+#
+# A single failed probe is not evidence that the router is down. A slow upstream,
+# a cold boot before NTP has synchronised and a loaded machine each produce one.
+# With automatic rollback as the DEFAULT, a single-probe trigger is a mechanism
+# that can tear down a working configuration while you are using it, and a
+# self-inflicted outage is worse than a false alarm. So the default acts on the
+# Nth **consecutive** failure, or once M minutes have passed since the first
+# failure, whichever comes first.
+#
+#   consecutive_failures: 3
+#   minimum_minutes: 10
+#
+# `consecutive_failures` is how many failed probes in a row. A successful probe
+# clears the count, so a resolver that answers even once is not on a path to a
+# rollback.
+#
+# `minimum_minutes` is the other arm of the same window, and it exists because
+# counting cannot see a gap: a machine that was suspended, or whose timer was
+# stopped, comes back with one recorded failure and ten minutes of unavailability
+# behind it. The count would need ten more minutes to notice; this does not.
+#
+# **Neither number is measured.** The false-positive rate of this mechanism has
+# never been measured, so neither number is a constant baked into the code: they
+# are here, in a file you can read and change, for exactly that reason. Set them
+# to `1` to act on a single failure, or raise them on a machine that is
+# intermittently slow. A value of `0` is refused.
+#
+# The watchdog keeps a record of the current failure streak at
+# /run/mosdns/watchdog.json, at mode 0640. It is on a tmpfs, so it does not
+# survive a reboot -- deliberately: the first minutes after a boot are when the
+# router is still coming up, and a machine that has just been rebooted gets its
+# window again rather than inheriting one. An absent record never means "healthy";
+# it means nothing has failed yet.
+#
+# ## If this file cannot be read
+#
+# The watchdog does nothing, and says so loudly in the journal, because a setting
+# it cannot read exactly is one it would have to guess at -- and guessing here
+# decides whether a working machine is taken apart. That is deliberately the
+# opposite of this program's usual fail-open, and the message says the machine is
+# not being watched.
+#
+# The keys are exactly these three, and an unknown key, an indented key, a key
+# written twice or a value that is not the shape it claims is a refusal naming
+# what was read.
+automatic: true
+consecutive_failures: 3
+minimum_minutes: 10

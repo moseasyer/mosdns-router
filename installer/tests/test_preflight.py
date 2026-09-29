@@ -2213,7 +2213,33 @@ class ArgumentArrayDisciplineTests(unittest.TestCase):
     # allowlist of attributes is the other half of that decision. It is short
     # because the module reads files and nothing else -- no environment, no
     # process, no signals, no paths beyond the ones it is handed.
-    OS_ALLOWED = {"readlink", "lstat", "stat"}
+    #
+    # **The four write-side attributes are the watchdog's, and each is here for a
+    # reason a reviewer can check rather than because the program needed it.**
+    # The watchdog publishes a failure record at a mode, and the three attributes
+    # are the only way to do that safely:
+    #
+    #   * `chmod` -- the record is 0640 and that is its mode, not the umask's. A
+    #     file whose mode is left to the process umask is a file an operator has
+    #     to reason about, and this package pins the mode of every document it
+    #     writes (the backup is 0600 and its case says so).
+    #   * `fsync` -- the record is read by a timer, on a machine that may lose
+    #     power between this write and the next probe, and a half-written
+    #     document is a document whose absence the next run would read as "no
+    #     failures recorded" -- which is the direction that acts.
+    #   * `getpid` -- the staged name, and nothing else. `internal/state` and every
+    #     other publisher in this repository stage into a name derived from the
+    #     pid, and the tmpfiles entry reaps `/run/mosdns/.*.tmp` precisely because
+    #     of that convention.
+    #   * `replace` -- the rename that makes the record atomic. This is the one
+    #     that carries the argument: `Path.rename` is not atomic over a tmpfs the
+    #     way `os.replace` is, and a reader that caught a partially renamed record
+    #     would start counting from nothing.
+    #
+    # None of the four can start a process, reach the environment, or act on a
+    # path the program was not handed, which is the property this allowlist
+    # exists to keep.
+    OS_ALLOWED = {"readlink", "lstat", "stat", "chmod", "fsync", "getpid", "replace"}
     # Every attribute of `os` and `pty` that starts a process, named rather than
     # inferred. The needle list above missed all of them: `os` is imported at
     # module scope, so `os.posix_spawn`, `os.fork` and `pty.spawn` would have
