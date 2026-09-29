@@ -54,6 +54,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
 
 import images  # noqa: E402
+from podman import ALLOWED_CAPABILITIES as ALLOWED_CAPS  # noqa: E402
 import podman  # noqa: E402
 
 IMAGES = REPO / "tests" / "podman" / "images"
@@ -2103,6 +2104,48 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
             "actually lives in, so it says where the DNS must not come from without saying where "
             "it does",
         )
+
+    def test_every_container_flag_listing_the_plan_gives_is_the_measured_one(self):
+        """**Task 4's step 1 still listed three capabilities, and the fourth is
+        the one DHCP cannot do without.**
+
+        The plan's architecture note and Task 1's flag listing both carry
+        `NET_RAW`; Task 4's step 1 did not, and said "a capability outside the
+        three above" — so a later task reading that step and starting a target
+        with three gets `IP configuration could not be reserved` and a DHCP
+        server that looks like it is not answering. Same shape as the option-6
+        case above: the plan is the record the next implementer works from, and
+        one stale sentence in it is a failed build or a dead cell.
+
+        The check is a search for the *instruction* in every task, and it holds
+        the target's set against the module's — derived, not re-spelled, so the
+        two cannot drift. It reads a task's own body, so a flag list that appears
+        in a code block somewhere else in the plan is not what it examines; what
+        it examines is the sentence that tells an implementer what to pass.
+        """
+        self.assertEqual(
+            set(ALLOWED_CAPS),
+            {"SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW"},
+            "the measured target's capability set is not the four this case searches the plan "
+            "for, so the search would pass on a plan listing something else",
+        )
+        for task in re.findall(r"### Task \d+:.*?(?=\n### Task |\n---\n\Z)", self.plan, re.S):
+            name = task.splitlines()[0].strip()
+            if "cap-add" not in task:
+                continue
+            with self.subTest(task=name):
+                listed = set(re.findall(r"--cap-add=([A-Z_]+)", task))
+                # A listing may *name* a capability to say it is not the one to
+                # pass, so a set that is a superset of the measured one is fine;
+                # what must not happen is an instruction missing one, because that
+                # is the sentence an implementer copies.
+                self.assertLessEqual(
+                    set(ALLOWED_CAPS), listed,
+                    f"{name} names {sorted(listed)} and does not include "
+                    f"{sorted(set(ALLOWED_CAPS) - listed)}; a target started from that instruction "
+                    f"cannot obtain a DHCP lease, because NetworkManager's client opens an "
+                    f"AF_PACKET socket",
+                )
 
     def test_the_architecture_note_no_longer_forbids_the_declaration(self):
         self.assertNotIn(
