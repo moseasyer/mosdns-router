@@ -106,6 +106,18 @@ PROBE_NAME = "install-probe.example"
 # next run tears the machine down with no window in front of it. See
 # `RecordOwnershipTests` and `DirectoryModeTests`.
 RECORD_MODE = 0o600
+# Where the uid-dropping cases build their fake root, and why it is named rather
+# than left to `TMPDIR`. A dropped uid must be able to traverse to the directory
+# under test, and on this host `TMPDIR` is inside `/home/ubuntu/.cache` at 0700 --
+# so every operation would fail on the path, above anything the case made, and
+# the permissions being measured would never be reached. `/tmp` is 1777.
+#
+# The case that would catch that is
+# `RecordOwnershipTests.test_the_control_proves_the_dropped_identity_really_could_reach_the_parent`:
+# it asserts the same dropped identity, in the same tree, at the PARENT's shipped
+# mode, **succeeds**. A harness that blocks the operation makes the control red
+# rather than the two protection cases quietly green.
+_UID_TEST_ROOT = "/tmp"
 RECORD_KEYS = {
     "schema_version",
     "consecutive_failures",
@@ -268,6 +280,44 @@ class WatchdogFixture(unittest.TestCase):
 
     def actions(self) -> list[tuple]:
         return [command for command in self.runner.commands if command[:1] == ACTION[:1]]
+
+    # -- the shared control lock, as another process holds it ----------------
+    # On the base fixture rather than on one subclass, because two subclasses
+    # need it: the exclusion cases, and the negative-list table's deferred-by-lock
+    # path. A helper copied into the second one would be a second thing to keep
+    # in step with the first.
+
+    def _open_lock(self) -> int:
+        path = self.rooted(CONTROL_LOCK)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(mode=0o640)
+        return os.open(path, os.O_CREAT | os.O_RDONLY, 0o640)
+
+    def hold_the_lock(self) -> int:
+        """Take the shared control lock, as another process would."""
+        self.holder = self._open_lock()
+        fcntl.flock(self.holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(self._release)
+        return self.holder
+
+    def _unlock_only(self) -> None:
+        fcntl.flock(self.holder, fcntl.LOCK_UN)
+
+    def _release(self) -> None:
+        """Drop the lock and close the descriptor, tolerating being called twice.
+
+        The cases release it mid-test and the cleanup releases it again, so this
+        has to be idempotent rather than raising out of a cleanup and burying the
+        assertion that failed.
+        """
+        try:
+            fcntl.flock(self.holder, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self.holder)
+        except OSError:
+            pass
 
 
 class WindowTests(WatchdogFixture):
@@ -740,6 +790,21 @@ class ActionMessagesTests(WatchdogFixture):
         "back to normal",
     )
 
+    #: The paths whose messages must not claim the machine is back, named. The
+    #: names are what the assertions report and what the docstring and the report
+    #: enumerate, so "how many paths are checked" has one answer rather than three.
+    NEGATIVE_LIST_PATHS = (
+        "success",
+        "below the window",
+        "switch off",
+        "no verdict",
+        "deferred by the lock",
+        "latch",
+        "action failed",
+        "action killed at its budget",
+        "setting unreadable",
+    )
+
     def _assert_no_false_claim(self, outcome, where: str):
         said = (outcome.stdout + outcome.stderr).lower()
         for lie in self.FALSE_CLAIMS:
@@ -756,17 +821,70 @@ class ActionMessagesTests(WatchdogFixture):
         # the switch off, the blind spot, the deferred-by-lock path, the latch, a
         # failed action, an action killed at its budget, and a setting that cannot
         # be read.
+        #
+        # **Nine, and the table is the thing the docstring and the report
+        # describe.** An earlier version of this case listed seven in the table
+        # while its own comment and the report both said eight or nine, so the
+        # coverage claim was not true of the coverage: two real branches -- the
+        # deferred-by-lock path and the latch -- were never checked at all, and a
+        # future message is checked against a table whose size is a guess.
+        # `test_every_watchdog_path_is_in_the_negative_list_table` holds the count.
         outcomes = {
             "success": self.reached(),
             "below the window": self.run_watchdog(),
             "switch off": self._switched_off(),
             "no verdict": self._blind(),
+            "deferred by the lock": self._deferred_by_lock(),
+            "latch": self._latched(),
             "action failed": self.reached(status=installer.EXIT_ROLLBACK_FAILED),
             "action killed at its budget": self.reached(status=installer.KILLED_AT_BUDGET),
             "setting unreadable": self._unreadable_setting(),
         }
         for where, outcome in outcomes.items():
             self._assert_no_false_claim(outcome, where)
+
+    def test_every_watchdog_path_is_in_the_negative_list_table(self):
+        # The table is not allowed to shrink, because nothing else would notice.
+        # Each of the nine is reachable and each prints a different set of
+        # sentences, and the two that were missing from the first version are the
+        # two an operator reads while an upgrade is running.
+        self.assertEqual(
+            len(self.NEGATIVE_LIST_PATHS),
+            9,
+            "the negative-list table is the thing a future message is checked against, so its "
+            "size has to be a fact rather than whatever the dict happens to contain",
+        )
+        for name in (
+            "success",
+            "below the window",
+            "switch off",
+            "no verdict",
+            "deferred by the lock",
+            "latch",
+            "action failed",
+            "action killed at its budget",
+            "setting unreadable",
+        ):
+            with self.subTest(path=name):
+                self.assertIn(name, self.NEGATIVE_LIST_PATHS)
+
+    def _deferred_by_lock(self):
+        self.setUp()
+        self.shapes[(LOCAL_DNS, DNS_PORT)] = SILENT
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.hold_the_lock()
+        try:
+            return self.run_watchdog()
+        finally:
+            self._release()
+
+    def _latched(self):
+        # A streak that has already acted, probed again. The latch's own words.
+        self.setUp()
+        self.shapes[(LOCAL_DNS, DNS_PORT)] = SILENT
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.run_watchdog()
+        return self.run_watchdog()
 
     def _switched_off(self):
         self.setUp()
@@ -1059,6 +1177,28 @@ class ActionTests(WatchdogFixture):
         self.assertIsNone(seen.get("action_status"), "the status was written before the action ran")
 
     def test_an_action_whose_status_could_not_be_recorded_is_not_run_again(self):
+        # **This case is permission-dependent too, and it is the fifth in this
+        # suite.** It makes the record's directory `0500` during the action so the
+        # post-action status write fails while the pre-action record stays
+        # readable -- and that state is only reachable for an identity the mode
+        # binds, which root is not. Run as root the write SUCCEEDS, the
+        # "could not be written" text never appears, and the case fails on an
+        # assertion about a message rather than about the latch.
+
+        # So it says so and skips, with the reason, rather than passing on a
+        # suite-wide false. The latch it is here for is demonstrated two ways that
+        # need no permission at all: this file's
+        # `test_a_killed_action_still_does_not_run_again`, and the plain streak
+        # cases in `ActionTests.test_the_action_runs_at_most_once_per_failure_streak`.
+        # What is NOT demonstrated anywhere is a *readable but unwritable* record
+        # still latching, and that is recorded in the report's residual list.
+        if os.geteuid() == 0:
+            self.skipTest(
+                "this case's evidence is a permission, and root is not bound by the mode bits it "
+                "sets: run it as an unprivileged uid, and note that the readable-but-unwritable "
+                "case has no non-root evidence elsewhere in this suite"
+            )
+
         def read_only_after(command, runner):
             if command[:1] != ACTION[:1]:
                 return None
@@ -1336,6 +1476,15 @@ class RecordOwnershipTests(WatchdogFixture):
 
     TMPFILES = REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf"
     POSTINST = REPO / "packaging" / "debian" / "postinst"
+    #: The three texts an operator reads about the record's cross-boot guard, and
+    #: the ones that overstated it. All three, because the report is gitignored:
+    #: a correction that lives only in a file nobody diffs is the shape ruling 184
+    #: was written about.
+    SECONDARY_GUARD_TEXTS = (
+        SHIPPED_SETTING,
+        REPO / "packaging" / "man" / "mosdns-router.8",
+        REPO / "packaging" / "man" / "mosdns-cdnctl.1",
+    )
 
     def test_the_record_is_not_readable_by_any_other_identity(self):
         self.setUp()
@@ -1361,38 +1510,185 @@ class RecordOwnershipTests(WatchdogFixture):
             "and a first failure in the past",
         )
 
+    def _refused(self, work) -> BaseException:
+        """Run `work` as the dropped identity and require the kernel to refuse it.
+
+        **The refusal is the assertion, not an exception to be caught.** A case
+        that let `PermissionError` escape would be a case that passes on any
+        failure at all -- a wrong path, a missing file, the temp root's own mode --
+        and the first version of these two did exactly that. Requiring
+        `PermissionError` specifically, and requiring the file to still be there
+        afterwards, makes the claim the positive one it should be: the kernel
+        denied this operation, for this reason, on this file.
+        """
+        try:
+            self._as_unprivileged(work)
+        except PermissionError as error:
+            return error
+        return None
+
     def test_an_unprivileged_member_of_the_group_cannot_delete_the_record(self):
         # The measured version, and the one a mode check cannot make. It builds
-        # the directory the package actually ships -- mode and default ACL, in
-        # the order the tmpfiles entry and `postinst` apply them -- drops to the
-        # real `mosdns-cdn` uid, and tries the unlink.
+        # the directory the package actually ships -- parent at its own mode with
+        # its own default ACL, the record's own directory at `0700 root:root` --
+        # has the REAL watchdog write the record, drops to an unprivileged uid
+        # that is a member of the parent's group, and tries the unlink.
         if os.geteuid() != 0:
             self.skipTest("changing uid needs root, and this suite must not require it")
         record = self._shipped_directory_with_a_record()
-        self._as_mosdns_cdn(lambda: os.unlink(record))
-        self.assertTrue(
-            record.exists(),
-            "a member of the record's own group deleted it, so the mechanism's only automatic "
+        refusal = self._refused(lambda: os.unlink(record))
+        self.assertIsNotNone(
+            refusal,
+            f"the unlink SUCCEEDED as {self.identity_used}, so the mechanism's only automatic "
             "protection can be switched off by the unprivileged identity in this package with no "
             "trace and no journal entry",
+        )
+        self.assertIsInstance(refusal, PermissionError)
+        self.assertTrue(
+            record.exists(),
+            f"the unlink was refused and the record is gone anyway, so something removed it "
+            f"besides the unlink: {refusal}",
         )
 
     def test_an_unprivileged_member_of_the_group_cannot_replace_the_record(self):
         if os.geteuid() != 0:
             self.skipTest("changing uid needs root, and this suite must not require it")
         record = self._shipped_directory_with_a_record()
-        # Staged in the SAME directory, because that is the only place a group
-        # member could stage it: a rename across directories needs write on both.
+        # Staged in the record's OWN directory, because that is the only place a
+        # rename could land: a rename needs write on BOTH directories, and being
+        # unable to write this one is the claim. Staged as root so the source
+        # file definitely exists and the operation's failure can only be about
+        # permission.
         replacement = record.with_name("watchdog.json.replacement")
         replacement.write_text('{"consecutive_failures": 99}\n')
         replacement.chmod(0o600)
-        self._as_mosdns_cdn(lambda: os.replace(replacement, record))
+        os.chown(replacement, 0, 0)
+        refusal = self._refused(lambda: os.replace(replacement, record))
+        self.assertIsNotNone(
+            refusal,
+            f"the rename SUCCEEDED as {self.identity_used}, so the next run reads a threshold of "
+            "99 and tears this machine down with no window in front of it",
+        )
+        self.assertIsInstance(refusal, PermissionError)
         self.assertEqual(
             json.loads(record.read_text())["consecutive_failures"],
             1,
-            "a member of the record's own group replaced it, so the next run reads a threshold of "
-            "99 and tears this machine down with no window in front of it",
+            "the rename was refused and the record's content is not what this run wrote",
         )
+        self.assertTrue(
+            replacement.exists(),
+            "the staged file was moved, so the rename succeeded and only the content assertion "
+            "above noticed",
+        )
+
+    @staticmethod
+    def _prose(path: Path) -> str:
+        """A shipped document's words, with troff and YAML structure removed.
+
+        **Necessary, and the failure it fixes is the case being false for the
+        wrong reason.** `mosdns-router(8)` writes the correction as
+
+            it does
+            .B not
+            fire in this package's own unit
+
+        so a regex over the raw source sees `.B` between `not` and `fire` and
+        reports a man page that says the right thing as one that does not. A gate
+        that cannot read the sentence it is checking is a gate whose failures
+        send a reader to the wrong file.
+
+        **Only the macro NAME is removed, never its argument** -- `.BR
+        ProcSubset=pid ,` must keep `ProcSubset=pid`, and a whole-line strip
+        would take it. The first version of this helper dropped every line
+        beginning with `.` and failed all three documents for exactly that
+        reason: a gate that cannot see the word it is looking for.
+        """
+        lines = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("."):
+                line = re.sub(r"^\.[A-Za-z]+\*?\s?", " ", line)
+            lines.append(line.replace("\\-", "-").replace("\\&", ""))
+        # Emphasis markers go too, for the same reason: `mosdns-cdnctl(1)` writes
+        # `it does **not** fire`, and an assertion about the WORDS must not care
+        # how they are marked up.
+        return re.sub(r"\s+", " ", " ".join(lines)).replace("*", "").lower()
+
+    def test_no_shipped_text_promises_a_boot_guard_that_does_not_fire(self):
+        # **The diff carried the overstatement and the correction only lived in a
+        # gitignored report** -- which is the shape ruling 184 was written about.
+        # The setting file and both man pages said the record "names the boot it
+        # belongs to, so a machine whose /run is a disk ... treats a carried-over
+        # streak as not its own", and a live cell measures
+        # `first_failure_boot_id: null` because the unit's own `ProcSubset=pid`
+        # hides `/proc/sys`. An operator reading any of the three was told a
+        # protection exists that does not operate in the configuration this
+        # package installs.
+        #
+        # So each of the three has to say the two things together: the record
+        # names the boot WHERE IT IS READABLE, and it is not readable in the
+        # shipped unit. Asserted as text because the failure is a sentence, and a
+        # sentence can only be held as one.
+        for path in self.SECONDARY_GUARD_TEXTS:
+            prose = self._prose(path)
+            with self.subTest(path=path.name):
+                self.assertIn(
+                    "procsubset=pid",
+                    prose,
+                    f"{path.name} does not say why the boot id is unavailable in the unit this "
+                    "package installs, so it either omits the limitation or hides it",
+                )
+                self.assertIn(
+                    "not fire in this package's own unit",
+                    prose,
+                    f"{path.name} promises the boot guard without saying it does not fire in the "
+                    "shipped unit, which is the overstatement this case exists to stop",
+                )
+
+    def test_the_shipped_texts_name_the_guard_that_is_actually_in_force(self):
+        # The positive half, so the case above cannot be satisfied by deleting
+        # the claim. The tmpfs IS the guard, and saying so is not a weakness; what
+        # is a weakness is implying there is a second one in force.
+        for path in self.SECONDARY_GUARD_TEXTS:
+            with self.subTest(path=path.name):
+                self.assertIn(
+                    "tmpfs",
+                    self._prose(path),
+                    f"{path.name} does not say what the guard in force actually is",
+                )
+                self.assertIn(
+                    "guard in force",
+                    self._prose(path),
+                    f"{path.name} does not name the guard that is in force, so a reader cannot "
+                    "tell which of the two answers protects this machine",
+                )
+
+    def test_the_record_directory_has_reap_lines_that_reach_it(self):
+        # The staged name is `.watchdog.json.<pid>.tmp` in `/run/mosdns/watchdog`,
+        # and a tmpfiles `r` line is NOT recursive: the two patterns for
+        # `/run/mosdns` never reached a file one level down, so a publication
+        # interrupted between staging and rename left a file nothing collects.
+        # The docstring in `write_watchdog_record` justifies the staged name by a
+        # reap line, so the two have to agree and the claim is a real one.
+        reaped = {
+            line.split()[1]
+            for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
+            if line.startswith("r ") and RECORD_DIR in line
+        }
+        self.assertEqual(
+            reaped,
+            {f"{RECORD_DIR}/*.tmp", f"{RECORD_DIR}/.*.tmp"},
+            "the record's own directory has no reap lines covering a publication interrupted "
+            "between staging and rename, and the two patterns for its parent are not recursive",
+        )
+        body = _function_body(SOURCE, "write_watchdog_record")
+        self.assertIn(
+            ".*.tmp",
+            body,
+            "the docstring still justifies the staged name by a reap line for the PARENT, which "
+            "does not reach the record's own directory",
+        )
+        self.assertIn("0600", body, "the docstring states a mode this record no longer has")
+        self.assertNotIn("0640", body, "the docstring still says 0640 for a 0600 record")
 
     def test_the_record_lives_in_a_directory_no_group_member_can_write(self):
         # The structural half, and the one that can be observed without root. A
@@ -1452,10 +1748,34 @@ class RecordOwnershipTests(WatchdogFixture):
         )["Service"]["ReadWritePaths"].split()
         self.assertEqual(entries, [f"-{RECORD_DIR}"])
 
-    def test_the_control_stands_up_and_reports_nothing_when_it_is_held(self):
-        # A guard that cannot fail is a comment. The same two operations, as
-        # root, in the same shipped directory: both succeed, so the two cases
-        # above are reading the ownership and not a typo in a path.
+    def test_the_control_proves_the_dropped_identity_really_could_reach_the_parent(self):
+        # The control, and it is the case that makes the other two mean anything.
+        #
+        # Both of them drop to an unprivileged member of `/run/mosdns`'s group and
+        # fail to touch the record's subdirectory. That is only evidence if the
+        # same identity, in the same directory, CAN touch the parent -- because
+        # `/run/mosdns` is 2770 root:mosdns on purpose (ruling 142, measured: the
+        # DHCP bridge publishes there as `mosdns-cdn`) and the subdirectory exists
+        # precisely because of it. So here the unlink in the PARENT succeeds, as
+        # root's would not be a control at all.
+        if os.geteuid() != 0:
+            self.skipTest("changing uid needs root, and this suite must not require it")
+        record = self._shipped_directory_with_a_record()
+        parent = record.parent.parent
+        victim = parent / "dhcp-upstreams.json"
+        victim.write_text("{}\n")
+        os.chown(victim, 0, self._mosdns_gid())
+        self._as_unprivileged(lambda: os.unlink(victim))
+        self.assertFalse(
+            victim.exists(),
+            f"the dropped identity ({self.identity_used}) could not unlink a file from the "
+            f"parent at its shipped mode, so the two cases above would be passing because the "
+            f"drop failed rather than because the subdirectory is protected",
+        )
+
+    def test_root_can_still_reach_the_record_and_the_control_says_so(self):
+        # And the other direction, because a record nothing can remove would be a
+        # record the uninstaller cannot clean up. Root owns both directories.
         if os.geteuid() != 0:
             self.skipTest("changing uid needs root, and this suite must not require it")
         record = self._shipped_directory_with_a_record()
@@ -1463,37 +1783,144 @@ class RecordOwnershipTests(WatchdogFixture):
         self.assertFalse(record.exists(), "root could not unlink the record in its own directory")
 
     def _shipped_directory_with_a_record(self) -> Path:
-        """A `/run/mosdns` built the way the package builds it, with a record in it.
+        """`RECORD_DIR` built the way the package builds it, with a record in it.
+
+        **The fake root is created under `/tmp`, not under `TMPDIR`, and that is
+        load-bearing rather than tidiness.** A dropped uid has to be able to
+        *arrive* at the directory under test, and `TMPDIR` on this host is inside
+        `/home/ubuntu/.cache`, which is `0700` — so every operation fails on the
+        PATH, one level above anything this case made, and the permissions being
+        measured are never reached. That is a third way for this case to pass for
+        the wrong reason, and only the control below catches it. `/tmp` is 1777.
+
+        The control is what makes the whole class trustworthy, and it is the part
+        to read first: it asserts the SAME dropped identity, in the SAME tree, at
+        the parent directory's own shipped mode, **succeeds** at an unlink. If the
+        harness is the thing blocking the operation, the control goes red instead
+        of the two protection cases going quietly green.
 
         The mode and the ACL come from the shipped tmpfiles entry and the shipped
         `postinst` rather than from constants here, so a change to either of them
         is a change to what this case exercises -- and so that the case fails if
         the packaging and the record's mode ever stop agreeing.
+
+        **It is `RECORD_DIR` and not its parent, and the record is the one the
+        program actually writes.** The first version of this helper built
+        `/run/mosdns`, took the mode from the `d /run/mosdns/watchdog` line, and
+        returned `/run/mosdns/watchdog.json` -- while the program writes
+        `/run/mosdns/watchdog/watchdog.json`. So the two uid cases operated on a
+        path nothing creates, inside a directory built at the subdirectory's mode,
+        and `_apply_shipped_default_acl` raised `StopIteration` on a tmpfiles file
+        whose only `a` line names the *parent*. All three were masked by a
+        `skipTest` that fires on any host where the suite is not root, which is
+        how three cases that had never run reported as evidence in a table.
+
+        The parent is still built, at its own shipped mode and with its own shipped
+        default ACL, because the claim is about what a member of the `mosdns`
+        group can reach THROUGH the parent. `RECORD_DIR` is then created inside
+        it exactly as `postinst` and the tmpfiles entry create it, and the record
+        is produced by running the watchdog rather than by being written here --
+        so the path under test is the path the program chooses.
         """
-        directory = self.root / "run" / "mosdns"
+        root = Path(tempfile.mkdtemp(dir=_UID_TEST_ROOT))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        # Traverse-and-nothing-else: the dropped identity can arrive at what this
+        # case made and can list none of it. `mkdtemp` gives 0700.
+        os.chmod(root, 0o711)
+        self.root = root
+        parent = self.root / "run" / "mosdns"
+        parent.mkdir(parents=True)
+        self._own_as_shipped(parent, "/run/mosdns")
+        self._apply_shipped_default_acl(parent, "/run/mosdns")
+
+        directory = self.root / RECORD_DIR.lstrip("/")
         directory.mkdir(parents=True)
-        os.chown(directory, 0, self._mosdns_gid())
-        os.chmod(directory, self._shipped_directory_mode())
-        self._apply_shipped_default_acl(directory)
-        record = directory / "watchdog.json"
+        self._own_as_shipped(directory, RECORD_DIR)
+        self._apply_shipped_default_acl(directory, RECORD_DIR)
+
         self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
         self.run_watchdog()
+        record = self.root / RECORD_PATH.lstrip("/")
+        self.assertTrue(
+            record.is_file(),
+            f"the watchdog wrote nothing to {RECORD_PATH} in a directory built the way the "
+            f"package builds it, so the cases below would be testing a path the program does "
+            f"not use. The directory holds: {sorted(p.name for p in directory.iterdir())}",
+        )
         return record
 
-    def _shipped_directory_mode(self) -> int:
+    def _own_as_shipped(self, directory: Path, path: str) -> None:
+        """Give `directory` the mode and ownership the shipped entry gives `path`.
+
+        **Ownership is read from the file too, not hardcoded.** A version of this
+        helper did `chown(0, 0)` on the record's directory, which is right today
+        and wrong the day the packaging changes: with the ownership pinned here, a
+        shipped entry saying `root mosdns` would still build a `root:root`
+        directory, the dropped identity would be outside the group, and both
+        protection cases would pass for a reason that has nothing to do with the
+        package. That is not hypothetical -- it is what happened when the entry was
+        mutated to `2770 root mosdns` while this helper still forced `root:root`.
+
+        Names are resolved to ids where the host has them. `mosdns` does not exist
+        on a build host, and the fallback is this host's own `_mosdns_gid()`, which
+        is also the group the dropped identity is placed in, so the group
+        relationship under test holds either way.
+        """
+        mode, owner, group = self._shipped_entry_for(path)
+        os.chown(
+            directory,
+            self._uid_of(owner, default=0),
+            self._uid_of(group, default=self._mosdns_gid()),
+        )
+        os.chmod(directory, mode)
+
+    def _uid_of(self, name: str, default: int) -> int:
+        if name == "root":
+            return 0
+        import grp
+
+        try:
+            return grp.getgrnam(name).gr_gid
+        except KeyError:
+            return default
+
+    def _shipped_entry_for(self, path: str) -> tuple:
+        """`(mode, owner, group)` as the shipped tmpfiles entry declares them.
+
+        Not a constant here, and not a parameter: a case that restates the mode
+        the package ships cannot fail when the two stop agreeing, and the whole
+        value of measuring the directory is that it is the one the package makes.
+        """
         line = next(
             line
             for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
-            if line.startswith(f"d {RECORD_DIR} ")
+            if line.startswith(f"d {path} ")
         )
-        return int(line.split()[2], 8)
+        fields = line.split()
+        return int(fields[2], 8), fields[3], fields[4]
 
-    def _apply_shipped_default_acl(self, directory: Path) -> None:
+    def _apply_shipped_default_acl(self, directory: Path, path: str) -> None:
+        """Reproduce the shipped default ACL for `path`, or nothing if there is none.
+
+        **Absence is the normal case for `RECORD_DIR` and is handled, not
+        exceptional.** The tmpfiles file's only `a` line names `/run/mosdns`; the
+        record's own directory deliberately has none, because a default ACL
+        granting the group `rwx` there would hand every member of `mosdns` the
+        ability to replace a 0600 root file inside it. The first version of this
+        helper asked for a line that does not exist and raised `StopIteration`,
+        which is how three never-run cases stayed green on a host where the suite
+        is not root.
+        """
         entry = next(
-            line
-            for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
-            if line.startswith(f"a {RECORD_DIR} ")
+            (
+                line
+                for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
+                if line.startswith(f"a {path} ")
+            ),
+            None,
         )
+        if entry is None:
+            return
         fields = entry.split()[6:]
         if not any(field.startswith("d:g:") for field in fields):
             return
@@ -1507,11 +1934,7 @@ class RecordOwnershipTests(WatchdogFixture):
         )
 
     def _entry(self, name: str):
-        """The passwd entry for a packaged identity, or None where there is none.
-
-        None rather than a made-up uid: a case that cannot find `mosdns-cdn` has
-        no business running as some other account and reporting what it did.
-        """
+        """The passwd entry for a name, or None where there is none."""
         import pwd
 
         try:
@@ -1520,33 +1943,97 @@ class RecordOwnershipTests(WatchdogFixture):
             return None
 
     def _mosdns_gid(self) -> int:
-        """The gid of the `mosdns` group, or a fallback for a build host without it."""
+        """The gid of the `mosdns` group, or a fallback for a build host without it.
+
+        The fallback is a number no real group on this host is likely to hold, and
+        that is deliberate: the parent directory is given that gid so that the
+        dropped identity -- which is placed in the *parent's* group, see
+        `_as_unprivileged` -- is a member of it. Whether the name `mosdns` exists
+        is not the question; whether the process is in the directory's group is.
+        """
         import grp
 
         try:
             return grp.getgrnam("mosdns").gr_gid
         except KeyError:
-            return self._entry("mosdns-cdn").pw_gid if self._entry("mosdns-cdn") else 4242
+            return 4242
 
-    def _as_mosdns_cdn(self, work) -> None:
-        """Run one callable as `mosdns-cdn`, and put this process back afterwards.
+    def _unprivileged_uid(self):
+        """The uid to drop to, and which account it is.
+
+        **The real `mosdns-cdn` account where the host has one**, because that is
+        the identity the threat is about. Where it does not -- a build host, or
+        this one -- an ordinary unprivileged account that every Linux host has, and
+        the case says which one it used. That is the same question, not a weaker
+        one: the property under test is *an identity that is not root and is not
+        the owner cannot unlink or rename a file in a 0700 root:root directory*,
+        and the account's name is not part of it.
+
+        Creating the account instead would be host mutation to make a test pass,
+        which is the wrong trade in a suite that exists to check a privilege
+        decision.
+        """
+        account = self._entry("mosdns-cdn")
+        if account is not None:
+            return account.pw_uid, "mosdns-cdn"
+        for name in ("nobody", "daemon"):
+            account = self._entry(name)
+            if account is not None:
+                return account.pw_uid, f"{name} (this host has no mosdns-cdn account)"
+        return None, None
+
+    def _as_unprivileged(self, work) -> None:
+        """Run one callable as an unprivileged member of the PARENT's group.
+
+        **A member of the parent directory's group, deliberately.** That is the
+        whole threat: `mosdns-cdn` is in `mosdns`, and `/run/mosdns` is 2770
+        root:mosdns with a default ACL, so the identity the review is about can
+        create and unlink anything in that directory. A drop to some uid that is
+        not in the group would pass for the wrong reason -- it could not touch the
+        parent either -- so the case would be reading the parent's mode rather
+        than the subdirectory's, which is the decision under test.
+
+        So the supplementary and effective group are BOTH set to the parent's gid,
+        and the control case below proves the setup is honest by doing the two
+        operations in the parent, where they succeed.
 
         Both halves of the id are restored even if the callable raises, because a
         test that leaves the suite running as another uid turns every later case
-        into a mystery. The order is setgid last, since dropping the privilege is
-        the direction that cannot be undone.
+        into a mystery. The order is setgid last, since dropping privilege is the
+        direction that cannot be undone.
         """
-        account = self._entry("mosdns-cdn")
-        if account is None:
-            self.skipTest("this host has no mosdns-cdn account, so there is nothing to be")
-        euid, egid = os.geteuid(), os.getegid()
+        uid, account = self._unprivileged_uid()
+        if uid is None:
+            self.skipTest(
+                "this host has no unprivileged account to drop to, so the primitive cannot be "
+                "demonstrated here; it needs a real uid and a fake root on a writable filesystem "
+                "cannot stand in for one"
+            )
+        gid = self._mosdns_gid()
+        euid, egid, groups = os.geteuid(), os.getegid(), os.getgroups()
         try:
-            os.setegid(account.pw_gid)
-            os.seteuid(account.pw_uid)
+            os.setgroups([gid])
+            os.setegid(gid)
+            os.seteuid(uid)
+            self.assertNotEqual(os.geteuid(), 0, "the drop did not take, so nothing was measured")
+            self.assertIn(
+                gid,
+                os.getgroups() + [os.getegid()],
+                f"the dropped process is not in the parent directory's group {gid}, so it could "
+                f"not touch /run/mosdns either and this case would be reading the parent's mode",
+            )
+            self.assertTrue(
+                os.access(self.root, os.X_OK),
+                f"the dropped identity cannot even traverse to {self.root}, so every operation "
+                f"here would fail on the path rather than on the permissions under test. That is "
+                f"the harness blocking the measurement, not the package; see {_UID_TEST_ROOT!r}.",
+            )
+            self.identity_used = account
             work()
         finally:
             os.seteuid(euid)
             os.setegid(egid)
+            os.setgroups(groups)
 
 
 class TransactionExclusionTests(WatchdogFixture):
@@ -1591,19 +2078,6 @@ class TransactionExclusionTests(WatchdogFixture):
         self.setUp()
         self.setting(automatic="true", consecutive_failures=failures, minimum_minutes=minutes)
         return self
-
-    def hold_the_lock(self):
-        """Take the shared control lock, as another process would."""
-        self.holder = self._open_lock()
-        fcntl.flock(self.holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        self.addCleanup(self._release)
-        return self.holder
-
-    def _open_lock(self):
-        path = self.rooted(CONTROL_LOCK)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch(mode=0o640)
-        return os.open(path, os.O_CREAT | os.O_RDONLY, 0o640)
 
     def test_the_watchdog_takes_no_action_while_a_transaction_holds_the_lock(self):
         self.arm()
@@ -1663,6 +2137,84 @@ class TransactionExclusionTests(WatchdogFixture):
         self.run_watchdog()
         self.assertEqual(self.record()["consecutive_failures"], 1)
         self.assertEqual(self.actions(), [], "a first failure acted with the lock free")
+
+    def test_a_streak_that_existed_before_the_lock_survives_it_and_then_acts(self):
+        # **The case the round did not write, and the one the message was wrong
+        # about.** The deferred message used to say "The count restarts from one on
+        # the first run after the lock is free" -- and it does not, because the
+        # deferred path returns BEFORE `read_watchdog_record`, so the record on
+        # disk is left exactly as it was. A machine that already held two of three
+        # failures keeps them, and the FIRST free probe counts the third and
+        # performs an unattended rollback.
+
+        # That is the right behaviour: the two failures are this machine's, they
+        # were counted before the transaction arrived, and a transaction does not
+        # make them untrue. What was wrong was the sentence -- it pointed at MORE
+        # caution than the machine has, on the one path an operator reads while an
+        # upgrade runs, and the only covering case started from no record at all.
+
+        # So this case starts from a real record, and it is the evidence the
+        # sentence should have been checked against.
+        self.arm(failures=3, minutes=10)
+        for _ in range(2):
+            self.run_watchdog()
+        self.assertEqual(self.record()["consecutive_failures"], 2)
+        self.assertEqual(self.actions(), [], "a failure acted below the threshold")
+
+        # A run while the transaction holds the lock: nothing counted, and the
+        # record left exactly as it was.
+        self.hold_the_lock()
+        deferred = self.run_watchdog()
+        self._release()
+        self.assertEqual(
+            self.record()["consecutive_failures"],
+            2,
+            "a run that stood down for the lock changed the record, so the failures this machine "
+            "had before the transaction started were discarded by it",
+        )
+        self.assertEqual(
+            deferred.reason,
+            "the control lock was held, so this run stood down",
+            "this is not the deferred path at all, so the case is not testing what it says",
+        )
+
+        # And the first free probe: counts 3, reaches the window, acts once.
+        outcome = self.run_watchdog()
+        self.assertEqual(
+            self.actions(),
+            [ACTION],
+            "the streak did not resume at the count it held, so either the record was reset by the "
+            "deferred run or the count does not carry across a lock",
+        )
+        self.assertEqual(self.record()["consecutive_failures"], 3)
+        self.assertEqual(outcome.status, installer.EXIT_OK)
+
+    def test_the_deferred_message_does_not_claim_the_count_restarts(self):
+        # The sentence itself, held as text. It is the false claim, and a message
+        # that misdescribes the machine's state to an operator reading a journal
+        # during an upgrade is the whole of what this case is for.
+        self.arm()
+        self.hold_the_lock()
+        outcome = self.run_watchdog()
+        said = (outcome.stdout + outcome.stderr).lower()
+        self.assertNotIn(
+            "restarts from one",
+            said,
+            "the message says the count restarts from one and it does not: the deferred path "
+            "returns before the record is read, so the record is left exactly as it was",
+        )
+        self.assertIn(
+            "left exactly as it was",
+            said,
+            "the message must say what actually happened to the record, which is that nothing "
+            "touched it",
+        )
+        self.assertIn(
+            "cannot reach this mechanism's window",
+            said,
+            "the second half of the old sentence was true -- a transaction cannot manufacture "
+            "failures into this mechanism's window -- and it must survive the correction",
+        )
 
     def test_it_acts_normally_when_the_lock_is_free(self):
         # The control. A guard that cannot be distinguished from a mechanism that
@@ -1818,25 +2370,6 @@ class TransactionExclusionTests(WatchdogFixture):
             _function_body(SOURCE, "_roll_back_under_the_lock"),
             "a rollback that ran without the lock did not say so",
         )
-
-    def _unlock_only(self):
-        fcntl.flock(self.holder, fcntl.LOCK_UN)
-
-    def _release(self):
-        """Drop the lock and close the descriptor, tolerating being called twice.
-
-        The cases release it mid-test and the cleanup releases it again, so this
-        has to be idempotent rather than raising out of a cleanup and burying the
-        assertion that failed.
-        """
-        try:
-            fcntl.flock(self.holder, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(self.holder)
-        except OSError:
-            pass
 
 
 class RecordTests(WatchdogFixture):
