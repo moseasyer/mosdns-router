@@ -59,14 +59,18 @@ import snapshot  # noqa: E402
 from podman import (  # noqa: E402
     CONTAINER_CAPABILITIES,
     DEFAULT_NETWORK_SUBNET,
+    NM_SETUP_ACTIVE,
+    NM_SETUP_UNIT,
     CleanupFailed,
     NetworkManagerDeviceError,
+    NetworkManagerSetupError,
     Podman,
     PodmanError,
     RunResources,
     new_run_id,
     podman_session,
     wait_for_networkmanager_device,
+    wait_for_networkmanager_setup,
 )
 from report import (  # noqa: E402
     EXIT_HARNESS_ERROR,
@@ -213,15 +217,53 @@ def run_target(
                 network=network,
                 extra_args=["--ip", dhcp_test.TARGET_ADDRESS],
             )
-            # A *wait*, not a single query: `podman run -d` returns before the
-            # target has finished booting, and the check's whole value is that it
-            # never lets an unmanaged device reach a scenario. The clock is the
-            # scenario seam so a case can run a cell without sitting out the
-            # budget; production waits.
+            # Two gates, in this order, and the order is the fix.
+            #
+            # **First: the target's own setup unit.** `GENERAL.NM-MANAGED` is
+            # produced *by* `target-nm-setup.service`, and on 24.04 and 26.04 the
+            # unit's third step is `systemctl restart NetworkManager`. So a field
+            # reads `yes` from the `conf.d` declaration while the unit is still
+            # running and about to restart the daemon underneath it. Gating on the
+            # field alone let a scenario's `nmcli connection up` land inside that
+            # restart and fail with `Error: NetworkManager is not running` -- about
+            # one run in four, and one in six measured before any of this round's
+            # code. Measured state per release, and the same on all three:
+            # `active`/`exited`/`success`.
+            #
+            # **Then: the field.** Not redundant. A unit that finished with the
+            # device unmanaged is a target the unit's own check would have failed
+            # on, but the harness does not rely on that having been said -- and
+            # the field is what every scenario downstream actually needs.
+            #
+            # The clock is the scenario seam so a case can run a cell without
+            # sitting out either budget; production waits.
             clock = scenario_clock()
+            wait_for_networkmanager_setup(
+                podman, container,
+                now=clock["now"], sleep=clock["sleep"],
+            )
             wait_for_networkmanager_device(
                 podman, container, device,
                 now=clock["now"], sleep=clock["sleep"],
+            )
+        except NetworkManagerSetupError as refusal:
+            # Its own `except`, before the device one, so the skip names the
+            # requirement that was actually not met. Both are the same refusal
+            # shape -- an incomplete cell, not a failed one -- and the subclassing
+            # is what lets one reporting path serve both.
+            return VersionResult(
+                version=version,
+                arch=arch,
+                detail=str(refusal),
+                skips=[
+                    Skip(
+                        requirement=(
+                            f"'{NM_SETUP_UNIT}' reaches '{NM_SETUP_ACTIVE}' in a running "
+                            f"target, before any scenario runs"
+                        ),
+                        reason=str(refusal).splitlines()[0],
+                    )
+                ],
             )
         except NetworkManagerDeviceError as refusal:
             # A target that booted wrong is not an installer failure and is not

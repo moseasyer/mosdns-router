@@ -54,6 +54,11 @@ PodmanTestCase = test_command.PodmanTestCase
 RUN_ID = test_dhcp_scenario.RUN_ID
 ROUTER = test_dhcp_scenario.ROUTER
 TARGET = test_dhcp_scenario.TARGET
+PROFILE = test_dhcp_scenario.PROFILE
+# The unit the target image installs and enables, named here rather than spelled
+# in each case: a case that typed the name would be a case that still passes if
+# the unit is renamed, which is the one edit that would silently un-gate the cell.
+NM_SETUP_UNIT = "target-nm-setup.service"
 MOCK_ROUTER_ADDRESS = test_dhcp_scenario.MOCK_ROUTER_ADDRESS
 SUBNET = "10.89.0.0/24"
 TARGET_ADDRESS = "10.89.0.10"
@@ -103,6 +108,14 @@ class EntryPoint(PodmanTestCase):
             {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
             {"match": ["cat", test_dhcp_scenario.ROUTER_LEASE_FILE], "stdout": ""},
             {"match": ["network", "exists"], "returncode": 1},
+            # The cell's first readiness gate: the target image's setup unit
+            # finished. `active` is measured on all three releases (`SubState`
+            # `exited`, `Result` `success`), and a case that wants another state
+            # says so in its own rules -- see `TargetReadinessTest`. An
+            # unanswered `is-active` is an empty string, which is not `active`, so
+            # leaving this out would make every cell here incomplete rather than
+            # passing, which is a loud failure rather than a silent one.
+            {"match": ["systemctl", "is-active", NM_SETUP_UNIT], "stdout": "active\n"},
         ] + test_dhcp_scenario.cell_rules()
 
 
@@ -297,6 +310,265 @@ class BuildFailureTest(EntryPoint):
             list(results.rglob("host-before.json")) and list(results.rglob("host-after.json")),
             "the run failed on its image and still did not snapshot the host, so there is no "
             "record of what this machine looked like either side of it",
+        )
+
+
+class TargetReadinessTest(EntryPoint):
+    """**A readiness wait on a field is not a readiness wait on the process that
+    owns the field.**
+
+    The cell's only readiness gate was `wait_for_networkmanager_device`, which
+    polls `GENERAL.NM-MANAGED` for `yes`. That field is produced by the target
+    image's `target-nm-setup.service` -- and the service is `Type=oneshot` with
+    `RemainAfterExit=yes`, so between NetworkManager answering `yes` (from the
+    `conf.d` declaration, during the daemon's own activation) and the unit
+    *finishing*, the unit is still running. On 24.04 and 26.04 its third step is
+    `systemctl restart NetworkManager`, so in that window the field reads `yes`
+    and NetworkManager is about to go away.
+
+    Measured, polling a starting 24.04 target once a second:
+
+    ```text
+    t=1s NM-MANAGED='Error: Could not create NMClient object…'  NM='inactive'   unit='inactive'
+    t=2s NM-MANAGED='yes'                                         NM='activating' unit='inactive'
+    ```
+
+    and the unit's own restart, from its journal:
+
+    ```text
+    NetworkManager[55]: caught SIGTERM, shutting down normally.
+    ```
+
+    So the gate returned, the scenario ran `nmcli connection up eth0-managed`, and
+    that landed inside the restart: `Error: NetworkManager is not running` (exit 8).
+    It failed about **1 run in 4**, and **1 in 6 measured on `4867d8d`** with none
+    of the later code checked out -- so it predates the fix round.
+
+    The two facts are separate and neither substitutes for the other: the **unit**
+    is what must be finished first, the **field** is what the scenarios need. The
+    cases below hold the *ordering*, not merely that two waits exist -- a harness
+    that waited on the field and the unit in either order, or on only one, fails
+    one of them.
+    """
+
+    def rules_for(self, *, unit_answers, managed_answers=("yes",)):
+        """The passing table with the two readiness reads made controllable.
+
+        `unit_answers` and `managed_answers` are *sequences*, so a case can say
+        "activating for the first three reads, then active" -- which is what a
+        target that is still booting looks like -- as well as "activating for
+        ever", which is what a target whose unit is wedged looks like. The two are
+        different failures and the failure message has to tell them apart, so the
+        cases need both.
+        """
+        rules = [
+            rule for rule in self.passing_fake_rules()
+            if rule["match"][:1] != ["systemctl"] and rule["match"][:2] != ["nmcli", "-g"]
+        ]
+        return rules + [
+            {"match": ["systemctl", "is-active", "NetworkManager"], "stdout": "active\n"},
+            {"match": ["systemctl", "is-active", NM_SETUP_UNIT],
+             "answers": [{"stdout": f"{state}\n"} for state in unit_answers]},
+            {"match": ["nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", "eth0"],
+             "answers": [{"stdout": f"{value}\n"} for value in managed_answers]},
+            {"match": ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", "eth0"],
+             "stdout": f"{PROFILE}\n"},
+        ] + test_dhcp_scenario.target_rules()
+
+    def cell(self, fake):
+        results = self.directory / "results"
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(results), "--run-id", RUN_ID,
+                      "matrix", "--arch", "amd64", "--versions", "24.04", "--scenario", "dhcp")
+        )
+        return code, output, results
+
+    def managed_reads(self, fake):
+        return [argv for argv in fake.invocations()
+                if argv[:2] == ["exec", TARGET] and argv[2:5] == ["nmcli", "-g", "GENERAL.NM-MANAGED"]]
+
+    def test_a_still_running_setup_unit_stops_the_cell_even_when_the_field_says_yes(self):
+        """**The race, exactly.** The field is `yes`; the unit is still running.
+
+        This is the one that matters, and the shape of it is the whole defect:
+        the field is what the field-based wait looks at, it reads `yes` from the
+        first read, and a harness with only that wait proceeds into a unit that
+        is about to restart NetworkManager. So the case is not "the wait exists"
+        -- it is "the cell refuses *while* the field is already satisfied", which
+        a field-only gate cannot do.
+
+        Two assertions, and the second is the sharp one:
+
+        * the cell is **incomplete**, with a reason naming the unit; and
+        * `GENERAL.NM-MANAGED` was **never read as a gate at all** -- the field
+          check is downstream of the unit check, so a cell that stopped on the
+          unit did not consult the field, and an implementation that read the
+          field first and treated it as sufficient would leave a read behind.
+
+        The second is what makes this an ordering case rather than a presence
+        case. `assertIsNone`-shaped absence assertions are easy to satisfy by
+        accident; this one is satisfied only by doing the checks in the right
+        order.
+        """
+        fake = self.fake(self.rules_for(unit_answers=["activating"], managed_answers=["yes"]))
+        code, output, results = self.cell(fake)
+        self.assertEqual(code, run.EXIT_INCOMPLETE, output)
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        result = document["results"][0]
+        self.assertEqual(result["status"], "incomplete", output)
+        self.assertTrue(result["skips"], "an incomplete cell with no reason to act on")
+        reason = " ".join(skip["reason"] for skip in result["skips"])
+        self.assertIn(NM_SETUP_UNIT, reason,
+                      f"the reason does not name the unit, so the reader is not told what to "
+                      f"look at: {reason}")
+        self.assertEqual(
+            self.managed_reads(fake), [],
+            "the cell stopped on the setup unit but still consulted GENERAL.NM-MANAGED, so the "
+            "field check is not downstream of the unit check -- the ordering is what keeps a "
+            "field that reads 'yes' from standing in for a finished setup",
+        )
+
+    def test_a_setup_unit_that_reports_its_verdict_as_a_failure_stops_the_cell(self):
+        """`failed` is a terminal state too, and the one that matters most.
+
+        The unit is `Type=oneshot` with the script's exit status as its verdict, so
+        `failed` means the target refused to continue -- the profile is missing, or
+        the device is not an ethernet one, or the declaration did not take effect.
+        A wait that only recognised `active` would spin until its budget and then
+        report the same message as a target that is merely slow, which sends the
+        reader to wait rather than to read the unit's own log where the script
+        said which of the three it was.
+        """
+        fake = self.fake(self.rules_for(unit_answers=["failed"], managed_answers=["yes"]))
+        code, output, results = self.cell(fake)
+        self.assertEqual(code, run.EXIT_INCOMPLETE, output)
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        reason = " ".join(skip["reason"] for skip in document["results"][0]["skips"])
+        self.assertIn(NM_SETUP_UNIT, reason)
+        self.assertIn(
+            "failed", reason.lower(),
+            f"the reason does not carry the state the unit reported, so a reader cannot tell a "
+            f"target that refused from one that is still starting: {reason}",
+        )
+        # **And it stops at once.** This is the behaviour that distinguishes a
+        # terminal state from a state the wait is still watching for, and it is
+        # the whole reason `failed` is not treated as "not yet": a wait that
+        # burned its 120s budget here would report a target that already said
+        # what was wrong as one that is merely slow, and a reader would go and
+        # wait instead of reading the unit's log.
+        self.assertIn(
+            "1 reads", reason,
+            f"the wait kept reading after the unit had reached a terminal state, so a target that "
+            f"refused is reported as one that is slow: {reason}",
+        )
+        # The read count is one because the very first read already said `failed`.
+        self.assertEqual(
+            len([argv for argv in fake.invocations()
+                 if argv[:4] == ["exec", TARGET, "systemctl", "is-active"]
+                 and NM_SETUP_UNIT in argv]),
+            1,
+            "the setup unit was read more than once despite reporting a terminal failure",
+        )
+
+    def test_a_unit_that_never_becomes_terminal_names_its_budget_and_read_count(self):
+        """The other bounded path: `inactive` for ever, so the budget runs out.
+
+        Separate from the `failed` case because it is a different reader. `failed`
+        is a target that told us what was wrong; `inactive` is a target whose
+        setup unit has not started at all, which is what a target still booting
+        looks like and what a target with a broken image looks like. The two must
+        not print the same message, and the message for this one has to carry the
+        numbers -- budget, read count, interval -- because "the unit never ran" and
+        "the unit is slow" are different findings and only the read count tells
+        them apart.
+        """
+        fake = self.fake(self.rules_for(unit_answers=["inactive"], managed_answers=["yes"]))
+        code, output, results = self.cell(fake)
+        self.assertEqual(code, run.EXIT_INCOMPLETE, output)
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        reason = " ".join(skip["reason"] for skip in document["results"][0]["skips"])
+        self.assertIn(NM_SETUP_UNIT, reason)
+        for needle in ("did not reach", "120s", "reads", "s apart"):
+            with self.subTest(needle=needle):
+                self.assertIn(
+                    needle, reason,
+                    f"the budget failure does not carry {needle!r}, so a reader cannot tell a "
+                    f"target that never started from one that is merely slow: {reason}",
+                )
+        # And it must have read more than once, or "never became active" is a
+        # claim about one reading.
+        self.assertGreater(
+            len([argv for argv in fake.invocations()
+                 if argv[:4] == ["exec", TARGET, "systemctl", "is-active"]
+                 and NM_SETUP_UNIT in argv]),
+            1,
+            "the wait gave up after a single read, so the budget in the message is not a "
+            "measurement of anything",
+        )
+
+    def test_a_finished_unit_with_an_unmanaged_device_still_stops_the_cell(self):
+        """The other direction, and it is why there are two waits.
+
+        The unit has run and the field is not `yes`. A gate on the *unit* alone
+        would wave this target through, and every scenario would then fail on a
+        lease it never had -- which is the misdirection the device wait's own
+        message was written to avoid. So the field check is not redundant with the
+        unit check, and this case is what says so.
+        """
+        fake = self.fake(self.rules_for(unit_answers=["active"], managed_answers=["no"]))
+        code, output, results = self.cell(fake)
+        self.assertEqual(code, run.EXIT_INCOMPLETE, output)
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        result = document["results"][0]
+        reason = " ".join(skip["reason"] for skip in result["skips"])
+        self.assertIn("GENERAL.NM-MANAGED", reason,
+                      f"the reason does not name the field, so it cannot be told from a target "
+                      f"that is merely still setting up: {reason}")
+        self.assertTrue(
+            any("GENERAL.NM-MANAGED" in " ".join(argv) for argv in fake.invocations()),
+            "the cell stopped without ever reading the managed field, so the second check is "
+            "not being made",
+        )
+
+    def test_a_unit_that_finishes_late_is_waited_for_rather_than_refused(self):
+        """The control for the case above: `activating` then `active` must pass.
+
+        A gate that refused the *first* non-`inactive` reading would turn this
+        case green by being a race-detector rather than a wait -- and would then
+        fail every healthy target, because a healthy target's unit is `activating`
+        for the first second or two of its life. So the sequence is the one the
+        cases above omit: still activating, then active, and the cell proceeds.
+        """
+        fake = self.fake(self.rules_for(
+            unit_answers=["activating", "activating", "active"], managed_answers=["yes"]))
+        code, output, _ = self.cell(fake)
+        self.assertEqual(code, run.EXIT_OK, output)
+
+    def test_the_unit_wait_and_the_field_wait_are_both_ordered_unit_first(self):
+        """The ordering, read off the invocation log rather than inferred.
+
+        Every other case here asserts an outcome. This one asserts the sequence
+        itself, so a future edit that hoists the field check back above the unit
+        check fails here even if the outcomes still happen to come out right --
+        which is exactly the regression that produced the flake, and the reason
+        the flake was invisible for a whole task.
+        """
+        fake = self.fake(self.rules_for(unit_answers=["active"], managed_answers=["yes"]))
+        self.cell(fake)
+        first_unit = next(
+            index for index, argv in enumerate(fake.invocations())
+            if argv[:4] == ["exec", TARGET, "systemctl", "is-active"]
+            and NM_SETUP_UNIT in argv
+        )
+        first_field = next(
+            index for index, argv in enumerate(fake.invocations())
+            if argv[2:5] == ["nmcli", "-g", "GENERAL.NM-MANAGED"]
+        )
+        self.assertLess(
+            first_unit, first_field,
+            "the managed-device field is consulted before the setup unit that owns it has "
+            "finished; a target can read 'yes' mid-restart, which is the race this gate exists "
+            "to close",
         )
 
 

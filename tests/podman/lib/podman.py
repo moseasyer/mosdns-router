@@ -445,6 +445,26 @@ class NetworkManagerDeviceError(PodmanError):
     """
 
 
+class NetworkManagerSetupError(NetworkManagerDeviceError):
+    """The target's own NetworkManager setup has not finished, or refused.
+
+    **A subclass, and that is load-bearing twice.** `run_target` already reports
+    a `NetworkManagerDeviceError` as an *incomplete cell* with a reason, which is
+    exactly right for this -- a target whose setup unit is mid-restart is not a
+    failed test, it is a target that is not ready -- so subclassing means one
+    `except` covers both readiness gates and neither can be raised without the
+    cell reporting it as incomplete. And it keeps the narrower type available:
+    `except NetworkManagerSetupError` before `except NetworkManagerDeviceError`
+    is how the cell names the *unit's* requirement in the skip rather than the
+    device's, so the requirement recorded in the report is the one that was
+    actually not met.
+
+    The boundary it draws is the same one the parent draws: this is the state of
+    the machine before a scenario runs, never a scenario's own failure. A
+    scenario that raises this would be reporting a broken matrix as a broken
+    harness, and `DhcpScenarioError` is the type for that.
+    """
+
 # The device a target gets on a netavark bridge network, and the two steps that
 # make NetworkManager manage it. Both are measured facts and both are stated
 # wherever the check is, because the previous plan's SKIPPED list came from
@@ -452,6 +472,50 @@ class NetworkManagerDeviceError(PodmanError):
 NM_DEVICE = "eth0"
 NM_MANAGED_FIELD = "GENERAL.NM-MANAGED"
 NM_MANAGED_YES = "yes"
+
+# The unit that makes the device managed, and the one state of it that means the
+# job is done.
+#
+# **The terminal state is `active`, measured on all three releases** -- not
+# assumed. The unit is `Type=oneshot` with `RemainAfterExit=yes`, so after its
+# script exits it stays `active` with `SubState=exited`, and that is the state
+# the cell must reach before any scenario runs. Measured, per release, on a
+# freshly started target:
+#
+# ```text
+# release  nmcli     ActiveState  SubState  Result   is-enabled
+# 22.04    1.36.6    active       exited    success  enabled
+# 24.04    1.46.0    active       exited    success  enabled
+# 26.04    1.54.3    active       exited    success  enabled
+# ```
+#
+# **It is the same on all three, and that is worth saying rather than
+# discovering per release.** 22.04 is where the setup script *skips* the override
+# sequence, so it is the obvious release to expect a different unit state -- and
+# it is not different: the script still runs, still creates the profile, still
+# makes its own check and still exits 0. Only two commands inside it are skipped.
+# So a per-release special case here would be a rule about a difference that does
+# not exist, and it would be one more thing to keep true.
+#
+# `failed` is the other terminal state, and it is the one a reader most needs to
+# be told about: the script's exit status *is* the unit's verdict (`Type=oneshot`,
+# no `Restart=`), and it exits non-zero with a message naming which of the three
+# things went wrong -- no profile, not an ethernet device, or the `conf.d`
+# declaration did not take effect. So the gate accepts `active`, refuses
+# `failed` *immediately* rather than waiting out its budget, and its refusal
+# points at `journalctl -u target-nm-setup.service` in that target.
+#
+# `activating` is not terminal and is not a failure: it is what a healthy target
+# reads for the first second or two, and it is the state the race lives in.
+NM_SETUP_UNIT = "target-nm-setup.service"
+NM_SETUP_ACTIVE = "active"
+NM_SETUP_TERMINAL = ("active", "failed")
+# `systemctl is-active` is documented to exit 0 only for `active`; these are the
+# states a caller can be given, and the last is what an answer with no state in
+# it looks like. `activating` is in neither list and is the state the cell waits
+# through, deliberately and silently.
+NM_SETUP_IN_FLIGHT = "activating"
+NM_SETUP_UNKNOWN = ""
 NM_MANAGE_STEPS = (
     "nmcli device set eth0 managed yes",
     "systemctl restart NetworkManager",
@@ -1492,6 +1556,26 @@ class Podman:
             container, "nmcli", "-g", NM_MANAGED_FIELD, "device", "show", device
         ).output
 
+    def setup_unit_state(self, container: str, unit: str = NM_SETUP_UNIT) -> str:
+        """The state of the target image's NetworkManager setup unit.
+
+        **Asked without `check=True`, deliberately.** `systemctl is-active` exits
+        non-zero for every state that is not `active` -- `activating`, `inactive`,
+        `failed` -- and all three are answers this read has to return rather than
+        raise on: `activating` is the state a healthy target is in for the first
+        second or two of its life, and `failed` is the state that carries the
+        setup script's own verdict. A read that raised on them would turn the
+        commonest case into an exception and the most informative case into a
+        traceback.
+
+        The state is returned as a bare word (`active`, `activating`, `failed`,
+        `inactive`, `unknown`) rather than a full status line, because the gate
+        compares it against one word and the reason the reader is given has to be
+        that word.
+        """
+        result = self.exec_container(container, "systemctl", "is-active", unit)
+        return (result.output or "").strip().splitlines()[-1].strip() if result.output.strip() else ""
+
 
 def assert_networkmanager_manages_device(
     podman: Podman, container: str, device: str = NM_DEVICE
@@ -1612,6 +1696,112 @@ def wait_for_networkmanager_device(
         f"ruled out ('journalctl -b' and 'systemctl is-active NetworkManager' inside {container}).\n"
         + _NM_MANAGE_STEPS_TEXT
         + NM_UNMANAGED_EXPLANATION
+    )
+
+
+# The target's own setup budget. A healthy target reaches `active` in **two to
+# three seconds** on every release measured (22.04 2s, 24.04 3s, 26.04 2s), so
+# this is not a tight bound -- it is a bound. It matches the device wait's budget
+# deliberately, so the two gates cannot disagree about how long a target is
+# allowed to take, and a reader who reads one of the two messages is not left
+# wondering whether the other is more patient.
+NM_SETUP_BOOT_TIMEOUT = NM_DEVICE_BOOT_TIMEOUT
+# **The same 5s as the device wait, and the argument is consistency rather than
+# latency.** A 1s interval would notice a unit that finished at t=2s about three
+# seconds sooner, which on a ~40s cell is not worth a second set of constants to
+# explain; and the interval is not free, because each read is a `podman exec`
+# subprocess. On a *virtual* clock -- which is how every case in `test_command.py`
+# runs a cell -- a wait that can never succeed does not stop early: it runs the
+# whole budget, so 120s/1s means 121 subprocess spawns in one case, and 120s/5s
+# means 25. The interval is therefore also the suite's cost for exercising this
+# gate's failure path, and 5s is the cheaper of the two by a factor of five.
+NM_SETUP_POLL_INTERVAL = NM_DEVICE_POLL_INTERVAL
+
+
+def wait_for_networkmanager_setup(
+    podman: Podman,
+    container: str,
+    unit: str = NM_SETUP_UNIT,
+    *,
+    timeout: float = NM_SETUP_BOOT_TIMEOUT,
+    interval: float = NM_SETUP_POLL_INTERVAL,
+    now=time.monotonic,
+    sleep=time.sleep,
+) -> str:
+    """Wait for the target image's NetworkManager setup unit to reach a terminal state.
+
+    **This is a gate, not a check, and it is the first of two.** The cell waits
+    here and *then* waits for `GENERAL.NM-MANAGED`, and the order is the whole
+    point -- see `TargetReadinessTest` for the measurement. In one sentence: the
+    field this harness used to gate on is produced by the unit this waits for, and
+    the unit is still running when the field first reads `yes`.
+
+    Two behaviours that are not decoration:
+
+    * **`failed` stops the wait immediately.** It is a terminal state and it
+      carries the setup script's own verdict, so waiting out the budget would
+      report a target that has already said what was wrong as one that is merely
+      slow. The message points at the unit's log rather than at the two
+      NetworkManager steps, because the script's message is the specific one --
+      it names whether the profile was missing, the device was not an ethernet
+      one, or the `conf.d` declaration did not take effect.
+
+    * **The failure names the last state it saw, and the budget.** A reader who
+      sees `answered 'inactive'` and a reader who sees `answered 'inactive' on
+      120 reads over 120.0s` know different things, and only the second knows the
+      answer was not a race.
+
+    Returns the terminal state, which is `NM_SETUP_ACTIVE` on the only path that
+    does not raise.
+    """
+    deadline = now() + timeout
+    last_state: str | None = None
+    last_error: str | None = None
+    reads = 0
+    while True:
+        reads += 1
+        try:
+            last_state = podman.setup_unit_state(container, unit)
+            last_error = None
+            if last_state == NM_SETUP_ACTIVE:
+                return last_state
+            if last_state == "failed":
+                raise NetworkManagerSetupError(
+                    f"{unit} FAILED in {container} after {reads} reads {interval:g}s apart. The "
+                    f"unit is Type=oneshot with the setup script's exit status as its verdict, so "
+                    f"it has already said what went wrong and the harness is not going to wait "
+                    f"for a second opinion: read its own log, which names which of the three it "
+                    f"was.\n"
+                    f"  journalctl -u {unit} -b            # inside {container}\n"
+                    f"  systemctl show {unit}             # Result, and the exit code\n"
+                    f"The unit creates the '{NM_PROFILE_STEP.split('--')[0].strip()}' connection "
+                    f"profile, and on releases with a persistent device override (from "
+                    f"{'.'.join(str(p) for p in NM_OVERRIDE_MINIMUM)} -- measured "
+                    f"{', '.join(sorted(NM_OVERRIDE_MEASUREMENTS))}) it also runs "
+                    f"'nmcli device set {NM_DEVICE} managed yes' and restarts NetworkManager, which "
+                    f"is why a scenario must not start before this unit is finished."
+                )
+        except NetworkManagerSetupError:
+            raise
+        except PodmanError as error:
+            last_error = str(error)
+        if now() >= deadline:
+            break
+        sleep(interval)
+    if last_error:
+        seen = f"the last query failed: {last_error.splitlines()[-1]}"
+    else:
+        seen = f"'systemctl is-active {unit}' answered {last_state!r}"
+    raise NetworkManagerSetupError(
+        f"{unit} did not reach {NM_SETUP_ACTIVE!r} in {container} after {timeout:g}s and {reads} "
+        f"reads {interval:g}s apart: {seen}. That is the gate a target has to pass before any "
+        f"scenario runs, and it is a *different* question from whether NetworkManager manages "
+        f"{NM_DEVICE} -- the unit owns that field and is still holding it. A target that has not "
+        f"finished booting answers the same way, and a target whose script refused exits "
+        f"'failed' and is reported at once rather than after this budget.\n"
+        f"  journalctl -u {unit} -b            # inside {container}: the script's own verdict\n"
+        f"  systemctl is-active NetworkManager # the unit restarts it on 24.04 and 26.04\n"
+        f"  nmcli -g {NM_MANAGED_FIELD} device show {NM_DEVICE}\n"
     )
 
 

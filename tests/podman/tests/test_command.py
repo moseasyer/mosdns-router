@@ -349,7 +349,26 @@ class FakePodmanBinary:
     matched first.
     """
 
-    DEFAULT_RULES = ({"match": ["network", "exists"], "returncode": 1},)
+    # The defaults every fake in this file starts from. So: a network the run
+    # has not created, and a target whose setup unit has finished.
+    #
+    # **The setup unit is here because most cases in this file are about
+    # something downstream of the cell's first readiness gate** -- the device
+    # wait, scenario ordering, the exit codes -- and each of them would otherwise
+    # have to carry the same line. `systemctl is-active target-nm-setup.service`
+    # answers `active`, which is the measured state on all three releases
+    # (`SubState=exited`, `Result=success`).
+    #
+    # It is a *default*, and `write_table` puts explicit rules first, so any case
+    # that wants a different state gets it. That is what keeps the default
+    # honest rather than load-bearing: `test_matrix_cell.TargetReadinessTest`
+    # passes explicit answers and asserts that `activating` and `failed` both stop
+    # the cell, so a case that relied on this default to be *wrong* would have to
+    # override it, and then be caught.
+    DEFAULT_RULES = (
+        {"match": ["network", "exists"], "returncode": 1},
+        {"match": ["systemctl", "is-active", "target-nm-setup.service"], "stdout": "active\n"},
+    )
 
     def __init__(self, directory, rules=None):
         self.directory = directory
