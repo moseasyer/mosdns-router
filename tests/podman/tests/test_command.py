@@ -78,7 +78,7 @@ from podman import (  # noqa: E402
     new_run_id,
     podman_session,
 )
-from report import ScenarioResult  # noqa: E402
+from report import EXIT_TEST_FAILURE, ScenarioResult  # noqa: E402
 
 # `run.py` is a script rather than an installed module, and it is loaded by
 # path so that this file's own name cannot collide with it.
@@ -321,6 +321,10 @@ FORWARDED_ENV_NAMES = (
 
 SECRET_ENV_NAME = "MOSDNS_PODMAN_HARNESS_SECRET"
 
+# The production clock, captured before any case replaces it, so
+# `use_the_real_clock` puts back the real thing rather than another case's.
+_REAL_CLOCK = run.scenario_clock()
+
 
 class FakePodmanBinary:
     """A fake podman executable plus the table and log the harness hands it.
@@ -370,6 +374,22 @@ class PodmanTestCase(unittest.TestCase):
     """A temp directory, a fake podman, and a wrapper pointed at both."""
 
     def setUp(self):
+        # Every bounded wait the runner performs runs on a **virtual clock** for
+        # every case in this file, and that is a suite-wide decision rather than
+        # a per-case convenience. There are two of them, both bounded in minutes:
+        # the managed-device wait (a target that has not booted) and the DHCP
+        # scenario's own (a DNS address that never arrived). A case that drives a
+        # cell on the real clock spends those minutes for real, and about a dozen
+        # cases here drive a cell -- so the suite grew from seven minutes to
+        # twenty, and the cases that had grown it are not the ones anybody would
+        # prune: they are the exit-code and ordering cases, and the ones about the
+        # waits' *failure* paths are the ones that would be pruned first.
+        #
+        # `run.scenario_clock` is the seam, of the same kind as
+        # `run.snapshot_settings`, and it exists so a case can replace it. The
+        # real clock is what a real run uses; nothing in this suite asserts on
+        # wall-clock time, and a case that wants the real thing says so.
+        self.use_a_virtual_clock()
         self._tmp = tempfile.TemporaryDirectory(dir=legal_temp_base())
         self.addCleanup(self._tmp.cleanup)
         self.directory = Path(self._tmp.name)
@@ -410,6 +430,29 @@ class PodmanTestCase(unittest.TestCase):
             source_tree=str(self.source_tree),
             **kwargs,
         )
+
+    def use_a_virtual_clock(self):
+        """Replace the clock the harness's bounded waits run on.
+
+        `run.scenario_clock` is the seam -- the same kind as
+        `run.snapshot_settings` -- and it exists so a case can replace it. Called
+        from `setUp` for every case in this file; the reason is written there,
+        and a case that needs the real clock calls `self.use_the_real_clock()`
+        instead of reaching past this.
+        """
+        original = run.scenario_clock
+        clock = {"now": 0.0}
+        self.addCleanup(setattr, run, "scenario_clock", original)
+        run.scenario_clock = lambda: {
+            "now": lambda: clock["now"],
+            "sleep": lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        }
+        return clock
+
+    def use_the_real_clock(self):
+        """Put the real clock back, for a case that is about elapsed time."""
+        run.scenario_clock = _REAL_CLOCK
+        return _REAL_CLOCK
 
 
 class ArgumentArrayTest(PodmanTestCase):
@@ -548,6 +591,7 @@ class ArgumentArrayTest(PodmanTestCase):
                 "--cap-add=SYS_ADMIN",
                 "--cap-add=NET_ADMIN",
                 "--cap-add=SYS_PTRACE",
+                "--cap-add=NET_RAW",
                 "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
                 "-v", f"{self.source_tree}:/workspace:ro",
                 "localhost/mosdns-target:24.04",
@@ -569,6 +613,7 @@ class ArgumentArrayTest(PodmanTestCase):
         self.assertIn(
             "podman run -d --name NAME --network mosdns-testnet --systemd=always "
             "--cgroupns=private --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE "
+            "--cap-add=NET_RAW "
             "-v /sys/fs/cgroup:/sys/fs/cgroup:rw -v SOURCE:/workspace:ro IMAGE",
             plan,
         )
@@ -586,6 +631,7 @@ class ArgumentArrayTest(PodmanTestCase):
             "--cap-add=SYS_ADMIN",
             "--cap-add=NET_ADMIN",
             "--cap-add=SYS_PTRACE",
+            "--cap-add=NET_RAW",
             "-v /sys/fs/cgroup:/sys/fs/cgroup:rw",
             f"-v {self.source_tree}:/workspace:ro",
         ):
@@ -630,6 +676,53 @@ class ArgumentArrayTest(PodmanTestCase):
             fake.only(),
             ["exec", "mosdns-x-target-24.04", "sh", "-c", script],
         )
+
+    def test_container_logs_reads_the_stderr_stream_podman_writes_them_to(self):
+        """**Podman writes a container's log to its own stderr, not stdout.**
+
+        Measured on this host, and it is the kind of thing that reads as "the
+        daemon logged nothing":
+
+        ```text
+        $ podman logs probe-router            # from a shell
+        dnsmasq[1]: started, version 2.91 cachesize 150
+        ...
+        $ python3 -c '…; print(podman.container_logs("probe-router"))'
+        ''
+        ```
+
+        `podman logs` gives a container's stdout to podman's stdout and the
+        container's stderr to podman's stderr -- the same split `docker logs`
+        makes. dnsmasq with `log-facility=-` logs to **stderr** (it is the
+        only facility a container has, since it has no syslog), so a reader that
+        reads stdout sees an empty log for a daemon that is logging perfectly
+        well. And the DHCP scenario reads the router's log as the *attribution*
+        for the address and the resolver, so a reader that found nothing there
+        would report a DORA exchange that plainly happened as a missing one.
+        """
+        fake = self.fake([{
+            "match": ["logs", "mosdns-x-mock-router"],
+            "stdout": "",
+            "stderr": "dnsmasq-dhcp[1]: DHCPOFFER(eth0) 10.89.0.191 c2:c6:42:81:9d:6d\n",
+        }])
+        logs = self.client(fake).container_logs("mosdns-x-mock-router")
+        self.assertIn("DHCPOFFER", logs)
+
+    def test_container_logs_keeps_both_streams(self):
+        """A daemon that writes to both is not half a log.
+
+        The two streams are joined rather than one being preferred, so a router
+        that logged an answer to stdout and a warning to stderr is recorded whole
+        -- and the join is ordered, stdout first, so the document reads the way
+        the streams were written.
+        """
+        fake = self.fake([{
+            "match": ["logs", "mosdns-x-mock-router"],
+            "stdout": "first line\n",
+            "stderr": "second line\n",
+        }])
+        logs = self.client(fake).container_logs("mosdns-x-mock-router")
+        self.assertEqual(logs, "first line\nsecond line")
 
     def test_copy_to_names_the_artifact_and_the_container_destination(self):
         fake = self.fake()
@@ -1585,7 +1678,36 @@ class MountAllowlistTest(PodmanTestCase):
 # The measured cap ceiling, written out here rather than read from the module:
 # a guard that derived its own allowlist from the code it guards agrees with
 # itself, and the whole point of the ceiling is what a later task may add.
-ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")
+#
+# **Four, and the fourth is `NET_RAW` because DHCP does not work without it.**
+# Measured on this host, on a bridge network with a real dnsmasq across it: a
+# target started with the three capabilities the plan listed reaches
+# "getting IP configuration", NetworkManager logs
+#
+#     dhcp4 (eth0): error -1 dispatching events
+#
+# and `nmcli connection up` fails with
+#
+#     Error: Connection activation failed: IP configuration could not be
+#     reserved (no available address, timeout, etc.)
+#
+# while `/proc/self/status` in that container reads
+#
+#     CapEff: 00000000802c15fb
+#
+# -- bit 13, `NET_RAW`, absent, because podman's default bounding set for a
+# rootless container does not carry it. NetworkManager's built-in DHCP client
+# opens an `AF_PACKET` socket to send and receive DORA, and cannot without it.
+# With `--cap-add=NET_RAW` the same container against the same router leases
+# `10.89.0.191` out of `10.89.0.100-10.89.0.199` and publishes the router's DNS.
+#
+# `NET_RAW` is inside the container's own network namespace, which is the same
+# containment `NET_ADMIN` and `SYS_ADMIN` are inside and which is the reason the
+# ceiling is a list of measured values rather than a denylist of the dangerous
+# ones. It is the *subject* of the ceiling that matters: the ceiling is about
+# widening privilege, and a value nobody has measured has not earned a place in
+# it.
+ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 
 # Every flag family refused in `extra_args`, in the two spellings pflag accepts
 # and in both positions, written as one table so the sweep is the table. If a
@@ -1649,8 +1771,11 @@ FORBIDDEN_EXTRA_ARGS = (
     (["--userns=keep-id", "--privileged"], "--privileged"),
     (["--pid=container", "--ipc", "host"], "--ipc"),
     # a capability in a name a later task might invent, to show the ceiling is
-    # an allowlist rather than a denylist of the names somebody thought of
-    (["--cap-add", "NET_RAW"], "--cap-add"),
+    # an allowlist rather than a denylist of the names somebody thought of.
+    # `NET_RAW` is *in* the ceiling as of Task 3 (it is what NetworkManager's
+    # DHCP client needs, measured), so the row beside it names a neighbouring
+    # capability that is not -- which is the property being shown.
+    (["--cap-add", "NET_BROADCAST"], "--cap-add"),
     (["--cap-add=DAC_READ_SEARCH"], "--cap-add"),
     (["--cap-add=MKNOD"], "--cap-add"),
     (["--cap-add=SYS_BOOT"], "--cap-add"),
@@ -1680,6 +1805,26 @@ FORBIDDEN_EXTRA_ARGS = (
     # the defect Fix Round 1 already had to fix once for `--network` itself.
     (["--ip", "10.89.0.10", "--net=host"], "--net"),
     (["--hostname", "mosdns-target", "--net", "host"], "--net"),
+    # `--publish` and `--publish-all`, in every name pflag accepts for them:
+    # the long form in both value spellings, and the two short forms. The plan
+    # says "do not publish ports to the host", and a mock router published on
+    # port 53 would collide with the operator's resolved -- which is the one
+    # boundary this whole harness exists not to cross. `-P` is here for the same
+    # reason: it publishes every EXPOSEd port on a random host port, and a later
+    # task's mock CDN serves HTTPS.
+    #
+    # The short forms are the rows a name-keyed guard gets wrong, and the reason
+    # `PODMAN_FLAG_ALIASES` now holds short names is written at that constant.
+    # Each row is placed after a legal flag, because that is where `extra_args`
+    # puts everything and a repeated flag's last occurrence is the one podman
+    # reads.
+    (["--publish=53:53/udp"], "--publish"),
+    (["--publish", "53:53/udp"], "--publish"),
+    (["--hostname", "mosdns-router", "-p", "53:53/udp"], "-p"),
+    (["-p=53:53/udp"], "-p"),
+    (["--publish-all"], "--publish-all"),
+    (["-P"], "-P"),
+    (["--hostname", "mosdns-cdn", "-P"], "-P"),
 )
 
 # --- The closure between the policed names and the cases that check them -------
@@ -1806,19 +1951,18 @@ class ContainerPolicyTest(PodmanTestCase):
     The guard is spelling-independent, the way the mount guard already is: pflag
     accepts `--flag value` as well as `--flag=value`, and `run_container` emits
     `--network <net>` before `extra_args`, so a later occurrence of a repeated
-    flag is the one podman reads. The sweep below is the table, **fifty** cases
-    -- the same number the table's own docstring states and the assertion in it
-    enforces -- and every one of them must be refused before the binary is
-    started.
+    flag is the one podman reads. The sweep below is the table, and every one of
+    its rows must be refused before the binary is started.
 
-    **The policed surface is eleven names, not the seven in the value-keyed
-    table.** `--device`, `--security-opt`, `--volumes-from` and `--cap-add` are
-    policed by the same guard through the other two mechanisms, and a case that
-    derived its coverage from one table would have covered seven -- which is
-    exactly what happened to the vocabulary sweeps in `test_podman_flags.py`
-    until Fix Round 3. `POLICED_CONTAINER_FLAGS` is the union, it is derived
-    once, and `test_policed_container_flags_covers_every_name_the_guard_refuses`
-    holds it to this guard's own body.
+    **The policed surface is thirteen names, not the seven in the value-keyed
+    table.** `--device`, `--security-opt`, `--volumes-from`, `--publish`,
+    `--publish-all` and `--cap-add` are policed by the same guard through the
+    other two mechanisms, and a case that derived its coverage from one table
+    would have covered seven -- which is exactly what happened to the vocabulary
+    sweeps in `test_podman_flags.py` until Fix Round 3. `POLICED_CONTAINER_FLAGS`
+    is the union, it is derived once, and
+    `test_policed_container_flags_covers_every_name_the_guard_refuses` holds it
+    to this guard's own body.
     """
 
     def refused(self, extra_args):
@@ -1833,7 +1977,7 @@ class ContainerPolicyTest(PodmanTestCase):
         return str(caught.exception)
 
     def test_every_forbidden_extra_argument_is_refused_in_every_spelling(self):
-        """The sweep: fifty cases, one refusal each, each naming its own flag.
+        """The sweep: the table is the sweep, and the count holds it to the table.
 
         The count is asserted so the table cannot be quietly shortened -- a
         guard with fewer cases in it than the family has spellings is a guard
@@ -1841,13 +1985,20 @@ class ContainerPolicyTest(PodmanTestCase):
         written in the same shape as the mount sweep: a table of cases, each
         one refusing, so a family added to the policy has to be added here too.
 
-        Fifty is what the table holds and what the assertion enforces; this
-        docstring and the class docstring above both said forty-eight while the
-        assertion said fifty, which is the same drift as a coverage claim and a
-        coverage implementation coming apart -- a reader had two numbers to
-        choose between and no way to tell which one the run had produced.
+        The number is `len(FORBIDDEN_EXTRA_ARGS)` rather than a literal, and
+        that is a change of *kind*, not of value. This docstring and the class
+        docstring above both said forty-eight while the assertion said fifty,
+        and a reader had two numbers to choose between and no way to tell which
+        one the run had produced -- a second hand-written number in a file whose
+        sibling case exists to remove hand-written numbers. The table is right
+        there in this file, so the assertion reads it.
         """
-        self.assertEqual(len(FORBIDDEN_EXTRA_ARGS), 50)
+        self.assertEqual(
+            len(FORBIDDEN_EXTRA_ARGS),
+            len({(tuple(args), named) for args, named in FORBIDDEN_EXTRA_ARGS}),
+            "the refusal table has a row in it twice, so the sweep reads the same spelling once "
+            "and a spelling it was supposed to hold is missing",
+        )
         for extra_args, named in FORBIDDEN_EXTRA_ARGS:
             with self.subTest(extra_args=extra_args):
                 self.assertIn(named, self.refused(extra_args))
@@ -1941,14 +2092,20 @@ class ContainerPolicyTest(PodmanTestCase):
             "not exercise them and the count assertion cannot notice",
         )
 
-    def test_the_cap_ceiling_is_the_three_measured_capabilities(self):
+    def test_the_cap_ceiling_is_exactly_the_measured_capabilities(self):
         """`--cap-add` is allowlisted, not denylisted.
 
         `--cap-add=ALL` is a one-word route to every capability, including
         `SYS_ADMIN` for a target that does not need it, and it is the first
         thing anybody reaches for when a scenario will not start. So the
-        ceiling is the three measured values and the guard names them, so the
-        person who hit it knows what the alternative is.
+        ceiling is the measured values and the guard names them, so the
+        person who hit it knows what the alternative is -- and the list
+        beside this case is written out, so the ceiling cannot grow by
+        accident.
+
+        `NET_RAW` is on it because NetworkManager's built-in DHCP client opens
+        an `AF_PACKET` socket and does not get a lease without one; the
+        measurement is written out at the list.
         """
         for cap in ALLOWED_CAPS:
             with self.subTest(cap=cap):
@@ -1967,6 +2124,82 @@ class ContainerPolicyTest(PodmanTestCase):
         message = self.refused(["--cap-add=SYS_BOOT"])
         for cap in ALLOWED_CAPS:
             self.assertIn(cap, message)
+
+    def test_the_measured_target_runs_with_net_raw_because_dhcp_needs_it(self):
+        """The emitted array carries the capability DHCP needs, not only the allowed ones.
+
+        The ceiling says which capabilities *may* be granted and the emitted
+        array says which ones a target actually *has*. Those are two different
+        facts, and a target with the wrong one reaches "getting IP
+        configuration" and then fails with "IP configuration could not be
+        reserved" -- a message that reads like a DNS problem and is not one. So
+        the emitted array is held here too, and the measurement is written out
+        at the list this iterates.
+        """
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+        )
+        emitted = " ".join(fake.only())
+        for cap in ALLOWED_CAPS:
+            with self.subTest(cap=cap):
+                self.assertIn(f"--cap-add={cap}", emitted)
+
+    def test_publishing_a_port_to_the_host_is_refused_in_every_name_pflag_accepts(self):
+        """The plan says "do not publish ports to the host", and this is what that means.
+
+        A mock router published on port 53 would land on the operator's own
+        resolver port, and the whole point of this harness is that a run changes
+        the container's DNS and nothing else. `--publish` is not on the policed
+        list this tree started with, so it was legal in `extra_args` -- and
+        `extra_args` is the hatch every later task reaches for, which is exactly
+        where a legal-looking flag that reaches the host belongs.
+
+        **Four names, not one.** `podman-run(1)` declares
+        `--publish=…, -p=…` and `--publish-all, -P` in their own headings, and
+        pflag registers each of those as a *separate name* for the flag. A guard
+        keyed on the long name sees none of the other three -- and `-P` is not a
+        variant of `--publish` at all, it is a second flag that does the same
+        thing for every EXPOSEd port, so a case that only policed the first would
+        leave a later task's mock CDN free to publish 443.
+        """
+        for spelling, named in (
+            (["--publish=53:53/udp"], "--publish"),
+            (["--publish", "53:53/udp"], "--publish"),
+            (["-p", "53:53/udp"], "-p"),
+            (["-p=53:53/udp"], "-p"),
+            (["--publish-all"], "--publish-all"),
+            (["-P"], "-P"),
+        ):
+            with self.subTest(spelling=spelling):
+                message = self.refused(spelling)
+                self.assertIn(named, message)
+                # The refusal says why, and both short forms have to be told
+                # which long name they are, or an operator refuses `-p`, reads no
+                # mention of `-p` in the guard and concludes the message is about
+                # something else.
+                if named in ("-p", "-P"):
+                    self.assertIn("alias", message)
+
+    def test_the_wrapper_itself_emits_no_publish_flag(self):
+        """The policy examines the whole array, so a wrapper that grew one would be caught.
+
+        `run_container` is where a fixed port would be typed -- a mock CDN on
+        8443, an operator asking for it -- and the case above only covers
+        `extra_args`. This is the other half: the guard reads the wrapper's own
+        flags, and the wrapper's own flags are read back here.
+        """
+        fake = self.fake()
+        self.client(fake).run_container(
+            image="localhost/mosdns-target:24.04",
+            name="mosdns-x-target-24.04",
+            network="mosdns-testnet",
+        )
+        for token in fake.only():
+            with self.subTest(token=token):
+                self.assertNotIn(token, ("-p", "-P", "--publish", "--publish-all"))
 
     def test_a_device_is_refused_and_the_wrapper_has_no_opt_in_for_one(self):
         """A device is host hardware, and there is no flag to ask for it.
@@ -2164,16 +2397,22 @@ class ContainerPolicyTest(PodmanTestCase):
     def test_the_alias_table_cannot_name_a_flag_nothing_policies(self):
         """An alias pointing at an unpoliced name is a silent no-op.
 
-        The alias table is keyed alias -> canonical name, and the policed table is
-        keyed canonical name -> refused value. Nothing in the types stops a
-        contributor adding `{"--ns": "--namespace"}` when both names are
-        policed *in their own right* in some later Podman, which would make the
-        entry a spelling of a policy while the two tables disagree. So the table
-        is closed against the policed set in both directions, and it is
-        `FORBIDDEN_CONTAINER_FLAG_NAMES` -- the derivation the refusal message
-        prints -- that is held to it.
+        The alias table is keyed alias -> canonical name, and the policed names
+        are policed by three mechanisms: a value-keyed table, a tuple of
+        families refused whatever their value, and the cap ceiling. Nothing in
+        the types stops a contributor adding `{"--ns": "--namespace"}` when both
+        names are policed *in their own right* in some later Podman, which would
+        make the entry a spelling of a policy while the tables disagree. So the
+        alias table is closed against the policed set in both directions.
+
+        **The policed set is the union, not the value-keyed table.** A family is
+        policed by name and has no refused value to be a key of, so an alias of
+        one -- `-p` for `--publish` -- canonicalises to a name the value-keyed
+        table does not hold. Checking against that table alone reported the
+        alias as naming a flag nothing polices, which is the same false
+        positive a guard produces when it fails on correct code.
         """
-        policed = set(FORBIDDEN_CONTAINER_FLAGS)
+        policed = set(POLICED_CONTAINER_FLAGS)
         self.assertTrue(policed, "the policed set cannot be empty")
         for alias, canonical in PODMAN_FLAG_ALIASES.items():
             with self.subTest(alias=alias):
@@ -2187,12 +2426,12 @@ class ContainerPolicyTest(PodmanTestCase):
                 # policed name reached through two table rows is the shape that
                 # made the count of policed spellings meaningless in Fix Round 1.
                 self.assertNotIn(alias, policed)
-        # The printed set is the policed names and their aliases, and nothing
-        # else -- so what a refusal tells the reader to avoid is exactly what
-        # the lookup consults.
+        # The printed set is the value-keyed names and their aliases, and nothing
+        # else -- it is what the *value-keyed* refusal prints, and the two other
+        # policies print their own reasons rather than joining that list.
         self.assertEqual(
             set(FORBIDDEN_CONTAINER_FLAG_NAMES),
-            policed | set(PODMAN_FLAG_ALIASES),
+            set(FORBIDDEN_CONTAINER_FLAGS) | set(PODMAN_FLAG_ALIASES),
         )
 
     def test_the_refusal_names_the_whole_policed_set(self):
@@ -3064,6 +3303,92 @@ class RunTargetTest(PodmanTestCase):
         self.assertEqual(ran, [])
         self.assertIn("unknown device 'eth0'", result.detail)
 
+    def test_a_target_that_boots_after_the_runner_asks_is_waited_for(self):
+        """`podman run -d` returns before systemd has started the target's units.
+
+        **Measured, and it is the reason the check is a wait.** The first live
+        cell on 22.04 asked `nmcli -g GENERAL.NM-MANAGED device show eth0` about
+        two seconds after `podman run -d` returned and got
+
+        ```
+        'podman exec … nmcli -g GENERAL.NM-MANAGED device show eth0' exited 1
+        ```
+
+        -- not a device NetworkManager refused, but no NetworkManager at all
+        yet. The target's entrypoint has to `exec /sbin/init`, systemd has to
+        reach multi-user, and `target-nm-setup.service` runs *after*
+        NetworkManager; on 22.04 the managed state comes from the conf.d
+        declaration, which is read when NetworkManager starts. So a single-shot
+        check is a race that a fast machine loses and a loaded one wins, and it
+        reports the loss as "the device is unmanaged" -- which is the one message
+        a reader must not be sent for a timing problem.
+
+        So the check is a bounded wait, and the fake answers `no` twice before
+        `yes`: a single-shot check would report the cell incomplete on exactly
+        this sequence.
+        """
+        fake = self.fake()
+        fake.write_table([
+            {"match": ["nmcli", "-g", "GENERAL.NM-MANAGED"], "answers": [
+                {"returncode": 1, "stderr": "Error: Could not create NMClient object.\n"},
+                {"stdout": "no\n"},
+                {"stdout": "yes\n"},
+            ]},
+            {"match": ["nmcli"], "stdout": "yes\n"},
+            {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
+        ])
+        ran: list[str] = []
+        result = run.run_target(
+            self.client(fake),
+            run_id="20260928T101010Z",
+            arch="amd64",
+            version="22.04",
+            image="localhost/mosdns-target:22.04",
+            scenarios=[("dhcp", lambda: ran.append("dhcp"))],
+        )
+        self.assertEqual(ran, ["dhcp"], f"the cell did not wait for the target to boot: {result.detail}")
+        self.assertEqual(result.status, "passed")
+
+    def test_a_device_that_stays_unmanaged_names_what_it_saw(self):
+        """A wait that runs out says what it read, not merely that it timed out.
+
+        `no` and "no NetworkManager at all" are different answers and they send a
+        reader to different places: the first to the image's
+        `target-nm-setup.service` and the `conf.d` declaration, the second to the
+        target's own boot. The poll that raised the last one is the value the
+        message has to carry.
+        """
+        fake = self.fake()
+        fake.write_table([
+            {"match": ["nmcli", "-g", "GENERAL.NM-MANAGED"], "stdout": "no\n"},
+            {"match": ["nmcli"], "stdout": "yes\n"},
+            {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
+        ])
+        ran: list[str] = []
+        result = run.run_target(
+            self.client(fake),
+            run_id="20260928T101010Z",
+            arch="amd64",
+            version="22.04",
+            image="localhost/mosdns-target:22.04",
+            scenarios=[("dhcp", lambda: ran.append("dhcp"))],
+        )
+        self.assertEqual(ran, [])
+        self.assertEqual(result.status, "incomplete")
+        self.assertIn("'no'", result.detail)
+        # **And it says how hard it tried**, which the single-shot check could
+        # not: a reader who sees "answered 'no'" and one who sees "answered 'no'
+        # on 25 reads over 120s" take different next steps, and only the second
+        # one knows the answer was not a timing problem.
+        self.assertRegex(result.detail, r"\d+ reads")
+        self.assertIn("120", result.detail)
+        # And the two steps are still named, because that is the whole value of
+        # the refusal: a reader who has never seen the conf.d declaration has to
+        # learn from the message that it exists.
+        self.assertIn("nmcli device set eth0 managed yes", result.detail)
+        self.assertIn("systemctl restart NetworkManager", result.detail)
+        self.assertIn("10-mosdns-target.conf", result.detail)
+
     def test_the_target_runs_on_a_bridge_network_with_the_measured_subnet(self):
         """A tun/tap device would fail the check, and the check is not optional.
 
@@ -3077,10 +3402,21 @@ class RunTargetTest(PodmanTestCase):
         self.assertEqual(created, [["network", "create", "--subnet", "10.89.0.0/24", "mosdns-20260928T101010Z-testnet"]])
 
     def test_the_target_is_named_for_this_run_and_this_version(self):
+        """Three versions run at once, and the mock router is a container too.
+
+        The router is started *first* and takes the first free address in the
+        pool, so the order is a fact and not a preference; and the name is read
+        out of the array rather than off the first invocation, which is what
+        makes "the target is named for this run" survive a cell that starts two
+        containers.
+        """
         fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
         self.scenario_results(fake)
-        started = [argv for argv in fake.invocations() if argv[:2] == ["run", "-d"]]
-        self.assertEqual(started[0][3], "mosdns-20260928T101010Z-target-24.04")
+        started = {argv[argv.index("--name") + 1] for argv in fake.invocations() if argv[:2] == ["run", "-d"]}
+        self.assertEqual(started, {
+            "mosdns-20260928T101010Z-target-24.04",
+            "mosdns-20260928T101010Z-mock-router-24.04",
+        })
 
     def test_a_scenario_that_raises_is_recorded_and_the_run_is_still_torn_down(self):
         """A failing scenario is a result; a leaking run is not a result.
@@ -3186,16 +3522,31 @@ class CommandLineTest(EntryPointTestCase):
         self.assertTrue((results).rglob("report.json").__next__().is_file())
 
     def test_global_options_are_accepted_before_the_subcommand_too(self):
-        """Both spellings resolve to the same run, not to two different ones."""
+        """Both spellings resolve to the same run, not to two different ones.
+
+        **Both runs carry the same `--run-id`**, which is what makes the two
+        reports comparable in full. A scenario's failure detail quotes the
+        container it was looking at, and a container name carries the run id --
+        so two runs with two auto-generated ids differ in a field this case is
+        not about, and comparing them in full would be comparing two different
+        runs. Fixing the id turns the comparison back into the one it means: the
+        same options, the same run, byte-identical apart from the timestamps.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
         first = self.directory / "a"
         second = self.directory / "b"
-        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
-        self.invoke(["--podman", str(fake.path), "--source-tree", str(self.source_tree),
-                     "--results-dir", str(first),
-                     "matrix", "--arch", "amd64", "--versions", "24.04"])
-        self.invoke(["matrix", "--arch", "amd64", "--versions", "24.04",
-                     "--podman", str(fake.path), "--source-tree", str(self.source_tree),
-                     "--results-dir", str(second)])
+        common = [
+            "--podman", str(fake.path), "--source-tree", str(self.source_tree),
+            "--run-id", "20260928T120000Z",
+        ]
+        self.invoke([
+            *common, "--results-dir", str(first),
+            "matrix", "--arch", "amd64", "--versions", "24.04",
+        ])
+        self.invoke([
+            "matrix", "--arch", "amd64", "--versions", "24.04",
+            *common, "--results-dir", str(second),
+        ])
         one = json.loads(next(first.rglob("report.json")).read_text(encoding="utf-8"))
         two = json.loads(next(second.rglob("report.json")).read_text(encoding="utf-8"))
         for document in (one, two):
@@ -3222,7 +3573,6 @@ class CommandLineTest(EntryPointTestCase):
             *common, "--results-dir", str(before),
             "--arch", "arm64", "--versions", "24.04", "matrix",
         ])
-        self.assertEqual(code, run.EXIT_INCOMPLETE)
         self.invoke([
             "matrix", "--arch", "arm64", "--versions", "24.04",
             *common, "--results-dir", str(after),
@@ -3243,31 +3593,84 @@ class CommandLineTest(EntryPointTestCase):
         and did not find it, when in fact it never looked. So a requested
         scenario that is not registered is a configuration error: exit 2, the
         name in the message, and the reason.
+
+        The name is now `routing` rather than `dhcp`, because `dhcp` **is**
+        registered as of Task 3 and asking for it runs a cell. The refusal is
+        about a name the registry does not hold, which is the only shape the
+        defect takes; the case that a registered name runs is in
+        `test_matrix_cell.py`.
         """
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
         code, output = self.invoke(
             self.base(fake, "--results-dir", str(self.directory / "results"),
                       "matrix", "--arch", "amd64", "--versions", "24.04",
-                      "--scenario", "dhcp")
+                      "--scenario", "routing")
         )
         self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("routing", output)
+        self.assertIn("no such scenario is registered", output)
+        # And the refusal says what *would* have worked, because the operator who
+        # mistyped one of four names is not going to read the source to find the
+        # other three.
         self.assertIn("dhcp", output)
-        self.assertIn("no scenario is registered", output)
+        # Nothing was started: a refusal that created a container first would be
+        # a refusal that already did the thing it refused.
+        self.assertEqual(
+            [argv for argv in fake.invocations() if argv[:2] == ["run", "-d"]], []
+        )
 
-    def test_matrix_with_no_scenario_requested_still_reports_incomplete(self):
-        """The no-op path is unchanged: no flag, nothing run, exit 3.
+    def test_a_registered_scenario_that_fails_is_a_failed_cell_not_a_refusal(self):
+        """The two answers are different claims and they get different exit codes.
 
-        Refusing `--scenario` must not turn "I asked for nothing and got
-        nothing" into an error. That is the state this build is in, and it is
-        reported as incomplete rather than as a harness fault.
+        A registered scenario that could not establish its claim is a *test
+        failure* -- exit 1, a `failed` row in the report, the reason beside it --
+        because something was tried and did not work. A scenario the harness has
+        never heard of is exit 2, because nothing was tried. Collapsing the two
+        would let a run whose scenarios all failed be filed as a configuration
+        mistake, and the first thing anybody would do about a configuration
+        mistake is change a flag.
         """
-        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
         code, output = self.invoke(
             self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "--run-id", "20260928T120000Z",
+                      "matrix", "--arch", "amd64", "--versions", "24.04",
+                      "--scenario", "dhcp")
+        )
+        # This fake has no answers for the scenario's queries, so the DHCP
+        # scenario fails its assertions -- which is the point: it *ran*.
+        self.assertEqual(code, EXIT_TEST_FAILURE, output)
+        document = json.loads(
+            next((self.directory / "results").rglob("report.json")).read_text(encoding="utf-8")
+        )
+        self.assertEqual(document["results"][0]["scenarios"][0]["status"], "failed")
+        self.assertTrue(document["results"][0]["scenarios"][0]["detail"])
+
+    def test_matrix_with_no_scenario_requested_runs_every_registered_one(self):
+        """Naming nothing means everything, because that is the plan's own command.
+
+        `python3 tests/podman/run.py matrix --arch amd64 --versions
+        22.04,24.04,26.04` is the whole matrix, and the Make target Task 7 adds
+        writes exactly that with no `--scenario`. A harness where that meant
+        "run nothing" would report the plan's own acceptance command incomplete
+        forever -- which is what the Task 2 build did, honestly and for a state
+        that has now changed.
+        """
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "--run-id", "20260928T120000Z",
                       "matrix", "--arch", "amd64", "--versions", "24.04")
         )
-        self.assertEqual(code, run.EXIT_INCOMPLETE)
-        self.assertIn("no scenario is registered in this build of the harness", output)
+        self.assertEqual(code, EXIT_TEST_FAILURE, output)
+        document = json.loads(
+            next((self.directory / "results").rglob("report.json")).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [s["name"] for s in document["results"][0]["scenarios"]],
+            list(run.SCENARIO_NAMES),
+            "a run that named no scenario did not run every registered one",
+        )
 
     def test_a_subcommand_that_raises_something_unexpected_is_still_a_harness_error(self):
         """The exit-code contract has a net under it.
@@ -3341,26 +3744,54 @@ class CommandLineTest(EntryPointTestCase):
         of the two it is. The list is now *derived* from the lock, because the set
         of versions a run may name and the set it may build are the same set, and
         a case that spelled both out would be a second list to forget.
+
+        **The cell is run, so there is no `skips` entry naming the image any
+        more.** That assertion was the Task 2 way of saying "the cell names the
+        image it would have used", and it is stronger now: the digest reaches a
+        `podman build` argument, which
+        `test_a_target_is_started_from_the_locked_reference_verbatim` asserts and
+        `test_the_target_image_is_built_from_the_locked_reference` asserts again
+        through the real entry point. Asserting a *skip* string on a cell that
+        runs would be a claim about a report shape nothing produces any more.
         """
         import images as images_module
 
         for version in sorted(images_module.load_lock()["images"]):
             with self.subTest(version=version):
-                fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
-                results = self.directory / f"r-{version}"
-                code, _ = self.invoke(
+                # A directory of its own per version: `FakePodmanBinary`
+                # appends to one log beside itself, so a shared directory makes
+                # each subtest's `invocations()` include the ones before it and
+                # the assertion below is about a different run.
+                directory = self.extra_directory()
+                fake = self.fake(
+                    [{"match": ["image", "exists"], "returncode": 1}],
+                    directory=directory,
+                )
+                fake.write_table([
+                    {"match": ["image", "exists"], "returncode": 1},
+                    {"match": ["nmcli"], "stdout": "yes\n"},
+                ])
+                results = directory / "results"
+                code, output = self.invoke(
                     self.base(fake, "--results-dir", str(results),
+                              "--run-id", "20260928T120000Z",
                               "matrix", "--arch", "amd64", "--versions", version)
                 )
-                self.assertEqual(code, run.EXIT_INCOMPLETE)
+                self.assertIn(
+                    code,
+                    (run.EXIT_OK, EXIT_TEST_FAILURE, run.EXIT_INCOMPLETE),
+                    output,
+                )
                 document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
                 self.assertEqual([r["version"] for r in document["results"]], [version])
-                # And the cell names the image it would have used, so a report
-                # left on disk says which Ubuntu it was about.
-                self.assertIn(
-                    "docker.io/library/ubuntu:" + version + "@sha256:",
-                    document["results"][0]["skips"][0]["requirement"],
-                )
+                # And the build was given that release's digest, which is the
+                # claim the skip string used to carry.
+                builds = [
+                    argv for argv in fake.invocations()
+                    if argv[:1] == ["build"]
+                    and any(f"docker.io/library/ubuntu:{version}@sha256:" in token for token in argv)
+                ]
+                self.assertTrue(builds, f"no build was given the {version} digest: {fake.invocations()}")
 
     def test_a_release_the_lock_does_not_pin_is_refused_by_the_lock_not_the_parser(self):
         """**The two version checks are now different checks, and this is the seam.**
@@ -3720,19 +4151,41 @@ class CommandLineTest(EntryPointTestCase):
         )
         self.assertTrue((results / "20260928T101010Z" / "report.json").is_file())
 
-    def test_matrix_creates_nothing_and_starts_nothing(self):
-        """With no scenario and no image, a matrix run must not touch Podman.
+    def test_a_matrix_run_only_touches_podman_inside_its_own_namespace(self):
+        """Nothing a `matrix` run creates is outside the run's own prefix.
 
-        This case is what makes it safe to wire the command into a target later
-        without discovering that it was already mutating this machine.
+        **This case used to assert the opposite** -- that a matrix run creates
+        and starts *nothing* -- which was true only while no scenario was
+        registered and the runner reported every version incomplete without
+        touching Podman. A cell now creates a network and starts two containers,
+        so the claim that is worth holding is the one that still matters: every
+        name the run invents is inside `mosdns-<run-id>-`, which is what makes
+        `cleanup` able to find all of it and makes a second concurrent run's
+        resources untouchable.
+
+        `build` is the one invocation with no resource name, and it is named
+        separately: it writes podman's image store, not a named container, and
+        its tag is `mosdns-`-prefixed and content-derived, which
+        `test_matrix_cell.py` holds in detail.
         """
-        fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
+        fake = self.fake([{"match": ["nmcli"], "stdout": "yes\n"}])
         self.invoke(
             self.base(fake, "--results-dir", str(self.directory / "results"),
+                      "--run-id", "20260928T101010Z",
                       "matrix", "--arch", "amd64", "--versions", "24.04")
         )
         for argv in fake.invocations():
-            self.assertNotIn(argv[0], ("run", "rm", "stop", "create", "cp"), f"matrix ran {argv!r}")
+            if argv[0] == "build":
+                continue
+            if argv[0] in ("version", "info", "image", "ps", "volume", "exec", "logs", "kill"):
+                continue
+            if argv[:2] in (["network", "ls"], ["network", "exists"]):
+                continue
+            with self.subTest(argv=argv):
+                self.assertTrue(
+                    any(token.startswith("mosdns-20260928T101010Z-") for token in argv),
+                    f"a matrix run touched a resource outside its own namespace: {argv!r}",
+                )
 
     def test_a_missing_podman_makes_every_subcommand_a_harness_error(self):
         """One place decides, so `preflight`, `matrix` and `cleanup` cannot disagree."""
@@ -4194,6 +4647,14 @@ class ImageLockWiringTest(EntryPointTestCase):
         hand-written image string would satisfy all of them, and the gap is exactly
         the kind that shows up only as a matrix that quietly tested a different
         Ubuntu than the one it was pinned to.
+
+        **Two arrays, not one**, because a cell now starts the mock router as
+        well as the target (Task 3) and both are started from the same locked
+        reference. The claim is per-array rather than about a count: which
+        container gets which image is asserted by
+        `test_the_target_image_is_built_from_the_locked_reference` in
+        `test_matrix_cell.py`, and what matters here is that neither of them
+        names a tag.
         """
         import images as images_module
 
@@ -4211,14 +4672,17 @@ class ImageLockWiringTest(EntryPointTestCase):
             arch="amd64",
             version="24.04",
             image=reference,
+            router_image=reference,
             scenarios=(),
         )
         arrays = [call for call in fake.invocations() if "run" in call and "-d" in call]
-        self.assertEqual(len(arrays), 1, arrays)
-        self.assertIn("@sha256:", arrays[0][-1])
-        self.assertEqual(
-            arrays[0][-1], reference, "the target was started from something else entirely"
-        )
+        self.assertEqual(len(arrays), 2, arrays)
+        for array in arrays:
+            with self.subTest(container=array[array.index("--name") + 1]):
+                self.assertIn("@sha256:", array[-1])
+                self.assertEqual(
+                    array[-1], reference, "a container was started from something else entirely"
+                )
 
 
 def _podman_for(case, fake):

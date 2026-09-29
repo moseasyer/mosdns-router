@@ -97,6 +97,19 @@ against podman's own documentation here. The set is derived in
 `test_command.py` holds that derivation to the guard's own body — this case
 iterates a set, and a set that stopped matching the code would still pass.
 
+**Thirteen now, and two of them carry a short form.** Task 3 added `--publish`
+and `--publish-all` to the families, which is the plan's "do not publish ports
+to the host" made structural: publishing the mock router on port 53 would
+collide with the operator's resolved. `podman-run(1)` gives them `-p` and `-P`,
+and pflag registers those as separate names for the flags — so
+`PODMAN_FLAG_ALIASES` now holds short forms, and the short-form case below
+changed its invariant from "no policed flag has a short form" to "every short
+form is resolved". The first of those is a claim about podman rather than about
+the guard, and it became false; a guard that still asserted it would go red on a
+correct policy, which is the failure mode this file has already produced once
+elsewhere. No count is asserted anywhere here: the set is derived, which is the
+entire reason for deriving it.
+
 ## It is a skipping case, and the skip says so
 
 Podman is not installed on every machine that checks out this repository, and
@@ -225,6 +238,49 @@ def pflag_knows(spelling):
     return False
 
 
+def documented_short_forms(page_text: str) -> dict[str, str]:
+    """Every long flag the run page gives a short form, as name -> short.
+
+    A heading is one line, so `--publish=…, -p=…` is a single declaration of a
+    single flag with two names -- and the association between them is the whole
+    point. Rendering the page would lose it, and `podman run --help` is not a
+    superset of the documented set (`--net` is absent from it), so the roff is
+    the only oracle that keeps the pair together.
+
+    Only a *short* form is recorded, and only for a heading whose own name is a
+    long flag: `-a` beside `--attach` is the short form of the same flag, not a
+    second name, which is the same distinction the alias table above is built on.
+    """
+    forms: dict[str, str] = {}
+    for line in page_text.splitlines():
+        if not line.startswith(".SS "):
+            continue
+        text = line.replace("\\fP", " ").replace("\\fB", "")
+        longs = LONG_FLAG.findall(text)
+        if not longs:
+            continue
+        shorts = SHORT_FLAG.findall(text)
+        if shorts:
+            forms.setdefault(longs[0], shorts[0])
+    return forms
+
+
+def unresolved_short_forms(page_text: str, policed, aliases) -> list[str]:
+    """`"name / short"` for every policed flag whose short form is not resolved.
+
+    The predicate the gate asserts, kept out of the case so a control can be run
+    against it: a detector that cannot report the defect is a comment, and the
+    two directions -- a short form that is resolved, and one that is not -- have
+    to be distinguishable or the control proves nothing.
+    """
+    documented = documented_short_forms(page_text)
+    return sorted(
+        f"{name} / {documented[name]}"
+        for name in policed
+        if name in documented and aliases.get(documented[name]) != name
+    )
+
+
 class PodmanVocabularyTest(unittest.TestCase):
     """Every spelling podman has for a policed flag reaches the policy."""
 
@@ -296,9 +352,16 @@ class PodmanVocabularyTest(unittest.TestCase):
         The alias must also canonicalise to a name the policy governs **and** be
         a name this file's own derivation covers: the first half is a table that
         refuses something, the second is a name whose future aliases would be
-        checked. An alias of a family or of `--cap-add` is policed by a raw-name
-        check, which the closure in `test_command.py` now canonicalises, so both
-        halves are needed rather than one.
+        checked. An alias of a family or of `--cap-add` is policed by a
+        name-keyed check, which the closure in `test_command.py` now
+        canonicalises, so both halves are needed rather than one -- and "the
+        policy" has to be the **union** of the three mechanisms rather than the
+        value-keyed table alone. A family is policed by name and has no refused
+        value to be a key of, so `-p` canonicalises to `--publish`, which is in
+        the families tuple and not in the table: checked against the table, the
+        first version of this assertion reported the port policy as an alias of
+        nothing, which is the failure mode of a guard that is right about podman
+        and wrong about its own module.
         """
         self.assertTrue(PODMAN_FLAG_ALIASES, "the alias table cannot be empty: --net is in it")
         policed = set(POLICED_CONTAINER_FLAGS)
@@ -309,7 +372,7 @@ class PodmanVocabularyTest(unittest.TestCase):
                     f"podman does not accept {alias!r}, so mapping it onto {canonical!r} is an "
                     f"entry that reads like coverage and provides none",
                 )
-                self.assertIn(canonical, FORBIDDEN_CONTAINER_FLAGS)
+                self.assertIn(canonical, policed)
                 self.assertIn(
                     alias,
                     FORBIDDEN_CONTAINER_FLAG_NAMES,
@@ -326,41 +389,73 @@ class PodmanVocabularyTest(unittest.TestCase):
 
         `--net` was one second name for one policed flag. A *short* form is the
         same hazard by a different route: pflag registers `-v` and `--volume` as
-        two names for one flag, so `-n`, if `--network` ever grew one, would be a
-        host-namespace request the guard's name lookup would not see -- and
-        `canonical_flag_name` resolves only the long names in its table, so it
-        would not help either.
+        two names for one flag, so `-p` is a second name for `--publish` and the
+        guard's name lookup has to resolve it. Two policed flags carry one today
+        and they are the two that would reach this host's resolver:
 
-        So this asserts the invariant over the documentation rather than trusting
-        that nobody thought of it: **no policed flag may carry a short form.**
-        Today none does, and a podman that added one fails here with the pair
-        named, which is the point at which `PODMAN_FLAG_ALIASES` (or whatever
-        mechanism the fix takes) has to learn about it.
+        ```text
+        .SS \\fB--publish\\fP, \\fB-p\\fP=\\fI[[ip:][hostPort]:]containerPort[/protocol]\\fP
+        .SS \\fB--publish-all\\fP, \\fB-P\\fP
+        ```
 
-        Over all eleven policed names, for the reason the case above gives: a
-        short form of `--device` or of `--cap-add` defeats the name lookup exactly
-        as a long alias of it does, and neither was inside the first version of
-        this case.
+        **The invariant is therefore "every short form is resolved", not "no
+        short form exists".** The first version of this case asserted the second
+        -- that no policed flag carries a short form -- and adding the port
+        policy to a podman that documents both spellings made it go red on a
+        correct file. That is the same failure mode the class docstring records
+        for the block-walking detector: a guard that fails on correct code is
+        how the next person learns to ignore it. So the check is over the
+        documentation, derived, and it reports a short form the table does not
+        resolve -- with both names in the message, because "a policed flag has a
+        short form" without saying which is a shrug.
+
+        Over all policed names, for the reason the case above gives: a short form
+        of `--device` or of `--cap-add` defeats the name lookup exactly as a long
+        alias of it does.
         """
-        shorts: dict[str, str] = {}
-        for line in self.page.splitlines():
-            if not line.startswith(".SS "):
-                continue
-            text = line.replace("\\fP", " ").replace("\\fB", "")
-            longs = LONG_FLAG.findall(text)
-            if not longs:
-                continue
-            found = SHORT_FLAG.findall(text)
-            if found:
-                shorts[longs[0]] = found[0]
-        with_short_form = sorted(
-            f"{name} / {shorts[name]}" for name in POLICED_CONTAINER_FLAGS if name in shorts
+        documented = documented_short_forms(self.page)
+        unresolved = sorted(
+            f"{name} / {short}"
+            for name in POLICED_CONTAINER_FLAGS
+            for short in [documented.get(name, "")] if short
+            and PODMAN_FLAG_ALIASES.get(short) != name
         )
         self.assertEqual(
-            with_short_form,
+            unresolved,
             [],
-            "a policed flag has a short form, which pflag accepts as a second name and the "
-            "name-keyed lookup does not see",
+            "a policed flag has a short form the name lookup does not resolve, and pflag accepts "
+            "both, so a target handed the short one reaches the host through a name the policed "
+            f"table does not contain: {unresolved}",
+        )
+
+    def test_the_short_form_detector_reports_a_policed_flag_it_cannot_resolve(self):
+        """The control, so the case above is not satisfied by a detector that reports nothing.
+
+        Two halves. The first asks the detector about a policed name the real
+        page does not carry a short form for, and requires that it reports
+        nothing -- so a detector that reported everything would fail here rather
+        than passing the gate above. The second is the planted defect: a page
+        whose `.SS` heading gives a policed flag a short form the table does not
+        know, which the gate must report with both names.
+        """
+        documented = documented_short_forms(self.page)
+        self.assertIsNone(
+            documented.get("--privileged"),
+            "podman now documents a short form for --privileged; the case above must learn it "
+            "rather than the detector below keeping quiet about it",
+        )
+        planted = "\n".join([
+            ".SS \\fB--device\\fP, \\fB-d\\fP=device",
+            ".SS \\fB--privileged\\fP",
+        ])
+        found = unresolved_short_forms(planted, ["--device"], PODMAN_FLAG_ALIASES)
+        self.assertEqual(found, ["--device / -d"],
+                         "a short form the alias table does not resolve was not reported")
+        # And the control: with the short form in the table, the same page is clean.
+        self.assertEqual(
+            unresolved_short_forms(planted, ["--device"], {"-d": "--device"}),
+            [],
+            "the detector reported a short form that the alias table does resolve",
         )
 
     def test_the_probe_this_file_relies_on_can_reject_a_spelling(self):

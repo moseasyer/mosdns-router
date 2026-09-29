@@ -260,6 +260,68 @@ def _by_package(conflicts) -> dict:
     return grouped
 
 
+# The one shape a **conditional** `apt-get install` may take in a Containerfile
+# here, and the reason it is a shape rather than a convention.
+#
+# `libnss-resolve` carries the resolved *NSS module* on all three releases, which
+# is what makes a lookup in a target go to 127.0.0.53 instead of past it. The
+# *daemon* behind that stub is not in the same place on all three: it is part of
+# the `systemd` package on 22.04, a hard `Depends` of `libnss-resolve` on 24.04
+# (`Depends: … systemd-resolved (= 255.4-…)`), and a plain `Recommends` on 26.04
+# (measured, in the built 26.04 target image: `Depends: libc6 (>= 2.39)`,
+# `Recommends: systemd-resolved`). The image builds with
+# `--no-install-recommends`, so on 26.04 it came out with the module and **no
+# daemon** — `resolvectl` was absent and every lookup in the target would have
+# gone to a stub nobody was listening on.
+#
+# So the target image installs the daemon package *where it exists*, and the
+# "where it exists" has to be a test rather than a comment. The rule is two
+# halves, and both are cases below:
+#
+# 1. **a package installed unconditionally must exist on every release** (the
+#    rule that was already here, and the one `systemd-resolved` first broke); and
+# 2. **a package installed conditionally must be guarded by a test of its own
+#    existence** — `if apt-cache show <pkg> …; then apt-get install … <pkg>; fi` —
+#    so the guard and the install are the same name and a reader can see the
+#    condition without running anything.
+#
+# A third case closes the hole the second one leaves: it counts every
+# `apt-get install` in the file and requires the two parsers between them to
+# account for all of them. A conditional install written in a *third* shape is
+# then a failure rather than a package no rule sees.
+CONDITIONAL_INSTALL = re.compile(
+    r"if\s+apt-cache\s+show\s+(?P<guarded>[A-Za-z0-9][A-Za-z0-9.+-]*)"
+    r"[^;]*;\s*then\s+"
+    r"apt-get\s+install\b[^;]*?(?P<installed>[A-Za-z0-9][A-Za-z0-9.+-]*)\s*;"
+)
+
+
+def conditional_installs(text: str) -> list[tuple[str, str]]:
+    """Every `(guarded, installed)` pair a conditional install names, in file order.
+
+    Two names rather than one, and that is the point: the whole value of the
+    shape is that the package whose existence is tested is the package that is
+    installed, and a parser that returned one name could not see a guard for a
+    *different* package. The case that reads this requires the two to be equal.
+    """
+    return [
+        (match.group("guarded"), match.group("installed"))
+        for match in CONDITIONAL_INSTALL.finditer(" ".join(folded_lines(text)))
+    ]
+
+
+def install_statements(text: str) -> int:
+    """How many `apt-get install`s the file contains, in any shape.
+
+    The closure counter for the two parsers above: `installed_packages` reads
+    the unconditional ones and `conditional_installs` the guarded one, and a
+    third spelling would be a package no rule in this file sees. A count is
+    crude and it is the right instrument here — it does not have to understand
+    shell, only notice that a number did not add up.
+    """
+    return sum(line.count("apt-get install") for line in folded_lines(text))
+
+
 def package_release_conflicts(installed, availability) -> list[tuple[str, str]]:
     """(package, release) for every package `installed` names that `availability`
     records as absent from a release.
@@ -1250,6 +1312,129 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
             f"table covers are {known}, and the resolver integration has to be libnss-resolve -- "
             f"the name that exists on all three releases",
         )
+
+    def test_the_target_installs_the_resolved_daemon_where_the_release_has_one(self):
+        """**The module is not the daemon, and on 26.04 the image had only the module.**
+
+        Measured in the built 26.04 target image:
+
+        ```text
+        $ dpkg -s libnss-resolve | grep -E '^(Depends|Recommends)'
+        Depends: libc6 (>= 2.39)
+        Recommends: systemd-resolved
+        $ command -v resolvectl
+        NO_RESOLVECTL
+        ```
+
+        Against 24.04, where the same package says
+        `Depends: … systemd-resolved (= 255.4-1ubuntu8.17)` and `resolvectl` is at
+        `/usr/bin/resolvectl`. The image builds with `--no-install-recommends`, so
+        on 26.04 it came out with `libnss_resolve.so.2` and nothing behind it:
+        every lookup in a target goes to 127.0.0.53, nothing is listening there,
+        and the DHCP scenario's own `resolvectl dns eth0` exits 127. That is not
+        a scenario failure; it is a target that cannot resolve anything, and it
+        would have been reported as one.
+
+        So the daemon is installed where the release has it as a package, and the
+        condition is a test rather than a comment.
+        """
+        target = read(TARGET_CONTAINERFILE)
+        self.assertEqual(
+            conditional_installs(target),
+            [("systemd-resolved", "systemd-resolved")],
+            "the target image does not install the resolved daemon on the releases that package "
+            "it, so on 26.04 a target has the NSS module and no daemon behind it",
+        )
+
+    def test_a_conditional_install_is_guarded_by_a_test_of_its_own_existence(self):
+        """The guard and the install have to name the same package.
+
+        That is the whole safety of the shape. A guard for one package and an
+        install of another looks guarded and is not: the build would ask for a
+        package on a release that does not have it, which is the failure the
+        unconditional rule above exists to catch, wearing a disguise this file
+        can see through.
+        """
+        mismatched = [
+            (guarded, installed)
+            for guarded, installed in conditional_installs(read(TARGET_CONTAINERFILE))
+            if guarded != installed
+        ]
+        self.assertEqual(
+            mismatched, [],
+            "a conditional install is guarded by a test for a different package than the one it "
+            f"installs: {mismatched}",
+        )
+
+    def test_every_conditional_install_is_a_package_the_availability_table_knows(self):
+        """A conditional install is a recorded decision, not a way around the record.
+
+        The table is the place a package's per-release availability is a fact. A
+        conditional install whose package is not in it has made a decision about
+        a release nobody wrote down, and the coverage case above cannot hold a
+        table that is not about the matrix if the matrix can add to it silently.
+        """
+        for containerfile in containerfiles():
+            conditional = {installed for _, installed in conditional_installs(read(containerfile))}
+            unknown = sorted(conditional - set(self.AVAILABILITY))
+            with self.subTest(containerfile=containerfile.name):
+                self.assertEqual(
+                    unknown, [],
+                    f"{containerfile.name} installs {unknown} conditionally and the availability "
+                    f"table says nothing about them, so a release the lock later adds would be "
+                    f"covered by neither the table nor the live check",
+                )
+
+    def test_every_apt_get_install_is_one_of_the_two_parsers(self):
+        """The closure, and the limit of what a parser over shell can be.
+
+        `installed_packages` reads an unconditional install and
+        `conditional_installs` reads the guarded shape above. A *third* spelling
+        is a package no rule in this file sees — not refused, not recorded, just
+        absent from every set — and that is the same blindness this project's
+        guards exist to remove. The count cannot understand shell; it only has to
+        notice that a number did not add up, which is enough to make the next
+        spelling a failing case.
+        """
+        for containerfile in containerfiles():
+            text = read(containerfile)
+            statements = install_statements(text)
+            unconditional = [names for names in _unconditional_installs(text) if names]
+            accounted = len(unconditional) + len(conditional_installs(text))
+            with self.subTest(containerfile=containerfile.name):
+                self.assertEqual(
+                    accounted, statements,
+                    f"{containerfile.name} has {statements} `apt-get install`s and the two parsers "
+                    f"account for {accounted}, so at least one is a spelling no availability rule "
+                    f"reads",
+                )
+
+
+def _unconditional_installs(text: str) -> list[set[str]]:
+    """`installed_packages` per `apt-get install`, for the closure count.
+
+    Split out because the count is about *how many* installs there are and
+    `installed_packages` returns a set: three installs of two different packages
+    would collapse to two, and the closure case would then be satisfied by a
+    duplicate. A statement whose install yields no name is the conditional shape
+    -- `systemd-resolved;` ends the token scan at the `;` -- and is counted by
+    `conditional_installs` instead, so the closure case filters those out rather
+    than counting them twice.
+    """
+    found: list[set[str]] = []
+    for statement in instructions(text):
+        if "apt-get" not in statement or "install" not in statement.split():
+            continue
+        tokens = statement.split()
+        names: set[str] = set()
+        for token in tokens[tokens.index("install") + 1:]:
+            if token == "&&" or token.endswith(";"):
+                break
+            if token.startswith("-"):
+                continue
+            names.add(token)
+        found.append(names)
+    return found
 
 
 class SetupUnitTest(unittest.TestCase):

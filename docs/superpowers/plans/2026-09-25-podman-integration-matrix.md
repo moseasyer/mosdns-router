@@ -22,6 +22,8 @@
 
 > **A connection profile must exist for the device first — measured on this host, and not in the note above.** The two steps are necessary and, on their own, not sufficient: with **no** connection profile for `eth0`, both steps are accepted, `journalctl` records `op="device-managed" … result="success"`, the override is never written to `/run/NetworkManager/devices/`, and `GENERAL.NM-MANAGED` stays `no` — verified on every container tried. With a profile for `eth0` present, the same two steps take the field to `yes` and the device to `100 (connected)` — verified on three consecutive fresh containers. So the order is: **create the `eth0` connection profile, then `nmcli device set eth0 managed yes`, then `systemctl restart NetworkManager`** — and the profile therefore belongs to **Task 2, not to Task 3**. Within Task 2 it belongs to `tests/podman/images/target-nm-setup.service` and **not** to the image entrypoint: `nmcli` reaches NetworkManager over D-Bus, and there is no bus before `/sbin/init`, so an entrypoint that ran any of the three measured on this host as `Error: Could not create NMClient object: Could not connect: No such file or directory`. That was the first version's error and it is corrected here — the profile was to be created at scenario time in Task 3 step 4, which runs *after* the target has booted, so Task 2's image would have run the two steps with no profile at all, failed its own boot check, and left every cell of the matrix `incomplete` with exit 3 forever. Task 3 step 4 now **modifies** the profile the setup unit created, and says so. `tests/podman/lib/podman.py` carries this as `NM_PROFILE_STEP` and its runtime device check names it in the refusal, because a message that named only the two steps would send an operator to run them, watch them succeed, and conclude the harness was wrong.
 
+> **A fourth capability, and it is the one DHCP needs: `NET_RAW`.** The three flags above are this plan's original list and they start a target and make NetworkManager manage its device, but a target with only those three **cannot obtain a DHCP lease**: podman's default bounding set for a rootless container does not carry `NET_RAW` (bit 13, absent from `CapEff: 00000000802c15fb`), NetworkManager's built-in DHCP client opens an `AF_PACKET` socket to send and receive DORA, and without it every transaction fails with `dhcp4 (eth0): error -1 dispatching events` while `nmcli connection up` reports *IP configuration could not be reserved (no available address, timeout)*. Measured on this host against a real dnsmasq on a netavark bridge, on 24.04; adding `--cap-add=NET_RAW` to the same container against the same router produces a full `DHCPDISCOVER`/`DHCPOFFER`/`DHCPREQUEST`/`DHCPACK` and a published DNS address. It is in the harness's cap ceiling and in the emitted array rather than in a scenario's `extra_args`, because the target is one container for the whole cell and a capability one scenario needs and another does not is a property of the run.
+
 **Tech Stack:** Python 3 standard library, rootless Podman container/network, Ubuntu official images, systemd, NetworkManager, systemd-resolved, dnsmasq mock router, local TLS server, Mozilla Firefox headless for live ECH verification.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`
@@ -92,6 +94,8 @@ tests/podman/scenarios/cdn_ech_test.py
 tests/podman/scenarios/upgrade_uninstall_test.py
 tests/podman/scenarios/firefox_live.py
 tests/podman/tests/test_command.py
+tests/podman/tests/test_matrix_cell.py
+tests/podman/tests/test_dhcp_scenario.py
 tests/podman/tests/test_report.py
 tests/podman/tests/test_target_entrypoint.py
 docs/testing.md
@@ -137,7 +141,7 @@ podman version --format {{.Client.Version}}
 podman info --format {{.Store.GraphDriverName}}
 podman network create --subnet 10.89.0.0/24 mosdns-testnet
 podman network inspect mosdns-testnet --format {{.Name}}
-podman run -d --name NAME --network mosdns-testnet --systemd=always --cgroupns=private --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v SOURCE:/workspace:ro IMAGE
+podman run -d --name NAME --network mosdns-testnet --systemd=always --cgroupns=private --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE --cap-add=NET_RAW -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v SOURCE:/workspace:ro IMAGE
 podman exec NAME sh -c ...
 podman cp ARTIFACT NAME:/tmp/ARTIFACT
 podman stop --time 30 NAME
@@ -226,7 +230,10 @@ Sort output, redact environment-specific UUIDs only when they are not relevant t
 
 Target image installs `systemd-sysv`, `dbus`, `NetworkManager`, `libnss-resolve`, `python3`, `iproute2`, `dnsutils`, `curl`, `ca-certificates`, and test tools, but does not install the project package at build time. Mock router installs `dnsmasq-base`; mock CDN is built from the repository's Go module and installs no server package at all.
 
-**`libnss-resolve`, and not the package named `systemd-resolved`.** The latter is a binary package on 24.04 and 26.04 and does not exist on 22.04 at all, where the daemon is part of `systemd` — so naming it fails the 22.04 build with `E: Unable to locate package systemd-resolved` (measured, in this task). `libnss-resolve` exists on all three, brings the daemon with it where it is a separate package, and is the NSS module without which a lookup in a target reads `/etc/hosts` and then the network and never asks 127.0.0.53.
+**`libnss-resolve`, and not the package named `systemd-resolved`.** The latter is a binary package on 24.04 and 26.04 and does not exist on 22.04 at all, where the daemon is part of `systemd` — so naming it fails the 22.04 build with `E: Unable to locate package systemd-resolved` (measured, in this task). `libnss-resolve` exists on all three, brings the daemon with it where it is a **hard `Depends`**, and is the NSS module without which a lookup in a target reads `/etc/hosts` and then the network and never asks 127.0.0.53.
+
+> **But on 26.04 the daemon is a `Recommends`, so the target image installed the module and no daemon.** Measured in the 26.04 target image this task's first cell built: `dpkg -s libnss-resolve` reads `Depends: libc6 (>= 2.39)` and `Recommends: systemd-resolved`, and `command -v resolvectl` answers nothing — against 24.04, where the same package says `Depends: … systemd-resolved (= 255.4-1ubuntu8.17)`. The image builds with `--no-install-recommends`, for a good reason stated in the Containerfile, so on 26.04 a target had `libnss_resolve.so.2` and **nothing behind it**: every lookup went to a stub nobody was listening on, and the DHCP scenario's own `resolvectl dns eth0` exited 127. Found by running the third release, not by reading the manifest. The Containerfile therefore installs `systemd-resolved` **where the release has it as a package**, guarded by `if apt-cache show systemd-resolved >/dev/null 2>&1; then apt-get install …; fi` — the guard and the install name the same package on purpose, and `tests/podman/tests/test_images.py` holds the two names equal, holds the package against the availability table, and counts every `apt-get install` in the file so a third spelling is neither refused nor recorded but *noticed*.
+
 
 **The mock CDN installs nothing in its serving stage, and that is a measurement too.** `caddy` does not exist on 22.04 — not in `main`, not in `universe` — so an image that installed it could not be built on a third of the matrix, and the plan's own answer is the Go module's own TLS server. Every package any of the three images installs is checked against all three locked releases, and **the set of images is discovered by glob**, so a Containerfile added in a later task is covered without anybody editing the check.
 
@@ -311,6 +318,8 @@ Enable DNS only for the private network. Do not publish ports to the host.
 - [ ] **Step 3: Implement mock-router control**
 
 Run dnsmasq with DHCP range `10.89.0.100-10.89.0.199`, router option `10.89.0.2`, and configurable DNS addresses. A control command rewrites only the container-private dnsmasq config, sends HUP, and waits for target NM `dns-change`/lease evidence.
+
+> **`--conf-file` is the wrong file to rewrite, and this step's original sentence was wrong about HUP.** Measured, in `dnsmasq(8)`'s own NOTES section on this host: *"SIGHUP does NOT re-read the configuration file."* It re-reads `/etc/hosts`, `/etc/ethers` and **the files named by `--dhcp-hostsfile`, `--dhcp-optsfile`, `--addn-hosts` and friends** — and an option found in `--dhcp-optsfile` takes precedence over `dhcp-option`. So the control command rewrites `/etc/dnsmasq-dhcp-opts` (a path declared in the shipped config and absent from the checkout, so the write is inside the container), sends HUP, and the new DNS address reaches the next DHCP transaction. Rewriting `/etc/dnsmasq.conf` and sending HUP would change nothing, and the scenario would then report a *stale* baseline as a pass. The shipped config also carries `dhcp-option=option:dns-server,10.89.0.2` as the value the option file overrides, so a run with no reload still has a definite answer.
 
 - [ ] **Step 4: Make target use NetworkManager**
 

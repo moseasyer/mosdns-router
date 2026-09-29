@@ -51,6 +51,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,13 @@ from typing import Mapping, Sequence
 # service that has wedged reports nothing, and a wedged service is exactly what
 # a broken run looks like from the outside.
 DEFAULT_TIMEOUT = 120.0
+
+# The separate deadline for an image build. A target image installs a systemd
+# and a NetworkManager through apt on every release this matrix runs, which is
+# minutes rather than seconds, and a deadline the build cannot meet turns a
+# working machine into a harness error -- the one failure mode a shorter
+# deadline creates rather than prevents.
+DEFAULT_BUILD_TIMEOUT = 1800.0
 
 # The grace period given to a container's init to shut down. systemd inside the
 # target needs a moment to stop the units it started; the plan measures 30.
@@ -200,12 +208,29 @@ FORBIDDEN_CONTAINER_FLAGS = {
 # entry pointing at a name nothing polices -- an entry that would refuse nothing
 # -- is a test failure rather than a silent no-op.
 #
-# Only *long* names are here. pflag's short form (`-v`, `-p`) and its two value
-# spellings (`--flag` / `--flag=value`) are not aliases: a short form is a
-# different token shape, and the guard reads the flag's name and the value that
-# flag carries, so both value spellings are already covered by construction.
+# **Short forms are here, and they are here because the reasoning that excluded
+# them was the defect.** The first version of this comment said that pflag's
+# short form "is a different token shape, and the guard reads the flag's name
+# and the value that flag carries, so both value spellings are already covered by
+# construction". Both halves of that are true and neither of them helps: a
+# *different token shape* is exactly why the name lookup misses it, and the guard
+# reads the **name**. `podman-run(1)` declares the pairs in their own headings --
+#
+#     .SS \fB--publish\fP, \fB-p\fP=\fI[[ip:][hostPort]:]containerPort[/protocol]\fP
+#     .SS \fB--publish-all\fP, \fB-P\fP
+#
+# -- and pflag registers each of those as a separate name for its flag, so
+# `extra_args=["-p", "53:53/udp"]` is a port published to the host through a name
+# the policed table did not contain. It is the same defect `--net` was, arrived
+# at by a different route, and the route is now closed for both: the
+# `test_no_policed_flag_has_a_short_form_the_name_lookup_would_miss` case in
+# `test_podman_flags.py` reads the run page's own headings and requires every
+# short form it finds for a policed flag to be in this table, so the next
+# short form is a case failure rather than a review.
 PODMAN_FLAG_ALIASES = {
     "--net": "--network",
+    "-p": "--publish",
+    "-P": "--publish-all",
 }
 
 # The flag names a caller can see are policed *by the table above*: the canonical
@@ -217,21 +242,44 @@ PODMAN_FLAG_ALIASES = {
 # Scoped to that table deliberately, and `POLICED_CONTAINER_FLAGS` below is the
 # whole policed surface. This set is what the value-keyed refusal prints, and the
 # other two policies print their own reasons (a family is refused whatever its
-# value; `--cap-add` is refused unless the value is one of three), so mixing the
-# families in here would print a set that is not what was checked against.
-FORBIDDEN_CONTAINER_FLAG_NAMES = tuple(
-    sorted(set(FORBIDDEN_CONTAINER_FLAGS) | set(PODMAN_FLAG_ALIASES))
-)
+# value; `--cap-add` is refused unless the value is one of the measured
+# capabilities), so mixing the families in here would print a set that is not what
+# was checked against.
+#
+# Long names first and short forms after, rather than `sorted()`, because the
+# whole list is a single line an operator reads after a refusal: `-P, -p,
+# --cap-add, --cgroupns, …` puts the two short forms where they look like
+# typos.
+def _policed_flag_names() -> tuple[str, ...]:
+    names = set(FORBIDDEN_CONTAINER_FLAGS) | set(PODMAN_FLAG_ALIASES)
+    return tuple(
+        sorted(name for name in names if name.startswith("--"))
+        + sorted(name for name in names if not name.startswith("--"))
+    )
+
+
+FORBIDDEN_CONTAINER_FLAG_NAMES = _policed_flag_names()
 
 # Families refused outright, in both spellings, whatever the value. A device is
 # host hardware; a seccomp or apparmor override removes a layer of the boundary
 # the caps are inside; `--volumes-from` is another container's filesystems, and
 # the name would have to be one this harness created for the boundary to mean
 # anything, which is a property of the caller rather than of the flag.
+#
+# **`--publish` and `--publish-all` are here for the plan's "do not publish ports
+# to the host", and they are here rather than in the value-keyed table because no
+# value of either is safe.** Every port value is a port on the operator's
+# machine: a mock router published on 53 collides with `systemd-resolved` on the
+# host, and a mock CDN published on 443 answers for a name the operator is
+# visiting. The plan states the rule, and a rule with no flag behind it is a
+# sentence, so it is a refusal here -- with the two short forms resolved through
+# `PODMAN_FLAG_ALIASES`, which is where `-p` and `-P` are.
 FORBIDDEN_CONTAINER_FLAG_FAMILIES = (
     "--device",
     "--security-opt",
     "--volumes-from",
+    "--publish",
+    "--publish-all",
 )
 
 # The one flag policed by a value check against a ceiling rather than by a table
@@ -262,25 +310,50 @@ POLICED_CONTAINER_FLAGS = tuple(
     )
 )
 
-# The cap ceiling. The measured target needs exactly these three, and
+# The cap ceiling. The measured target needs exactly these, and
 # `--cap-add=ALL` is a one-word route to every capability including `SYS_ADMIN`
-# for a target that does not need it. The ceiling is the three measured values
-# rather than a denylist of the dangerous ones, so a capability nobody has
-# thought of yet is refused too.
+# for a target that does not need it. The ceiling is the measured values rather
+# than a denylist of the dangerous ones, so a capability nobody has thought of
+# yet is refused too.
 #
-# **`--cap-drop` is deliberately outside this ceiling, and the asymmetry is the
-# design, not an oversight** -- so a later task that reaches for `--cap-add`
-# and finds it policed while `--cap-drop` is not is not looking at an
-# inconsistency. The ceiling's subject is *widening* a container's privilege, and
-# only `--cap-add` widens it. `--cap-drop` can only take privilege away, so a
-# guard that policed it would be removed the first time a scenario wanted a
-# narrower container -- and would have bought nothing while it stood, because a
-# drop cannot reach the host. The escape that *would* matter is a drop
-# combined with a wide add, and that is refused on the add side, where the
-# ceiling is (`--cap-drop=ALL --cap-add=ALL` is refused for the `--cap-add`).
-# If a future task finds a way to make a drop reach host state, that is a case
-# to add here -- not an argument for having policed the word.
-ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE")
+# **Four values, and `NET_RAW` is the one that was not on the plan's list until
+# it was measured to be necessary.** A target started with only the plan's three
+# capabilities reaches NetworkManager's "getting IP configuration" and then fails:
+#
+#     Error: Connection activation failed: IP configuration could not be reserved
+#     (no available address, timeout, etc.)
+#
+# and the journal says
+#
+#     dhcp4 (eth0): error -1 dispatching events
+#
+# which reads like a DHCP server that is not answering. `/proc/self/status` in
+# that container reads `CapEff: 00000000802c15fb` -- bit 13, `NET_RAW`, absent,
+# because podman's default bounding set for a rootless container does not carry
+# it. NetworkManager's built-in DHCP client opens an `AF_PACKET` socket to send
+# and receive DORA and cannot without the capability. With `NET_RAW` the same
+# container against the same dnsmasq leases an address out of the configured
+# range and publishes the router's DNS. (Measured on this host; see the DHCP
+# scenario's report.)
+#
+# `NET_RAW` is inside the container's own network namespace, which is the same
+# containment `NET_ADMIN` and `SYS_ADMIN` are already inside, and the ceiling's
+# subject is *widening* a container's privilege -- so the bar is that a value
+# earns its place by having been measured, not by looking harmless.
+#
+# `--cap-drop` is deliberately outside this ceiling, and the asymmetry is the
+# design, not an oversight -- so a later task that reaches for `--cap-add` and
+# finds it policed while `--cap-drop` is not is not looking at an inconsistency.
+# The ceiling's subject is **widening** a container's privilege, and only
+# `--cap-add` widens it. `--cap-drop` can only take privilege away, so a guard
+# that policed it would be removed the first time a scenario wanted a narrower
+# container -- and would have bought nothing while it stood, because a drop cannot
+# reach the host. The escape that *would* matter is a drop combined with a wide
+# add, and that is refused on the add side, where the ceiling is
+# (`--cap-drop=ALL --cap-add=ALL` is refused for the `--cap-add`). If a future
+# task finds a way to make a drop reach host state, that is a case to add here --
+# not an argument for having policed the word.
+ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 
 
 class PodmanError(RuntimeError):
@@ -663,6 +736,7 @@ class Podman:
         connection: str | None = None,
         source_tree: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        build_timeout: float = DEFAULT_BUILD_TIMEOUT,
         extra_env: Mapping[str, str] | None = None,
     ):
         self.executable = executable
@@ -672,6 +746,13 @@ class Podman:
         self.connection = _checked_connection(connection)
         self.source_tree = _checked_source_tree(source_tree)
         self.timeout = timeout
+        # An image build installs packages, and a target image installs
+        # NetworkManager and a systemd; that is minutes rather than seconds, and
+        # a deadline the build cannot meet is a deadline that turns a working
+        # machine into a harness error. It is a separate attribute rather than a
+        # per-call argument because a caller shortening the command deadline
+        # (`network_exists` below does) is not asking to shorten a build.
+        self.build_timeout = build_timeout
         self._extra_env = dict(extra_env or {})
 
     # -- the command line ---------------------------------------------------
@@ -793,8 +874,11 @@ class Podman:
             if policed in FORBIDDEN_CONTAINER_FLAG_FAMILIES:
                 violations.append(
                     f"{token!r} (this harness has no opt-in for it: a device is host hardware, "
-                    f"a seccomp or apparmor override removes a layer of the boundary, and "
-                    f"--volumes-from is another container's filesystems.{alias_note})"
+                    f"a seccomp or apparmor override removes a layer of the boundary, "
+                    f"--volumes-from is another container's filesystems, and publishing a port "
+                    f"would put a mock router or a mock CDN on the operator's own machine -- the "
+                    f"plan's bridge network is private to the run and a published port is the one "
+                    f"way past it.{alias_note})"
                 )
                 continue
             if policed == CAPABILITY_ADD_FLAG:
@@ -1085,10 +1169,22 @@ class Podman:
         """Start a target container and return its id.
 
         The flags are the ones measured to work on this host: systemd as the
-        init, a private cgroup namespace, three capabilities, and the cgroup
-        filesystem bound in. `--cgroupns=host` and `--privileged` are not here
-        and must not be added -- the first does not start, the second reaches
+        init, a private cgroup namespace, the four measured capabilities, and the
+        cgroup filesystem bound in. `--cgroupns=host` and `--privileged` are not
+        here and must not be added -- the first does not start, the second reaches
         the host this harness is required not to touch.
+
+        **`--cap-add=NET_RAW` is in this list because a DHCP lease needs it, and
+        the plan's three flags are not enough.** The measurement is written out
+        at `ALLOWED_CAPABILITIES`; the short version is that NetworkManager's
+        built-in DHCP client opens an `AF_PACKET` socket, podman's default
+        bounding set does not carry `NET_RAW`, and without it every DHCP
+        transaction in the target fails with `dhcp4 (eth0): error -1 dispatching
+        events` while the mock router sits on the other side of the bridge with
+        an empty pool. It is here rather than in a scenario's `extra_args` because
+        the target is *one* container for the whole cell: a capability a later
+        scenario needs and an earlier one does not is a property of the run, not
+        of the scenario that happens to be looking.
         """
         args = [
             "run",
@@ -1100,6 +1196,7 @@ class Podman:
             "--cap-add=SYS_ADMIN",
             "--cap-add=NET_ADMIN",
             "--cap-add=SYS_PTRACE",
+            "--cap-add=NET_RAW",
         ]
         args += self.mount_arguments()
         args += list(extra_args)
@@ -1108,6 +1205,32 @@ class Podman:
 
     def exec_container(self, container: str, *command: str) -> CommandResult:
         return self.run(["exec", container, *[str(c) for c in command]])
+
+    def exec_status(self, container: str, *command: str) -> int:
+        """The exit status of one command inside a container, asked without raising.
+
+        **`check=True` is the policy everywhere else here, and it is right there:**
+        a scenario that read stdout from a command that failed would be reading
+        the output of a failure. This is the one question that is *about* the
+        status -- "is this file there?" is `test -e`, and its whole answer is a
+        number -- so a method that raised would turn a question into an error and
+        force the caller to catch an exception to ask whether a file exists.
+
+        It is deliberately narrow: a caller that wanted the output of a command
+        that might fail gets an exception from `exec_container`, because a status
+        a scenario did not look at is a failure a scenario cannot see.
+        """
+        argv = self.build_argv(["exec", container, *[str(c) for c in command]])
+        completed = subprocess.run(
+            argv,
+            cwd=self.working_directory,
+            env=self.child_environment(),
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            check=False,
+        )
+        return completed.returncode
 
     def exec_script(self, container: str, script: str) -> CommandResult:
         """Run a shell script inside a container.
@@ -1132,6 +1255,119 @@ class Podman:
 
     def remove_volume(self, name: str) -> CommandResult:
         return self.run(["volume", "rm", "-f", name])
+
+    # -- the image and process operations a scenario needs ---------------------
+
+    def image_exists(self, tag: str) -> bool:
+        """Whether `tag` is in the local store, asked the way podman answers it.
+
+        `image exists` exits 0 for present and 1 for absent, the same shape as
+        `network exists` above, and for the same reason: a build is expensive and
+        a scenario should not pay for one it already has. The digest behind a
+        reusable tag is a property of what was built, which is why the tag
+        itself carries a hash of the Containerfile and the base reference --
+        `images.image_tag` is what makes this question safe to ask.
+
+        A non-zero status that carries a diagnostic is a store that could not be
+        asked, and is raised rather than read as absence, for the reason the
+        network case gives: a teardown that read it as absence would claim a
+        clean sweep it never performed.
+        """
+        argv = self.build_argv(["image", "exists", tag])
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=self.working_directory,
+                env=self.child_environment(),
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as expired:
+            raise PodmanTimeout(
+                f"'{' '.join(argv)}' ran longer than {expired.timeout}s and was abandoned"
+            ) from expired
+        if completed.returncode == 0:
+            return True
+        if completed.returncode == 1 and not completed.stderr.strip():
+            return False
+        raise PodmanError(
+            f"'{' '.join(argv)}' exited {completed.returncode}"
+            + (f":\n{completed.stderr.strip()}" if completed.stderr.strip() else "")
+        )
+
+    def build_image(
+        self,
+        tag: str,
+        containerfile: str,
+        build_args: Sequence[tuple[str, str]] = (),
+        context: str = ".",
+    ) -> str:
+        """Build `tag` from `containerfile` and return the image id.
+
+        **The base image arrives as a build argument and never as a `FROM` in the
+        file.** That is what `images.lock.json` is for: `docker.io/library/ubuntu:
+        24.04@sha256:…` names the release for a reader and the bytes for the
+        machine, and it has to be resolved at run time from the lock rather than
+        written into a Containerfile, where a point release would land under the
+        same tag without it changing.
+
+        `--pull` is left at podman's default on purpose. `never` would make a
+        build against a base that is not in the store fail with a manifest
+        error, and `always` would re-resolve the tag of a digest-pinned
+        reference on every run for no gain -- the digest is the pin.
+        """
+        args = ["build", "--file", str(containerfile)]
+        for name, value in build_args:
+            args += ["--build-arg", f"{name}={value}"]
+        args += ["--tag", tag, str(context)]
+        return self.run(args, timeout=self.build_timeout).output
+
+    def container_logs(self, container: str) -> str:
+        """Everything a container has written to its stdout and stderr.
+
+        **Both of podman's own streams, because podman puts them on different
+        ones.** Measured on this host:
+
+        ```text
+        $ podman logs probe-router
+        dnsmasq[1]: started, version 2.91 cachesize 150      # on a shell's stdout
+        $ python3 -c '…; print(podman.container_logs("probe-router"))'
+        ''
+        ```
+
+        `podman logs` gives a container's stdout to podman's stdout and the
+        container's stderr to podman's stderr, the same split `docker logs`
+        makes. dnsmasq with `log-facility=-` logs to **stderr** -- it is the only
+        facility a container has, there being no syslog in one -- so a reader that
+        read only stdout would see an empty log for a daemon logging perfectly
+        well. The DHCP scenario reads this log as the *attribution* for the
+        address and the resolver the target was given, so a reader that found
+        nothing here would report a DORA exchange that plainly happened as a
+        missing one. That is not hypothetical: it is what the first live 22.04
+        cell did, and it is the reason this method joins the two streams.
+
+        They are joined stdout-first rather than one being preferred, so a
+        container that writes to both is recorded whole and the document reads in
+        the order the streams were written. The result is stripped, as
+        `CommandResult.output` is, so a log's trailing newline is not a
+        difference between two runs of the same thing.
+        """
+        result = self.run(["logs", container])
+        return "".join(part for part in (result.stdout, result.stderr) if part).strip()
+
+    def signal_container(self, container: str, signal: str = "HUP") -> CommandResult:
+        """Send a signal to a container's **init**.
+
+        `podman kill --signal` reaches PID 1 inside the container, which for the
+        mock router is dnsmasq itself: the image runs it with
+        `--keep-in-foreground` for exactly this reason. An entrypoint that
+        started it in the background and waited would have a shell as PID 1, the
+        signal would go to the shell, and the scenario would wait for a DNS change
+        that no process had been asked to make.
+        """
+        return self.run(["kill", "--signal", signal, container])
 
     def all_container_names(self, prefix: str) -> tuple[str, ...]:
         """Every container whose name starts with `prefix`, running or not.
@@ -1205,22 +1441,105 @@ def assert_networkmanager_manages_device(
     except PodmanError as error:
         raise NetworkManagerDeviceError(
             f"NetworkManager device check failed in {container}: {error}\n"
-            f"Make the target manage {device} before any scenario runs:\n"
-            f"  1. {NM_MANAGE_STEPS[0]}\n"
-            f"  2. {NM_MANAGE_STEPS[1]}\n"
-            f"{NM_UNMANAGED_EXPLANATION}"
+            + _NM_MANAGE_STEPS_TEXT
+            + NM_UNMANAGED_EXPLANATION
         ) from error
     if value != NM_MANAGED_YES:
         raise NetworkManagerDeviceError(
             f"NetworkManager does not manage {device} in {container}: "
             f"'nmcli -g {NM_MANAGED_FIELD} device show {device}' answered {value!r}, "
             f"not {NM_MANAGED_YES!r}\n"
-            f"Make the target manage {device} before any scenario runs:\n"
-            f"  1. {NM_MANAGE_STEPS[0]}\n"
-            f"  2. {NM_MANAGE_STEPS[1]}\n"
-            f"{NM_UNMANAGED_EXPLANATION}"
+            + _NM_MANAGE_STEPS_TEXT
+            + NM_UNMANAGED_EXPLANATION
         )
     return value
+
+
+# The two steps, formatted for a message. One place, because the wait below and
+# the single-shot check above have to print the same thing: a reader who has
+# been told one set of steps by the wait and a different one by a later check is
+# being handed two claims about the same fix.
+_NM_MANAGE_STEPS_TEXT = (
+    f"Make the target manage {NM_DEVICE} before any scenario runs:\n"
+    f"  1. {NM_MANAGE_STEPS[0]}\n"
+    f"  2. {NM_MANAGE_STEPS[1]}\n"
+)
+
+# How long a target gets to finish booting before the managed-device check gives
+# up, and how long to sit still between reads. A target's entrypoint has to
+# `exec /sbin/init`, systemd has to reach multi-user, and
+# `target-nm-setup.service` runs *after* NetworkManager -- and on 22.04 the
+# managed state comes from the conf.d declaration, which NetworkManager reads
+# when it starts. So the device is managed *after* the container is running, not
+# when it is started, and the budget is for the boot rather than for DHCP.
+NM_DEVICE_BOOT_TIMEOUT = 120.0
+NM_DEVICE_POLL_INTERVAL = 5.0
+
+
+def wait_for_networkmanager_device(
+    podman: Podman,
+    container: str,
+    device: str = NM_DEVICE,
+    *,
+    timeout: float = NM_DEVICE_BOOT_TIMEOUT,
+    interval: float = NM_DEVICE_POLL_INTERVAL,
+    now=time.monotonic,
+    sleep=time.sleep,
+) -> str:
+    """Wait for a booting target to bring NetworkManager up on `device`.
+
+    **`podman run -d` returns long before the device is managed**, and a
+    single-shot check is therefore a race that reports its own loss as a fact
+    about the target. Measured on this host on the first live cell: the check
+    ran about two seconds after `podman run -d` returned and `nmcli` answered
+
+    ```text
+    Error: Could not create NMClient object: Could not connect: No such file or directory
+    ```
+
+    which is *no NetworkManager yet*, and which the single-shot check reported
+    with the same message it uses for "NetworkManager is running and refuses
+    this device" -- the one message a reader must not be sent for a timing
+    problem, because the two steps printed with it do not fix a container that
+    has not booted.
+
+    Bounded, and the failure carries the last value, the budget and the number of
+    reads: a reader who sees `answered 'no'` and a reader who sees `answered
+    'no' on 25 reads over 120s` know different things, and only the second knows
+    the answer was not a race.
+    """
+    deadline = now() + timeout
+    last_value: str | None = None
+    last_error: str | None = None
+    reads = 0
+    while True:
+        reads += 1
+        try:
+            last_value = podman.nm_managed(container, device)
+            last_error = None
+            if last_value == NM_MANAGED_YES:
+                return last_value
+        except PodmanError as error:
+            last_error = str(error)
+        if now() >= deadline:
+            break
+        sleep(interval)
+    if last_error:
+        seen = f"the last query failed: {last_error.splitlines()[-1]}"
+    else:
+        seen = (
+            f"'nmcli -g {NM_MANAGED_FIELD} device show {device}' answered {last_value!r}, "
+            f"not {NM_MANAGED_YES!r}"
+        )
+    raise NetworkManagerDeviceError(
+        f"NetworkManager did not come up managing {device} in {container} after {timeout:g}s and "
+        f"{reads} reads {interval:g}s apart: {seen}. A target that has not finished booting answers "
+        f"the same way, and the steps below fix a device NetworkManager has *refused* -- so read "
+        f"this as 'the target never managed its device' only after 'the target never booted' is "
+        f"ruled out ('journalctl -b' and 'systemctl is-active NetworkManager' inside {container}).\n"
+        + _NM_MANAGE_STEPS_TEXT
+        + NM_UNMANAGED_EXPLANATION
+    )
 
 
 # -- the lifecycle ------------------------------------------------------------

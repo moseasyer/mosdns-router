@@ -37,6 +37,7 @@ no provenance is a claim; this is what makes the file reviewable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -214,16 +215,129 @@ def every_reference(path: str | Path | None = None) -> dict[str, str]:
     }
 
 
+# -- the images this harness builds, and the tags that name them ----------------
+
+# Where the Containerfiles live, relative to the repository root. Discovered by
+# role rather than by glob so a role with no Containerfile is a refusal with a
+# name in it -- a glob would return an empty list and a build would be skipped
+# with nothing said, which is how a scenario ends up running against an image
+# nothing accounts for.
+CONTAINERFILE_DIRECTORY = "tests/podman/images"
+CONTAINERFILE_SUFFIX = ".Containerfile"
+
+# The roles a cell builds, in the order it needs them: the router owns the
+# address the target will be given, so it is started first.
+IMAGE_ROLES = ("mock-router", "target")
+
+# How much of the content hash goes in the tag. Twelve hex characters is 48 bits:
+# enough that two different Containerfiles do not collide by accident, and short
+# enough that the tag is still readable when a container fails to start and the
+# operator has to type it.
+TAG_HASH_LENGTH = 12
+
+_ROLE = re.compile(r"[a-z][a-z0-9-]*")
+
+
+def containerfile(role: str, repo_root: str | Path | None = None) -> Path:
+    """The Containerfile for `role`, or a refusal naming the role.
+
+    **The role is a shape, not a path.** `containerfile("../../etc/passwd")`
+    would return a file outside the repository if the name were merely joined to
+    a directory, and a build would then be handed a Containerfile the repository
+    does not contain. The pattern below admits a lowercase word with hyphens and
+    nothing else, and the file still has to exist -- so both a traversal and a
+    role nobody has written an image for are refusals rather than a build against
+    whatever was there.
+    """
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[3]
+    if not _ROLE.fullmatch(str(role or "")):
+        raise LockError(
+            f"refusing image role {role!r}: a role is a lowercase name with hyphens, and it is "
+            f"joined to {CONTAINERFILE_DIRECTORY} -- anything else would be a path rather than a "
+            f"role, and a build would be handed a file this repository does not contain"
+        )
+    path = root / CONTAINERFILE_DIRECTORY / f"{role}{CONTAINERFILE_SUFFIX}"
+    if not path.is_file():
+        raise LockError(
+            f"there is no {CONTAINERFILE_DIRECTORY}/{role}{CONTAINERFILE_SUFFIX}, so the matrix "
+            f"cannot build the {role} image. The roles with a Containerfile are "
+            f"{', '.join(sorted(known_roles())) or 'none'}"
+        )
+    return path
+
+
+def known_roles(repo_root: str | Path | None = None) -> list[str]:
+    """Every role with a Containerfile, for the refusals that have to name them."""
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[3]
+    directory = root / CONTAINERFILE_DIRECTORY
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path.name[: -len(CONTAINERFILE_SUFFIX)]
+        for path in directory.glob(f"*{CONTAINERFILE_SUFFIX}")
+    )
+
+
+def image_tag(role: str, version: str, base_reference: str) -> str:
+    """The tag a built image is named, derived from everything that goes into it.
+
+    A tag is this harness's **cache key**, and podman has no other way to know
+    whether a tag it is asked to reuse is the image this run would have built. So
+    the tag carries a hash of the two inputs that decide the bytes: the
+    Containerfile's contents and the base reference. Edit the Containerfile and
+    the tag changes and the image is rebuilt; change nothing and the tag is
+    identical and the build is skipped.
+
+    **Without the Containerfile in the key, a stale image is what the matrix
+    runs.** That is not a theoretical risk in this project: the DHCP task
+    changed `mock-router.Containerfile` to have dnsmasq read a configuration file
+    that is copied in at build time, and an image tagged by version alone would
+    have been reused with no configuration in it -- a container whose daemon
+    exits at start, reported as a network failure.
+
+    The version is validated rather than interpolated, so a typo in it is a
+    refusal instead of a second image for a release nobody ships.
+    """
+    release = check_version(version)
+    reference = str(base_reference or "").strip()
+    if not reference:
+        raise LockError(
+            f"refusing to name the {role} image: no base reference. The base image comes from "
+            f"{LOCK_RELATIVE_PATH} and has to be a 'repo:tag@sha256:…' reference, or the build "
+            f"would be against a floating tag"
+        )
+    digest = hashlib.sha256()
+    digest.update(containerfile(role).read_bytes())
+    digest.update(b"\0")
+    digest.update(reference.encode("utf-8"))
+    return f"{RESOURCE_TAG_PREFIX}-{role}:{release}-{digest.hexdigest()[:TAG_HASH_LENGTH]}"
+
+
+# Images are names, not resources in the run's namespace, so this prefix is the
+# harness's own rather than a run's: it is what makes `podman images` on an
+# operator's machine legible, and it is why an image this harness built is
+# recognisable as one. `cleanup` does not remove images -- they are podman's
+# store, they are content-addressed by what went into them, and removing them
+# would make the next run pay for a build it does not need.
+RESOURCE_TAG_PREFIX = "mosdns"
+
+
 __all__ = [
     "ARCH",
+    "CONTAINERFILE_DIRECTORY",
+    "IMAGE_ROLES",
     "LOCK_RELATIVE_PATH",
     "LockError",
     "REPOSITORY",
     "SCHEMA",
+    "TAG_HASH_LENGTH",
     "base_image_reference",
     "check_version",
+    "containerfile",
     "default_lock_path",
     "every_reference",
+    "image_tag",
+    "known_roles",
     "load_lock",
     "reference_for_version",
 ]

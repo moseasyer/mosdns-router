@@ -45,12 +45,15 @@ import argparse
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 
+import dhcp_test  # noqa: E402
 import images  # noqa: E402
 import snapshot  # noqa: E402
 from podman import (  # noqa: E402
@@ -60,14 +63,15 @@ from podman import (  # noqa: E402
     Podman,
     PodmanError,
     RunResources,
-    assert_networkmanager_manages_device,
     new_run_id,
     podman_session,
+    wait_for_networkmanager_device,
 )
 from report import (  # noqa: E402
     EXIT_HARNESS_ERROR,
     EXIT_INCOMPLETE,
     EXIT_OK,
+    STATUS_PASSED,
     Report,
     ScenarioResult,
     Skip,
@@ -76,6 +80,38 @@ from report import (  # noqa: E402
 
 DEFAULT_VERSIONS = ("22.04", "24.04", "26.04")
 DEFAULT_RESULTS_DIR = REPO / "build" / "test-results"
+
+# -- the scenario registry -----------------------------------------------------
+#
+# One mapping, name -> builder, and both the refusal and the runner read it. A
+# second list would drift: a scenario registered in one and not the other is
+# either a scenario nobody can ask for or a refusal that lies about which names
+# would have worked, and neither shows up anywhere.
+#
+# The builders are looked up by name at call time rather than bound at import
+# time, so a scenario module that fails to import takes the whole harness down
+# loudly at start-up instead of at the first scenario -- and so a later task
+# adding a scenario is one entry here and one module.
+def build_scenarios() -> dict[str, str]:
+    """`{name: "module:function"}` for every scenario the harness can run.
+
+    Strings rather than objects, so the mapping is a literal and a case can read
+    it with `ast.literal_eval` -- the same reasoning as the policed flag sets in
+    `lib/podman.py`: a registry built by a function call is invisible to a reader
+    that walks the source, and the thing that has to be held to the code is
+    exactly the thing that names the code.
+    """
+    return {"dhcp": "dhcp_test:build_scenario"}
+
+
+def _resolve_builder(name: str):
+    target = build_scenarios()[name]
+    module_name, _, function_name = target.partition(":")
+    module = __import__(module_name)
+    return getattr(module, function_name)
+
+
+SCENARIO_NAMES = tuple(sorted(build_scenarios()))
 
 # The first line of every preflight, because it is the fact this plan turns on
 # and the previous plan got wrong. It is stated before any command runs so that
@@ -105,8 +141,10 @@ NM_DEVICE_NOT_CHECKABLE = (
     "skipped on a NetworkManager without a persistent device override (measured: "
     "nmcli 1.36.6 and 1.42.4 have none, 1.44.2 and later do), and the check then "
     "reports what it actually saw.\n"
-    "This harness will not assume it either way: run_target asserts it on a "
-    "running target and refuses with the two steps above if it is not 'yes'."
+    "This harness will not assume it either way: run_target *waits* for it on a "
+    "running target -- a single query would be a race, because `podman run -d` "
+    "returns before the target has booted -- and refuses with the two steps above "
+    "if it is not 'yes'."
 )
 
 
@@ -121,16 +159,33 @@ def run_target(
     version: str,
     image: str,
     scenarios,
+    router_image: str | None = None,
     network_name: str = "testnet",
     subnet: str = DEFAULT_NETWORK_SUBNET,
     device: str = "eth0",
+    results_dir: Path | None = None,
 ) -> VersionResult:
-    """Run one matrix cell: a private network, a target, the scenarios, teardown.
+    """Run one matrix cell: a private network, a mock router, a target, the scenarios, teardown.
 
-    The order is the point. The network is created first because a target on
-    the wrong network gets a tun/tap device; the device is asserted next and
-    before the first scenario; the scenarios run inside a session whose
-    teardown happens whatever they do.
+    The order is the point, and each step is a precondition of the one after it:
+
+    1. the **network** is created first, because a target on Podman's default
+       rootless network gets a tun/tap device and NetworkManager refuses that by
+       design;
+    2. the **mock router** is started next, and started *before* the target
+       because podman hands out the first free address in the pool, which is the
+       router's -- a target left to its own devices would be given the router's
+       address and the DHCP exchange would be a target talking to itself. Both
+       addresses are named by the plan and both are passed with `--ip`;
+    3. the **device** is waited for next, before the first scenario, so a target
+       that booted unmanaged is reported as itself rather than as an installer
+       bug -- and waited for, not asked, because `podman run -d` returns before
+       the target has booted; and
+    4. the **scenarios** run inside a session whose teardown happens whatever
+       they do.
+
+    Both containers are tracked, so `cleanup` removes them. A container named by
+    hand is one nothing finds.
     """
     network = RunResources(podman, run_id).network_name(network_name)
     results: list[ScenarioResult] = []
@@ -138,9 +193,30 @@ def run_target(
     with podman_session(podman, run_id, network=network) as run:
         try:
             podman.create_network(network, subnet)
+            router = run.track_container(run.container_name("mock-router", version))
+            podman.run_container(
+                image=router_image or image,
+                name=router,
+                network=network,
+                extra_args=["--ip", dhcp_test.MOCK_ROUTER_ADDRESS],
+            )
             container = run.track_container(run.container_name("target", version))
-            podman.run_container(image=image, name=container, network=network)
-            assert_networkmanager_manages_device(podman, container, device)
+            podman.run_container(
+                image=image,
+                name=container,
+                network=network,
+                extra_args=["--ip", dhcp_test.TARGET_ADDRESS],
+            )
+            # A *wait*, not a single query: `podman run -d` returns before the
+            # target has finished booting, and the check's whole value is that it
+            # never lets an unmanaged device reach a scenario. The clock is the
+            # scenario seam so a case can run a cell without sitting out the
+            # budget; production waits.
+            clock = scenario_clock()
+            wait_for_networkmanager_device(
+                podman, container, device,
+                now=clock["now"], sleep=clock["sleep"],
+            )
         except NetworkManagerDeviceError as refusal:
             # A target that booted wrong is not an installer failure and is not
             # a pass either: the cell is incomplete and the reason is the two
@@ -305,40 +381,118 @@ def command_preflight(args) -> int:
     return EXIT_OK
 
 
-def _run_cells(args, podman: Podman, versions, base_images: dict) -> list:
-    """Run one cell per version, and say honestly which ones did not run.
+def _build_images(podman: Podman, versions, base_images: dict) -> dict[str, dict[str, str]]:
+    """Every image each cell needs, built from the lock and tagged by content.
 
-    **No scenario is registered yet**, which is the whole of the plan's Task 2
-    state: the target image and the lock are here, the scenarios arrive in Task 3
-    on. So every requested version is reported `incomplete` with the reason, which
-    is the honest answer and the reason the exit code is 3 rather than 0.
+    **Built, not named.** A harness that started the target from
+    `localhost/mosdns-target:24.04` would be testing an image nothing in the
+    repository accounts for, and the digest `images.lock.json` pins would be a
+    comment in a file. So the base image reaches the build as a build argument --
+    `BASE_IMAGE=docker.io/library/ubuntu:24.04@sha256:…` -- resolved from the lock
+    before the run does anything, and the Containerfile has no `FROM` a reader
+    could mistake for the input.
 
-    The loop is shaped for what Task 3 registers, and the shape is the point: the
-    image a cell is started from is `base_images[version]` -- the locked
-    reference, resolved before the run -- and not a name this function builds. A
-    cell that reached for its own tag would be a matrix that tested a different
-    Ubuntu than the one it was pinned to, on the one run nobody re-reads the lock.
+    **The tag is the cache key**, and it is a hash of the Containerfile and the
+    base reference, so an image this run would not build is not reused and an
+    image it would build again is. `images.image_tag` is where that is written
+    down, and the case in `tests/podman/tests/test_matrix_cell.py` is what holds
+    it to a Containerfile edit.
 
-    The requirement string each cell carries names that reference, so a report
-    left behind says which image it was about rather than only which version it
-    asked for.
+    A build that fails is a harness error -- exit 2 -- and not a failed cell: a
+    cell that could not start proves nothing about the package, and reporting it
+    as `failed` would send a reader looking for an installer bug.
     """
-    reason = "no scenario is registered in this build of the harness"
-    return [
-        VersionResult(
-            version=version,
-            arch=args.arch,
-            detail=f"{reason}, so this cell was not run",
-            skips=[
-                Skip(
-                    requirement=f"the {version} {args.arch} scenarios on "
-                    f"{base_images[version]}",
-                    reason=reason,
+    built: dict[str, dict[str, str]] = {}
+    for version in versions:
+        reference = base_images[version]
+        built[version] = {}
+        for role in images.IMAGE_ROLES:
+            tag = images.image_tag(role, version, reference)
+            if podman.image_exists(tag):
+                built[version][role] = tag
+                continue
+            try:
+                podman.build_image(
+                    tag,
+                    str(images.containerfile(role)),
+                    build_args=(("BASE_IMAGE", reference),),
+                    context=str(REPO),
                 )
-            ],
+            except PodmanError as failure:
+                raise PodmanError(
+                    f"could not build the {role} image for {version} ({tag}) from {reference}: "
+                    f"{failure}. Nothing was proved about that release, so this is a harness "
+                    f"error rather than a failed cell -- a cell that could not start is not a "
+                    f"result"
+                ) from failure
+            built[version][role] = tag
+    return built
+
+
+def scenario_clock() -> dict:
+    """The clock a scenario's bounded waits run on.
+
+    One function, two values, and it exists for the same reason
+    `snapshot_settings()` does two directories below: a scenario is a thing that
+    waits, and a *case* that runs one has to be able to run it without spending
+    the scenario's real budget. The DHCP scenario's first wait is bounded at
+    ninety seconds and its failure path is the one most of its cases are about,
+    so a case driving a `matrix` run against a fake podman would otherwise sit
+    through every bound in turn -- a suite nobody runs, and the one that would
+    be pruned first.
+
+    It is a seam rather than a CLI option because "wait longer on this run" is
+    not a thing an operator needs, while "prove the wait is bounded" is a thing
+    a test needs. Production uses the real clock and a case replaces this
+    function.
+    """
+    return {"now": time.monotonic, "sleep": time.sleep}
+
+
+def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: dict) -> list:
+    """Run one cell per version, with the scenarios that were asked for.
+
+    The cell is started from `cell_images[version]`, whose entries were built
+    from `base_images[version]` -- the locked reference, resolved before the run
+    -- and not from a name this function builds. A cell that reached for its own
+    tag would be a matrix that tested a different Ubuntu than the one it was
+    pinned to, on the one run nobody re-reads the lock.
+    """
+    requested = tuple(args.scenario or ()) or SCENARIO_NAMES
+    clock = scenario_clock()
+    cells = []
+    for version in versions:
+        builders = [
+            (name, _resolve_builder(name)) for name in requested
+        ]
+        scenarios = [
+            (name, builder(
+                podman=podman,
+                version=version,
+                arch=args.arch,
+                run_id=args.run_id,
+                router=RunResources(podman, args.run_id).container_name("mock-router", version),
+                target=RunResources(podman, args.run_id).container_name("target", version),
+                network=RunResources(podman, args.run_id).network_name("testnet"),
+                results_dir=Path(args.results_dir),
+                now=clock["now"],
+                sleep=clock["sleep"],
+            ))
+            for name, builder in builders
+        ]
+        cells.append(
+            run_target(
+                podman,
+                run_id=args.run_id,
+                arch=args.arch,
+                version=version,
+                image=cell_images[version]["target"],
+                router_image=cell_images[version]["mock-router"],
+                scenarios=scenarios,
+                results_dir=Path(args.results_dir),
+            )
         )
-        for version in versions
-    ]
+    return cells
 
 
 def command_matrix(args) -> int:
@@ -350,15 +504,19 @@ def command_matrix(args) -> int:
     # ignoring it made the plan's first "expected: PASS" command report
     # "no scenario is registered" -- which reads as though the harness looked
     # for `dhcp` and did not find it, when in fact it never looked. So the
-    # refusal is explicit, names the scenario, and is exit 2.
+    # refusal is explicit, names every scenario that was asked for, and is
+    # exit 2.
+    registered = build_scenarios()
     requested = tuple(args.scenario or ())
-    if requested:
+    unknown = [name for name in requested if name not in registered]
+    if unknown:
         raise PodmanError(
-            f"refusing --scenario {', '.join(requested)}: no scenario is registered in this "
-            f"build of the harness, so the requested one cannot be run. The target image, the "
-            f"mock router and the scenarios arrive in the tasks after this one; until a scenario "
-            f"is registered, 'matrix' with no --scenario reports every version incomplete and "
-            f"exits {EXIT_INCOMPLETE}"
+            f"refusing --scenario {', '.join(unknown)}: no such scenario is registered in this "
+            f"build of the harness, so the requested one cannot be run. The registered scenarios "
+            f"are {', '.join(sorted(registered)) or 'none'}, and 'matrix' with no --scenario runs "
+            f"all of them. A scenario that is registered but fails is a *failed cell* with the "
+            f"reason in the report; one that is not registered is a configuration error, because "
+            f"nothing ran and nothing was proved"
         )
     # The run id names the result directory, so a run that writes one needs
     # one. `cleanup` does not: with no --run-id it sweeps the whole namespace,
@@ -381,7 +539,8 @@ def command_matrix(args) -> int:
     # is a snapshot that exists when it is least needed.
     _snapshot(snapshot.BEFORE, args.run_id, results_dir)
     try:
-        results = _run_cells(args, podman, versions, base_images)
+        cell_images = _build_images(podman, versions, base_images)
+        results = _run_cells(args, podman, versions, base_images, cell_images)
         report = _report_shell(args, podman, results, started, None)
         path = _write_report(report, results_dir)
     finally:
@@ -394,6 +553,9 @@ def command_matrix(args) -> int:
         # leaves the reader to open the JSON to learn that nothing ran at all,
         # and "incomplete" is exactly the status that most needs its reason
         # next to it.
+        for scenario in result.scenarios:
+            if scenario.status != STATUS_PASSED and scenario.detail:
+                print(f"      {scenario.name}: {scenario.detail.splitlines()[0]}")
         for skip in result.skips:
             print(f"      not closed: {skip.reason}")
     print(f"report: {path}")

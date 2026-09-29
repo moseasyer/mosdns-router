@@ -60,6 +60,43 @@ RUN apt-get update \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
+# The resolved **daemon**, on the releases that package it separately. 24.04
+# already has it (a hard `Depends` of `libnss-resolve`) and 22.04 does not have the
+# package at all (the daemon is part of `systemd`, installed above). **26.04 is
+# the one that needed this**, and the measurement is in the image the previous
+# version of this file built:
+#
+#     $ dpkg -s libnss-resolve | grep -E '^(Depends|Recommends)'
+#     Depends: libc6 (>= 2.39)
+#     Recommends: systemd-resolved
+#     $ command -v resolvectl
+#     NO_RESOLVECTL
+#
+# So `--no-install-recommends` above left 26.04 with `libnss_resolve.so.2` and
+# **nothing behind it**: every lookup in a target goes to 127.0.0.53, nothing is
+# listening there, and the DHCP scenario's own `resolvectl dns eth0` exits 127.
+# That is not a scenario failure, it is a target that cannot resolve anything --
+# and it would have been reported as one.
+#
+# So the package is installed **where it exists**, and "where it exists" is a
+# test rather than a comment. The `if` and the `install` name the same package on
+# purpose: that is the whole safety of the shape, and
+# `tests/podman/tests/test_images.py` holds the two names equal, holds the
+# package against the availability table, and counts every `apt-get install` in
+# the file so a third spelling cannot slip past both parsers.
+#
+# On 22.04 `apt-cache show systemd-resolved` finds nothing and the daemon is
+# already in `systemd`; the `else` says so rather than passing silently, because
+# "there is no daemon" and "the daemon is in another package" are the same image
+# and very different explanations.
+RUN apt-get update \
+    && if apt-cache show systemd-resolved >/dev/null 2>&1; then \
+         apt-get install -y --no-install-recommends systemd-resolved; \
+       else \
+         echo "systemd-resolved is not a package on this release; the resolved daemon is part of systemd here"; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
+
 # `/etc/resolv.conf` is NOT touched here, and that is a measurement rather than
 # an omission.
 #
