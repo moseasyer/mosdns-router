@@ -540,6 +540,30 @@ it continues past individual errors rather than stopping at the first. A
 leftover container or network makes the *next* run fail for the wrong reason,
 so a failed teardown is reported as a failure, not a warning.
 
+**`cleanup` does not remove images, and the cost is small — measured on this
+host, September 2026.** Images are podman's content-addressed store, tagged by a
+hash of the Containerfile and the base reference, so an edited Containerfile gets
+a *new* tag and the old image stays under its old one. Six stale harness images
+were sitting on this machine alongside the six current ones. Removing all six
+reclaimed **4.4 MB**, not the ~1.2 GB their reported sizes sum to
+(`podman system df`: 728 MB → 723.6 MB), because the layers they share with the
+current set are the large ones — each image's `UNIQUE SIZE` in
+`podman system df -v` was a few kilobytes. A stale tag costs the *deltas* from
+whichever layer the edit changed; a comment-only edit cost 0 bytes, a late
+`RUN` cost 480 bytes, and an edit invalidating the big `apt-get` layer cost
+160 MB. No names leak: a stale tag is content-derived, so it cannot be mistaken
+for a current one, and the only way to tell them apart is
+`podman images --filter reference=localhost/mosdns-*` against the tags
+`tests/podman/lib/images.py` would compute. To reclaim them:
+
+```bash
+podman image prune -f                                  # unused images, harness tags included
+podman rmi localhost/mosdns-target:24.04-<old-hash>    # or name them one at a time
+```
+
+Leave the six current tags and the three `docker.io/library/ubuntu` base images
+alone — the next run needs them, and a rebuild is minutes.
+
 ## Adding a scenario
 
 Scenarios are registered, not discovered. A scenario that is asked for by name
