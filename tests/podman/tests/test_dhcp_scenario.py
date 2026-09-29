@@ -261,6 +261,17 @@ class DnsOptionFileTest(unittest.TestCase):
     def shipped_config(self) -> str:
         return (HARNESS / "mock-router" / "dnsmasq.conf").read_text(encoding="utf-8")
 
+    def plan(self) -> str:
+        """The plan, which is a record the next implementer works from.
+
+        Read by path rather than imported: it is prose, and the claim is about
+        what it says, not about what any code does with it.
+        """
+        return (
+            REPO / "docs" / "superpowers" / "plans"
+            / "2026-09-25-podman-integration-matrix.md"
+        ).read_text(encoding="utf-8")
+
     def test_the_shipped_config_names_the_option_file_a_reload_rewrites(self):
         self.assertIn(f"dhcp-optsfile={DNS_OPTION_FILE}", self.shipped_config())
         self.assertEqual(dhcp.DNS_OPTION_FILE, DNS_OPTION_FILE)
@@ -333,6 +344,21 @@ class DnsOptionFileTest(unittest.TestCase):
             "the config sets option 6 as well as the option file, so dnsmasq logs 'Ignoring "
             "duplicate dhcp-option 6' into the very document this scenario records as evidence, "
             "and the line does not say which one it ignored",
+        )
+        # And the plan must not describe a line the config does not have. The
+        # check above holds the config; nothing held the *plan*, and the plan is
+        # the record the next implementer works from -- so a later task reading
+        # "the shipped config also carries dhcp-option=option:dns-server,10.89.0.2"
+        # would restore the line, and the run would produce
+        # `Ignoring duplicate dhcp-option 6` in the evidence document. That
+        # sentence was in the plan; this is what keeps it from coming back.
+        self.assertNotIn(
+            f"carries `dhcp-option=option:dns-server,{MOCK_ROUTER_ADDRESS}`",
+            self.plan(),
+            "the plan says the shipped config carries a dhcp-option=option:dns-server line, and it "
+            "does not: restoring the line the plan describes puts 'Ignoring duplicate "
+            "dhcp-option 6' into the document this scenario records as the attribution for a "
+            "DNS address",
         )
 
     def test_the_image_ships_the_option_file_with_the_routers_address(self):

@@ -1120,16 +1120,62 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
 
     # What was measured, per package, per release. `absent` is a fact about the
     # archive, not a preference, and the reason is in the entry.
+    #
+    # **Re-measured for this round, in the target images this checkout builds,
+    # with `dpkg -s` and `dpkg -S /usr/lib/systemd/systemd-resolved`.** The 26.04
+    # entry was wrong and the rule did not catch it, because the rule reads only
+    # presence or absence -- which is the point of a recorded table *and* its
+    # limit. It said the daemon is in `systemd` on 26.04; it is not. Measured:
+    #
+    # ```text
+    # 22.04  libnss-resolve  Depends: libc6 (>= 2.34), systemd (= 249.11-0ubuntu3.22)
+    #        dpkg -S .../systemd-resolved  ->  systemd: /lib/systemd/systemd-resolved
+    #        systemd-resolved             ->  no such package
+    # 24.04  libnss-resolve  Depends: libc6 (>= 2.39), libcap2 (>= 1:2.10),
+    #                                   systemd-resolved (= 255.4-1ubuntu8.17)
+    #        dpkg -S .../systemd-resolved  ->  systemd-resolved: /usr/lib/systemd/systemd-resolved
+    # 26.04  libnss-resolve  Depends: libc6 (>= 2.39)
+    #                            Recommends: systemd-resolved
+    #        dpkg -S .../systemd-resolved  ->  systemd-resolved: /usr/lib/systemd/systemd-resolved
+    # ```
+    #
+    # So the three releases differ in a way the old 26.04 entry denied: 24.04
+    # makes the daemon a hard `Depends` and 26.04 makes it a `Recommends`, and
+    # that difference is the whole reason the target image installs the daemon
+    # conditionally. With `--no-install-recommends` (which the Containerfile
+    # passes, for a reason written there) 26.04 comes out with the NSS module and
+    # no daemon behind it. The table records the *measurements*; the conditional
+    # lives in the Containerfile and is held by
+    # `test_the_target_installs_the_resolved_daemon_where_the_release_has_one`.
     AVAILABILITY = {
         "libnss-resolve": {
-            "22.04": "present (Depends: systemd = 249.11-0ubuntu3.22, the daemon with it)",
-            "24.04": "present (Depends: systemd-resolved = 255.4-1ubuntu8.17)",
-            "26.04": "present (Depends: libc6 >= 2.39; the daemon is in systemd)",
+            "22.04": (
+                "present (Depends: libc6 (>= 2.34), systemd (= 249.11-0ubuntu3.22) -- a hard "
+                "Depends, and systemd owns /lib/systemd/systemd-resolved, so the daemon comes "
+                "with it; systemd itself is brought in by systemd-sysv)"
+            ),
+            "24.04": (
+                "present (Depends: libc6 (>= 2.39), libcap2 (>= 1:2.10), systemd-resolved "
+                "(= 255.4-1ubuntu8.17) -- a hard Depends, and the daemon is in the "
+                "systemd-resolved binary package at /usr/lib/systemd/systemd-resolved)"
+            ),
+            "26.04": (
+                "present (Depends: libc6 (>= 2.39); Recommends: systemd-resolved -- NOT a hard "
+                "Depends. The daemon is in the systemd-resolved binary package at "
+                "/usr/lib/systemd/systemd-resolved, not in systemd, and the image builds with "
+                "--no-install-recommends, so nothing installs it unless the build asks"
+            ),
         },
         "systemd-resolved": {
-            "22.04": "ABSENT -- the daemon is part of systemd on 22.04",
-            "24.04": "present",
-            "26.04": "present",
+            "22.04": (
+                "ABSENT -- the daemon is part of systemd on 22.04, at "
+                "/lib/systemd/systemd-resolved, and systemd-sysv is what brings systemd in"
+            ),
+            "24.04": "present (a hard Depends of libnss-resolve, so it is installed with it)",
+            "26.04": (
+                "present (only a Recommends of libnss-resolve, so --no-install-recommends "
+                "leaves it out and the image has to name it)"
+            ),
         },
     }
 
@@ -1291,6 +1337,69 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
             {"systemd-resolved"},
             "the synthetic Containerfile did not install what the control claims, so both "
             "probes above are vacuous",
+        )
+
+    def test_the_recorded_note_for_each_release_says_where_the_daemon_actually_is(self):
+        """**A table whose prose can be wrong, read back as if it were right.**
+
+        The rule above reads presence and absence. Nothing reads the *note*, so a
+        note that contradicts the measurement is invisible to it -- which is how the
+        26.04 entry came to say `the daemon is in systemd` when the measurement
+        says the daemon is in the `systemd-resolved` binary package and `systemd`
+        does not own it. A table is explicitly a record, and a wrong record is the
+        shape this project warns about: it looks like a measurement, so nobody
+        re-measures it.
+
+        So the notes are held to the one thing that makes them true here, and the
+        relationship is *derived from the table's own two rows* rather than written
+        out again. A release whose `systemd-resolved` row says `ABSENT` must have
+        its daemon inside `systemd`, because there is no other package to put it
+        in. A release whose row says `present` must **not** claim the daemon is in
+        `systemd`: the daemon is in the package that exists, and a note that says
+        otherwise sends the next reader to the wrong package on the one release
+        where the two disagree.
+
+        The 26.04 note is the one this is about, and the distinction it turns on is
+        `Depends` against `Recommends` -- measured, and the reason the target image
+        installs the daemon conditionally at all.
+        """
+        for release in self.locked_versions():
+            with self.subTest(release=release):
+                daemon_package = self.AVAILABILITY["systemd-resolved"][release]
+                note = self.AVAILABILITY["libnss-resolve"][release]
+                if daemon_package.startswith("ABSENT"):
+                    self.assertIn(
+                        "systemd", note,
+                        f"on {release} there is no systemd-resolved package, so the note has to "
+                        f"say the daemon comes with systemd; it does not say where the daemon is",
+                    )
+                    continue
+                # Present, so the daemon is in *that* package and a note naming
+                # `systemd` as its home is a claim about the wrong package.
+                self.assertNotIn(
+                    "the daemon is in systemd;", note,
+                    f"the note for {release} says the daemon is in systemd, but this release's "
+                    f"own row records systemd-resolved as present and it is that package which "
+                    f"owns the binary -- so a reader would look in the wrong package on the "
+                    f"release where the two differ",
+                )
+                self.assertIn(
+                    "systemd-resolved", note,
+                    f"the note for {release} does not name the package the daemon is in",
+                )
+        # And the one the Containerfile's conditional exists for, stated as a fact
+        # about the notes rather than about the archive: 26.04 is a Recommends.
+        self.assertIn(
+            "Recommends", self.AVAILABILITY["libnss-resolve"]["26.04"],
+            "26.04's note does not record that systemd-resolved is only recommended, which is the "
+            "fact that makes the target image's --no-install-recommends build come out with the "
+            "NSS module and no daemon behind it",
+        )
+        self.assertIn(
+            "hard Depends", self.AVAILABILITY["libnss-resolve"]["24.04"],
+            "24.04's note does not record that systemd-resolved is a hard Depends there, so the "
+            "difference between 24.04 and 26.04 -- the reason the image is conditional at all -- "
+            "is not in the record",
         )
 
     def test_the_resolver_integration_package_is_one_of_them(self):
@@ -1933,6 +2042,66 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
     def setUp(self):
         self.plan = (REPO / "docs/superpowers/plans/2026-09-25-podman-integration-matrix.md").read_text(
             encoding="utf-8"
+        )
+
+    def test_the_plan_does_not_describe_a_dhcp_option_the_shipped_config_omits(self):
+        """**The plan told the next implementer to restore a line that breaks the evidence.**
+
+        The plan's Task 3 step 3 note said *"The shipped config also carries
+        `dhcp-option=option:dns-server,10.89.0.2` as the value the option file
+        overrides"*. It does not, and the omission is deliberate: with the line
+        present, dnsmasq logs
+
+        ```text
+        dnsmasq-dhcp[1]: Ignoring duplicate dhcp-option 6
+        ```
+
+        into the very document the DHCP scenario records as the attribution for a
+        DNS address, and the line does not say which of the two sources it ignored.
+        `test_option_6_comes_from_the_option_file_and_nowhere_else` in
+        `test_dhcp_scenario.py` requires the line's absence from the config, so
+        the config and the plan were in direct contradiction and only one of them
+        said so.
+
+        The failure mode is not a failing test, it is a **passing one**: a later
+        task that reads the plan, "restores" the line to match it, and the run
+        goes green with a confusing line in its evidence document. So the sentence
+        is corrected in the plan, with the reason, and this case holds it -- the
+        plan must not describe a `dhcp-option=option:dns-server` line the shipped
+        config does not carry.
+
+        The check is on the plan's *claim* (`carries …`), not a bare search for
+        the option: the note is allowed to name the line in order to explain why
+        it is absent, and a case that forbade the string would forbid the
+        correction along with the error.
+        """
+        shipped = (REPO / "tests" / "podman" / "mock-router" / "dnsmasq.conf").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "dhcp-option=option:dns-server", shipped,
+            "the shipped config sets option 6 as well as the option file, so the plan cannot be "
+            "held to describing its absence -- fix the config and this case with it",
+        )
+        self.assertNotIn(
+            "carries `dhcp-option=option:dns-server,10.89.0.2`", self.plan,
+            "the plan says the shipped config carries a dhcp-option=option:dns-server line and it "
+            "does not. A later task reading the plan would restore the line, and the run would "
+            "put 'Ignoring duplicate dhcp-option 6' into the document the DHCP scenario records "
+            "as the attribution for a DNS address",
+        )
+        # And the note says *why*, so a reader who finds the absence is not left
+        # to guess whether it is an oversight to be corrected.
+        self.assertIn(
+            "Ignoring duplicate dhcp-option 6", self.plan,
+            "the plan no longer describes the line, but it does not say what the line would do to "
+            "the evidence document, so the next reader cannot tell an oversight from a decision",
+        )
+        self.assertIn(
+            "dhcp-optsfile", self.plan,
+            "the plan's note about option 6's source no longer names the file the baseline "
+            "actually lives in, so it says where the DNS must not come from without saying where "
+            "it does",
         )
 
     def test_the_architecture_note_no_longer_forbids_the_declaration(self):
