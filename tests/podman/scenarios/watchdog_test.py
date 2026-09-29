@@ -530,13 +530,28 @@ def build_scenario(
                 "make it usable",
             )
 
-            # -- 2. the package, installed in a live target -------------------
+            # -- 2. the package, UNPACKED in a live target --------------------
             # The package, copied in and installed with `dpkg -i`, because the
             # thing under test is the package: the unit, the timer, the setting,
             # the two numbers, the timer being enabled by postinst and the verb
-            # the unit runs are all installed by the same path an operator's
-            # machine takes. A scenario that hand-copied those four files would
-            # be testing a constructed approximation of it.
+            # the unit runs all come out of the same .deb an operator's machine
+            # gets. A scenario that hand-copied those four files would be
+            # testing a constructed approximation of it.
+            #
+            # **AND IT ENDS `unpacked`, NOT `configured`, and that is asserted
+            # rather than left in the document for a reader to notice.**
+            # `postinst` exits 1 when the install transaction refuses -- which it
+            # does in every cell of this matrix, because the transaction's
+            # `update-lists --refresh-ranges` step needs `api.cloudflare.com` and
+            # there is no route off the container bridge -- so dpkg records
+            # `install ok unpacked` and never reaches the enable step. The
+            # watchdog's evidence is unaffected: every file it needs is
+            # unpacked, and the scenario starts the service by hand because the
+            # timer was never enabled. But a cell whose install did not complete
+            # must not read as a cell that tested an installed package, and
+            # `postinst`'s own timer-enable path is therefore NOT exercised by
+            # this scenario at all. Both facts are in the document, and both are
+            # required.
             podman.copy_to(target, str(deb), "/tmp/mosdns-router.deb")
             document["package_bytes"] = int(
                 try_read("stat", "-c", "%s", "/tmp/mosdns-router.deb").strip() or 0
@@ -557,6 +572,28 @@ def build_scenario(
             document["package_unpacked"] = try_read(
                 "sh", "-c", "dpkg-query -W -f='${Status}\\n' mosdns-router 2>&1 || true"
             ).strip()
+            document["package_state_explained"] = (
+                "unpacked, NOT configured: postinst exits 1 when the install transaction refuses, "
+                "and it refuses in this matrix because `update-lists --refresh-ranges` needs "
+                "api.cloudflare.com and the container has no route off its bridge. Everything this "
+                "scenario observes was unpacked and is present; the timer was never enabled by "
+                "postinst, so the service is started by hand and postinst's enable path is NOT "
+                "exercised here."
+            )
+            _require(
+                document["package_state"] == "unpacked",
+                f"the package is {document['package_state']!r} and this scenario's evidence document "
+                "claims a cell that tested an installed package. Either the transaction succeeded "
+                "in this cell -- in which case this text is wrong and must be rewritten -- or it "
+                "did not, and the state is what this scenario documents. The dpkg exit was "
+                f"{document['dpkg_exit']} and the configure output is in this document.",
+            )
+            _require(
+                "ok unpacked" in document["package_unpacked"],
+                f"dpkg reports {document['package_unpacked']!r}, which is not the "
+                "unpacked-but-unconfigured state this scenario is written for, so what it "
+                "observed is not what it says it observed",
+            )
 
             for path in (INSTALLER, CDNCTL, SETTING_PATH):
                 _require(

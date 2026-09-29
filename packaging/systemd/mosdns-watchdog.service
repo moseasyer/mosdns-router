@@ -90,14 +90,44 @@ ExecStart=/usr/lib/mosdns-router/mosdns_installer.py watchdog
 # per-command budget, and requires this to be above the result. A sixth command
 # or a longer per-command timeout makes that gate red here.
 TimeoutStartSec=330
-# No SuccessExitStatus. Every non-zero exit is something an operator has to
-# read: 1 is this program's own refusal (the resolver is not answering and the
-# window has not been reached, or the setting could not be read, or the record
-# could not be written), and anything else is the ACTION's own status, passed
-# through unchanged so a caller can tell a rollback that did not finish from one
-# that changed nothing. A watchdog that reported success on a run where it did
-# not act would be the defect this package keeps correcting.
+# No SuccessExitStatus. Every non-zero exit is something an operator has to read:
+# 1 is this program's own refusal (the resolver is not answering and the window
+# has not been reached, the setting could not be read, the record could not be
+# written, or another operation holds the control lock), and anything else is the
+# ACTION's own status, passed through unchanged so a caller can tell a rollback
+# that did not finish from one that changed nothing.
+#
+# **TWO PATHS EXIT 0 WITHOUT ACTING**, and claiming otherwise would be false:
+# the switch is off, which is an operator's decision and not a fault; and there
+# is no verdict at all -- the operator's force-ECH list makes the router answer
+# the probe name itself, so a probe whose answer is meaningless was not counted.
+# Neither is a run in which the watchdog "reported success about the machine",
+# because neither one had a verdict to report. Both print what they found and
+# both say plainly that nothing was changed.
 CapabilityBoundingSet=
+# ## 4. It stands down while something else is changing this machine
+#
+# On an upgrade this timer is already enabled, and the install transaction then
+# try-restarts the two units that serve 127.0.0.1:53. While they restart, the
+# local resolver is not answering BY CONSTRUCTION -- the transaction creates that
+# failure deliberately, for up to a minute a unit -- and a watchdog that read it
+# as a fault would fire an emergency rollback underneath a running install. At
+# the shipped defaults three failed probes are two minutes, so the threshold is
+# comfortably inside that window.
+#
+# So this run takes the package's shared control lock,
+# /var/lib/mosdns/runtime/control.lock, after probing and before it believes
+# anything: the same lock the optimizer, the health check and `update-lists`
+# take, and the one the transaction now holds across the window in which it
+# moves this machine's DNS. A run that cannot take it counts nothing and acts on
+# nothing, and says which lock and who holds it. That is the same protection the
+# `OnBootSec=3min` above gives at boot, through the mechanism this package
+# already has rather than a fourth one.
+#
+# The lock is taken WITHOUT waiting and released before the action runs: this is
+# a timer, and blocking on it would mean sitting for the length of a transaction
+# and then acting anyway.
+#
 # 0007, inherited from the health check's, and it does NOT describe this record:
 # the record is 0600 and its directory is 0700 root:root, because nothing in this
 # package but this unit reads it. The umask is the packaged one -- a per-unit

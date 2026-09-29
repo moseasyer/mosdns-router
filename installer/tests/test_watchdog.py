@@ -692,6 +692,98 @@ class ActionMessagesTests(WatchdogFixture):
             with self.subTest(lie=lie):
                 self.assertNotIn(lie, (outcome.stdout + outcome.stderr).lower())
 
+    #: The phrases a message must not contain, as a table rather than a literal
+    #: at the two call sites. The review's minor: the list was five literals
+    #: inside one case, so adding a claim of health to a DIFFERENT message was
+    #: invisible, and the failure path -- which has its own wording and its own
+    #: sentences -- was never checked at all.
+    FALSE_CLAIMS = (
+        "the machine is back",
+        "everything is back to normal",
+        "the machine is working again",
+        "everything is fine",
+        "fully restored",
+        "this machine's dns is restored",
+        "the fault is fixed",
+        "is working again",
+        "the machine is healthy",
+        "back to normal",
+    )
+
+    def _assert_no_false_claim(self, outcome, where: str):
+        said = (outcome.stdout + outcome.stderr).lower()
+        for lie in self.FALSE_CLAIMS:
+            with self.subTest(where=where, lie=lie):
+                self.assertNotIn(
+                    lie, said, f"the {where} message claims {lie!r}, which is the one claim this "
+                    "mechanism must never make"
+                )
+
+    def test_no_message_on_any_path_claims_the_machine_is_back(self):
+        # Every path, not just the success one. Each of these is a distinct set of
+        # sentences written by a distinct branch, and a branch nobody read is a
+        # branch nobody checked: the success path, the refusal below the window,
+        # the switch off, the blind spot, the deferred-by-lock path, the latch, a
+        # failed action, an action killed at its budget, and a setting that cannot
+        # be read.
+        outcomes = {
+            "success": self.reached(),
+            "below the window": self.run_watchdog(),
+            "switch off": self._switched_off(),
+            "no verdict": self._blind(),
+            "action failed": self.reached(status=installer.EXIT_ROLLBACK_FAILED),
+            "action killed at its budget": self.reached(status=installer.KILLED_AT_BUDGET),
+            "setting unreadable": self._unreadable_setting(),
+        }
+        for where, outcome in outcomes.items():
+            self._assert_no_false_claim(outcome, where)
+
+    def _switched_off(self):
+        self.setUp()
+        self.shapes[(LOCAL_DNS, DNS_PORT)] = SILENT
+        self.setting(automatic="false", consecutive_failures=1, minimum_minutes=10)
+        return self.run_watchdog()
+
+    def _blind(self):
+        self.setUp()
+        self.shapes[(LOCAL_DNS, DNS_PORT)] = SILENT
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.write("/etc/mosdns/force-ech-domains.txt", "install-probe.example.\n")
+        return self.run_watchdog()
+
+    def _unreadable_setting(self):
+        self.setUp()
+        self.setting(automatic="perhaps")
+        return self.run_watchdog()
+
+    def test_the_actions_own_words_are_checked_for_the_same_lies(self):
+        # The review's minor, second half: the failure message deliberately ECHOES
+        # the action's output -- "the action's own words follow, because they are
+        # the report" -- and the negative list never saw that output, so a
+        # rollback that printed "the machine is back" would have been repeated
+        # verbatim into a watchdog message that is the only thing an operator
+        # reads at three in the morning.
+        #
+        # This cannot be fixed in the product: the watchdog is not going to
+        # rewrite what the operator's own command said, and a message that
+        # paraphrased it would be worse than one that quotes it. So the claim is
+        # the opposite one -- the echo is labelled as the action's words and not
+        # as the watchdog's verdict, and the watchdog's OWN sentences around it
+        # make no claim. A case that failed the whole run on a lying action would
+        # be a case that had decided the watchdog should lie less than the command
+        # an operator ran by hand.
+        outcome = self.reached(
+            status=installer.EXIT_ROLLBACK_FAILED,
+            stderr="emergency-rollback: the machine is back and everything is fine\n",
+        )
+        self.assertIn("the action's own words follow", outcome.stderr)
+        self.assertIn("the machine is back", outcome.stderr, "the action's words were not echoed")
+        # And the watchdog's own sentences around the echo claim nothing.
+        for line in outcome.stderr.splitlines():
+            if "the machine is back" in line:
+                with self.subTest(line=line):
+                    self.assertIn("the action's own words", line)
+
     def test_a_success_names_the_command_that_puts_the_router_back(self):
         outcome = self.reached()
         self.assertIn(f"{INSTALLER} install", outcome.stdout)
@@ -802,6 +894,47 @@ class ActionMessagesTests(WatchdogFixture):
         self.assertEqual(status, outcome.status)
         self.assertEqual(out, outcome.stdout)
         self.assertEqual(err, outcome.stderr)
+
+    def test_no_verdict_and_verify_local_disagree_on_the_status_and_that_is_stated(self):
+        # The review's minor, and it is a real inconsistency that was left to be
+        # discovered: on the IDENTICAL condition -- the force-ECH blind spot --
+        # `verify-local` exits 1 and the watchdog exits 0. The verdicts agree, and
+        # the substantive requirement is met on both sides: nothing was counted,
+        # nothing was acted on, and the message is explicit that this is not a
+        # sign the router is down. Only the STATUS differs, and it differs in the
+        # patient direction, which is a choice worth writing down.
+        #
+        # It is the right direction for each unit separately. `verify-local` is
+        # the second command of the health unit, and a health unit that failed is
+        # the signal an operator acts on -- a check that cannot be made is not a
+        # check that passed. The watchdog's unit carries no `SuccessExitStatus`
+        # at all, so every non-zero it returns is something to read; a blind spot
+        # is a configuration the operator has to know about and not a fault, and
+        # a unit failing every minute over a line in a text file would be noise
+        # that trains an operator to ignore this unit.
+        self.setUp()
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.write("/etc/mosdns/force-ech-domains.txt", "install-probe.example.\n")
+        outcome = self.run_watchdog()
+        self.assertEqual(outcome.status, installer.EXIT_OK)
+        self.assertEqual(outcome.verdict, installer.NO_VERDICT)
+        self.assertIn("NOT A SIGN THE ROUTER IS DOWN", outcome.stdout)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            verify = installer._run_verify_local(self.root, self.probe())
+        self.assertEqual(verify, installer.EXIT_REFUSED, "the two verbs no longer disagree, so the")
+        self.assertIn("NOT A SIGN THE ROUTER IS DOWN", err.getvalue())
+        # The disagreement is the point, so it is asserted as a disagreement
+        # rather than left for a reader to work out from two different numbers.
+        self.assertNotEqual(
+            outcome.status,
+            verify,
+            "this case exists to hold the two statuses apart; if they now agree, the reasoning "
+            "above is out of date and this case is asserting a difference that is not there",
+        )
+        # And the reason is in the shipped text, not only in this file.
+        self.assertIn("exit", _function_body(SOURCE, "_deferred"))
+        body = _function_body(SOURCE, "watchdog")
+        self.assertIn("NO_VERDICT", body)
 
     def test_the_two_verbs_ask_the_same_question_through_one_function(self):
         # One definition of "resolvable" in this package, held structurally: both
@@ -1829,6 +1962,53 @@ class SettingFileTests(WatchdogFixture):
         self.assertFalse(setting.automatic)
         self.assertEqual(setting.minimum_minutes, 1)
 
+    def test_an_empty_setting_file_is_a_refusal_and_not_the_default(self):
+        # The review's minor, and it is the UNSAFE direction: a file with no keys
+        # in it parsed to `automatic: true` with no refusal, so a truncated file,
+        # a `sed -i` that matched every line, and a deployment that wrote a
+        # placeholder all left a watchdog pointed at nothing that would tear a
+        # working machine down.
+        self.write(SETTING_PATH, "")
+        setting, refusal = installer.read_watchdog_setting(self.root)
+        self.assertIsNone(setting, "an empty setting file was read as a decision to act")
+        self.assertIn("empty", refusal)
+        outcome = self.run_watchdog()
+        self.assertEqual(self.actions(), [], "an empty setting file still acted")
+        self.assertIsNone(self.record(), "a run that refused its setting recorded a failure")
+        self.assertIn("not being watched", outcome.stderr)
+
+    def test_an_empty_file_is_a_refusal_while_an_absent_one_is_the_default(self):
+        # The two are treated in OPPOSITE directions and that is the whole point,
+        # so it is asserted rather than left to the reader. Absence is a deletion
+        # and a deletion is not a decision, so the shipped default stands; an
+        # empty file is a statement that says nothing, and a mechanism that
+        # cannot say what it is allowed to do does nothing.
+        # The fixture writes a policy and a force-ECH list but no setting, and
+        # that is asserted rather than assumed -- a case about the absent file
+        # that ran on a fixture which had written one would be asserting nothing.
+        self.assertFalse(
+            self.rooted(SETTING_PATH).exists(),
+            "the fixture left a setting file behind, so this case is not testing absence",
+        )
+        absent, refusal = installer.read_watchdog_setting(self.root)
+        self.assertEqual(refusal, "")
+        self.assertTrue(absent.automatic, "an absent setting file is not the shipped default")
+        self.write(SETTING_PATH, "\n\n   \n# only a comment\n")
+        empty, refusal = installer.read_watchdog_setting(self.root)
+        self.assertIsNone(empty, "a file of nothing but a comment was read as a decision")
+        self.assertIn("empty", refusal)
+
+    def test_one_key_alone_is_still_readable(self):
+        # The other side of the empty-file rule, so it cannot be satisfied by
+        # refusing everything: a single `automatic: false` is the whole point of
+        # being able to switch this off in one line.
+        self.write(SETTING_PATH, "automatic: false\n")
+        setting, refusal = installer.read_watchdog_setting(self.root)
+        self.assertEqual(refusal, "")
+        self.assertFalse(setting.automatic)
+        self.assertEqual(setting.consecutive_failures, SHIPPED_FAILURES)
+        self.assertEqual(setting.minimum_minutes, SHIPPED_MINUTES)
+
     def test_a_setting_that_cannot_be_read_takes_no_action_and_says_the_machine_is_unwatched(self):
         self.write(SETTING_PATH, "automatic: perhaps\n")
         outcome = self.run_watchdog()
@@ -1978,6 +2158,15 @@ class UnitAgreementTests(unittest.TestCase):
                     f"{WATCHDOG_UNIT} does not carry the health unit's {key}, so it has a "
                     "hardening shape of its own",
                 )
+
+    def test_the_unit_text_says_why_no_verdict_exits_zero(self):
+        # The two statuses differ, so the difference has to be findable from the
+        # product rather than from a test file. `verify-local`'s docstring is
+        # where a reader of THAT verb looks, and the watchdog's own is where a
+        # reader of this one looks.
+        verify = _function_body(SOURCE, "_run_verify_local")
+        self.assertIn("fail-closed", verify)
+        self.assertIn("NO_VERDICT", _function_body(SOURCE, "watchdog"))
 
     def test_it_carries_no_exit_status_excuse_at_all(self):
         # The health unit's `SuccessExitStatus=4` is the shared control lock: a

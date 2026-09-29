@@ -100,6 +100,15 @@ LIST_TIMER = "mosdns-list-check.timer"
 # for the same reason `emergency_rollback` refuses to guess at a value.
 WATCHDOG_TIMER = "mosdns-watchdog.timer"
 PROJECT_TIMERS = (OPTIMIZER_TIMER, HEALTH_TIMER, LIST_TIMER, WATCHDOG_TIMER)
+# The watchdog's SERVICE, stopped with the timers and for the same reason plus
+# one. A timer only STARTS a unit, so stopping the timer does not stop a run the
+# timer has already started -- and an uninstall landing inside a watchdog run
+# (up to `WATCHDOG_ACTION_TIMEOUT_SECONDS`, because the action reactivates a
+# NetworkManager connection) would restore the connection underneath that run.
+# The window is narrow and the consequences honest, and one line in the sequence
+# is the whole of the fix.
+WATCHDOG_SERVICE = "mosdns-watchdog.service"
+STOPPED_ONESHOT = (WATCHDOG_SERVICE,)
 # The two units are stopped router first. At this point in an uninstall the
 # machine's DNS is not ours any more, so neither order opens a window; the reason
 # to name one is that it is the order the install's own rollback uses, and two
@@ -453,7 +462,7 @@ class UninstallFixture(unittest.TestCase):
         for prop, value in OUR_VALUES.items():
             answers[PROPERTY_READ + (prop, "connection", "show", UUID)] = value + "\n"
         answers[PROPERTY_READ + (IPV6_DNS, "connection", "show", UUID)] = "\n"
-        for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
+        for unit in (*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS):
             answers[("systemctl", "is-active", unit)] = "active\n"
         answers[RESOLVECTL_DNS] = f"Link 2 ({DEVICE}): {DHCP_UPSTREAM}\n"
         answers.update(self.overrides)
@@ -477,7 +486,7 @@ class UninstallFixture(unittest.TestCase):
         self.overrides[PROPERTY_READ + (prop, "connection", "show", UUID)] = value
 
     def unit_answers(self, answer="active\n"):
-        for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
+        for unit in (*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS):
             self.overrides[("systemctl", "is-active", unit)] = answer
 
     def resolvectl_fails(self, code=1, output=""):
@@ -601,6 +610,8 @@ class UninstallFixture(unittest.TestCase):
             self.property_reads()
             + [("systemctl", "is-active", timer) for timer in PROJECT_TIMERS]
             + [("systemctl", "stop", timer) for timer in PROJECT_TIMERS]
+            + [("systemctl", "is-active", unit) for unit in STOPPED_ONESHOT]
+            + [("systemctl", "stop", unit) for unit in STOPPED_ONESHOT]
             + [MODIFY + (UUID, prop, value) for prop, value in restore]
             + [CONNECTION_UP + (UUID,), RESOLVECTL_DNS]
             + [("systemctl", "is-active", unit) for unit in STOPPED_UNITS]
@@ -1503,6 +1514,39 @@ class UninstallOrderTests(UninstallFixture):
             self.assertNotIn("flock", command, f"{command!r} takes a lock this program never asked for")
             self.assertNotIn("lock", " ".join(command), f"{command!r} mentions the lock file")
 
+    def test_a_running_watchdog_run_is_stopped_before_the_connection_is_restored(self):
+        # The review's minor, held. A timer only STARTS a unit, so stopping
+        # `mosdns-watchdog.timer` does not stop a run that timer already started
+        # -- and that run can be up to `WATCHDOG_ACTION_TIMEOUT_SECONDS` long,
+        # because its action reactivates a NetworkManager connection. An
+        # uninstall landing inside that window would restore the connection
+        # underneath a rollback that is rewriting the same properties.
+        self.result = self.run_uninstall()
+        self.restored()
+        # The connection on this fixture already carries the recorded values, so
+        # there are no modifies; the reactivation is the first thing that
+        # changes anything, and it is the thing a watchdog run would collide
+        # with. Asserted against the whole sequence rather than one write so the
+        # case does not depend on which values the fixture starts from.
+        writes = [
+            index
+            for index, command in enumerate(self.commands)
+            if command[:2] in (("nmcli", "connection"), ("resolvectl", "dns"))
+        ]
+        self.assertTrue(writes, "the uninstall changed nothing on the connection at all")
+        stop = self.commands.index(("systemctl", "stop", WATCHDOG_SERVICE))
+        self.assertLess(
+            stop,
+            min(writes),
+            f"{WATCHDOG_SERVICE} is stopped after the connection is rewritten, so a watchdog run "
+            "in progress would be restoring the same properties underneath this uninstall",
+        )
+        self.assertLess(
+            self.commands.index(("systemctl", "stop", WATCHDOG_TIMER)),
+            stop,
+            "the timer is stopped after the service it starts, so a run can start between the two",
+        )
+
     def test_an_already_restored_connection_is_restored_nothing_and_still_reactivated(self):
         for prop, raw in RECORDED_RAW.items():
             self.property_value(prop, raw)
@@ -2025,7 +2069,7 @@ class UnitOwnershipTests(UninstallFixture):
         before = self.snapshot()
         self.result = self.run_uninstall()
         self.assertTrue(self.result.ok, "an unreadable unit state is not a failed uninstall")
-        for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
+        for unit in (*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS):
             self.assertNotIn(
                 ("systemctl", "stop", unit),
                 self.commands,
@@ -2034,7 +2078,7 @@ class UnitOwnershipTests(UninstallFixture):
             self.assertIn(unit, " ".join(self.result.notes) + (self.result.error or ""))
         self.assertEqual(
             sorted(self.result.left_running),
-            sorted((*PROJECT_TIMERS, *STOPPED_UNITS)),
+            sorted((*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS)),
             "the units this program would not touch are not reported",
         )
         self.assertEqual(
@@ -2047,7 +2091,7 @@ class UnitOwnershipTests(UninstallFixture):
     def test_a_unit_that_answers_is_stopped(self):
         self.result = self.run_uninstall()
         self.restored()
-        for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
+        for unit in (*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS):
             self.assertIn(("systemctl", "stop", unit), self.commands)
         self.assertEqual(self.result.left_running, [])
 
@@ -2085,7 +2129,7 @@ class UnitOwnershipTests(UninstallFixture):
         stopped = {command[-1] for command in self.commands if command[:2] == ("systemctl", "stop")}
         self.assertEqual(
             stopped,
-            {*PROJECT_TIMERS, *STOPPED_UNITS},
+            {*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS},
             "the uninstall stopped a unit this package does not install",
         )
 
@@ -2716,7 +2760,7 @@ class NeverAppliedRemovalTests(UninstallFixture):
             f"cannot remove: {err}",
         )
         self.assertEqual(err, "", "a removal that succeeded complained about something")
-        for unit in (*PROJECT_TIMERS, *STOPPED_UNITS):
+        for unit in (*PROJECT_TIMERS, *STOPPED_ONESHOT, *STOPPED_UNITS):
             with self.subTest(unit=unit):
                 self.assertIn(("systemctl", "stop", unit), self.commands)
         self.assertFalse(

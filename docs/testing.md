@@ -440,6 +440,33 @@ The evidence document says all of this, and says explicitly that the router was
 not successfully started by the cell. A cell that claimed a working install here
 would be claiming something it did not achieve.
 
+### The cell's package state is `unpacked`, and the cell says so
+
+`postinst` exits 1 when the transaction refuses, and it refuses in every cell of
+this matrix, so `dpkg -i` records **`install ok unpacked`** and never reaches
+STEP 5. The scenario asserts that state rather than only recording it: a fixture
+answering `installed` fails the cell, and a fixture answering `half-installed`
+fails it too, so a cell that did not complete cannot read as one that did.
+
+What that means, in the evidence document's own
+`package_state_explained` field and in this file:
+
+* **Every file the watchdog needs is unpacked and present.** The unit, the timer,
+  the setting, the installer and `mosdns-cdnctl` are all on disk, which is why
+  the scenario can start `mosdns-watchdog.service` by hand and observe the
+  mechanism.
+* **`postinst`'s timer-enable path is NOT exercised.** The timer is `disabled` in
+  the cell, and the scenario reads that through
+  `show --property=UnitFileState` rather than `is-enabled` — the latter exits 1
+  for `disabled`, which the wrapper's `check=True` turns into an exception rather
+  than an answer. **The watchdog has never been observed with a configured
+  package**, so "the timer gets enabled by an install that succeeded" rests on
+  `postinst`'s own tests and not on this matrix. That is the largest NOT VERIFIED
+  item in the scenario's report.
+* **The timer actually elapsing is also unexercised**, for the same reason: the
+  scenario starts the service by hand at its own cadence. `OnBootSec=3min` and
+  `OnUnitActiveSec=1min` are asserted from the unit file, not watched.
+
 ### The journal is read through a cursor, and that is not a detail
 
 `journalctl -n 40` returns the cell's last forty lines, so the switch-off

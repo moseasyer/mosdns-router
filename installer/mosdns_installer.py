@@ -311,6 +311,22 @@ PROJECT_TIMERS = (
     "mosdns-watchdog.timer",
 )
 PROJECT_UNITS = (ROUTER_UNIT, RESOLVER_UNIT) + PROJECT_TIMERS
+# The watchdog's SERVICE, stopped with the timers and for the same reason, plus
+# one more.
+#
+# A timer only starts a unit; stopping the timer does not stop a unit the timer
+# has already started. So an uninstall landing inside the watchdog's own run --
+# which can be up to `WATCHDOG_ACTION_TIMEOUT_SECONDS` long, because the action
+# reactivates a NetworkManager connection -- would leave that run going while the
+# uninstall restores the connection underneath it. Two mutations of the same
+# thing at once is the outcome this package is most careful everywhere else to
+# avoid.
+#
+# The window is narrow (the uninstall has to land in a five-minute window on a
+# one-minute timer) and the consequences are honest rather than severe: the
+# rollback only restores recorded values, so the worst case is a confusing double
+# mutation. Narrow and honest is still worth one line, and this is the line.
+PROJECT_SERVICES = ("mosdns-watchdog.service",)
 # The unit whose stub listener already holds port 53 on a stock Ubuntu, and the
 # one the install keeps: resolved stays in front and forwards to the router, so
 # its socket is not a conflict to be cleared first. It is named here because the
@@ -4904,6 +4920,7 @@ def _remove_what_was_never_applied(
     record, only a prefix list and a range cache.
     """
     left = _stop_units(run, PROJECT_TIMERS, notes)
+    left += _stop_units(run, PROJECT_SERVICES, notes)
     left += _stop_units(run, (ROUTER_UNIT, RESOLVER_UNIT), notes)
     _remove_dispatcher(root, notes)
     try:
@@ -5031,8 +5048,12 @@ def uninstall(root: Path, run: CommandRunner, purge: bool = False, probe=None) -
             purged=False,
         )
 
-    # 1. the timers, which are the only units that write anything.
+    # 1. the timers, which are the only units that write anything -- and the
+    #    watchdog's SERVICE, because a timer that has already started its unit
+    #    does not stop it when the timer is stopped, and an uninstall landing
+    #    inside a watchdog run would restore the connection underneath that run.
     left = _stop_units(run, PROJECT_TIMERS, notes)
+    left += _stop_units(run, PROJECT_SERVICES, notes)
     # 2. the profile, newest change first, and then the reactivation, which is
     #    what makes the restored values live. What reached the profile is tracked
     #    per write rather than taken from the list of intended ones, because a
@@ -5884,6 +5905,21 @@ def parse_watchdog_setting(contents: str, source: str) -> tuple:
     A key that is ABSENT takes its default, and that is not a contradiction: an
     operator who wants to switch the mechanism off should be able to write one
     line, and the two numbers are documented in the file the package ships.
+
+    **An empty file is a refusal, and it is the one case where the argument above
+    does not apply.** `read_watchdog_setting` treats an ABSENT file as the
+    shipped default, and argues it: a file somebody deleted is not a decision, and
+    the alternative is a mechanism that turns itself off quietly. That argument is
+    about a file that is not there. An empty file IS there, and it says nothing --
+    which is a different thing, and the difference is exactly the unsafe
+    direction: an editor that truncated it, a `sed -i` that matched everything, a
+    deployment that wrote a placeholder. Each of those leaves a file whose
+    silence would be read as `automatic: true`, so a watchdog that has just been
+    pointed at nothing at all would tear a working machine down. The two cases are
+    therefore treated in opposite directions on purpose, and the reason is in both
+    messages: absence is a deletion and deletion is not a decision, while an empty
+    file is a statement that says nothing and this mechanism will not act on a
+    statement it cannot read.
     """
     values = {}
 
@@ -5929,6 +5965,15 @@ def parse_watchdog_setting(contents: str, source: str) -> tuple:
                 "this setting exists not to be."
             )
         values[key] = int(token)
+    if not values:
+        return refuse(
+            "the file is empty. An ABSENT file is not this: an absent file is a deletion, and a "
+            "deletion is not a decision, so the shipped default stands. An empty file is a "
+            "statement that says nothing, and a watchdog that cannot say what it is allowed to do "
+            "will not act -- an editor that truncated this file, a `sed -i` that matched every "
+            "line, and a deployment that wrote a placeholder all leave one, and treating that "
+            "silence as `automatic: true` would be a machine torn down by a file that is empty"
+        )
     shipped = default_watchdog_setting()
     return (
         WatchdogSetting(

@@ -88,6 +88,11 @@ MOCK_ROUTER_ADDRESS = "10.89.0.2"
 # that read them out of the module would agree with whatever the module said, and
 # these are the paths the package installs.
 CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
+# The two package-state reads, as the scenario spells them. Restated here because
+# the rule table below matches on them, and a rule that matched a shortened form
+# of a command would be a rule matching nothing.
+DPKG_STATE_QUERY = "dpkg-query -W -f='${db:Status-Status}\\n' mosdns-router 2>&1 || true"
+DPKG_STATUS_QUERY = "dpkg-query -W -f='${Status}\\n' mosdns-router 2>&1 || true"
 
 BACKUP = json.dumps(
     {
@@ -213,7 +218,27 @@ def watchdog_rules(
         # -- the package ----------------------------------------------------
         {"match": ["dpkg", "-i"], "returncode": 0, "stdout": "Setting up mosdns-router ...\n"},
         {"match": ["stat", "-c", "%s"], "stdout": "16167412\n"},
-        {"match": ["dpkg-query"], "stdout": "install ok installed\n"},
+        # **TWO dpkg-query answers, and they are different strings on purpose.**
+        # The scenario asks twice, in this order:
+        #
+        #   1. `-f='${db:Status-Status}\n'`          -> the one-word state
+        #   2. `-f='${Status}\n'`                    -> the full phrase
+        #
+        # and in a cell where the transaction refused they read `unpacked` and
+        # `install ok unpacked`, because `postinst` exits 1 and dpkg never
+        # reaches the configure step. The scenario ASSERTS both, so a fixture
+        # that answered `installed` would have been reading a cell that tested a
+        # configured package -- which this matrix has never produced. The comment
+        # in the rules below about the timer not being enabled is the same fact.
+        # Matched on the WHOLE `sh -c` script, because that is one argv token:
+        # the scenario reads the package state as
+        # `sh -c "dpkg-query -W -f='...' mosdns-router 2>&1 || true"`, so a rule
+        # matching the program's name never matches it, and the two reads are
+        # told apart by their format string inside that one token. Two rules
+        # rather than one with a sequence, because a sequence would make the
+        # order the mechanism and this is not order-dependent.
+        {"match": ["sh", "-c", DPKG_STATE_QUERY], "stdout": "unpacked\n"},
+        {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": "install ok unpacked\n"},
         {"match": ["dpkg-reconfigure"], "stdout": "postinst: nothing to do\n"},
         {"match": ["stat", "-c", "%a %U %G"], "stdout": "644 root root\n"},
         # -- the units ------------------------------------------------------
@@ -612,6 +637,45 @@ class WithoutARecordTest(WatchdogScenarioHarness):
     cases: a watchdog whose action cannot run would otherwise be reported as a
     watchdog whose window did not work.
     """
+
+    def test_the_scenario_asserts_the_package_state_it_records(self):
+        # The review's finding 5, held. `dpkg_exit`, `package_state`,
+        # `package_unpacked` and `configure_output` were all written into the
+        # evidence document and none of them was asserted, so a cell whose
+        # install did not complete read as a cell that tested an installed
+        # package -- and the reading a future reader would take.
+        #
+        # These are the two directions, and both matter: a fixture claiming
+        # `configured` must fail (a cell that did not complete must not pass as
+        # one that did), and so must a scenario that records the state without
+        # checking it (the assertion is removed here, not the state).
+        passing = self.run_scenario()[1]
+        self.assertEqual(passing.status, "passed", passing.detail)
+        for state, phrase in (("installed", "install ok installed"), ("half-installed", "")):
+            with self.subTest(state=state):
+                rules = watchdog_rules()
+                for rule in rules:
+                    if rule.get("match") == ["sh", "-c", DPKG_STATE_QUERY]:
+                        rule["stdout"] = f"{state}\n"
+                    elif rule.get("match") == ["sh", "-c", DPKG_STATUS_QUERY]:
+                        rule["stdout"] = f"{phrase}\n"
+                fake, result = self.run_scenario(rules=rules)
+                self.assertNotEqual(
+                    result.status,
+                    "passed",
+                    f"the scenario passed with the package in state {state!r}, which is not the "
+                    "unpacked-but-unconfigured state this cell is, so its evidence document would "
+                    "describe a package install that did not happen",
+                )
+
+    def test_the_evidence_document_says_what_the_package_state_means(self):
+        passing = self.run_scenario()[1]
+        self.assertEqual(passing.status, "passed", passing.detail)
+        written = self.record(passing)
+        self.assertEqual(written["package_state"], "unpacked")
+        self.assertIn("ok unpacked", written["package_unpacked"])
+        self.assertIn("NOT configured", written["package_state_explained"])
+        self.assertIn("postinst's enable path is NOT", written["package_state_explained"])
 
     def test_a_target_with_no_record_fails_rather_than_proving_anything(self):
         # The transaction's LATER refusal still leaves a record -- it is written
