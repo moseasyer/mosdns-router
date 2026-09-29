@@ -550,18 +550,48 @@ class AnotherBootTests(WatchdogFixture):
             "probe after a reboot performs a rollback with two failures of this boot behind it",
         )
 
-    def test_a_record_with_no_boot_id_is_re_seeded_rather_than_trusted(self):
-        # The forward-compatible reading of a record written by an older version
-        # of this file. It is the same question as the one above -- is this record
-        # about this boot? -- and it has to be asked before the record is used, not
-        # afterwards.
+    def test_a_record_whose_boot_cannot_be_confirmed_is_used_and_says_so(self):
+        # **Measured, and it changed the design.** The live cell's record reads
+        # `first_failure_boot_id: null` with a perfectly good
+        # `first_failure_boot_seconds`, because `mosdns-watchdog.service` carries
+        # the packaged `ProcSubset=pid` and that hides `/proc/sys` -- so
+        # `/proc/sys/kernel/random/boot_id` is not there to read. The guard
+        # above therefore does not fire in the shipped unit at all, and a guard
+        # that cannot fire while looking armed is worse than none.
+        #
+        # The two ways to close that are both wrong. Refusing the elapsed arm
+        # whenever the boot cannot be confirmed would disable the M arm on every
+        # machine this package ships -- and the M arm exists for the suspend case,
+        # which is the one place waiting is the wrong answer. And dropping
+        # `ProcSubset=pid` would give this unit a hardening shape of its own, which
+        # is the thing the plan's reuse ruling exists to prevent.
+        #
+        # So the guard degrades in the open: the record is used, its boot id stays
+        # null, and the run says once that the boot could not be confirmed, why,
+        # and which guard IS in force -- the record on a tmpfs, which is the
+        # design's primary answer to exactly this question.
         self.arm()
         self.run_watchdog(now=at(), boot=at())
         self.rewrite(first_failure_boot_id=None)
         outcome = self.run_watchdog(now=at(minutes=30), boot=at(minutes=30))
-        self.assertEqual(self.actions(), [])
-        self.assertIn("boot", (outcome.stdout + outcome.stderr).lower())
-        self.assertEqual(self.record()["consecutive_failures"], 1)
+        said = (outcome.stdout + outcome.stderr).lower()
+        self.assertEqual(
+            self.record()["consecutive_failures"],
+            2,
+            "a run whose boot could not be confirmed threw the streak away, so the mechanism "
+            "counts from one on every run and never reaches its threshold",
+        )
+        self.assertIn("could not be confirmed", said)
+        self.assertIn("tmpfs", said)
+        self.assertIn(
+            "/proc/sys/kernel/random/boot_id",
+            said,
+            "the message does not say WHY the boot could not be confirmed, and the reason is a "
+            "directive in the unit's own sandbox",
+        )
+        # And the elapsed arm is still alive for it, because that is the whole
+        # of the trade this case is documenting.
+        self.assertEqual(self.actions(), [ACTION])
 
     def test_the_record_names_the_boot_this_run_is_in(self):
         self.arm()
@@ -1401,10 +1431,16 @@ class RecordOwnershipTests(WatchdogFixture):
             if line.startswith(f"d {RECORD_DIR} ")
         ).split()
         mode, owner, group = entry[2], entry[3], entry[4]
-        self.assertEqual(mode, "0700", f"the record's directory is {mode}, not 0700")
-        self.assertEqual(owner, "root")
-        self.assertEqual(group, "root", "the record's directory is group-owned, so it is reachable")
-        self.assertEqual(int(mode, 8) & 0o077, 0, "the record's directory is reachable by others")
+        self.assertEqual((owner, group), ("root", "root"), "the record's directory is not root's")
+        bits = int(mode, 8)
+        self.assertEqual(bits & 0o700, 0o700, f"the record's directory is {mode}")
+        self.assertEqual(
+            bits & 0o070,
+            0,
+            f"the record's directory is {mode}, and a group-reachable directory is a directory the "
+            "group can read the record through even when the record itself is 0600",
+        )
+        self.assertEqual(bits & 0o007, 0, f"the record's directory is {mode}")
 
     def test_the_units_writable_path_is_the_records_own_directory(self):
         # The unit can only write where it is told it may, so the path in
@@ -1639,12 +1675,18 @@ class TransactionExclusionTests(WatchdogFixture):
 
     def test_a_lock_it_cannot_open_declines_rather_than_acting_without_one(self):
         # The lock is a guarantee only while it can be taken. A machine whose
-        # control lock cannot be opened -- a directory that is not there, a lock
-        # that is a directory, a filesystem that will not let it be created -- is
-        # a machine where "nobody else is mutating this" cannot be established,
-        # and the patient answer is to do nothing and say so.
+        # control lock cannot be opened is a machine where "nobody else is
+        # mutating this" cannot be established, and the patient answer is to do
+        # nothing and say so.
+        #
+        # The shape here is a lock whose PARENT is a regular file, because a
+        # directory at the lock's own path is NOT a shape that fails: `open(O_RDONLY)`
+        # on a directory succeeds on Linux and `flock` on it works, so a case
+        # using that shape would pass while testing nothing. `ENOTDIR` is a real
+        # answer to a real question, and this is the shape that produces it.
         self.arm(failures=1, minutes=10)
-        self.rooted(CONTROL_LOCK).mkdir(parents=True)
+        self.rooted("/var/lib/mosdns").mkdir(parents=True, exist_ok=True)
+        self.rooted("/var/lib/mosdns/runtime").write_text("not a directory\n")
         outcome = self.run_watchdog()
         self.assertEqual(
             self.actions(),
@@ -1652,6 +1694,69 @@ class TransactionExclusionTests(WatchdogFixture):
             "the action ran with no way to know whether a transaction was in flight",
         )
         self.assertIn(CONTROL_LOCK, outcome.stderr)
+        self.assertEqual(outcome.status, installer.EXIT_REFUSED)
+
+        self.arm(failures=1, minutes=10)
+        self.assertFalse(
+            self.rooted(CONTROL_LOCK).exists(),
+            "the fixture left a control lock behind, so this case is not testing absence",
+        )
+        # **Found by the live run, and it made the mechanism inert.**
+        # `mosdns-watchdog.service` runs with `ProtectSystem=strict` and a
+        # `ReadWritePaths` naming only the record's own directory, so
+        # `/var/lib/mosdns/runtime` is READ-ONLY inside it. Taking the lock with
+        # `O_CREAT` therefore fails there, and the first live cell said so:
+        #
+        #   watchdog: /var/lib/mosdns/runtime/control.lock could not be opened
+        #   ([Errno 30] Read-only file system), so whether some other operation is
+        #   mutating this machine's DNS right now cannot be established.
+        #
+        # and the watchdog then declined to do anything at all, for ever, on any
+        # machine where the optimizer had not yet run and created the lock. The
+        # whole protection was a unit that exits 1 every minute with a
+        # well-reasoned message.
+        #
+        # The fix is the same shape as the bridge's own lock discipline: a
+        # READER does not create the thing it reads. An absent lock means nobody
+        # holds it -- every holder had to create it first -- so absence is free,
+        # and the watchdog opens it `O_RDONLY` with no `O_CREAT`, which needs no
+        # write permission on a directory it does not own.
+        self.arm(failures=1, minutes=10)
+        self.assertFalse(
+            self.rooted(CONTROL_LOCK).exists(),
+            "the fixture left a control lock behind, so this case is not testing absence",
+        )
+        outcome = self.run_watchdog()
+        self.assertEqual(
+            self.actions(),
+            [ACTION],
+            "the watchdog did nothing because the control lock did not exist, which is the state "
+            "of every machine whose optimizer has not yet run",
+        )
+        self.assertEqual(
+            self.rooted(CONTROL_LOCK).exists(),
+            False,
+            "the watchdog created the control lock, which needs a write on a directory its unit "
+            "is not granted",
+        )
+        self.assertEqual(outcome.status, installer.EXIT_OK)
+
+    def test_a_lock_that_exists_and_is_held_still_stops_the_watchdog(self):
+        # The control for the case above: absent is free, present-and-held is
+        # not, and the two are told apart by the open rather than by a guess.
+        self.arm()
+        self.hold_the_lock()
+        self.run_watchdog()
+        self.assertEqual(self.actions(), [], "an existing, held lock did not stop the action")
+
+    def test_the_watchdogs_lock_open_asks_for_no_write_permission(self):
+        # Asserted on the source because the failure was a permission, and
+        # `O_CREAT` on a read-only directory is a permission. The watchdog's
+        # caller must not ask to create it; the transaction's must, because a
+        # mutating caller is the one that can afford the write.
+        body = _function_body(SOURCE, "watchdog")
+        self.assertIn("_try_control_lock(root, create=False)", body)
+        self.assertIn("create=True", _function_body(SOURCE, "_hold_control_lock"))
 
     def test_the_lock_is_taken_without_waiting(self):
         # Asserted on the source, and it matters in both directions: a watchdog
@@ -1695,7 +1800,10 @@ class TransactionExclusionTests(WatchdogFixture):
         # during one would be doing to a machine being put RIGHT what it does to a
         # machine being left broken.
         self.assertIn("_roll_back_under_the_lock(root, transaction, notes)", _function_body(SOURCE, "install"))
-        self.assertIn("with _try_control_lock(root):", _function_body(SOURCE, "_roll_back_under_the_lock"))
+        self.assertIn(
+            "with _try_control_lock(root, create=True):",
+            _function_body(SOURCE, "_roll_back_under_the_lock"),
+        )
 
     def test_a_rollback_that_cannot_take_the_lock_still_rolls_back(self):
         # The one place the discipline is deliberately broken, and it is worth

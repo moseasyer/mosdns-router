@@ -197,7 +197,7 @@ class LockUnavailable(Exception):
 
 
 @contextlib.contextmanager
-def _try_control_lock(root: Path):
+def _try_control_lock(root: Path, create: bool = False):
     """Hold `CONTROL_LOCK` for the duration of the block, or say it is held.
 
     **This is the package's mutual exclusion and it is now used by the transaction
@@ -213,12 +213,26 @@ def _try_control_lock(root: Path):
     there would mean sitting for the length of a transaction and then acting
     anyway. Both decline instead, and both say so in words that name the lock.
 
-    The descriptor is read-only, as in the bridge's own lock: a process holding
-    this lock has no way to modify the state it protects, and closing it releases
-    the lock. The mode is pinned on every acquire, not only on creation, because
-    the umask narrows the mode argument and a lock at 0600 would be a lock the
-    other service identity could not take -- which presents as "somebody else
-    holds it", for ever.
+    **``create`` is False for a reader and True for a mutator, and the watchdog
+    must pass False.** `mosdns-watchdog.service` runs with `ProtectSystem=strict`
+    and a `ReadWritePaths` naming only the record's own directory, so
+    `/var/lib/mosdns/runtime` is read-only inside it and an `O_CREAT` there fails
+    with `EROFS`. The first live cell measured exactly that, and the watchdog then
+    declined to do anything at all on every machine whose optimizer had not yet
+    run and created the lock -- the entire protection, inert, with a correct
+    message explaining why.
+
+    So a reader opens `O_RDONLY` and treats **absence as free**: every holder had
+    to create the lock first, so a lock that is not there is a lock nobody holds.
+    That is the same discipline as the bridge's own publication lock, and it costs
+    the reader no permission it was not granted. A mutator creates it, and pins
+    the mode on every acquire rather than only on creation, because the umask
+    narrows the mode argument and a lock at 0600 would be a lock the other
+    service identity could not take -- which presents as "somebody else holds it",
+    for ever.
+
+    The descriptor is read-only either way: a process holding this lock has no way
+    to modify the state it protects, and closing it releases the lock.
     """
     path = root / CONTROL_LOCK.lstrip("/")
     descriptor = None
@@ -226,23 +240,32 @@ def _try_control_lock(root: Path):
         import fcntl
 
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor = os.open(path, os.O_CREAT | os.O_RDONLY, LOCK_MODE)
-            os.fchmod(descriptor, LOCK_MODE)
+            if create:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor = os.open(path, os.O_CREAT | os.O_RDONLY, LOCK_MODE)
+                os.fchmod(descriptor, LOCK_MODE)
+            else:
+                descriptor = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            # Absence is free, and the comment above says why. The block runs
+            # with no descriptor held, which is the same state as holding a lock
+            # nobody has: there is nothing to exclude anybody from.
+            pass
         except OSError as error:
             raise LockUnavailable(
                 f"{CONTROL_LOCK} could not be opened ({error}), so whether some other operation "
                 f"is mutating this machine's DNS right now cannot be established"
             ) from None
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                raise LockUnavailable(
-                    f"{CONTROL_LOCK} is held by another operation, so something else is changing "
-                    f"this machine's DNS right now"
-                ) from None
-            raise LockUnavailable(f"{CONTROL_LOCK} could not be locked ({error})") from None
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                    raise LockUnavailable(
+                        f"{CONTROL_LOCK} is held by another operation, so something else is "
+                        "changing this machine's DNS right now"
+                    ) from None
+                raise LockUnavailable(f"{CONTROL_LOCK} could not be locked ({error})") from None
         yield
     finally:
         if descriptor is not None:
@@ -264,7 +287,7 @@ def _hold_control_lock(root: Path):
     finds no undos registered, because nothing was done.
     """
     try:
-        with _try_control_lock(root):
+        with _try_control_lock(root, create=True):
             yield
     except LockUnavailable as error:
         raise InstallRefused(
@@ -3868,7 +3891,7 @@ def _roll_back_under_the_lock(root: Path, transaction: Transaction, notes: List[
     lock -- rather than a traceback and a machine left where it was.
     """
     try:
-        with _try_control_lock(root):
+        with _try_control_lock(root, create=True):
             return transaction.rollback()
     except LockUnavailable as error:
         notes.append(
@@ -6064,20 +6087,37 @@ def read_watchdog_record(root: Path, boot_id: Optional[str] = None) -> tuple:
         # falling back to a clock somebody can step.
         boot = None
     recorded_boot = _as_text(document.get("first_failure_boot_id"))
-    if recorded_boot != boot_id:
-        named = (
-            f"it was written during another boot ({recorded_boot}, and this boot is {boot_id})"
-            if recorded_boot
-            else f"it names no boot ({document.get('first_failure_boot_id')!r}, and this boot is "
-            f"{boot_id})"
-        )
+    if recorded_boot and boot_id and recorded_boot != boot_id:
         return WatchdogRecord.empty(), (
-            f"the failure record at {WATCHDOG_RECORD} is not about this boot: {named}. A record "
-            "measures one boot, and a reboot is exactly the moment this mechanism must not act -- "
-            "the first minutes after a boot are when a machine most produces a failure that is not "
-            "a fault -- so the count starts again from this failure rather than continuing a "
-            "streak, and an elapsed time measured across a reboot, or in a clock from a boot that "
-            "is gone, is not a time at all."
+            f"the failure record at {WATCHDOG_RECORD} is not about this boot: it was written "
+            f"during another boot ({recorded_boot}, and this boot is {boot_id}). A record measures "
+            "one boot, and a reboot is exactly the moment this mechanism must not act -- the first "
+            "minutes after a boot are when a machine most produces a failure that is not a fault "
+            "-- so the count starts again from this failure rather than continuing a streak, and "
+            "an elapsed time measured across a reboot, or in a clock from a boot that is gone, is "
+            "not a time at all."
+        )
+    unconfirmed = ""
+    if (recorded_boot is None) != (boot_id is None):
+        unconfirmed = (
+            f"the boot the record at {WATCHDOG_RECORD} was written in could not be confirmed "
+            f"against this one: the record says {recorded_boot!r} and this run says {boot_id!r}, "
+            f"and {BOOT_ID} is not readable in one of the two processes. "
+        )
+    elif recorded_boot is None:
+        unconfirmed = (
+            f"neither this run nor the record at {WATCHDOG_RECORD} could confirm the boot it "
+            f"belongs to, because {BOOT_ID} is not readable here -- this unit's `ProcSubset=pid` "
+            "hides /proc/sys, and that is the packaged sandbox, not a choice made for the "
+            "watchdog. "
+        )
+    if unconfirmed:
+        unconfirmed += (
+            "The record is on a tmpfs at /run, so it is gone at a reboot and the streak it holds "
+            "cannot have survived one; that is the guard in force here, and naming the boot is a "
+            "second answer to the same question for a host whose /run is a disk rather than a "
+            "tmpfs. The elapsed half of the window is still measured, on the boot clock, because "
+            "refusing it would switch off the arm that exists for a machine which was suspended."
         )
     return (
         WatchdogRecord(
@@ -6089,7 +6129,7 @@ def read_watchdog_record(root: Path, boot_id: Optional[str] = None) -> tuple:
             action_utc=_as_text(document.get("action_utc")),
             action_status=status,
         ),
-        "",
+        unconfirmed,
     )
 
 
@@ -6342,7 +6382,7 @@ def watchdog(
     # upgrade's failure streak, not this machine's -- and the first probe after
     # the upgrade would then reach a threshold the upgrade manufactured.
     try:
-        with _try_control_lock(root):
+        with _try_control_lock(root, create=False):
             pass
     except LockUnavailable as error:
         return _deferred(verdict, error)

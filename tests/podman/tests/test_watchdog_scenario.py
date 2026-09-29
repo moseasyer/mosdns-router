@@ -93,6 +93,17 @@ CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
 # of a command would be a rule matching nothing.
 DPKG_STATE_QUERY = "dpkg-query -W -f='${db:Status-Status}\\n' mosdns-router 2>&1 || true"
 DPKG_STATUS_QUERY = "dpkg-query -W -f='${Status}\\n' mosdns-router 2>&1 || true"
+DPKG_INSTALL = "dpkg -i /tmp/mosdns-router.deb 2>&1 || true"
+# dpkg's own output, trimmed to what makes the point. The real string on a cell
+# where the transaction refuses carries the installer's whole refusal with it,
+# which is the most useful thing in the document and the reason `dpkg -i` is now
+# run through `sh -c` rather than through `exec_status` at all.
+DPKG_OUTPUT = (
+    "dpkg: error processing package /tmp/mosdns-router.deb (--install):\n"
+    " postinst script for package mosdns-router returned error exit status 1.\n"
+    "Errors were encountered while processing:\n"
+    " /tmp/mosdns-router.deb\n"
+)
 
 BACKUP = json.dumps(
     {
@@ -139,10 +150,23 @@ JOURNAL_OFF = (
 
 
 def _record(count: int, action: bool = False, status: int | None = None) -> dict:
+    """One failure record as the shipped watchdog writes it.
+
+    **The two boot fields are here, and both are `None`, and that is measured
+    rather than convenient.** `mosdns-watchdog.service` carries the packaged
+    `ProcSubset=pid`, which hides /proc/sys, so
+    /proc/sys/kernel/random/boot_id cannot be read inside the unit and the record
+    carries a null boot id. The boot-relative stamp is a real number, because
+    `CLOCK_BOOTTIME` is a syscall rather than a file. A fixture that answered
+    `unpacked`/schema 1 here would be describing a record no release has written
+    since the clock moved off the wall clock.
+    """
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "consecutive_failures": count,
         "first_failure_utc": "2026-09-29T03:00:00Z",
+        "first_failure_boot_seconds": 381174.782824722,
+        "first_failure_boot_id": None,
         "last_failure_utc": "2026-09-29T03:00:00Z",
         "action_utc": "2026-09-29T03:00:00Z" if action else None,
         "action_status": status,
@@ -216,7 +240,6 @@ def watchdog_rules(
         {"match": ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", "eth0"],
          "answers": [{"stdout": "eth0\n"}, {"stdout": f"{PROFILE}\n"}]},
         # -- the package ----------------------------------------------------
-        {"match": ["dpkg", "-i"], "returncode": 0, "stdout": "Setting up mosdns-router ...\n"},
         {"match": ["stat", "-c", "%s"], "stdout": "16167412\n"},
         # **TWO dpkg-query answers, and they are different strings on purpose.**
         # The scenario asks twice, in this order:
@@ -237,10 +260,35 @@ def watchdog_rules(
         # told apart by their format string inside that one token. Two rules
         # rather than one with a sequence, because a sequence would make the
         # order the mechanism and this is not order-dependent.
-        {"match": ["sh", "-c", DPKG_STATE_QUERY], "stdout": "unpacked\n"},
-        {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": "install ok unpacked\n"},
-        {"match": ["dpkg-reconfigure"], "stdout": "postinst: nothing to do\n"},
-        {"match": ["stat", "-c", "%a %U %G"], "stdout": "644 root root\n"},
+        #
+        # `half-configured` and not `unpacked`, because that is what a live run
+        # MEASURED: the first version of this table answered `unpacked` and
+        # `install ok installed` on the strength of what the review said the
+        # state was, the scenario's new assertion then failed on a real run, and
+        # the real word turned out to be this one. The scenario asserts the
+        # PROPERTY (not configured) rather than the literal, because dpkg picks
+        # the word; the table answers the word a real dpkg used.
+        {"match": ["sh", "-c", DPKG_STATE_QUERY], "stdout": "half-configured\n"},
+        {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": "install ok half-configured\n"},
+        # `dpkg -i` runs TWICE: once through `sh -c '... || true'` for the
+        # captured output, and once through `exec_status` for the exit status.
+        # The two rules are disjoint -- the `sh -c` form is one argv token, so
+        # `["dpkg", "-i"]` cannot match it -- and they carry DIFFERENT exit
+        # statuses, because the `|| true` really does make the shell exit 0 while
+        # `exec_status` sees dpkg's own 1. That difference is the point of
+        # running it through a shell: the output is captured without the read
+        # raising.
+        {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0, "stdout": DPKG_OUTPUT},
+        {"match": ["dpkg", "-i"], "returncode": 1, "stdout": DPKG_OUTPUT},
+        {"match": ["dpkg-reconfigure"],
+         "stdout": "/usr/sbin/dpkg-reconfigure: mosdns-router is broken or not fully installed\n"},
+        # The setting's own mode, NAMED rather than matched on the bare
+        # `["stat", "-c", "%a %U %G"]`: the fake takes the FIRST matching rule,
+        # so a generic rule here would swallow the record's and the record's
+        # mode -- the property finding 3 is about -- would silently be the
+        # setting's.
+        {"match": ["stat", "-c", "%a %U %G", "/etc/mosdns/watchdog.yaml"],
+         "stdout": "644 root root\n"},
         # -- the units ------------------------------------------------------
         # `ActiveState` through `show`, which exits 0 for every state, because
         # that is what the scenario reads: `is-active` exits 3 for anything that
@@ -284,9 +332,9 @@ def watchdog_rules(
         # the switch off the watchdog clears the record, and a record that still
         # named an action after four no-action runs is exactly the property the
         # switch has to have.
-        {"match": ["test", "-e", "/run/mosdns/watchdog.json"],
+        {"match": ["test", "-e", "/run/mosdns/watchdog/watchdog.json"],
          "answers": [{"returncode": 0}, {"returncode": 0}, {"returncode": 1}]},
-        {"match": ["cat", "/run/mosdns/watchdog.json"],
+        {"match": ["cat", "/run/mosdns/watchdog/watchdog.json"],
          "answers": [{"stdout": state} for state in states]},
         {"match": ["test", "-e", "/var/lib/mosdns/installer/network-manager-backup.json"],
          "returncode": 0 if backup else 1},
@@ -294,8 +342,16 @@ def watchdog_rules(
          "stdout": backup or ""},
         {"match": ["cat", "/var/lib/mosdns/installer/managed-by"],
          "stdout": "mosdns-router\n"},
-        {"match": ["stat", "-c", "%a %U %G", "/run/mosdns/watchdog.json"],
-         "stdout": "640 root root\n"},
+        {"match": ["stat", "-c", "%a %U %G", "/run/mosdns/watchdog/watchdog.json"],
+         "stdout": "600 root root\n"},
+        # The DIRECTORY, which is the half that matters: a 0600 file in a
+        # group-writable directory is still deletable and replaceable, because
+        # unlink and rename are the containing directory's decision. `2700` and
+        # not `700`, measured: the parent is setgid, so `install -d` creates this
+        # one setgid too. The setgid bit is inherited and harmless when the group
+        # is root and the group field is empty.
+        {"match": ["stat", "-c", "%a %U %G", "/run/mosdns/watchdog"],
+         "stdout": "2700 root root\n"},
         # -- the four watchdog runs ------------------------------------------
         # The journal is read through a CURSOR, so each read is one run's output
         # and nothing else. `--show-cursor` is the position and `--after-cursor`
@@ -645,10 +701,17 @@ class WithoutARecordTest(WatchdogScenarioHarness):
         # install did not complete read as a cell that tested an installed
         # package -- and the reading a future reader would take.
         #
-        # These are the two directions, and both matter: a fixture claiming
-        # `configured` must fail (a cell that did not complete must not pass as
-        # one that did), and so must a scenario that records the state without
-        # checking it (the assertion is removed here, not the state).
+        # The claim asserted is the PROPERTY, not dpkg's word: a fixture
+        # claiming `installed` must fail, because a cell that did not complete
+        # must not pass as one that did. `half-installed` must fail too, since
+        # nothing in this matrix produces it and a cell in that state is a cell
+        # something else happened to.
+        #
+        # **This case is why the literal is not asserted.** A live run measured
+        # `half-configured` where the first version of this table answered
+        # `unpacked`, and the assertion is what caught it -- the alternative
+        # would have been to have rewritten the table to the new word and learned
+        # nothing.
         passing = self.run_scenario()[1]
         self.assertEqual(passing.status, "passed", passing.detail)
         for state, phrase in (("installed", "install ok installed"), ("half-installed", "")):
@@ -663,19 +726,86 @@ class WithoutARecordTest(WatchdogScenarioHarness):
                 self.assertNotEqual(
                     result.status,
                     "passed",
-                    f"the scenario passed with the package in state {state!r}, which is not the "
-                    "unpacked-but-unconfigured state this cell is, so its evidence document would "
-                    "describe a package install that did not happen",
+                    f"the scenario passed with the package in state {state!r}, which is not a "
+                    "state this cell can be in, so its evidence document would describe a package "
+                    "install that did not happen",
                 )
+
+    def test_the_record_lives_in_a_directory_the_group_cannot_write(self):        # The finding 3 property, observed on a real target rather than only in
+        # the unit tests. The record's own mode is the half anyone would check;
+        # the directory is the half that matters, because a 0600 file inside a
+        # group-WRITABLE directory can still be unlinked and renamed by
+        # `mosdns-cdn` -- the identity the Go health check runs as.
+        passing = self.run_scenario()[1]
+        self.assertEqual(passing.status, "passed", passing.detail)
+        written = self.record(passing)
+        self.assertEqual(
+            written["record_file_mode"].split()[0],
+            "600",
+            f"the record is {written['record_file_mode']!r} and something other than root reads it",
+        )
+        mode, owner, group = (written["record_dir_mode"] or "--- --- ---").split()
+        self.assertEqual((owner, group), ("root", "root"))
+        bits = int(mode, 8)
+        self.assertEqual(
+            bits & 0o700,
+            0o700,
+            f"the record's directory is {written['record_dir_mode']!r} and its owner cannot even "
+            "list it",
+        )
+        # The setgid bit is 0o2000, NOT part of 0o070, so this reads the group's
+        # permission field on its own -- a test that masked with 0o077 would see
+        # zero for a 2700 directory and conclude the owner bits were empty, which
+        # is how the first version of this case failed on a correct value.
+        self.assertEqual(
+            bits & 0o070,
+            0,
+            f"the record's directory is {written['record_dir_mode']!r}, and a group-readable or "
+            "group-writable directory hands the record's directory to every member of `mosdns`",
+        )
+        self.assertEqual(
+            bits & 0o007,
+            0,
+            f"the record's directory is {written['record_dir_mode']!r} and the world can reach it",
+        )
+
+    def test_the_record_cannot_name_its_boot_in_this_cell_and_says_why(self):
+        # Measured, and it is the packaged sandbox doing it. `mosdns-watchdog.service`
+        # carries `ProcSubset=pid`, which hides /proc/sys, so
+        # /proc/sys/kernel/random/boot_id is not readable inside the unit and the
+        # record's boot id is null. The cross-boot guard therefore does not fire
+        # here; the tmpfs under /run is the guard that does.
+        #
+        # Asserted rather than assumed, because a cell that DID record a boot id
+        # would be a cell whose unit had a different sandbox from the shipped one,
+        # and every other conclusion drawn from it would then be about a machine
+        # that does not exist.
+        passing = self.run_scenario()[1]
+        self.assertEqual(passing.status, "passed", passing.detail)
+        written = self.record(passing)
+        self.assertIsNone(
+            written["record_below_window"]["first_failure_boot_id"],
+            "the record names a boot, so this cell's unit can read /proc/sys and therefore is not "
+            "running the shipped sandbox",
+        )
+        self.assertIsNotNone(
+            written["record_below_window"]["first_failure_boot_seconds"],
+            "the record carries no boot-relative stamp either, so the elapsed arm is not being "
+            "measured in this cell at all",
+        )
 
     def test_the_evidence_document_says_what_the_package_state_means(self):
         passing = self.run_scenario()[1]
         self.assertEqual(passing.status, "passed", passing.detail)
         written = self.record(passing)
-        self.assertEqual(written["package_state"], "unpacked")
-        self.assertIn("ok unpacked", written["package_unpacked"])
+        self.assertFalse(written["package_configured"], "the document claims a configured package")
+        self.assertIn("ok ", written["package_unpacked"])
         self.assertIn("NOT configured", written["package_state_explained"])
         self.assertIn("postinst's enable path is NOT", written["package_state_explained"])
+        # And the transaction's own refusal is in the document, which is the
+        # thing `dpkg -i` through `sh -c` was added for.
+        self.assertIn("postinst", written["dpkg_output"])
+        self.assertIn("exit status 1", written["dpkg_output"])
 
     def test_a_target_with_no_record_fails_rather_than_proving_anything(self):
         # The transaction's LATER refusal still leaves a record -- it is written

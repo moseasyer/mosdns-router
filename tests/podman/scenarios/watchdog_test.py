@@ -66,7 +66,8 @@ INSTALLER = "/usr/lib/mosdns-router/mosdns_installer.py"
 CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
 BACKUP_PATH = "/var/lib/mosdns/installer/network-manager-backup.json"
 MARKER_PATH = "/var/lib/mosdns/installer/managed-by"
-RECORD_PATH = "/run/mosdns/watchdog.json"
+RECORD_PATH = "/run/mosdns/watchdog/watchdog.json"
+RECORD_DIR = "/run/mosdns/watchdog"
 SETTING_PATH = "/etc/mosdns/watchdog.yaml"
 # The name the installer's own probe asks for, and the one the mock router is
 # configured to answer. Both are named here rather than imported from the
@@ -556,42 +557,66 @@ def build_scenario(
             document["package_bytes"] = int(
                 try_read("stat", "-c", "%s", "/tmp/mosdns-router.deb").strip() or 0
             )
+            # `dpkg -i` through `sh -c` so the installer's own stdout AND stderr
+            # are captured. `exec_status` keeps no output, and the previous
+            # version used it -- which is why the evidence document had the dpkg
+            # exit status and nothing that said WHY. That gap is what let the
+            # first version of this report call the resulting state `unpacked`
+            # when a live run measures `half-configured`: the transaction's own
+            # refusal, which names the step it stopped at, is in this string.
+            document["dpkg_output"] = try_read(
+                "sh", "-c", "dpkg -i /tmp/mosdns-router.deb 2>&1 || true"
+            )[:4000]
             installed = podman.exec_status(target, "dpkg", "-i", "/tmp/mosdns-router.deb")
             document["dpkg_exit"] = installed
             document["package_state"] = try_read(
                 "sh", "-c", "dpkg-query -W -f='${db:Status-Status}\\n' mosdns-router 2>&1 || true"
             ).strip()
-            # dpkg prints the postinst's own output on the `dpkg -i` run, and it
-            # is captured rather than read from there because `exec_status` keeps
-            # no output. `dpkg-reconfigure` re-runs the configure step, so the
-            # transaction's own messages are in the evidence document whatever
-            # the first run printed.
+            # `dpkg-reconfigure` re-runs the configure step, so the transaction's
+            # messages are in the document whatever the first run printed -- and
+            # on a package dpkg has already left half-configured it REFUSES
+            # ("broken or not fully installed"), which is itself an answer worth
+            # having next to the state.
             document["configure_output"] = try_read(
                 "sh", "-c", "dpkg-reconfigure mosdns-router 2>&1 || true"
             )[:4000]
             document["package_unpacked"] = try_read(
                 "sh", "-c", "dpkg-query -W -f='${Status}\\n' mosdns-router 2>&1 || true"
             ).strip()
+            # **MEASURED, NOT ASSUMED.** The first version of this scenario
+            # reported the state as `unpacked` because that is what the review
+            # said, and a live run measured `half-configured` -- dpkg records a
+            # different word depending on how far its state machine got before
+            # `postinst` exited 1, and "unpacked" was simply the wrong one. Both
+            # words mean the same thing for every claim this scenario makes, so
+            # what is asserted is the PROPERTY -- not configured, and the files
+            # are there -- rather than a literal dpkg is free to change. The
+            # word is recorded either way.
+            configured = document["package_state"] in ("installed", "install ok installed")
+            document["package_configured"] = configured
             document["package_state_explained"] = (
-                "unpacked, NOT configured: postinst exits 1 when the install transaction refuses, "
-                "and it refuses in this matrix because `update-lists --refresh-ranges` needs "
-                "api.cloudflare.com and the container has no route off its bridge. Everything this "
-                "scenario observes was unpacked and is present; the timer was never enabled by "
-                "postinst, so the service is started by hand and postinst's enable path is NOT "
-                "exercised here."
+                f"{document['package_state']!r}, NOT configured: postinst exits 1 when the install "
+                "transaction refuses, and it refuses in this matrix because `update-lists "
+                "--refresh-ranges` needs api.cloudflare.com and the container has no route off its "
+                "bridge. Everything this scenario observes was unpacked and is present; the timer "
+                "was never enabled by postinst, so the service is started by hand and postinst's "
+                "enable path is NOT exercised here. (dpkg's exact word for this state is measured "
+                "per run rather than asserted: it has been observed as both `unpacked` and "
+                "`half-configured` depending on how far dpkg's state machine got.)"
             )
             _require(
-                document["package_state"] == "unpacked",
+                not configured,
                 f"the package is {document['package_state']!r} and this scenario's evidence document "
                 "claims a cell that tested an installed package. Either the transaction succeeded "
-                "in this cell -- in which case this text is wrong and must be rewritten -- or it "
+                "in this cell -- in which case that text is wrong and must be rewritten -- or it "
                 "did not, and the state is what this scenario documents. The dpkg exit was "
-                f"{document['dpkg_exit']} and the configure output is in this document.",
+                f"{document['dpkg_exit']} and dpkg's own output is in this document:\n"
+                f"{document['dpkg_output']}",
             )
             _require(
-                "ok unpacked" in document["package_unpacked"],
-                f"dpkg reports {document['package_unpacked']!r}, which is not the "
-                "unpacked-but-unconfigured state this scenario is written for, so what it "
+                "ok " in document["package_unpacked"],
+                f"dpkg reports {document['package_unpacked']!r}, which is not one of the "
+                "unpacked-but-not-configured states this scenario is written for, so what it "
                 "observed is not what it says it observed",
             )
 
@@ -834,7 +859,11 @@ def build_scenario(
             document["record_file_mode"] = try_read(
                 "stat", "-c", "%a %U %G", RECORD_PATH
             )
-
+            # The DIRECTORY the record lives in, which is the half of the
+            # ownership that a file mode cannot show: a 0600 file in a
+            # group-writable directory is still deletable and replaceable,
+            # because unlink and rename are the containing directory's decision.
+            document["record_dir_mode"] = try_read("stat", "-c", "%a %U %G", RECORD_DIR)
             # -- 10. the switch, in the OFF position -------------------------
             # The SHIPPED threshold, and a window longer than the default:
             # `SHIPPED_FAILURES + 1` consecutive failures, which is one more than
