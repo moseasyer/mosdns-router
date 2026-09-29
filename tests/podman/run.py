@@ -56,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 import dhcp_test  # noqa: E402
 import images  # noqa: E402
 import snapshot  # noqa: E402
+import watchdog_test  # noqa: E402
 from podman import (  # noqa: E402
     CONTAINER_CAPABILITIES,
     DEFAULT_NETWORK_SUBNET,
@@ -106,7 +107,24 @@ def build_scenarios() -> dict[str, str]:
     that walks the source, and the thing that has to be held to the code is
     exactly the thing that names the code.
     """
-    return {"dhcp": "dhcp_test:build_scenario"}
+    return {
+        "dhcp": "dhcp_test:build_scenario",
+        "watchdog": "watchdog_test:build_scenario",
+    }
+
+
+# The scenarios that need the built package, and why the two sets are named here
+# rather than discovered by inspecting the builders.
+#
+# `dhcp` needs no package: it drives NetworkManager and the mock router, both of
+# which the target image has. `watchdog` needs the `.deb`, because the mechanism
+# it observes is four files inside it -- the unit, the timer, the setting and the
+# verb -- and a scenario that hand-copied those four would be testing a
+# constructed approximation of the package rather than the package. So the
+# harness copies the real artifact in, and the set of scenarios that need it is
+# declared here where a case can read it. A builder that gained a `package`
+# parameter would not be found by this: the registration is the fact.
+PACKAGE_SCENARIOS = ("watchdog",)
 
 
 def _resolve_builder(name: str):
@@ -507,6 +525,39 @@ def scenario_clock() -> dict:
     return {"now": time.monotonic, "sleep": time.sleep}
 
 
+def _package_path(arch: str) -> Path:
+    """The built `.deb` for `arch`, or a refusal naming the command that makes it.
+
+    One file and it is named by its version and architecture, both of which the
+    build script composes into the filename, so this looks for the exact name
+    rather than globbing: a glob would find a stale `.deb` from a previous build
+    of a different source, and a cell that installed it would report results for
+    a package nobody built now. The version is read out of the filename by the
+    caller that knows it -- `packaging/debian/changelog`'s version is a second
+    place to keep in step, and this way there is only one.
+    """
+    directory = REPO / "build"
+    expected = sorted(directory.glob(f"mosdns-router_*_{arch}.deb"))
+    if not expected:
+        raise PodmanError(
+            f"no package for {arch} was found in {directory} (expected "
+            f"mosdns-router_<version>_{arch}.deb). A scenario that installs the package cannot "
+            "run without it, and this harness does not build one: `make package` does, it needs "
+            "go 1.25.8 and the pinned dnscrypt-proxy archive, and it is not wired into `matrix` "
+            "because a release gate that builds artifacts is a different thing from one that "
+            "measures them"
+        )
+    if len(expected) > 1:
+        raise PodmanError(
+            f"{directory} holds {len(expected)} packages for {arch} "
+            f"({', '.join(path.name for path in expected)}) and this harness will not choose "
+            "between them: more than one version on disk is a build directory somebody has not "
+            "cleaned, and installing the wrong one would produce a result about a package nobody "
+            "meant to measure"
+        )
+    return expected[0]
+
+
 def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: dict) -> list:
     """Run one cell per version, with the scenarios that were asked for.
 
@@ -523,6 +574,12 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
         builders = [
             (name, _resolve_builder(name)) for name in requested
         ]
+        # The package, resolved once per cell and only when something needs it.
+        # `dpkg -i` of a `.deb` that is not there is a cell that fails for a
+        # reason no message would explain, so the absence is a refusal naming the
+        # command that builds it -- and it is a harness error (exit 2), because
+        # nothing was proved about the release either way.
+        package = _package_path(args.arch) if set(requested) & set(PACKAGE_SCENARIOS) else None
         scenarios = [
             (name, builder(
                 podman=podman,
@@ -535,6 +592,7 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
                 results_dir=Path(args.results_dir),
                 now=clock["now"],
                 sleep=clock["sleep"],
+                **({"deb": package} if name in PACKAGE_SCENARIOS else {}),
             ))
             for name, builder in builders
         ]
