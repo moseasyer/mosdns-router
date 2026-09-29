@@ -2147,6 +2147,110 @@ class PlanAgreesWithTheImageTest(unittest.TestCase):
                     f"AF_PACKET socket",
                 )
 
+    def test_the_readiness_ruling_does_not_contradict_its_own_table(self):
+        """**A ruling that quotes a number and then prints a different one.**
+
+        The readiness note says "polling 12 target boots per release" and then
+        gives a table reading "10 of 10" three times, with "8 of 10" beside it. The
+        two are the same measurement written twice, and a reader has no way to tell
+        which is the claim. It is the defect of item 4 in this file and of the
+        `dhcp-option` case above, one level up: the plan is the record the next
+        implementer works from, and a record that contradicts itself is worse than
+        one that is merely missing something.
+
+        So the table's own boot count and the sentence introducing it have to agree,
+        and they are checked *against each other* rather than against a number
+        written here -- a case that hard-coded 12 would pass on a plan that had been
+        re-measured to 20 boots, which is the opposite of what it is for.
+
+        The second half is the same kind of check on the failure rate, where the
+        note has to carry the *defect* figure (the one a reader can act on) rather
+        than only the load-dependent one, and must not attribute a measurement to a
+        commit that is not where it was taken.
+        """
+        note = self.readiness_ruling()
+        self.assertIsNotNone(note, "the readiness ruling is no longer in the plan's architecture note")
+
+        # The "N target boots per release" claim and the table's own boot column.
+        claimed = re.search(r"(\d+)\s+target boots per release", note)
+        self.assertIsNotNone(claimed, "the ruling no longer says how many boots per release it polled")
+        claimed_boots = int(claimed.group(1))
+
+        rows = re.findall(r"^>\s*(\d{2}\.\d{2})\s+(\d+)\s+", note, re.M)
+        self.assertTrue(rows, "the ruling's measurement table no longer has a boot column")
+        for release, boots in rows:
+            with self.subTest(release=release):
+                self.assertEqual(
+                    int(boots), claimed_boots,
+                    f"the ruling says it polled {claimed_boots} target boots per release and its "
+                    f"own table says {boots} for {release}, so the note contradicts itself inside "
+                    f"one paragraph",
+                )
+
+        # Every "N of M" in the note must be quoted against a sample size the note
+        # itself declares -- one release's worth, or the whole set's. This is where
+        # "10 of 10" sat next to "12 target boots per release": a denominator
+        # belonging to a sample the sentence above it does not describe. A
+        # *numerator* below the denominator is fine and expected ("8 of 12" is a
+        # partial rate, and quoting it is the point), so only the denominator is
+        # held.
+        declared = {claimed_boots, claimed_boots * len(rows)}
+        for numerator, denominator in re.findall(r"(\d+)\s+of\s+(\d+)", note):
+            with self.subTest(phrase=f"{numerator} of {denominator}"):
+                self.assertIn(
+                    int(denominator), declared,
+                    f"the ruling quotes '{numerator} of {denominator}' but declares "
+                    f"{sorted(declared)} as its sample size, so a rate is being reported against "
+                    f"a measurement the note does not describe",
+                )
+                self.assertLessEqual(
+                    int(numerator), int(denominator),
+                    f"the ruling quotes '{numerator} of {denominator}', a rate above 100%",
+                )
+
+        # And the defect figure, not only the load-dependent one.
+        self.assertIn(
+            "24 of 24", note,
+            "the ruling quotes only the load-dependent visible-failure rate, which is a property "
+            "of the host's load; the figure a reader can act on is that the gate was wrong on "
+            "every boot measured",
+        )
+        self.assertIn("under load", note, "the visible-failure rate is quoted without saying it "
+                                         "depends on what else the host is doing")
+        # The misattribution, corrected in place: a measurement must not be
+        # credited to a commit that postdates it.
+        self.assertNotIn(
+            "on this commit's parent", note,
+            "the ruling attributes a measurement to 'this commit's parent', which is the fixed "
+            "tree for this ruling -- the measurement was taken elsewhere and the attribution makes "
+            "a load-dependent number look like a property of a commit",
+        )
+        self.assertIn("4867d8d", note, "the ruling no longer says which commit the 1-in-6 "
+                                       "measurement was actually taken at")
+
+    def readiness_ruling(self) -> str:
+        """The readiness note, located by its own opening words, or `None`.
+
+        Not by a line number and not by a heading: the plan's architecture notes
+        are a blockquote block near the top with no heading of their own, and a
+        check anchored to either a line number or a heading it does not have is a
+        check that raises instead of asserting. Located by its own words, so a
+        paragraph added above it does not silently make this read the wrong one.
+        """
+        marker = "A readiness wait on a field is not a readiness wait"
+        if marker not in self.plan:
+            return None
+        # Start at the *line* carrying the marker, not at the marker: the note is
+        # a blockquote, so the marker sits after a `> ` prefix and slicing at the
+        # marker would lose it.
+        start = self.plan.rindex("\n", 0, self.plan.index(marker)) + 1
+        lines = []
+        for line in self.plan[start:].splitlines():
+            if line and not line.startswith(">"):
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
     def test_the_architecture_note_no_longer_forbids_the_declaration(self):
         self.assertNotIn(
             "Do **not** add a `NetworkManager.conf.d` entry",

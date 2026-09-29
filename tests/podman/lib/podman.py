@@ -445,6 +445,24 @@ class NetworkManagerDeviceError(PodmanError):
     """
 
 
+class PodmanUnitStateUnavailable(PodmanError):
+    """`systemctl is-active` answered something that is not a unit state.
+
+    **A distinct type, and it is a terminal condition rather than a transient
+    one.** `is-active` exits 0 for `active` and 3 for every state it knows; any
+    other exit means the query itself did not work -- most importantly exit 4,
+    which is what a target whose image has **no such unit** answers, while
+    printing the same `inactive` a unit that has not started yet prints.
+
+    It is its own type because a caller has to treat it differently from a
+    transport failure. A `PodmanError` from a container that is still starting is
+    "not yet" and worth retrying; this one will never become ready, so retrying
+    it spends the whole budget and then reports a broken image as a slow target.
+    That is the misdirection `wait_for_networkmanager_setup` avoids by letting
+    this through on the first read.
+    """
+
+
 class NetworkManagerSetupError(NetworkManagerDeviceError):
     """The target's own NetworkManager setup has not finished, or refused.
 
@@ -509,13 +527,33 @@ NM_MANAGED_YES = "yes"
 # reads for the first second or two, and it is the state the race lives in.
 NM_SETUP_UNIT = "target-nm-setup.service"
 NM_SETUP_ACTIVE = "active"
-NM_SETUP_TERMINAL = ("active", "failed")
-# `systemctl is-active` is documented to exit 0 only for `active`; these are the
-# states a caller can be given, and the last is what an answer with no state in
-# it looks like. `activating` is in neither list and is the state the cell waits
-# through, deliberately and silently.
+NM_SETUP_FAILED = "failed"
+# The two states the wait acts on, and the one it waits through. **These are
+# load-bearing, not documentation** -- `wait_for_networkmanager_setup` branches on
+# them -- and a case in `test_command.py` holds that each is one of the words
+# `systemctl is-active` can actually print, because a constant that names a state
+# systemd does not have is a gate that cannot fire.
+NM_SETUP_TERMINAL = (NM_SETUP_ACTIVE, NM_SETUP_FAILED)
 NM_SETUP_IN_FLIGHT = "activating"
+# What an answer with no state word in it looks like. Also load-bearing: it is
+# what `setup_unit_state` returns when the command succeeded and printed nothing,
+# and the wait treats it as "not terminal" rather than as `active`.
 NM_SETUP_UNKNOWN = ""
+# `systemctl is-active`'s exit codes, measured on a real 24.04 target rather than
+# assumed -- and the last line is the reason this is a table and not a boolean:
+#
+# ```text
+# target-nm-setup.service     exit=0  stdout=active
+# a unit in any other state   exit=3  stdout=<that state>
+# a unit that does not exist  exit=4  stdout=inactive
+# ```
+#
+# A missing unit prints the *same word* a unit that has not started yet prints, so
+# stdout cannot tell them apart and the exit code is the only discriminator. That
+# is what lets `setup_unit_state` return the three interesting states as words
+# while still refusing to call a broken image a slow target.
+NM_IS_ACTIVE_EXIT_ACTIVE = 0
+NM_IS_ACTIVE_EXIT_STATE = 3
 NM_MANAGE_STEPS = (
     "nmcli device set eth0 managed yes",
     "systemctl restart NetworkManager",
@@ -538,6 +576,18 @@ NM_PROFILE_STEP = (
     "ipv4.method auto' -- with no profile the override is accepted and the "
     "field stays 'no'"
 )
+# **The name of that profile, as a separate constant, and the reason is a bug this
+# file had.** `NM_PROFILE_STEP` is a *sentence* for a message, and an earlier
+# version of the setup-failure message tried to name the profile by splicing
+# `NM_PROFILE_STEP.split('--')[0]`, which rendered as
+#
+#     The unit creates the 'a connection profile must already exist for the device,
+#     e.g. 'nmcli connection add … auto'' connection profile
+#
+# -- ungrammatical, self-contradictory, and a sentence spliced out of a sentence
+# that was written for a different reader. So the name lives here and the sentence
+# stays a sentence; a message that needs both uses both.
+NM_PROFILE_NAME = "eth0-managed"
 # The measured NetworkManager version boundary for the persistent device
 # override, and the five measurements that establish it. The target image's
 # setup script gates the same two commands on it, and the suite asserts both
@@ -1158,12 +1208,31 @@ class Podman:
                 f"':ro' instead"
             )
 
-    def run(self, args: Sequence[str], timeout: float | None = None) -> CommandResult:
+    def run(
+        self,
+        args: Sequence[str],
+        timeout: float | None = None,
+        check: bool = True,
+    ) -> CommandResult:
         """Run one Podman command and return what it produced.
 
         Streams are captured, the status is checked, and the deadline is
         explicit. A caller that wanted the status instead of an exception wants
         a different method.
+
+        **`check` exists for one command, and it defaults to `True`.**
+        `systemctl is-active` exits **3** for every state that is not `active`, and
+        those states are the *answer* rather than a failure: `activating` is what a
+        healthy target reads for the first seconds of its life, and `failed` is the
+        verdict the target's own setup script returned. So the one read whose
+        answer is a non-zero exit asks for it by name, rather than being handed an
+        exception that says only that a command failed.
+
+        The default is the load-bearing half. A permissive default would stop
+        every `nmcli` refusal in this harness from raising, and those refusals are
+        what keep a scenario from reading the output of a failure;
+        `SetupUnitStateTest.test_the_read_is_the_only_one_that_opts_out_of_checking`
+        holds the default so a later task cannot widen the exception by accident.
         """
         argv = self.build_argv(args)
         try:
@@ -1174,7 +1243,7 @@ class Podman:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout if timeout is None else timeout,
-                check=True,
+                check=check,
             )
         except subprocess.TimeoutExpired as expired:
             raise PodmanTimeout(
@@ -1340,8 +1409,15 @@ class Podman:
         args.append(image)
         return self.run(args).output
 
-    def exec_container(self, container: str, *command: str) -> CommandResult:
-        return self.run(["exec", container, *[str(c) for c in command]])
+    def exec_container(
+        self, container: str, *command: str, check: bool = True
+    ) -> CommandResult:
+        """Run one command inside a container, raising unless it is told not to.
+
+        `check=False` is for a command whose *answer* is a non-zero exit -- see
+        `Podman.run` and `setup_unit_state`, which is the only caller that uses it.
+        """
+        return self.run(["exec", container, *[str(c) for c in command]], check=check)
 
     def exec_status(self, container: str, *command: str) -> int:
         """The exit status of one command inside a container, asked without raising.
@@ -1559,22 +1635,57 @@ class Podman:
     def setup_unit_state(self, container: str, unit: str = NM_SETUP_UNIT) -> str:
         """The state of the target image's NetworkManager setup unit.
 
-        **Asked without `check=True`, deliberately.** `systemctl is-active` exits
-        non-zero for every state that is not `active` -- `activating`, `inactive`,
-        `failed` -- and all three are answers this read has to return rather than
-        raise on: `activating` is the state a healthy target is in for the first
-        second or two of its life, and `failed` is the state that carries the
-        setup script's own verdict. A read that raised on them would turn the
-        commonest case into an exception and the most informative case into a
-        traceback.
+        **Asked with `check=False`, and that is not a convenience -- it is the whole
+        point of the read.** `systemctl is-active` exits **3** for every state that
+        is not `active`, and all three of those are answers rather than failures:
+        `activating` is what a healthy target reads for the first seconds of its
+        life, `inactive` is what a target reads before the unit starts, and
+        `failed` is the verdict the setup script itself returned. A read that
+        raised on them would answer a different question -- *did a command fail?* --
+        and the wait that uses this read would then report a target that is simply
+        not ready yet as a target whose query could not be made.
 
-        The state is returned as a bare word (`active`, `activating`, `failed`,
-        `inactive`, `unknown`) rather than a full status line, because the gate
-        compares it against one word and the reason the reader is given has to be
-        that word.
+        That is not hypothetical. This method shipped a `check=True` call whose
+        docstring claimed the states came back as words, so `activating`, `inactive`
+        and `failed` all raised, the `failed` branch in `wait_for_networkmanager_setup`
+        was unreachable against a real target, and the budget message said "the last
+        query failed" for a target that had merely not finished starting. The race
+        itself was still closed -- a raised state is not `active`, so the wait kept
+        going -- but the second terminal state and both refusal messages were not
+        delivered. `SetupUnitStateTest` drives the real class against a fake that
+        models the exit code, which is the only way that class of bug is visible in
+        a suite: a fake that always exits 0 agrees with a wrapper that cannot read
+        the state at all.
+
+        Only the states systemd *means* are returned as words, and the
+        discriminator is the **exit code**, not the output. Measured on a real
+        24.04 target:
+
+        ```text
+        target-nm-setup.service   exit=0  stdout=active
+        a unit that is not active  exit=3  stdout=<the state word>
+        a unit that does not exist exit=4  stdout=inactive
+        ```
+
+        The last line is the one that matters: a **missing** unit prints
+        `inactive`, the same word a unit that has not started yet prints, and only
+        the exit code separates them. So exit 4 -- a target whose image has no such
+        unit -- raises `PodmanUnitStateUnavailable`, which the wait treats as
+        terminal rather than retrying: it will never become ready, and retrying it
+        would spend the whole budget and then report a broken image as a slow
+        target.
         """
-        result = self.exec_container(container, "systemctl", "is-active", unit)
-        return (result.output or "").strip().splitlines()[-1].strip() if result.output.strip() else ""
+        result = self.exec_container(container, "systemctl", "is-active", unit, check=False)
+        word = (result.output or "").strip().splitlines()[-1].strip() if result.output.strip() else NM_SETUP_UNKNOWN
+        if result.returncode not in (NM_IS_ACTIVE_EXIT_ACTIVE, NM_IS_ACTIVE_EXIT_STATE):
+            raise PodmanUnitStateUnavailable(
+                f"'systemctl is-active {unit}' in {container} exited {result.returncode}, which is "
+                f"neither {NM_IS_ACTIVE_EXIT_ACTIVE} (the unit is active) nor "
+                f"{NM_IS_ACTIVE_EXIT_STATE} (the unit is in a state systemd reports). It printed "
+                f"{word!r}, and the most likely reason is that the target's image has no such "
+                f"unit -- which is a broken image, not a target that is slow"
+            )
+        return word
 
 
 def assert_networkmanager_manages_device(
@@ -1664,6 +1775,17 @@ def wait_for_networkmanager_device(
     reads: a reader who sees `answered 'no'` and a reader who sees `answered
     'no' on 25 reads over 120s` know different things, and only the second knows
     the answer was not a race.
+
+    **Do not give this the `check=False` treatment `setup_unit_state` needed.**
+    The two look like the same shape -- "a read whose answer is not what we want"
+    -- and they are opposites. `nmcli` exits non-zero when the *device is not
+    there yet*, and for this wait that **is** "not yet": the field's whole
+    contract is that the target is not ready, and an exception saying
+    `Error: Could not create NMClient object: Could not connect` is the single most
+    informative thing it can report about a target that has not finished booting.
+    `setup_unit_state` is the opposite because `is-active`'s non-zero exits are
+    *states* rather than failures, and it is the only read here where that is true.
+    If you add a second `check=False`, check this first.
     """
     deadline = now() + timeout
     last_value: str | None = None
@@ -1765,7 +1887,7 @@ def wait_for_networkmanager_setup(
             last_error = None
             if last_state == NM_SETUP_ACTIVE:
                 return last_state
-            if last_state == "failed":
+            if last_state == NM_SETUP_FAILED:
                 raise NetworkManagerSetupError(
                     f"{unit} FAILED in {container} after {reads} reads {interval:g}s apart. The "
                     f"unit is Type=oneshot with the setup script's exit status as its verdict, so "
@@ -1774,15 +1896,30 @@ def wait_for_networkmanager_setup(
                     f"was.\n"
                     f"  journalctl -u {unit} -b            # inside {container}\n"
                     f"  systemctl show {unit}             # Result, and the exit code\n"
-                    f"The unit creates the '{NM_PROFILE_STEP.split('--')[0].strip()}' connection "
-                    f"profile, and on releases with a persistent device override (from "
-                    f"{'.'.join(str(p) for p in NM_OVERRIDE_MINIMUM)} -- measured "
-                    f"{', '.join(sorted(NM_OVERRIDE_MEASUREMENTS))}) it also runs "
-                    f"'nmcli device set {NM_DEVICE} managed yes' and restarts NetworkManager, which "
-                    f"is why a scenario must not start before this unit is finished."
+                    f"The unit creates the {NM_PROFILE_NAME} connection profile, and on releases "
+                    f"with a persistent device override (measured boundary "
+                    f"{'.'.join(str(part) for part in NM_OVERRIDE_MINIMUM)}; measured "
+                    f"{', '.join(f'{v} -> {r}' for v, r in sorted(NM_OVERRIDE_MEASUREMENTS.items()))}) "
+                    f"it also runs 'nmcli device set {NM_DEVICE} managed yes' and restarts "
+                    f"NetworkManager -- which is why a scenario must not start before this unit is "
+                    f"finished."
                 )
         except NetworkManagerSetupError:
             raise
+        except PodmanUnitStateUnavailable as unavailable:
+            # **Terminal, on the first read.** A target whose image has no such
+            # unit will not grow one, so retrying spends the budget and then
+            # reports a broken image as a slow target. The `PodmanError` below
+            # this one is the opposite case: a container that has not started yet
+            # answers with a transport failure, and that *is* worth retrying.
+            raise NetworkManagerSetupError(
+                f"the setup unit could not be read in {container} after {reads} "
+                f"read{'s' if reads != 1 else ''} {interval:g}s apart: {unavailable}. The gate is "
+                f"not waiting for a slow target, it is reporting that there is no such unit to "
+                f"wait for, so there is no budget to spend.\n"
+                f"  podman exec {container} systemctl list-unit-files | grep nm-setup\n"
+                f"  podman exec {container} ls -l /etc/systemd/system/{unit}\n"
+            ) from unavailable
         except PodmanError as error:
             last_error = str(error)
         if now() >= deadline:

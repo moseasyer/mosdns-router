@@ -39,6 +39,7 @@ Podman. Nothing in this file starts, stops or inspects anything real.
 import ast
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -4450,6 +4451,91 @@ class CommandLineTest(EntryPointTestCase):
         self.assertTrue(fake.invocations())
         for recorded in fake.invocations():
             self.assertNotIn("machine", recorded, f"a machine subcommand was emitted: {recorded!r}")
+
+
+class SetupUnitStateTest(PodmanTestCase):
+    """`systemctl is-active` exits 3 for every state that is not `active`.
+
+    **This is the tool's real contract, and it is why this class drives the real
+    `Podman` against a fake binary rather than a fake method.** `setup_unit_state`
+    is the only read in the wrapper whose *answer is a non-zero exit*, so it is the
+    only one that cannot go through `exec_container`, and it is therefore the one
+    place in this file where "the fake is convenient" and "the fake is right" come
+    apart. The fake models the exit code, so a wrapper that went through the
+    raising path would raise here too -- which is what makes the cases below worth
+    having.
+    """
+
+    # The contract, as `systemctl(1)` states it: `is-active` exits 0 only for
+    # `active`, and 3 for every other known state. Spelled out rather than
+    # assumed, because the whole class is about that number.
+    NON_ACTIVE_EXIT = 3
+
+    def client_answering(self, state: str):
+        """A fake binary that answers `is-active` the way systemd does."""
+        directory = self.extra_directory()
+        fake = self.fake(directory=directory)
+        fake.write_table([
+            {"match": ["systemctl", "is-active", "target-nm-setup.service"],
+             "returncode": 0 if state == "active" else self.NON_ACTIVE_EXIT,
+             "stdout": f"{state}\n"},
+        ])
+        return self.client(fake)
+
+    def test_every_state_a_target_can_be_in_is_returned_as_a_word(self):
+        """**The states, including the three that exit non-zero.**
+
+        `activating`, `inactive` and `failed` are *answers*. A reader that got an
+        exception for them would learn nothing about the target -- only that a
+        command failed -- and the wait above this read would report "the last query
+        failed" for a target it should have reported as *not ready yet*, which is a
+        different message for a different reader and a different fix.
+        """
+        for state in ("active", "activating", "inactive", "failed"):
+            with self.subTest(state=state):
+                client = self.client_answering(state)
+                self.assertEqual(
+                    client.setup_unit_state("mosdns-x-target-24.04"), state,
+                    f"systemctl is-active answered {state!r} with a non-zero exit and the read "
+                    f"did not return it as a word",
+                )
+
+    def test_a_query_that_genuinely_fails_still_raises(self):
+        """`check=False` is for this command's contract, not a blanket amnesty.
+
+        A wrapper that swallowed every non-zero exit would make a *missing* unit --
+        `systemctl is-active` on a target whose image has no such unit exits
+        non-zero with an error on stderr -- look like a unit that is merely not
+        running yet, and the gate would sit out its 120s budget reporting a slow
+        target when the truth is that the image is wrong. So the narrow case is
+        asserted as well as the broad one: only the states systemd *means* come
+        back as words.
+        """
+        fake = self.fake(directory=self.extra_directory())
+        fake.write_table([
+            {"match": ["systemctl", "is-active", "target-nm-setup.service"],
+             "returncode": 4, "stdout": "",
+             "stderr": "Failed to get unit file state: No such file or directory\n"},
+        ])
+        client = self.client(fake)
+        with self.assertRaises(PodmanError) as caught:
+            client.setup_unit_state("mosdns-x-target-24.04")
+        self.assertIn("exited 4", str(caught.exception))
+
+    def test_the_read_is_the_only_one_that_opts_out_of_checking(self):
+        """`check` defaults to `True`, so every other caller is unchanged.
+
+        The parameter is the fix for one read, and a parameter defaulting to the
+        *permissive* value would be a different and much larger change: `nmcli`
+        answering non-zero would stop raising, and every refusal in this suite
+        rests on it. So this holds the default rather than the fix, because the
+        default is the thing a later task would get wrong.
+        """
+        self.assertIs(
+            inspect.signature(Podman.run).parameters["check"].default, True,
+            "Podman.run's check parameter does not default to True, so every caller that relied "
+            "on a non-zero exit raising has silently stopped raising",
+        )
 
 
 class ClockSeamTest(EntryPointTestCase):

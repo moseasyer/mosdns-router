@@ -29,14 +29,14 @@
 > **Measured, and the window is not a corner case — it is every boot.** Polling 12 target boots per release and recording the unit's state *at the poll where the field first read `yes`*:
 >
 > ```text
-> 24.04   10 of 10: unit is 'inactive' or 'activating', never 'active'
->                NetworkManager 'activating' in 10 of 10
->                the eth0-managed profile does NOT yet exist in 8 of 10
-> 22.04   10 of 10: unit is 'inactive' or 'activating', never 'active'
->                NetworkManager 'active' in 10 of 10, profile present in 10 of 10
+> release  boots  unit state when the field first read 'yes'   NetworkManager   eth0-managed profile
+> 24.04       12   'inactive' or 'activating', never 'active'   activating 12/12  does NOT exist in 8/12
+> 22.04       12   'inactive' or 'activating', never 'active'   active 12/12      present in 12/12
 > ```
 >
-> So the gate was wrong on **100% of boots on both releases**, and the *visible* failure rate is a separate and much smaller number, because it depends only on whether the scenario happens to reach `nmcli` inside the window: measured 3 failures in 9 runs on 24.04 under load, 1 in 6 on this commit's parent, and **0 in 12 on a quiet machine**. That gap is the reason it survived a whole task: a flaky-looking number, an underlying certainty, and no case that could have seen it.
+> The `activating` counts, which is where the harm is, are 5 of 12 on 24.04 and 8 of 12 on 22.04; the remainder were `inactive`, i.e. the unit had not started yet. **The profile column was measured over a second, 10-boot pass per release** and reads 5×`inactive`/no-profile, 3×`activating`/no-profile, 2×`inactive`/profile-present on 24.04 and 9×`activating`/profile-present, 1×`inactive`/profile-present on 22.04 -- the same conclusion, from a smaller sample.
+>
+> So the gate was wrong on **24 of 24 boots, 100%**, and the *visible* failure rate is a separate and much smaller number, because it depends only on whether the scenario happens to reach `nmcli` inside the window. Measured, on 24.04: **3 failures in 9 runs under load**, and **0 in 12 on a quiet machine**. An earlier version of this note attributed a 1-in-6 figure to "this commit's parent"; that measurement was taken at `4867d8d`, seven commits before the ruling, and **the parent of the ruling is itself the fixed tree** -- so the attribution was wrong and the number was not a property of the parent at all. The load-dependent figure is the reason this survived a whole task: a flaky-looking number over an underlying certainty, and no case that could have seen it.
 >
 > **The ruling, and it is about ordering rather than about either check alone.** The cell waits for `target-nm-setup.service` to reach a terminal state and *then* for `GENERAL.NM-MANAGED`, and the order is the fix. Neither check substitutes for the other: a unit that has finished with the device unmanaged is a target every scenario would fail on without ever having been managed, and a field that reads `yes` mid-restart is a target whose daemon is about to go away. The terminal state is `active` (`SubState=exited`, `Result=success`) — **measured, and identical on all three releases**, including 22.04 where the script skips the override sequence and so is the obvious release to expect something different. `failed` is the other terminal state and is reported **at once**, because the script's exit status is the unit's verdict and it exits non-zero naming which of the three things went wrong. `activating` is neither: it is the state a healthy target is in for the first seconds of its life, and it is the state the race lives in.
 >

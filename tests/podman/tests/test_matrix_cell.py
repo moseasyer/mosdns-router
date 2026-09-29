@@ -115,7 +115,8 @@ class EntryPoint(PodmanTestCase):
             # unanswered `is-active` is an empty string, which is not `active`, so
             # leaving this out would make every cell here incomplete rather than
             # passing, which is a loud failure rather than a silent one.
-            {"match": ["systemctl", "is-active", NM_SETUP_UNIT], "stdout": "active\n"},
+            {"match": ["systemctl", "is-active", NM_SETUP_UNIT],
+             **test_dhcp_scenario.is_active_answer("active")},
         ] + test_dhcp_scenario.cell_rules()
 
 
@@ -341,8 +342,19 @@ class TargetReadinessTest(EntryPoint):
 
     So the gate returned, the scenario ran `nmcli connection up eth0-managed`, and
     that landed inside the restart: `Error: NetworkManager is not running` (exit 8).
-    It failed about **1 run in 4**, and **1 in 6 measured on `4867d8d`** with none
-    of the later code checked out -- so it predates the fix round.
+
+    **Two rates, and the one that is easy to quote is the one that means least.**
+    The *visible* failure was 3 in 9 runs on a loaded machine and 1 in 6 at
+    `4867d8d` with none of the later code checked out -- so it predates the fix
+    round -- but it is also **0 in 12 on a quiet machine**, measured at the parent
+    commit. A number that depends on what else the host is doing is a property of
+    the host.
+
+    The defect is the gate, and it was wrong on **24 of 24 boots measured** (12 per
+    release, recording the unit's state at the poll where the field first read
+    `yes`): `inactive` or `activating` every time, never `active`. That is the
+    figure to act on, and it is the one a reader of the diff alone can check.
+    After the fix, 24 runs -- 12 on 24.04, 12 on 22.04 -- all passed.
 
     The two facts are separate and neither substitutes for the other: the **unit**
     is what must be finished first, the **field** is what the scenarios need. The
@@ -368,7 +380,7 @@ class TargetReadinessTest(EntryPoint):
         return rules + [
             {"match": ["systemctl", "is-active", "NetworkManager"], "stdout": "active\n"},
             {"match": ["systemctl", "is-active", NM_SETUP_UNIT],
-             "answers": [{"stdout": f"{state}\n"} for state in unit_answers]},
+             "answers": [test_dhcp_scenario.is_active_answer(state) for state in unit_answers]},
             {"match": ["nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", "eth0"],
              "answers": [{"stdout": f"{value}\n"} for value in managed_answers]},
             {"match": ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", "eth0"],
@@ -528,6 +540,68 @@ class TargetReadinessTest(EntryPoint):
             any("GENERAL.NM-MANAGED" in " ".join(argv) for argv in fake.invocations()),
             "the cell stopped without ever reading the managed field, so the second check is "
             "not being made",
+        )
+
+    def test_a_unit_that_does_not_exist_is_reported_as_a_broken_image_not_a_slow_target(self):
+        """**Why the fake has to model the exit code at all.**
+
+        `systemctl is-active` on a unit the image does not have prints
+        `inactive` and exits **4**; a unit that merely has not started prints the
+        same word and exits **3**. Measured on a real target. So the two are
+        indistinguishable from stdout, and only the exit code separates them --
+        and they mean opposite things to a reader: one is a target that is slow,
+        the other is an image that is wrong.
+
+        A fake that answers every state with `returncode: 0` cannot tell them
+        apart either, so it cannot hold this case, and a wrapper that could not
+        read the state at all would have agreed with that fake.
+
+        So the reason must name the image, and the cell must stop on the first
+        read. `inactive` on its own is the correct answer for a target that is
+        booting, and a reader who is told that of a broken image goes and waits --
+        which is what a budget exists to make them do.
+
+        **This case, with `test_a_setup_unit_that_reports_its_verdict_as_a_failure_stops_the_cell`,
+        is what catches the wrapper regression this round fixed.** With
+        `setup_unit_state` reading through `check=True` again -- the state it
+        shipped with, and the state its docstring claimed the opposite of -- and
+        the exit codes modelled, both go red: the `failed` case reports 25 reads
+        against a 120s budget, and this one reports a slow target. Verified.
+        """
+        fake = self.fake([
+            # The unit file is not in the image: `is-active` says so on the exit
+            # code, and prints the same word a unit that has not started prints.
+            {"match": ["systemctl", "is-active", NM_SETUP_UNIT],
+             "stdout": "inactive\n", "returncode": 4},
+        ] + [
+            rule for rule in self.rules_for(unit_answers=["active"], managed_answers=["yes"])
+            if rule["match"] != ["systemctl", "is-active", NM_SETUP_UNIT]
+        ])
+        code, output, results = self.cell(fake)
+        self.assertEqual(code, run.EXIT_INCOMPLETE, output)
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        reason = " ".join(skip["reason"] for skip in document["results"][0]["skips"])
+        self.assertIn(
+            "no such unit", reason,
+            f"a target whose image has no {NM_SETUP_UNIT} is reported as though the unit were "
+            f"merely not running yet, so a reader is sent to wait instead of to the image: "
+            f"{reason}",
+        )
+        self.assertNotIn(
+            "did not reach", reason,
+            f"the reason is the budget-exhausted message, which is for a target that is slow -- "
+            f"and this target is not slow, its image is wrong: {reason}",
+        )
+        # And terminal, not merely reported differently: one read. A wait that
+        # spent its budget here would cost 120 seconds to say something it knew
+        # on the first read.
+        self.assertEqual(
+            len([argv for argv in fake.invocations()
+                 if argv[:4] == ["exec", TARGET, "systemctl", "is-active"]
+                 and NM_SETUP_UNIT in argv]),
+            1,
+            "the wait kept reading after learning the target has no such unit, which will never "
+            "become true",
         )
 
     def test_a_unit_that_finishes_late_is_waited_for_rather_than_refused(self):

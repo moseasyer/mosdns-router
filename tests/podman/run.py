@@ -225,9 +225,19 @@ def run_target(
             # reads `yes` from the `conf.d` declaration while the unit is still
             # running and about to restart the daemon underneath it. Gating on the
             # field alone let a scenario's `nmcli connection up` land inside that
-            # restart and fail with `Error: NetworkManager is not running` -- about
-            # one run in four, and one in six measured before any of this round's
-            # code. Measured state per release, and the same on all three:
+            # restart and fail with `Error: NetworkManager is not running`.
+            #
+            # **Two rates, and only one of them is the defect.** The *visible*
+            # failure was about 1 run in 4 on a loaded machine and 1 in 6 at
+            # `4867d8d` -- but **0 in 12 on a quiet one**, so that number is a
+            # property of the host's load and not of the harness. The defect is
+            # the gate itself, and it was wrong on **24 of 24 boots measured**
+            # (12 per release, recording the unit's state at the poll where the
+            # field first read `yes`): the field read `yes` while the unit was
+            # `inactive` or `activating`, never `active`. 24 runs after the fix
+            # (12 per release) all passed.
+            #
+            # Measured terminal state per release, and the same on all three:
             # `active`/`exited`/`success`.
             #
             # **Then: the field.** Not redundant. A unit that finished with the

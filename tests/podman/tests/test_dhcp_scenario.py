@@ -592,6 +592,35 @@ def target_rules(*, dns_answers=None, connection=None, route=None, state_file=No
     ]
 
 
+# How `systemctl is-active` answers, **including the exit code**.
+#
+# `is-active` exits 0 only for `active` and 3 for every other state -- measured on
+# a real 24.04 target, which also showed that a unit which does **not exist**
+# exits 4 while printing `inactive`, the same word a unit that has not started yet
+# prints. So the exit code is the discriminator and stdout alone is not.
+#
+# The previous fixture answered every state with `returncode: 0`, and that was not
+# a harmless simplification: with the wrapper reading its state from a command
+# that always succeeded, a wrapper that could not read the state at all agreed
+# with it. That is how the `failed` branch in `wait_for_networkmanager_setup` went
+# unreachable without anything going red -- the read raised on the states that
+# exit 3, and the fake never produced one. A fake that cannot fail the way the
+# real thing fails is a fake that agrees with a broken wrapper.
+_IS_ACTIVE_EXIT = {
+    "active": 0, "activating": 3, "deactivating": 3, "inactive": 3, "failed": 3,
+}
+
+
+def is_active_answer(state: str) -> dict:
+    """One `systemctl is-active` answer, with the exit code systemd would give.
+
+    An unrecognised word gets 4, which is what systemd answers for a unit that
+    does not exist -- so a case that invents a state cannot accidentally make the
+    read look successful.
+    """
+    return {"stdout": f"{state}\n", "returncode": _IS_ACTIVE_EXIT.get(state, 4)}
+
+
 def cell_rules(**overrides) -> list[dict]:
     """Every answer a cell that passes its scenario needs, in one table.
 
