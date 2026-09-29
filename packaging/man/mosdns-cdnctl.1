@@ -112,6 +112,21 @@ installed for diagnosis. It does not consult the preflight, so it works on a
 machine whose preflight refuses \(em which is the machine whose install died. It
 runs the installed installer with an argument array and no shell, so nothing an
 operator controls can be reinterpreted on the way there.
+.SS emergency\-rollback, unattended
+.BR mosdns\-watchdog.service (5)
+runs exactly this verb, unattended, once a window of failures has been reached,
+and reports the status this verb returned. Nothing here is a second rollback
+path: the argument array is the one an operator types, and the watchdog cannot
+take a route a human would not.
+
+The watchdog's default is ON, and
+.I /etc/mosdns/watchdog.yaml
+is where it is switched off. What a successful rollback restores and what it
+does not is stated in
+.BR mosdns\-router (8)
+and in that file's own comments: basic connectivity comes back and
+foreign\-name resolution through DNSCrypt does not, so the fault this package
+was installed to fix is no longer in the way and is not fixed.
 .SH SHARED STATE
 The optimizer, the health check and an operator's own command share one control
 lock and one set of state files under
@@ -132,6 +147,19 @@ The generated routing document.
 .I /etc/mosdns/dnscrypt\-proxy.toml
 The generated resolver document. Custom stamps are edited HERE, and they need a
 dnscrypt\-proxy restart to take effect.
+.TP
+.I /etc/mosdns/watchdog.yaml
+Whether the watchdog performs
+.B emergency\-rollback
+unattended, and the consecutive\-failure count and elapsed\-time window it waits
+for. Ships with
+.BR "automatic: true" .
+.TP
+.I /run/mosdns/watchdog.json
+The watchdog's failure streak, mode 0640. It is on a tmpfs and does not survive a
+reboot, deliberately: the first minutes after a boot are when the router is still
+coming up, and a machine that has just been rebooted gets its window again. An
+absent record never means "healthy"; it means nothing has failed yet.
 .TP
 .I /var/lib/mosdns/runtime/control.lock
 The shared control lock, mode 0640, created on first acquire.

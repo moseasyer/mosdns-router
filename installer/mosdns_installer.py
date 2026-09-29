@@ -1799,6 +1799,13 @@ PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--r
 # wrong on a build where the prefix is not the one above.
 CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
 
+# The directory those three programs, the installer and the bridge package live
+# in. It is a constant rather than a derivation because it is the one value the
+# installer's DHCP capture has to put on `PYTHONPATH`: the bridge is installed as
+# a package here, the system path does not include it, and the capture that omits
+# it cannot import the module it is running. See `capture_command`.
+BINARY_DIRECTORY = "/usr/lib/mosdns-router"
+
 # This program, at the path the package installs it to and the path its own units
 # and `mosdns-cdnctl` name. Named for the same reason as `CDNCTL` above: the
 # watchdog's messages tell an operator which command to run next, and a message
@@ -2400,15 +2407,33 @@ def _checked(runner: CommandRunner, args: Sequence[str], what: str) -> None:
 def capture_command(interface: str) -> List[str]:
     """The capture, as an argument array, with the four names scrubbed in it.
 
-    `env -u` four times and then the bridge's own documented module invocation. It
-    is an array and never a string, so an interface name cannot be reinterpreted,
-    and the scrub is part of the command rather than a property of the process that
-    runs it -- which is what makes it visible to a test and independent of what the
-    installer's own environment happened to carry.
+    `env -u` four times, `PYTHONPATH` set, and then the bridge's own documented
+    module invocation. It is an array and never a string, so an interface name
+    cannot be reinterpreted, and the scrub is part of the command rather than a
+    property of the process that runs it -- which is what makes it visible to a
+    test and independent of what the installer's own environment happened to
+    carry.
+
+    **The `PYTHONPATH` is measured, and it was missing until a live run said so.**
+    The bridge is installed as a package under
+    ``/usr/lib/mosdns-router/mosdns_dhcp_bridge/``, which is not on the system
+    path; the package's own dispatcher hook sets `PYTHONPATH` for that reason and
+    this capture did not. So `python3 -m mosdns_dhcp_bridge.cli` failed to find
+    its own module, and on a real 24.04 target the transaction refused with
+
+        install: the DHCP capture failed with status 1; nothing has been changed;
+        it said: /usr/bin/python3: Error while finding module specification for
+        'mosdns_dhcp_bridge.cli' (ModuleNotFoundError: No module named
+        'mosdns_dhcp_bridge')
+
+    -- an install that fails on EVERY machine, cleanly and with a message about a
+    module rather than about DNS. The two callers of the same module now name the
+    same directory, and a case holds the capture's `PYTHONPATH` to the hook's.
     """
     command = ["env"]
     for name in SCRUBBED_ENVIRONMENT_NAMES:
         command += ["-u", name]
+    command += [f"PYTHONPATH={BINARY_DIRECTORY}"]
     command += list(DHCP_BRIDGE)
     command += [
         DHCP_CAPTURE,

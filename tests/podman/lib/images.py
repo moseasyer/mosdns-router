@@ -295,6 +295,24 @@ def image_tag(role: str, version: str, base_reference: str) -> str:
     have been reused with no configuration in it -- a container whose daemon
     exits at start, reported as a network failure.
 
+    **The files a Containerfile COPIES are in the key too**, and the third live
+    instance of the same defect is the reason. `mock-router.Containerfile` copies
+    `tests/podman/mock-router/dnsmasq.conf` in with a `COPY`, and that config is
+    the whole of the router's configuration -- an edit to it changes the image's
+    bytes and changes nothing about the tag. So a run after an edit to the config
+    reused the image built before it. Task 8 hit this: the mock router was given
+    `address=/install-probe.example/…` so that a restored machine could actually
+    resolve, the file changed, the tag did not, and the live run kept reporting a
+    rollback that could not resolve -- which reads as a defect in the watchdog
+    and is a stale image.
+
+    So the key is every input the build reads: the Containerfile, the base
+    reference, and the contents of every file the Containerfile copies. The
+    copies are found by parsing the `COPY` lines rather than by globbing the
+    directory, so a file the Containerfile does not copy cannot change the tag --
+    a tag that moved for an unused file would rebuild the image for nothing,
+    which is the same mistake in the other direction.
+
     The version is validated rather than interpolated, so a typo in it is a
     refusal instead of a second image for a release nobody ships.
     """
@@ -306,11 +324,67 @@ def image_tag(role: str, version: str, base_reference: str) -> str:
             f"{LOCK_RELATIVE_PATH} and has to be a 'repo:tag@sha256:…' reference, or the build "
             f"would be against a floating tag"
         )
+    containerfile_path = containerfile(role)
     digest = hashlib.sha256()
-    digest.update(containerfile(role).read_bytes())
+    digest.update(containerfile_path.read_bytes())
+    for copied in copied_sources(containerfile_path):
+        digest.update(b"\0")
+        digest.update(copied.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(copied.read_bytes())
     digest.update(b"\0")
     digest.update(reference.encode("utf-8"))
     return f"{RESOURCE_TAG_PREFIX}-{role}:{release}-{digest.hexdigest()[:TAG_HASH_LENGTH]}"
+
+
+# A `COPY` line, as the two shapes the three Containerfiles use: `COPY <src> <dst>`
+# and `COPY ["<src>", "<dst>"]`. The source list is the part before the last
+# token, so a multi-source `COPY` contributes every file it names.
+_COPY = re.compile(r"^\s*COPY\s+(.+)$", re.IGNORECASE)
+
+
+def copied_sources(containerfile_path: Path, repo_root: Path | None = None) -> list[Path]:
+    """Every file the Containerfile copies in, in the order it names them.
+
+    Read out of the `COPY` lines rather than by globbing the Containerfile's own
+    directory, and that is the whole of the design: a tag must move when the
+    image's bytes would move and not otherwise. The `COPY` source is relative to
+    the **build context**, which is the repository root and not this file's
+    directory -- so a path resolved against the wrong root is a build that fails
+    or an image built from something else.
+
+    A `COPY` whose source is not a file on disk is **skipped rather than
+    refused**, and the reason is which failure each answer produces. A Containerfile
+    that copies a file a later task has not written yet would otherwise make
+    every image untaggable in this tree, and the build would report the real
+    problem. What this costs is stated rather than hidden: a `COPY` from outside
+    the repository -- a URL, or a path above the context -- is not in the tag, so
+    an image built from one is reused after whatever that source becomes. None of
+    the three Containerfiles does that, and a case below holds it.
+    """
+    root = Path(repo_root) if repo_root else containerfile_path.resolve().parents[3]
+    found: list[Path] = []
+    for line in containerfile_path.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        match = _COPY.match(line)
+        if match is None:
+            continue
+        remainder = match.group(1).strip()
+        if remainder.startswith("["):
+            remainder = remainder.strip("[]")
+        tokens = [
+            token.strip().strip("\"'")
+            for token in remainder.split()
+            if token.strip().strip("\"'")
+        ]
+        for source in tokens[:-1]:  # the last token is the destination
+            if source.startswith("--"):
+                continue
+            candidate = root / source
+            if candidate.is_file():
+                found.append(candidate)
+    return found
 
 
 # Images are names, not resources in the run's namespace, so this prefix is the

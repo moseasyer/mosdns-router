@@ -84,6 +84,15 @@ TARGET_PACKAGES = (
     "dnsutils",
     "curl",
     "ca-certificates",
+    "procps",
+    # `acl`, and the reason is measured rather than tidiness. The package's
+    # postinst provisions every state directory with `setfacl -d -m g::rwx` after
+    # the mode, and under `set -e` a target without `setfacl` dies in STEP 2 --
+    # so `dpkg -i` leaves the package `unpacked`, with every file in place and
+    # dpkg still calling it uninstalled. A scenario that asserted a file existed
+    # would have passed while the package was in that state, which is the class
+    # of false pass this project's own record names several times.
+    "acl",
 )
 
 
@@ -629,6 +638,30 @@ class TargetContainerfileTest(unittest.TestCase):
             "systemd-resolved is a binary package on 24.04 and 26.04 only; on 22.04 the daemon "
             "is part of systemd, and naming it there fails the build with 'Unable to locate "
             "package'. libnss-resolve is the package that exists on all three",
+        )
+
+    def test_the_target_can_configure_the_package_it_is_a_target_for(self):
+        """`acl`, and the failure it prevents is a package that looks installed.
+
+        The postinst's STEP 2 runs `setfacl -d -m g::rwx` after the mode, and the
+        order is load-bearing (a chmod after a setfacl narrows the group mask, and
+        the directory is then one no service identity can write). The script runs
+        under `set -e`, so a target without `setfacl` aborts there and dpkg is
+        left reporting the package `unpacked` -- with every file in place. That
+        combination is the dangerous one: a scenario that checked for a file would
+        find it, and `dpkg -l` would disagree with what it is looking at.
+
+        The check is by package name rather than by running the postinst, because
+        running it in a unit test means running the thing whose failure is being
+        guarded. The live measurement is in the Containerfile's own comment and in
+        Task 8's report.
+        """
+        packages = installed_packages(read(TARGET_CONTAINERFILE))
+        self.assertIn(
+            "acl",
+            packages,
+            "the target image cannot run this package's postinst without setfacl, so dpkg -i "
+            "leaves it unpacked rather than installed and a scenario cannot tell the two apart",
         )
 
     def test_it_installs_test_tools_too(self):

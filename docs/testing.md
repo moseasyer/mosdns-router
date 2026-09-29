@@ -99,12 +99,21 @@ be the worst of the three answers available** — the build would succeed agains
 floating image and the lock would be doing nothing.
 
 `matrix` builds what it needs itself, and the tag it uses is
-`mosdns-<role>:<version>-<12 hex>` where the hex is a hash of **the Containerfile
-and the base reference**. That makes the tag a cache key: edit the
-Containerfile and the tag changes and the image is rebuilt; change nothing and
-the tag is identical and the build is skipped. Without the Containerfile in the
-key a stale image is what the matrix runs, and a stale image here is a mock
-router whose dnsmasq has no configuration file to read.
+`mosdns-<role>:<version>-<12 hex>` where the hex is a hash of **the Containerfile,
+the base reference, and the contents of every file the Containerfile copies in**.
+That makes the tag a cache key: edit an input and the tag changes and the image
+is rebuilt; change nothing and the tag is identical and the build is skipped.
+Without the Containerfile in the key a stale image is what the matrix runs, and a
+stale image here is a mock router whose dnsmasq has no configuration file to read.
+
+**The copied files are in the key because a config file is not the Containerfile.**
+`mock-router.Containerfile` copies `tests/podman/mock-router/dnsmasq.conf` in, and
+that file is the whole of the router's configuration. Measured in Task 8: the
+config was given an `address=` line, the file changed, the tag did not, and the
+run kept reporting a rollback that could not resolve — which reads as a defect in
+the thing under test and is a stale image. The copies are read out of the `COPY`
+lines rather than by globbing the directory, so a file the build does not read
+cannot move the tag either.
 
 Each entry in `images.lock.json` carries the command its digest was read with, so
 a reader who doubts one can re-run that command. A digest with no provenance is a
@@ -380,6 +389,84 @@ The bridge was never the problem: the router's log records the DISCOVER
 (broadcast) arriving, so L2 broadcast crosses the netavark bridge, and the OFFER,
 REQUEST and ACK are ordinary unicast.
 
+## The resolver watchdog scenario
+
+`python3 tests/podman/run.py matrix --arch amd64 --versions 24.04 --scenario watchdog`
+
+This is the only scenario that **installs the package**, because the mechanism it
+observes is four files inside the `.deb` — the unit, the timer, the setting and
+the verb — and a scenario that hand-copied those would be testing a constructed
+approximation of the package. It needs `make package` to have run; a missing
+`.deb` is a harness error (exit 2) naming the command, not a failed cell.
+
+It is also the only scenario that can be described as a *product* test rather
+than a claim about files, because the watchdog is the first thing this project
+does to a machine with nobody watching. Three things are observed, and each is
+evidence of something a unit test cannot reach:
+
+1. **The window.** The device is handed to the image's own connection profile
+   (so the link has a resolver at all), the machine is pointed at `127.0.0.1`,
+   the router is stopped, and `mosdns-watchdog.service` is started by hand. The
+   *first* probe must do nothing and the record must read `consecutive_failures: 1`
+   — the count is checked at each step, not only at the end, because a watchdog
+   that acts on the first probe passes a test that only looks at the final state.
+2. **The action is the real one.** The evidence is the machine: the recorded DNS
+   is back on the connection, the connection no longer carries the loopback
+   address, the device's resolver is the DHCP one again, and a name resolves
+   through the machine's own stub (`getent hosts install-probe.example`). The
+   journal is the *explanation*; the machine is the claim.
+3. **The switch.** `automatic: false` is written, the machine is put back into
+   the broken condition, and `shipped_threshold + 1` probes are run. Nothing may
+   happen, and then the operator's own
+   `mosdns-cdnctl emergency-rollback` must still work. A switch implemented by
+   removing the action would leave a machine with no way back, and every other
+   assertion in the scenario would be green.
+
+### What the cell does not prove, and says so in its evidence document
+
+**The install transaction is refused in a container**, measured on 24.04:
+
+```text
+install: publishing the Cloudflare prefix list, which the router refuses to start
+without failed: ... update-lists: https://api.cloudflare.com/client/v4/ips: dial
+tcp: lookup api.cloudflare.com on 127.0.0.53:53: server misbehaving
+```
+
+A container on this bridge has no route off it, so the publish cannot happen. The
+refusal happens *after* the record is written and read back and *before* any DNS
+setting is changed, which is why the scenario has a record to restore — and it
+rolls itself back cleanly, so the machine is exactly the one the watchdog is for.
+The evidence document says all of this, and says explicitly that the router was
+not successfully started by the cell. A cell that claimed a working install here
+would be claiming something it did not achieve.
+
+### The journal is read through a cursor, and that is not a detail
+
+`journalctl -n 40` returns the cell's last forty lines, so the switch-off
+position would read the *armed* run's success message and report that the
+mechanism had acted with the switch off — a false failure on a mechanism that had
+done exactly the right thing, which is the worst direction for a false positive
+because the tempting fix is to weaken the assertion. The scenario takes a
+`--show-cursor` position before each run and reads `--after-cursor` from it, and
+the cursor is taken from the **whole** journal because a unit that has never run
+has no entries and prints `-- No entries --` and no cursor.
+
+### The mock router answers for one name, and `no-resolv` is why
+
+dnsmasq with `no-resolv` and no upstream SERVFAILs everything, and a SERVFAIL for
+`install-probe.example` is a *correct* answer from a resolver that reached nobody —
+which is exactly what the rollback checks for when it decides whether the machine
+came back. The first live run found this: the restore was faithful and the
+machine was still dead, and the watchdog reported exit 6 with the reason. The
+watchdog was right; the fixture could not answer. The router now carries
+
+```text
+address=/install-probe.example/10.89.0.2
+```
+
+— one name, `address=` rather than `server=`, and a case holds that there is no
+`server=` line anywhere in the config, so the mock cannot become a forwarder.
+
 ## Prerequisites
 
 **There is no virtual machine and no `podman machine`.** This is deliberate:
@@ -578,6 +665,18 @@ and is not registered is a **configuration error** (exit 2), not a silently
 ignored flag: the run must not report a pass for something it never looked for.
 `tests/podman/scenarios/` is where they go; `run.py` is where the registry is,
 in `build_scenarios()`.
+
+**A scenario that installs the package is named in `PACKAGE_SCENARIOS`**, and
+that set is what makes `run.py` copy the `.deb` in. It is a literal rather than
+something derived from the builder's signature for the same reason the registry
+is: a derived property is a property a reader cannot check, and a scenario that
+gained a `deb` parameter without being added to the set would be handed no
+artifact and fail with a `TypeError` at cell construction. The set is also why
+`matrix` with no `--scenario` cannot be exercised against a fake podman — it would
+try to install a package a fake cannot unpack — and the case that proves the
+flag-free path names the scenario it covers rather than letting the set decide.
+
+
 
 A scenario module gets:
 

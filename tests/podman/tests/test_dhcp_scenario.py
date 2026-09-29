@@ -58,6 +58,7 @@ sys.path.insert(0, str(DISCOVERED))
 # can be wrong about what a podman invocation looks like, and this suite's record
 # is that a duplicated fixture is a duplicated defect.
 import test_command  # noqa: E402
+from test_images import run_lines  # noqa: E402
 
 from podman import PodmanError  # noqa: E402
 
@@ -314,6 +315,35 @@ class DnsOptionFileTest(unittest.TestCase):
         # the resolver podman handed it would answer questions off this host.
         self.assertIn("no-resolv", conf)
         self.assertIn("no-hosts", conf)
+        # **And the one name it answers for itself, which `no-resolv` made
+        # necessary.** With no upstream at all, dnsmasq SERVFAILs every query --
+        # and a SERVFAIL for `install-probe.example` is a CORRECT answer from a
+        # resolver that reached nobody, which is precisely what the rollback
+        # checks for when it decides whether the machine came back. Measured on a
+        # real 24.04 target in Task 8's container run: the first unattended
+        # rollback restored the machine's own resolvers and then reported exit 6
+        # because a query through the stub did not resolve. The watchdog was
+        # right; the fixture could not answer. The line is the fix, and it is
+        # `address=` rather than `server=` so it is an answer dnsmasq gives
+        # without asking anybody.
+        self.assertIn("address=/install-probe.example/", conf)
+        # And exactly one answer, and NO upstream. A `server=` line would make
+        # this mock a forwarder, which is what `no-resolv` above exists to
+        # prevent, and the comment explaining the choice names the word -- so the
+        # check reads the DIRECTIVE lines rather than the raw text. Scanning the
+        # whole file for a substring a comment contains is a check that can only
+        # be satisfied by deleting the explanation.
+        self.assertEqual(
+            [line for line in run_lines(conf) if line.startswith("server=")], [],
+            "the mock router has an upstream, so it forwards and a question it answers came from "
+            "off this host",
+        )
+        self.assertEqual(
+            [line for line in run_lines(conf) if line.startswith("address=")],
+            ["address=/install-probe.example/10.89.0.2"],
+            "the mock router answers for more than the one test-only name, so it is a resolver "
+            "for the rest of the matrix rather than a fixture for one check",
+        )
         # Authoritative, or a DISCOVER is answered with an offer of nothing and
         # the client waits out its own transaction timeout for a server that is
         # standing right there.

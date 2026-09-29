@@ -31,6 +31,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   dnsutils           `dig`, which is how the routing scenarios measure anything
 #   curl, ca-certificates  for the scenarios that fetch, and to fetch with
 #   procps             `ps`, for the failure scenarios that look at processes
+#   acl                `setfacl`/`getfacl`, and this is NOT optional: the
+#                      package's `postinst` provisions every state directory with
+#                      `install -d -m 2770` FOLLOWED BY `setfacl -d -m g::rwx`,
+#                      and the ordering is load-bearing (a chmod after a setfacl
+#                      narrows the mask, leaving a directory no service identity
+#                      can write). Under `set -e` a target without `setfacl` dies
+#                      in STEP 2 of the postinst, so `dpkg -i` leaves the package
+#                      `unpacked` and never `installed` -- measured on 24.04 with
+#                      this package absent:
+#
+#                          $ dpkg -i mosdns-router_0.1.0_amd64.deb ; echo $?
+#                          ... /usr/sbin/dpkg-reconfigure: mosdns-router is
+#                              broken or not fully installed
+#                          1
+#
+#                      and every file the package ships IS unpacked, which is the
+#                      confusing part: the units are in /usr/lib/systemd/system
+#                      and the setting is in /etc/mosdns, and dpkg still calls
+#                      the package uninstalled. The package declares
+#                      `Depends: acl` and the container has no reason to install
+#                      a dependency of the thing under test by hand.
 #
 # `libnss-resolve` rather than `systemd-resolved`, and that is measured rather
 # than preferred: `systemd-resolved` is a binary package on 24.04 and 26.04 and
@@ -58,6 +79,7 @@ RUN apt-get update \
         curl \
         ca-certificates \
         procps \
+        acl \
     && rm -rf /var/lib/apt/lists/*
 
 # The resolved **daemon**, on the releases that package it separately. 24.04

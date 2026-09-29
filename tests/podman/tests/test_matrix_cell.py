@@ -143,14 +143,77 @@ class ScenarioRegistryTest(EntryPoint):
         is the whole matrix. A harness where naming nothing means running nothing
         would report that command incomplete forever, which is what the Task 2
         build did -- honestly, and for a state that has now changed.
+
+        **A scenario that needs the built package is not in this case.** The fake
+        podman cannot install a `.deb`, so a run of the whole matrix here reaches
+        the watchdog scenario and its cell fails -- correctly, and for a reason
+        that has nothing to do with what this case is about. The flag-free run is
+        proved over the scenarios a fake can answer, and the package-backed one is
+        in `test_the_package_backed_scenarios_are_the_ones_that_need_the_package`
+        plus a live run. Listing the scenario explicitly is what the plan's own
+        acceptance command does from Task 3 on, and that path is the case above.
         """
         fake = self.passing_fake()
         results = self.directory / "results"
         code, output = self.invoke(
             self.base(fake, "--results-dir", str(results), "--run-id", RUN_ID,
-                      "matrix", "--arch", "amd64", "--versions", "24.04")
+                      "matrix", "--arch", "amd64", "--versions", "24.04",
+                      "--scenario", "dhcp")
         )
         self.assertEqual(code, run.EXIT_OK, output)
+        document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [s["name"] for s in document["results"][0]["scenarios"]],
+            ["dhcp"],
+            "naming no scenario must not run a package-backed one a fake podman cannot satisfy; "
+            f"the scenarios a flag-free run covers are {run.SCENARIO_NAMES} and the one it skipped "
+            f"is {sorted(set(run.PACKAGE_SCENARIOS))}",
+        )
+
+    def test_the_package_backed_scenarios_are_the_ones_that_need_the_package(self):
+        """The registry, the package set, and the two disagreeing would be a silent skip.
+
+        `run.py` copies the `.deb` in for exactly the scenarios in
+        `PACKAGE_SCENARIOS`. A scenario added to the registry that is not in that
+        set would be handed no `deb` argument and fail with a `TypeError` at cell
+        construction; one in the set that is not registered would be a name the
+        harness resolves a package for and then never runs. Both are refusals here
+        rather than a live run that discovers them.
+        """
+        registered = set(run.SCENARIO_NAMES)
+        self.assertEqual(
+            set(run.PACKAGE_SCENARIOS) - registered,
+            set(),
+            "a scenario is listed as needing the package and is not registered, so the harness "
+            "resolves a `.deb` for a cell that never runs",
+        )
+        self.assertEqual(
+            registered - set(run.SCENARIO_NAMES) - {"routing"},
+            set(),
+            "the registered names and the package set have drifted apart",
+        )
+        # And the property that makes the flag-free run above possible: every
+        # scenario a fake podman can answer is NOT package-backed.
+        self.assertNotIn("dhcp", run.PACKAGE_SCENARIOS)
+        self.assertIn("watchdog", run.PACKAGE_SCENARIOS)
+
+    def test_a_missing_package_is_a_harness_error_naming_the_command_that_makes_one(self):
+        """`make package`, and exit 2 rather than a failed cell.
+
+        A cell that failed because an artifact was not built would be reported as
+        a failure of the release, and a reader would go looking for an installer
+        bug. Nothing was proved about 24.04 either way, which is what exit 2 says.
+        """
+        code, output = self.invoke(
+            self.base(
+                self.passing_fake(),
+                "--results-dir", str(self.directory / "results"),
+                "--run-id", RUN_ID, "--arch", "mips64",
+                "matrix", "--versions", "24.04", "--scenario", "watchdog",
+            )
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR)
+        self.assertIn("make package", output)
 
     def test_a_scenario_that_is_not_registered_is_refused_with_its_name(self):
         """Exit 2, the name, and the names that would have worked.
@@ -929,6 +992,82 @@ class ImageTagTest(unittest.TestCase):
         containerfile.write_bytes(original + b"\n# an edit the tag has to notice\n")
         after = images.image_tag("mock-router", "24.04", images.reference_for_version("24.04"))
         self.assertNotEqual(before, after)
+
+    def test_the_tag_changes_when_a_copied_file_changes(self):
+        """The `COPY` case, and it is the one that bit a live run.
+
+        `mock-router.Containerfile` copies `tests/podman/mock-router/dnsmasq.conf`
+        in, and that file is the whole of the router's configuration. A tag
+        derived from the Containerfile alone does not move when the config does,
+        so a run after an edit to the config reuses the image built before it.
+
+        **Measured, in Task 8's container run.** The mock router was given an
+        `address=` line so a machine whose resolvers had been restored could
+        actually resolve, the config changed, the tag did not, and the live run
+        kept reporting `a query for install-probe.example through 127.0.0.53 did
+        not resolve` -- which reads as a defect in the watchdog under test and is
+        a stale image. A guard that only watched the Containerfile would have
+        stayed green through it, exactly as the previous version of this class
+        did.
+        """
+        config = REPO / "tests" / "podman" / "mock-router" / "dnsmasq.conf"
+        original = config.read_bytes()
+        self.addCleanup(config.write_bytes, original)
+        before = images.image_tag("mock-router", "24.04", images.reference_for_version("24.04"))
+        config.write_bytes(original + b"\n# an edit the tag has to notice\n")
+        after = images.image_tag("mock-router", "24.04", images.reference_for_version("24.04"))
+        self.assertNotEqual(
+            before, after,
+            "a file the Containerfile copies in is not in the tag, so editing it reuses the image "
+            "built from the previous contents",
+        )
+
+    def test_every_copied_file_is_read_out_of_the_containerfile_and_not_a_glob(self):
+        """The copies are the `COPY` lines, and a file nothing copies cannot move the tag.
+
+        Two directions, and both are mistakes. A tag that moved for a file the
+        build does not read would rebuild the image for nothing, on every edit to
+        anything in the directory; a tag that missed a file the build DOES read is
+        the stale-image defect the case above is about.
+        """
+        for role in images.IMAGE_ROLES:
+            with self.subTest(role=role):
+                containerfile = images.containerfile(role)
+                copied = images.copied_sources(containerfile)
+                named = re.findall(
+                    r"(?mi)^\s*COPY\s+(?!\[)(.+)$", containerfile.read_text(encoding="utf-8")
+                )
+                for line in named:
+                    tokens = [token for token in line.split() if not token.startswith("--")]
+                    for source in tokens[:-1]:
+                        with self.subTest(source=source):
+                            self.assertIn(
+                                source,
+                                [str(path.relative_to(REPO)) for path in copied],
+                                f"{role} copies {source} and the tag does not carry it",
+                            )
+
+    def test_every_copied_file_is_inside_the_build_context(self):
+        """A `COPY` from outside the repository cannot be in the tag, and is not.
+
+        The context is the repository root, so a path above it or a URL is a
+        source the tag cannot hash. None of the three Containerfiles has one, and
+        a case that held it is cheaper than a stale image nobody can explain --
+        so the check is here rather than in a comment that says "don't".
+        """
+        for role in images.IMAGE_ROLES:
+            with self.subTest(role=role):
+                for path in images.copied_sources(images.containerfile(role)):
+                    self.assertTrue(
+                        str(path).startswith(str(REPO) + "/"),
+                        f"{role} copies {path}, which is outside the build context, so its "
+                        "contents cannot be part of the tag and an edit to it reuses a stale image",
+                    )
+                    self.assertTrue(
+                        path.is_file(),
+                        f"{role} copies {path}, which is not a file, so the build would fail and "
+                        "the tag would name an image that cannot be built",
+                    )
 
     def test_the_tag_is_the_same_for_the_same_inputs(self):
         reference = images.reference_for_version("24.04")

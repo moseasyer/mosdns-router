@@ -36,7 +36,74 @@ It replaces an address only for a response every one of whose addresses is insid
 a published range, and only while the published selection's proof window is open.
 Nothing in the domestic branch is rewritten: those answers come from the network
 the user is not leaving, and nothing here has proved anything about them.
+.SH THE RESOLVER WATCHDOG
+.BR mosdns\-watchdog.service (5)
+is the one unit in this package that changes the machine with nobody watching.
+It runs every minute, asks this machine's own resolver one question, and when the
+answer is no for long enough it runs
+.BR "mosdns\-cdnctl emergency\-rollback" (1)
+**by itself**.
+
+This is a default and it is switchable, and both facts matter. The
+.B automatic
+key in
+.I /etc/mosdns/watchdog.yaml
+is
+.B true
+as shipped.
+.SS What it restores, and what it does not
+The rollback puts the DNS settings the install RECORDED back on the connection
+\- on a machine this package has taken over, the resolvers the machine's own DHCP
+lease published \- so ordinary name resolution works again.
+
+**Foreign\-name resolution through DNSCrypt does not work afterwards.** That is
+the condition this package was installed to fix, and the rollback does not fix
+it: it stops nothing, removes nothing and starts nothing, so the router, the
+resolver and the configuration are all still installed and the local resolver is
+still not serving. The fault is no longer in the way; it is not fixed. The
+watchdog says both halves in its own message every time it acts, and the message
+is in the journal where the action is.
+.SS Why it waits
+A single failed probe is not evidence that the router is down: a slow upstream, a
+cold boot before NTP has synchronised and a loaded machine each produce one.
+With automatic rollback as the default, acting on one would be a mechanism that
+can tear down a working configuration while somebody is using it, and a
+self\-inflicted outage is worse than a false alarm. So the default acts on the
+.BR 3rd
+consecutive failure, or once
+.B 10
+minutes have passed since the first, whichever comes first \- and both numbers
+are in
+.IR /etc/mosdns/watchdog.yaml ,
+because the false\-positive rate has never been measured and a number nobody
+measured does not get baked in as a constant.
+.SS Turning it off
+Set
+.B automatic: false
+in
+.IR /etc/mosdns/watchdog.yaml .
+The probe keeps running and the messages keep appearing; what stops is the
+unattended part.
+.BR "mosdns\-cdnctl emergency\-rollback" (1)
+is unaffected, because a switch that stopped the action for the operator as well
+would leave a broken machine with no way back. Turning the mechanism back on
+starts its window again rather than resuming a streak that was interrupted.
+.SS If the setting cannot be read
+The watchdog does nothing and says so loudly, because a setting it cannot read
+exactly is one it would have to guess at \- and guessing there decides whether a
+working machine is taken apart. That is deliberately the opposite of this
+package's usual fail\-open. The message says the machine is not being watched.
 .SH FILES
+.TP
+.I /etc/mosdns/watchdog.yaml
+The watchdog's setting: whether automatic rollback is on, the consecutive\-failure
+count, and the elapsed\-time window. Ships with
+.B automatic: true
+and the two numbers the unit's header explains; a conffile, so an upgrade asks
+before replacing an operator's
+.BR automatic:\ false .
+Its own comments say what a rollback restores and what it does not, because an
+operator who has read only this file has to be able to learn that.
 .TP
 .I /etc/mosdns/mosdns.yaml
 The routing document. Generated; a conffile, so an upgrade asks before replacing
@@ -136,6 +203,7 @@ own; a unit that has failed says why in the journal.
 .SH SEE ALSO
 .BR "mosdns\-cdnctl" (1),
 .BR dnscrypt\-proxy (8),
+.BR mosdns\-watchdog.service (5),
 .BR systemd.unit (5),
 .BR resolv.conf (5),
 .BR tmpfiles.d (5)

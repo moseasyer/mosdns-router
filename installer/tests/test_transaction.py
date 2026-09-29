@@ -343,11 +343,31 @@ def capture_command(interface=DEVICE):
     The four ``-u`` pairs are the scrub, and they are in the array rather than in
     a parameter: :meth:`CommandRunner.run` has no ``env=``, so the environment
     the capture would inherit is changed by the command itself.
+
+    ``PYTHONPATH`` is here for the reason the live run established, and it is a
+    **measured** addition rather than a tidy one. ``DHCP_BRIDGE`` runs
+    ``python3 -m mosdns_dhcp_bridge.cli``, and the package installs that module at
+    ``/usr/lib/mosdns-router/mosdns_dhcp_bridge/`` -- which is not on the system
+    path, and never was: the dispatcher hook sets ``PYTHONPATH`` for exactly this
+    reason and the installer's own capture did not. On a real 24.04 target
+    (measured, in Task 8's container run) the transaction refused with:
+
+        install: the DHCP capture failed with status 1; nothing has been changed;
+        it said: /usr/bin/python3: Error while finding module specification for
+        'mosdns_dhcp_bridge.cli' (ModuleNotFoundError: No module named
+        'mosdns_dhcp_bridge')
+
+    which is a refused install on every machine, and a silent one in the sense
+    that matters: the transaction rolls itself back cleanly and dpkg reports a
+    normal failure. The bridge's own path is the one the package's dispatcher
+    already uses, so the two callers of the same module now agree on where it
+    lives.
     """
     return (
         ("env",)
         + tuple(word for name in SCRUBBED for word in ("-u", name))
         + (
+            "PYTHONPATH=/usr/lib/mosdns-router",
             "python3",
             "-m",
             "mosdns_dhcp_bridge.cli",
@@ -1278,6 +1298,38 @@ class TransactionOrderTests(TransactionFixture):
             if command[:2] == ("systemctl", "reload-or-restart"):
                 self.fail(f"{command!r} restarts more than this connection")
         self.assertNotIn(("systemctl", "restart", "NetworkManager.service"), self.commands)
+
+    def test_the_capture_can_import_the_bridge_the_package_installs(self):
+        # **Measured on a real 24.04 target, in Task 8's container run.** The
+        # bridge is installed as a package at /usr/lib/mosdns-router, which is
+        # not on the system path, so `python3 -m mosdns_dhcp_bridge.cli` could not
+        # find it and the transaction refused with:
+        #
+        #   install: the DHCP capture failed with status 1; nothing has been
+        #   changed; it said: /usr/bin/python3: Error while finding module
+        #   specification for 'mosdns_dhcp_bridge.cli' (ModuleNotFoundError: No
+        #   module named 'mosdns_dhcp_bridge')
+        #
+        # A clean rollback and a message about a module: an install that fails on
+        # every machine, and a reader sent to Python rather than to DNS. The
+        # package's own dispatcher hook already set PYTHONPATH for this reason;
+        # the second caller of the same module did not, so the two disagreed about
+        # where the bridge lives.
+        #
+        # Held against the HOOK's value rather than against a literal, because
+        # the disagreement this fixes is between two callers of one module and a
+        # case that compared both to a constant would still be green if the
+        # constant and both call sites moved together.
+        hook = (
+            REPO / "packaging" / "networkmanager" / "10-mosdns-dhcp-bridge"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PYTHONPATH=/usr/lib/mosdns-router", hook)
+        self.assertIn(
+            "PYTHONPATH=/usr/lib/mosdns-router",
+            capture_command(),
+            "the installer's capture does not put the bridge package on the path, so the module "
+            "it runs cannot be imported and every install refuses",
+        )
 
     def test_the_capture_runs_before_anything_is_changed(self):
         # The capture is the only way this machine's original resolvers can be
