@@ -358,31 +358,46 @@ ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 # **The ceiling is not the policy.** `ALLOWED_CAPABILITIES` above is the widest
 # set any container this harness starts may hold -- it is what a `--cap-add` in a
 # scenario's `extra_args` is checked against. This is the narrower question: which
-# container holds which of them. They are separate because a ceiling read as a
-# policy is how a container that needs nothing is handed four capabilities: the
-# mock router ran with all four while `run_container` was shared, and the reason
-# it needed none is short.
+# container holds which of them.
 #
-# | role | why |
-# |---|---|
-# | `target` | all four. `SYS_ADMIN` and `NET_ADMIN` for systemd and a netavark bridge, `SYS_PTRACE` for `journalctl` in the target, and `NET_RAW` measured necessary for NetworkManager's `AF_PACKET` DHCP client (see `ALLOWED_CAPABILITIES`). |
-# | `mock-router` | **none.** dnsmasq answers DHCP and DNS on the run's own bridge inside the container's own network namespace. It opens no raw socket, spawns nothing that needs to be traced, and runs no init. `port=53` binds below 1024 and does not need `--cap-add` for it: podman's default bounding set already carries `NET_BIND_SERVICE` (bit 10, present in `CapEff: 00000000802c15fb`). |
+# | role | capabilities | measured why |
+# |---|---|---|
+# | `target` | all four | `SYS_ADMIN` and `NET_ADMIN` for systemd and a netavark bridge, `SYS_PTRACE` for `journalctl` inside the target, and `NET_RAW` for NetworkManager's `AF_PACKET` DHCP client (see `ALLOWED_CAPABILITIES`). |
+# | `mock-router` | `NET_ADMIN`, `NET_RAW` | **measured, and the measurement contradicted the obvious answer.** dnsmasq refuses to start without both, in its own words: `dnsmasq: process is missing required capability NET_ADMIN`, and `… NET_RAW` for the other. It opens the *same* `AF_PACKET` socket NetworkManager does, because a DHCP server must receive the broadcast DISCOVER before it has an address to reply from. `SYS_ADMIN` and `SYS_PTRACE` are not needed: the router runs no init and is not traced. |
 #
-# A capability a container did not need and cannot be shown to need is not a
-# measured ceiling, it is a default nobody looked at -- and the default is what a
-# reader of the emitted array takes as the requirement. The measurement that put
-# `NET_RAW` in the *target* is the argument for the target; it says nothing about
-# dnsmasq, and applying it there was the defect.
+# **`NET_BIND_SERVICE` is not in either row, and that is measured too.** `port=53`
+# binds below 1024, so it looks like it should be. A container started with no
+# `--cap-add` at all reports `CapEff: 00000000800405fb` on this host, which carries
+# bit 10 -- podman's default rootless bounding set already has it.
 #
-# **The cost of this table is one line per container,** which is the cost of any
+# **An empty set is what this table said before a live run, and it was wrong.**
+# dnsmasq does not look like something that needs capabilities: it is a
+# foreground daemon answering on one interface, and the argument for "none" --
+# `NET_BIND_SERVICE` is already present -- is true and beside the point. The
+# scenario then failed with
+#
+# ```text
+# Error: Connection activation failed: IP configuration could not be reserved
+# ```
+#
+# and the router's own log carried `dnsmasq: process is missing required
+# capability NET_ADMIN`. A capability *removed* is as loud as one added, and
+# louder in this direction: the failure surfaces on the **target**, three steps
+# from the container that was under-privileged, and reads exactly like a network
+# fault. It is the mirror image of the defect this table exists to fix -- too much
+# privilege is invisible, too little is a DHCP timeout on the other container.
+#
+# So each row here is a measurement, and a row that cannot name one will be wrong.
+#
+# The cost of the table is one line per container, which is the cost of any
 # per-container policy and is why a shared array is tempting. The alternative --
 # one array for every container -- is free until the first container that does not
 # need what the others do, and then it is wrong in a way nothing reports, because
-# a capability that is granted and not needed is not an error podman or the kernel
-# will ever mention.
+# a capability granted and not needed is not an error podman or the kernel will
+# ever mention.
 CONTAINER_CAPABILITIES = {
     "target": ALLOWED_CAPABILITIES,
-    "mock-router": (),
+    "mock-router": ("NET_ADMIN", "NET_RAW"),
 }
 
 
@@ -1210,18 +1225,30 @@ class Podman:
         target's four.** `ALLOWED_CAPABILITIES` is the *ceiling* -- the widest set
         any container here may hold -- and `CONTAINER_CAPABILITIES` is the policy
         that says which container holds how much of it. They are different
-        questions and one answer for both is how the mock router came to be given
-        `NET_RAW`: `run_container` is shared, so before this was a parameter every
-        container got whatever the target needed, and the router -- which is
-        dnsmasq, needs no `AF_PACKET` socket, opens no raw socket and has never
-        asked for a capability -- was handed four. A capability the target needed
-        and was measured to need is defensible; one the router never needed is
-        only defensible if the code says why, and it did not.
+        questions, and one answer for both is how the mock router came to be given
+        `SYS_ADMIN` and `SYS_PTRACE`: `run_container` is shared, so before this was
+        a parameter every container got whatever the target needed. A capability
+        the target needed and was measured to need is defensible; one handed to a
+        container that did not is only defensible if the code says why, and it did
+        not.
+
+        **The router's row was written as an empty set and a live run proved it
+        wrong.** dnsmasq needs `NET_ADMIN` and `NET_RAW` -- it opens an
+        `AF_PACKET` socket to receive the broadcast DISCOVER, exactly as
+        NetworkManager does to send one -- and it exits 5 with
+        `dnsmasq: process is missing required capability NET_ADMIN` rather than
+        starting. The symptom appears on the *target* as an unresolvable lease, so
+        the measurement belongs here and not to whoever reads the failure first.
+        Both facts are in `CONTAINER_CAPABILITIES`.
 
         The cost of the shared array was a ceiling that read as a policy: a
         reader of `ALLOWED_CAPABILITIES` would conclude the router needs
-        `NET_RAW`, and would carry that belief into the next container the plan
-        adds. So the per-container answer is in the code, next to the flags.
+        `SYS_ADMIN` and `SYS_PTRACE` for a daemon that runs no init, and would
+        carry that belief into the next container the plan adds. So the
+        per-container answer is in the code, next to the flags -- and it is
+        narrower than the target's by exactly the two the router does not need,
+        which is the only part of this that is an argument rather than a
+        measurement. `CONTAINER_CAPABILITIES` carries the measurement.
 
         **`--cap-add=NET_RAW` is in the *target's* set because a DHCP lease needs
         it, and the plan's three flags are not enough.** The measurement is written

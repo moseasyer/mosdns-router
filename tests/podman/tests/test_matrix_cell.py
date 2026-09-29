@@ -42,6 +42,7 @@ sys.path.insert(0, str(HARNESS / "tests"))
 import images  # noqa: E402
 import test_command  # noqa: E402
 import test_dhcp_scenario  # noqa: E402
+from podman import CONTAINER_CAPABILITIES as CONTAINER_CAPS  # noqa: E402
 from podman import RunResources  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("mosdns_matrix_cell_run", HARNESS / "run.py")
@@ -337,29 +338,31 @@ class CellCompositionTest(EntryPoint):
             f"mosdns-{RUN_ID}-target-24.04": TARGET_ADDRESS,
         })
 
-    def test_the_router_gets_none_of_the_capabilities_the_target_needs(self):
-        """**A shared array handed dnsmasq four capabilities it has never used.**
+    def test_the_router_is_started_with_the_two_capabilities_dnsmasq_measures_as_necessary(self):
+        """**A shared array handed dnsmasq two capabilities it cannot run without,
+        and two it has never used.**
 
         `run_container` builds one argument array and both containers went through
-        it, so the router was started with the target's `--cap-add` set: `SYS_ADMIN`,
-        `NET_ADMIN`, `SYS_PTRACE` and `NET_RAW`. dnsmasq needs none of them. It
-        opens no raw socket -- the `AF_PACKET` socket that made `NET_RAW` necessary
-        is NetworkManager's, in the *target* -- spawns no init, and is not traced.
-        `port=53` is below 1024 and does not need the flag either, because podman's
-        default bounding set already carries `NET_BIND_SERVICE`.
+        it, so the router was started with the target's whole set: `SYS_ADMIN`,
+        `NET_ADMIN`, `SYS_PTRACE`, `NET_RAW`. dnsmasq runs no init and is not
+        traced, so the first and third are not its business. The second and fourth
+        are, and this case says which -- because the answer is not guessable from
+        the outside, and getting it wrong fails **on the other container**:
 
-        So this is the case that separates the **ceiling** from the **policy**.
-        `ALLOWED_CAPABILITIES` is the widest set any container here may hold, and
-        it is what a scenario's `--cap-add` is checked against; `CONTAINER_CAPABILITIES`
-        says which container holds which. Reading the ceiling as the policy is what
-        made this a defect rather than a style question: the emitted array is the
-        thing a reader consults, and it said the router needs `NET_RAW` because a
-        DHCP lease needs `NET_RAW` -- which is true, of the *other* container.
+        * with all four (the old shared array) the router ran, DHCP worked, and two
+          of the four were never used;
+        * with **none**, the router exits 5 with `dnsmasq: process is missing
+          required capability NET_ADMIN`, and the *target* then fails with `IP
+          configuration could not be reserved` -- a message three steps from the
+          container that was under-privileged, reading exactly like a network
+          fault. That is measured: the first version of this case asserted an empty
+          set, on the argument that dnsmasq "opens no raw socket", and the live
+          24.04 cell refuted it.
 
-        The two halves, because either alone would be half a claim: the target
-        still gets all four (asserted here too, so a fix that emptied both would
-        pass a case about the router alone), and the router's own array carries no
-        `--cap-add` at all.
+        So the assertion is the exact two-flag list -- not "not all four", which the
+        old defect would pass, and not "none", which only shows up as a DHCP
+        timeout. The target's four are asserted in the same breath, so a fix that
+        emptied both containers would not pass a case about the router alone.
         """
         fake = self.passing_fake()
         self.cell(fake)
@@ -370,16 +373,40 @@ class CellCompositionTest(EntryPoint):
             for argv in fake.invocations() if argv[:2] == ["run", "-d"]
         }
         self.assertEqual(
-            granted.get(f"mosdns-{RUN_ID}-mock-router-24.04"), [],
-            "the mock router is started with capabilities it does not need: dnsmasq opens no "
-            "raw socket and has never been measured to need one. The measurement that made "
-            "NET_RAW necessary was NetworkManager's, in the target",
+            granted.get(f"mosdns-{RUN_ID}-mock-router-24.04"),
+            ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
+            "the mock router's capabilities are not the measured two. dnsmasq opens an "
+            "AF_PACKET socket to receive the broadcast DISCOVER and exits 5 with 'process is "
+            "missing required capability NET_ADMIN' without NET_ADMIN; it runs no init and is "
+            "not traced, so SYS_ADMIN and SYS_PTRACE are not its business either",
         )
         self.assertEqual(
             granted.get(f"mosdns-{RUN_ID}-target-24.04"),
             ["--cap-add=SYS_ADMIN", "--cap-add=NET_ADMIN", "--cap-add=SYS_PTRACE", "--cap-add=NET_RAW"],
             "the target lost a capability it was measured to need, so a DHCP lease would fail "
             "with 'IP configuration could not be reserved'",
+        )
+
+    def test_the_router_and_the_target_do_not_share_one_capability_set(self):
+        """The structural half, and the one that cannot go stale.
+
+        The exact list in the case above is a measurement, so it is right until a
+        release changes it. This is the property that made the measurement
+        necessary in the first place: both containers are started through the
+        *same* function, and before the capabilities became a parameter they
+        necessarily got the same answer. So this asserts the two sets differ --
+        which holds for any two containers with different needs, and fails the
+        moment somebody collapses them back into one array.
+        """
+        self.assertNotEqual(
+            CONTAINER_CAPS["mock-router"], CONTAINER_CAPS["target"],
+            "both roles resolve to the same set again, so the per-container policy has been "
+            "collapsed back into the shared array this was written to stop",
+        )
+        self.assertLess(
+            set(CONTAINER_CAPS["mock-router"]), set(CONTAINER_CAPS["target"]),
+            "the router is not granted strictly less than the target, so the shared array is "
+            "back in force",
         )
 
     def test_every_container_the_cell_starts_is_named_from_this_runs_prefix(self):

@@ -200,9 +200,10 @@ def run_target(
                 name=router,
                 network=network,
                 extra_args=["--ip", dhcp_test.MOCK_ROUTER_ADDRESS],
-                # dnsmasq needs none of the target's four, and handing it all
-                # four made the emitted array say the router needs `NET_RAW`.
-                # The reason is in `CONTAINER_CAPABILITIES`.
+                # dnsmasq does not run an init and is not traced, so the target's
+                # SYS_ADMIN and SYS_PTRACE are not its business -- but it *does*
+                # need NET_ADMIN and NET_RAW, measured, and it exits 5 without
+                # them. The measurement is in `CONTAINER_CAPABILITIES`.
                 capabilities=CONTAINER_CAPABILITIES["mock-router"],
             )
             container = run.track_container(run.container_name("target", version))

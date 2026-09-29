@@ -1740,13 +1740,27 @@ ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 # widest set any container may hold. This is the narrower question, which the
 # ceiling cannot answer: which container holds which of them.
 #
-# The router's entry is empty and that is the finding, not an oversight.
-# `run_container` built one argument array and both containers went through it,
-# so dnsmasq was started holding the target's four. It needs none: the
-# `AF_PACKET` socket that made `NET_RAW` necessary is NetworkManager's, in the
-# target; dnsmasq runs no init and is not traced; and `port=53` binds below 1024
-# without the flag because podman's default bounding set already carries
-# `NET_BIND_SERVICE` (bit 10, present in `CapEff: 00000000802c15fb`).
+# The router's entry is **not** empty, and getting that wrong took a live run to
+# discover. `run_container` built one argument array and both containers went
+# through it, so dnsmasq held the target's four. The obvious narrowing -- none of
+# them, on the grounds that dnsmasq "opens no raw socket" -- is false: it opens
+# the *same* `AF_PACKET` socket NetworkManager does, because a DHCP server must
+# receive the broadcast DISCOVER before it has an address to reply from. Measured
+# on this host, the daemon's own words:
+#
+# ```text
+# $ podman run … --cap-add=NET_RAW      … mosdns-mock-router:24.04-…
+# dnsmasq: process is missing required capability NET_ADMIN
+# $ podman run … --cap-add=NET_ADMIN    … mosdns-mock-router:24.04-…
+# dnsmasq: process is missing required capability NET_RAW
+# $ podman run … --cap-add=NET_ADMIN --cap-add=NET_RAW … mosdns-mock-router:24.04-…
+# dnsmasq[1]: started, version 2.91 cachesize 150
+# ```
+#
+# `SYS_ADMIN` and `SYS_PTRACE` are the half that is genuinely unused: no init, no
+# tracing. `NET_BIND_SERVICE` is in neither row -- `port=53` is below 1024, and a
+# container with no `--cap-add` at all reports `CapEff: 00000000800405fb` on this
+# host, which already carries bit 10.
 #
 # The cost of the table is one line per container, which is the cost of any
 # per-container policy. A shared array is free until the first container that
@@ -1754,7 +1768,7 @@ ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 # granted and not needed is not something podman or the kernel ever reports.
 PER_CONTAINER_CAPS = {
     "target": ALLOWED_CAPS,
-    "mock-router": (),
+    "mock-router": ("NET_ADMIN", "NET_RAW"),
 }
 
 # Every flag family refused in `extra_args`, in the two spellings pflag accepts
@@ -2213,9 +2227,18 @@ class ContainerPolicyTest(PodmanTestCase):
                     f"and the guard disagree about what may be granted",
                 )
         self.assertEqual(
-            CONTAINER_CAPS["mock-router"], (),
-            "the mock router is granted capabilities again. dnsmasq needs none of them: the "
-            "AF_PACKET socket that made NET_RAW necessary is NetworkManager's, in the target",
+            set(CONTAINER_CAPS["mock-router"]), {"NET_ADMIN", "NET_RAW"},
+            "the router's capability set is not the measured pair. dnsmasq opens an AF_PACKET "
+            "socket to receive the broadcast DISCOVER and exits 5 with 'process is missing "
+            "required capability NET_ADMIN' without NET_ADMIN, or the NET_RAW message without "
+            "that one; SYS_ADMIN and SYS_PTRACE are not its business because it runs no init and "
+            "is not traced",
+        )
+        self.assertNotIn(
+            "NET_BIND_SERVICE", CONTAINER_CAPS["mock-router"],
+            "the router is granted NET_BIND_SERVICE, but podman's default rootless bounding set "
+            "already carries bit 10 -- measured in CapEff: 00000000800405fb for a container "
+            "started with no --cap-add at all -- so port=53 does not need it",
         )
         self.assertEqual(
             CONTAINER_CAPS["target"], ALLOWED_CAPS,
@@ -2225,8 +2248,8 @@ class ContainerPolicyTest(PodmanTestCase):
         # be a naming accident that a later edit papers over.
         self.assertIsNot(
             CONTAINER_CAPS["mock-router"], CONTAINER_CAPS["target"],
-            "both roles resolve to the same tuple, so a container that needs nothing is given "
-            "everything again",
+            "both roles resolve to the same tuple, so a container with narrower needs is given "
+            "the target's set again",
         )
 
     def test_the_measured_target_runs_with_net_raw_because_dhcp_needs_it(self):
