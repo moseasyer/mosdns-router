@@ -87,6 +87,7 @@
 - DHCP DNS changes must be driven through the mock router and observed by NetworkManager.
 - Killing dnscrypt-proxy must produce foreign SERVFAIL without a domestic fallback.
 - **The NetworkManager device sequence is asserted, not assumed** — the previous plan's largest SKIPPED list came from concluding a container could not do this, and it can.
+- **The watchdog is judged on what it says as much as what it does** — a default-on mechanism that restores basic connectivity while leaving the project's actual problem in place must say so, and a switch nobody has observed in the off position is not a switch.
 - A live ECH pass must verify encrypted ClientHello behavior without installing a CA or modifying Firefox DoH.
 
 ---
@@ -603,6 +604,96 @@ Expected: unit tests pass; preflight reports a missing Podman clearly rather tha
 ```bash
 git add tests/podman/tests/test_matrix.py tests/podman/run.py Makefile docs/testing.md
 git commit -m "test: gate cross-version host isolation"
+```
+
+---
+
+### Task 8: Add the resolver watchdog, on by default and switchable off
+
+**This task exists because the previous plan left a decision open and the user has now
+made it.** It is a product feature inside a testing plan, which is a deliberate
+placement and not an accident: the `emergency-rollback` action is the previous plan's,
+the health unit that detects the condition is this plan's image, and **this** plan's
+harness is the only place the behaviour can be observed at all — kill the router inside
+a container and watch what happens is not something a fake command runner can answer.
+There is no plan 8, and re-opening a closed plan to add a feature would be worse.
+
+**Interfaces:**
+- Consumes: the health unit's resolvability probe, `mosdns-cdnctl emergency-rollback`,
+  and an operator setting.
+- Produces: a watchdog that restores the machine's own resolvers when the local one has
+  stopped answering, and a documented way to turn that off.
+
+- [ ] **Step 1: Write the decision down before the code, in the plan and in the docs**
+
+The user's decision, verbatim in substance: **automatic rollback is the default, and it
+must be possible to switch it off.** Record also what automatic rollback actually
+restores and what it does not: it restores the machine's own (DHCP-provided) resolvers,
+so basic connectivity returns while **foreign-name resolution through DNSCrypt does
+not** — the condition this project exists to fix is unfixed, only no longer in the way.
+An operator reading the log at 3am must be able to learn that from the message itself.
+
+- [ ] **Step 2: Write the setting, its default, and its shape**
+
+An operator-authored file under `/etc/mosdns/` — the same directory and the same
+ownership rules as the other user inputs, so an unprivileged read cannot change it.
+`automatic: true` is the shipped default. Also settable: the **consecutive-failure
+count** and the **minimum elapsed time** before anything is touched.
+
+**Why the window exists, stated as a decision and not as a caveat.** A single failed
+probe is not evidence that the router is down: an upstream that is slow, a cold boot
+before NTP has synchronised, and a loaded machine all produce one. With automatic
+rollback as the *default*, a single-probe trigger is a mechanism that can tear down a
+working configuration while the operator is using it, and a self-inflicted outage is
+worse than a false alarm. The window is therefore part of the default behaviour rather
+than an opt-in hardening — and the two numbers are **settings**, because the false-
+positive rate has not been measured and a number nobody measured should not be baked in.
+
+- [ ] **Step 3: Write the watchdog**
+
+A systemd timer alongside the health timer, so it inherits the packaged unit's
+hardening rather than inventing its own. Each run: probe resolvability through the
+**same predicate the health unit and the installer already use** — a second definition
+of "resolvable" is exactly the defect this project has been correcting. On failure,
+record it and stop; on the Nth consecutive failure, or once M minutes have elapsed
+since the first, run `emergency-rollback` **exactly as the operator would**, so the
+watchdog cannot take a path a human would not. On a successful probe, reset the counter
+and log that it did.
+
+- [ ] **Step 4: Make every refusal and every action say what it did**
+
+- Not enough failures yet: name the count, the threshold, the elapsed time and the
+  first-failure timestamp, so the operator can tell "working" from "about to act".
+- The action failed: name the action's exit status and what the operator should run by
+  hand. **Never claim the machine is back when it is not** — that is the defect class
+  this project has hit repeatedly, and the `postinst` fix-round history is the
+  precedent.
+- The action succeeded: name what was restored, and repeat the limitation in
+  production, not only in the docs.
+
+A test that reads these messages and would fail if a claim were removed.
+
+- [ ] **Step 5: Prove the switch works, in a container, and prove the action is the real one**
+
+A scenario that: points the machine at the local resolver, stops the router, and
+records what the watchdog does across the window — nothing before the threshold, the
+real `emergency-rollback` after it, the recorded DNS restored, the machine still
+usable. Then the same scenario with `automatic: false` must observe **no** action at
+all across a window longer than the default, and the operator's manual
+`emergency-rollback` must still work afterwards. A switch that has never been observed
+in the off position is not a switch.
+
+- [ ] **Step 6: Document it where an operator will actually read it**
+
+The man page, the README or `docs/testing.md`'s troubleshooting section, and the
+setting file's own comments. State the default, the two numbers, what is restored and
+what is not, and how to disable it.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add packaging/systemd tests/podman/scenarios docs
+git commit -m "feat: roll the machine's resolvers back when the local one stops answering"
 ```
 
 ---
