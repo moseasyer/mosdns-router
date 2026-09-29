@@ -24,6 +24,24 @@
 
 > **A fourth capability, and it is the one DHCP needs: `NET_RAW`.** The three flags above are this plan's original list and they start a target and make NetworkManager manage its device, but a target with only those three **cannot obtain a DHCP lease**: podman's default bounding set for a rootless container does not carry `NET_RAW` (bit 13, absent from `CapEff: 00000000802c15fb`), NetworkManager's built-in DHCP client opens an `AF_PACKET` socket to send and receive DORA, and without it every transaction fails with `dhcp4 (eth0): error -1 dispatching events` while `nmcli connection up` reports *IP configuration could not be reserved (no available address, timeout)*. Measured on this host against a real dnsmasq on a netavark bridge, on 24.04; adding `--cap-add=NET_RAW` to the same container against the same router produces a full `DHCPDISCOVER`/`DHCPOFFER`/`DHCPREQUEST`/`DHCPACK` and a published DNS address. It is in the harness's cap ceiling and in the emitted array rather than in a scenario's `extra_args`, because the target is one container for the whole cell and a capability one scenario needs and another does not is a property of the run.
 
+> **A readiness wait on a field is not a readiness wait on the process that owns the field — and `GENERAL.NM-MANAGED` is a field.** This is the same class of error as the `conf.d` note above, one level up, and it is a **ruling** rather than an observation. The cell's only readiness gate was a bounded wait for `GENERAL.NM-MANAGED: yes`. That field is produced *by* `target-nm-setup.service`, which is `Type=oneshot` with `RemainAfterExit=yes`, and on 24.04 and 26.04 the script's third step is `systemctl restart NetworkManager`. So the field reads `yes` — from the `conf.d` declaration, during the daemon's own activation — while the unit is still running and about to restart that daemon underneath it. A scenario's `nmcli connection up eth0-managed` landing in that window fails with `Error: NetworkManager is not running` (exit 8), which reads as a network fault three steps from the cause.
+>
+> **Measured, and the window is not a corner case — it is every boot.** Polling 12 target boots per release and recording the unit's state *at the poll where the field first read `yes`*:
+>
+> ```text
+> 24.04   10 of 10: unit is 'inactive' or 'activating', never 'active'
+>                NetworkManager 'activating' in 10 of 10
+>                the eth0-managed profile does NOT yet exist in 8 of 10
+> 22.04   10 of 10: unit is 'inactive' or 'activating', never 'active'
+>                NetworkManager 'active' in 10 of 10, profile present in 10 of 10
+> ```
+>
+> So the gate was wrong on **100% of boots on both releases**, and the *visible* failure rate is a separate and much smaller number, because it depends only on whether the scenario happens to reach `nmcli` inside the window: measured 3 failures in 9 runs on 24.04 under load, 1 in 6 on this commit's parent, and **0 in 12 on a quiet machine**. That gap is the reason it survived a whole task: a flaky-looking number, an underlying certainty, and no case that could have seen it.
+>
+> **The ruling, and it is about ordering rather than about either check alone.** The cell waits for `target-nm-setup.service` to reach a terminal state and *then* for `GENERAL.NM-MANAGED`, and the order is the fix. Neither check substitutes for the other: a unit that has finished with the device unmanaged is a target every scenario would fail on without ever having been managed, and a field that reads `yes` mid-restart is a target whose daemon is about to go away. The terminal state is `active` (`SubState=exited`, `Result=success`) — **measured, and identical on all three releases**, including 22.04 where the script skips the override sequence and so is the obvious release to expect something different. `failed` is the other terminal state and is reported **at once**, because the script's exit status is the unit's verdict and it exits non-zero naming which of the three things went wrong. `activating` is neither: it is the state a healthy target is in for the first seconds of its life, and it is the state the race lives in.
+>
+> The general form, because it will recur: **a field is a projection of a process's state, and it is sampled at an instant. Gate on the process when the process is the thing that must have finished.** The plan already has two instances of the same shape — a bridge network's `eth0` is a projection of podman's choice, and a DHCP lease is a projection of a DORA — and this is the first one where a *test harness* was the thing that had to finish.
+
 **Tech Stack:** Python 3 standard library, rootless Podman container/network, Ubuntu official images, systemd, NetworkManager, systemd-resolved, dnsmasq mock router, local TLS server, Mozilla Firefox headless for live ECH verification.
 
 **Spec:** `docs/superpowers/specs/2026-09-25-mosdns-dnscrypt-cdn-ech-design.md`

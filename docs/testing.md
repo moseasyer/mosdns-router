@@ -564,6 +564,13 @@ podman rmi localhost/mosdns-target:24.04-<old-hash>    # or name them one at a t
 Leave the six current tags and the three `docker.io/library/ubuntu` base images
 alone — the next run needs them, and a rebuild is minutes.
 
+**So: do not go looking for a gigabyte.** The number to believe is the one
+`podman rmi` gives you, not the one `podman images` prints. Adding up a stale
+image's reported size double-counts every layer it shares with the images you
+kept, and a harness image is almost entirely shared layers — the Ubuntu base and
+the `apt-get install` are the bulk of it, and both are identical across a stale
+and a current image of the same release.
+
 ## Adding a scenario
 
 Scenarios are registered, not discovered. A scenario that is asked for by name
