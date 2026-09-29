@@ -895,6 +895,38 @@ class ScenarioRunsThePlanTest(ScenarioHarness):
             "of the comparison says the reload did not happen",
         )
 
+    def test_the_reload_is_checked_against_a_log_that_remembers_its_start_up(self):
+        """`podman logs` is cumulative, and the check depends on that being so.
+
+        The count is a difference between the log read before the signal and the
+        log read after it, and a difference is only meaningful if the second
+        reading contains the first. `podman logs` does: it is a container's whole
+        output since it started, not a delta since the last call. The fixture
+        used to model it as a replacement -- each read a fresh log -- which is not
+        what podman does, and against which a count says "dnsmasq re-read the
+        file once" for a run where it re-read it twice.
+
+        So the passing fixture carries its own start-up into the second answer, and
+        this case holds that. A fixture that forgets its start-up makes the
+        re-read assertion pass for the wrong reason: the count would be satisfied
+        by the start-up read alone.
+        """
+        self.assertIn(
+            f"read {DNS_OPTION_FILE}", RELOADED_LOG,
+            "the post-reload fixture dropped the start-up read, so the re-read count would be "
+            "satisfied by start-up alone -- the same defect as a presence test, in a fixture",
+        )
+        self.assertTrue(
+            RELOADED_LOG.startswith(DORA_LOG),
+            "the post-reload log is not the pre-reload log plus what the reload added, so it is "
+            "not a `podman logs` reading",
+        )
+        self.assertEqual(
+            dhcp._option_file_reads(RELOADED_LOG),
+            dhcp._option_file_reads(DORA_LOG) + 1,
+            "a genuine reload adds exactly one read of the option file to a cumulative log",
+        )
+
     def test_a_reload_that_happened_is_the_one_that_passes(self):
         """The other side of the check above, and it is the side that has to pass.
 

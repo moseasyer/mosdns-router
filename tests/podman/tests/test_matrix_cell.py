@@ -78,21 +78,31 @@ class EntryPoint(PodmanTestCase):
         needs and the scenario never asks for.
         """
         return self.fake(
-            (rules if rules is not None else [])
-            + [
-                {"match": ["version"], "stdout": "5.7.0\n"},
-                {"match": ["info"], "stdout": "overlay\n"},
-                # Not in the store, so the build is asked for rather than skipped
-                # -- a rule that said the image was there would make the build
-                # argument invisible to every case below.
-                {"match": ["image", "exists"], "returncode": 1},
-                {"match": ["build"], "stdout": "sha256:" + "a" * 64 + "\n"},
-                {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
-                {"match": ["cat", test_dhcp_scenario.ROUTER_LEASE_FILE], "stdout": ""},
-                {"match": ["network", "exists"], "returncode": 1},
-            ]
-            + test_dhcp_scenario.cell_rules()
+            (rules if rules is not None else []) + self.passing_fake_rules()
         )
+
+    def passing_fake_rules(self):
+        """`passing_fake`'s table, without the fake.
+
+        Split out so a case that wants to change *one* rule -- a build that fails,
+        an image that is already in the store -- edits the table the passing cases
+        use instead of spelling a second version of it out. A table copied in
+        order to be modified is the copy that goes stale, and it goes stale
+        silently: the case stays green, and green about a run that no longer
+        resembles the one its neighbours describe.
+        """
+        return [
+            {"match": ["version"], "stdout": "5.7.0\n"},
+            {"match": ["info"], "stdout": "overlay\n"},
+            # Not in the store, so the build is asked for rather than skipped
+            # -- a rule that said the image was there would make the build
+            # argument invisible to every case below.
+            {"match": ["image", "exists"], "returncode": 1},
+            {"match": ["build"], "stdout": "sha256:" + "a" * 64 + "\n"},
+            {"match": ["run"], "stdout": "9f3c1d0e2b\n"},
+            {"match": ["cat", test_dhcp_scenario.ROUTER_LEASE_FILE], "stdout": ""},
+            {"match": ["network", "exists"], "returncode": 1},
+        ] + test_dhcp_scenario.cell_rules()
 
 
 class ScenarioRegistryTest(EntryPoint):
@@ -181,6 +191,112 @@ class ScenarioRegistryTest(EntryPoint):
                     "a registered scenario has no builder, so asking for it is refused and asking "
                     "for nothing does not run it",
                 )
+
+
+class BuildFailureTest(EntryPoint):
+    """A `podman build` that fails is a **harness error**, and it is exit 2.
+
+    **The asymmetry is the point, and it is one-directional.** A build that fails
+    is `PodmanError` from `_build_images`, which `main` reports as exit 2 and
+    which happens *before* any cell exists -- so no report is written, no cell is
+    recorded `failed`, and nothing in the artifact says a release was tested. The
+    reverse is not reachable: there is no path by which a build failure becomes a
+    `failed` row, because the build is not inside the cell.
+
+    Why it matters: a regression here is reported as a **broken image**, and the
+    consequence runs the wrong way. A cell that could not start proves nothing
+    about the package, so a `failed` row sends a reader after an installer bug
+    that is not there -- and the image is a harness artefact, not the thing the
+    plan is about. That is the misdirection the docstring warns about, and it is
+    why the refusal lives in `_build_images` rather than being left to the report.
+
+    So the case is: the build fails, the run exits 2, **and no row anywhere claims
+    a release was tested.** The last part is what a reader would check, and it is
+    the part that fails if somebody moves the build inside the cell.
+    """
+
+    def failing_build_fake(self):
+        """A fake whose answer is `passing_fake` except the build, which fails.
+
+        The passing table with its one `build` rule swapped for one that fails, so
+        every other answer a cell needs is still there: a fake that answered
+        nothing else would fail for a second reason too, and the case would not
+        say which of the two it was about. The stderr is a real `podman build`
+        failure -- an `apt-get` step that could not find a package -- so the
+        refusal is exercised against the message an operator would actually read,
+        and the role in the refusal can be checked against the image that failed.
+        """
+        return self.fake([
+            {
+                "match": ["build"],
+                "returncode": 1,
+                "stderr": (
+                    'Error: building at STEP "RUN apt-get install": exit status 100: '
+                    "E: Unable to locate package dnsmasq-base\n"
+                ),
+            },
+        ] + [
+            rule for rule in self.passing_fake_rules() if rule["match"] != ["build"]
+        ])
+
+    def test_a_build_that_fails_is_a_harness_error_and_not_a_failed_cell(self):
+        fake = self.failing_build_fake()
+        results = self.directory / "results"
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(results), "--run-id", RUN_ID,
+                      "matrix", "--arch", "amd64", "--versions", "24.04", "--scenario", "dhcp")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        # The message names the role, the version, the tag and why it is not a
+        # result. A reader who sees "build failed" alone looks in the wrong place.
+        for needle in ("mock-router", "24.04", "mosdns-mock-router:24.04-", "harness error"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, output)
+        # Nothing was started, so nothing was tested.
+        self.assertEqual(
+            [argv for argv in fake.invocations() if argv[:1] == ["run"]], [],
+            "a run whose image could not be built still started a container",
+        )
+        self.assertEqual(
+            [argv for argv in fake.invocations() if argv[:1] == ["network"] and argv[1:2] == ["create"]], [],
+            "a run whose image could not be built still created the network",
+        )
+
+    def test_a_build_failure_leaves_no_row_claiming_a_release_was_tested(self):
+        """**The half a reader actually reads.** Nothing says 24.04 was tested.
+
+        The failure is one-directional, and this is the direction that matters. If
+        a build failure were ever recorded as a cell, the report would carry
+        `24.04: failed` for a release no container ever ran on -- a row that reads
+        as a result and is not one, which is the shape this project keeps meeting.
+        So the case asserts the *absence* of any such row, and says why the
+        absence is the assertion rather than a side effect.
+        """
+        fake = self.failing_build_fake()
+        results = self.directory / "results"
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(results), "--run-id", RUN_ID,
+                      "matrix", "--arch", "amd64", "--versions", "24.04", "--scenario", "dhcp")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        reports = sorted(results.rglob("report.json")) if results.exists() else []
+        for path in reports:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            for result in document.get("results", []):
+                self.assertNotEqual(
+                    result.get("status"), "failed",
+                    f"{path} carries a failed row for {result.get('version')}, but no container "
+                    f"was ever started, so that row is not a result",
+                )
+        # And the before/after snapshots *were* written: the teardown is in a
+        # `finally`, and a harness error that skipped it would leave a run whose
+        # host state is unrecorded -- which is the case where a reader wants it
+        # most.
+        self.assertTrue(
+            list(results.rglob("host-before.json")) and list(results.rglob("host-after.json")),
+            "the run failed on its image and still did not snapshot the host, so there is no "
+            "record of what this machine looked like either side of it",
+        )
 
 
 class CellCompositionTest(EntryPoint):

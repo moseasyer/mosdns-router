@@ -3735,24 +3735,41 @@ class CommandLineTest(EntryPointTestCase):
                     self.assertEqual(code, run.EXIT_HARNESS_ERROR)
                     self.assertIn("is not a version", output)
 
-    def test_every_release_the_lock_pins_is_accepted(self):
-        """A version the lock covers is accepted, whatever the parser thinks.
+    def test_every_release_the_lock_pins_reaches_a_build_with_its_own_digest(self):
+        """**The lock pins every release, and each digest reaches a `podman build`.
 
-        A list of valid versions belongs to the image lock, not to the argument
-        parser, so a later task that adds a release does not have to change
-        this file -- and a case that only tested refusals would not say which
-        of the two it is. The list is now *derived* from the lock, because the set
-        of versions a run may name and the set it may build are the same set, and
-        a case that spelled both out would be a second list to forget.
+        That is the whole claim, and it is one claim rather than two. It used to
+        be a case called `..._is_accepted` whose exit-code assertion accepted three
+        of the four codes and in practice only ever saw one -- so the "the release
+        is accepted" half of the name was carried entirely by the build-argv
+        assertion below, while the assertion next to it read as though the exit
+        code were doing work. A subject that has quietly become a different claim
+        is worse than a weak one, because the docstring is what a later reader
+        trusts.
 
-        **The cell is run, so there is no `skips` entry naming the image any
-        more.** That assertion was the Task 2 way of saying "the cell names the
-        image it would have used", and it is stronger now: the digest reaches a
+        So the name says what is asserted. The exit code is **not** pinned to a
+        single value, and the reason is measured: the code this run returns is
+        `1` for all three releases, because this fake answers a cell only well
+        enough to build it and the DHCP scenario then fails on the missing
+        answers. That number is a property of how completely this case's table
+        describes a passing run, not a property of the lock, and pinning it would
+        be asserting a fact about the fixture.
+
+        The one exit code that *is* asserted is the one that would mean the
+        version was refused: `2`. A release the lock does not cover is refused
+        before anything is built -- `test_a_release_the_lock_does_not_pin_is_refused_by_the_lock_not_the_parser`
+        is the other side of that, and it names the versions the lock does cover
+        in its message. So "accepted" is carried by "not refused", and "built from
+        its own digest" is carried by the argv, and neither is carried by a number
+        that describes the fixture.
+
+        **There is no `skips` entry any more.** That assertion was the Task 2 way
+        of saying "the cell names the image it would have used". The cell runs, so
+        nothing skips, and the claim is stronger now: the digest reaches a
         `podman build` argument, which
         `test_a_target_is_started_from_the_locked_reference_verbatim` asserts and
         `test_the_target_image_is_built_from_the_locked_reference` asserts again
-        through the real entry point. Asserting a *skip* string on a cell that
-        runs would be a claim about a report shape nothing produces any more.
+        through the real entry point.
         """
         import images as images_module
 
@@ -3777,21 +3794,34 @@ class CommandLineTest(EntryPointTestCase):
                               "--run-id", "20260928T120000Z",
                               "matrix", "--arch", "amd64", "--versions", version)
                 )
-                self.assertIn(
-                    code,
-                    (run.EXIT_OK, EXIT_TEST_FAILURE, run.EXIT_INCOMPLETE),
-                    output,
+                # "Accepted", and nothing more specific than that: a refusal is
+                # exit 2 and happens before a single build.
+                self.assertNotEqual(
+                    code, run.EXIT_HARNESS_ERROR,
+                    f"the lock refused a version it pins, so no build was reached: {output}",
                 )
                 document = json.loads(next(results.rglob("report.json")).read_text(encoding="utf-8"))
                 self.assertEqual([r["version"] for r in document["results"]], [version])
-                # And the build was given that release's digest, which is the
-                # claim the skip string used to carry.
+                # And the claim: the build was given *this* release's own digest,
+                # not a bare tag and not another release's.
                 builds = [
                     argv for argv in fake.invocations()
                     if argv[:1] == ["build"]
                     and any(f"docker.io/library/ubuntu:{version}@sha256:" in token for token in argv)
                 ]
                 self.assertTrue(builds, f"no build was given the {version} digest: {fake.invocations()}")
+                for argv in fake.invocations():
+                    if argv[:1] != ["build"]:
+                        continue
+                    for token in argv:
+                        if "ubuntu:" not in token or token.startswith("docker.io/library/ubuntu:"):
+                            continue
+                        self.assertIn(
+                            f"docker.io/library/ubuntu:{version}@sha256:", token,
+                            "a build was given a base reference for a different release than the "
+                            f"one this subtest is about, so the digest that reached the build is "
+                            f"not the one the lock pins for {version}",
+                        )
 
     def test_a_release_the_lock_does_not_pin_is_refused_by_the_lock_not_the_parser(self):
         """**The two version checks are now different checks, and this is the seam.**
