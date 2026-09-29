@@ -387,27 +387,38 @@ git commit -m "test: drive NetworkManager DHCP in Podman"
 - Consumes: built `.deb`, mock router, and a test-only foreign DNS listener.
 - Produces: evidence that native units and NetworkManager integration work across Ubuntu versions.
 
-- [ ] **Step 1: Start the target systemd container**
+- [ ] **Step 1: Make the install possible without a route to the internet**
+
+**This step is first because every other step in this task is blocked by it, and it was recorded as this task's item by three review rounds before it was written here.** The install transaction has **never succeeded anywhere** — not in a container, not on a machine. Every cell so far ended `half-configured` or `unpacked` because the transaction refused: the CDN selector refuses to construct without a Cloudflare prefix list, the list's only producer fetches from the network, and a container on the private network has no route to `api.cloudflare.com`. The refusal itself is correct and deliberate — but it means nothing downstream of it has ever run.
+
+Ship a **pinned snapshot** of the ranges in the package, the same way the China list is already shipped, and let `update-lists` use it at install and refresh it afterwards. The requirements:
+
+- The snapshot is a **pinned artifact with a recorded digest**, verified the way the China list's `list_sha256` is verified, and `postinst` must place it without ever re-pinning — re-pinning at install is how an operator's reviewed pin becomes something nobody reviewed.
+- **A stale snapshot must be visible, not silent.** The package states in the shipped file how old the pin is, and `update-lists --check` reports drift against it. A snapshot that is three months old is fine for a selector; a snapshot nobody is measuring is not.
+- The install must now **succeed offline**, and that is the property this step delivers. A test must hold it: with no route to the internet at all, the transaction completes and the package reaches `install ok configured`.
+- **Do not weaken the refusal.** A machine with a *corrupt* or *missing* snapshot must still refuse rather than install a selector over bad ranges. The distinction is "a pinned snapshot shipped with the package" versus "no ranges at all", and it must be sharp.
+
+- [ ] **Step 2: Start the target systemd container**
 
 Use the locked image, `--systemd=always`, `--cgroupns=private`, `--cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SYS_PTRACE --cap-add=NET_RAW`, `-v /sys/fs/cgroup:/sys/fs/cgroup:rw`, and the private network's fixed IP. These are the exact flags measured to work on this host; `--cgroupns=host` and `--privileged` are **not** used — they were written for the machine architecture this plan no longer has, and the measured set is narrower. **`NET_RAW` is the fourth flag and Task 3 measured it necessary**: a target with only the three above cannot obtain a DHCP lease, because NetworkManager's built-in DHCP client opens an `AF_PACKET` socket (see the architecture note). Anything a scenario adds goes through the wrapper's `extra_args`, which refuses a privilege flag, a host namespace, a capability outside the four above, a device, a seccomp/apparmor override and `--volumes-from`, in both spellings pflag accepts. Do not mount host system directories. Copy the `.deb` with `podman cp`, then install it inside the container.
 
-- [ ] **Step 2: Validate packaged units**
+- [ ] **Step 3: Validate packaged units**
 
 Run `systemd-analyze verify`, `systemctl is-enabled/is-active`, and `ss -lntup`. Assert only loopback listeners for project services and successful `journalctl -b` service startup.
 
-- [ ] **Step 3: Validate NetworkManager handoff**
+- [ ] **Step 4: Validate NetworkManager handoff**
 
 Assert preinstall DNS equals the mock router, postinstall active NM DNS equals `127.0.0.1`, `/etc/resolv.conf` still targets resolved stub, and the bridge state retains the original mock DNS.
 
-- [ ] **Step 4: Add a test-only foreign override**
+- [ ] **Step 5: Add a test-only foreign override**
 
 For deterministic offline routing, copy a modified `/etc/mosdns/config.yaml` inside the container so only the foreign forward address points to a private mock listener. Production shipped config and packaged DNSCrypt config remain unchanged and are asserted separately.
 
-- [ ] **Step 5: Query routing paths**
+- [ ] **Step 6: Query routing paths**
 
 From a separate client container and from inside the target, query China-set and foreign test names. Assert query counters at mock domestic and foreign listeners. Repeat over UDP and TCP.
 
-- [ ] **Step 6: Run all three amd64 versions**
+- [ ] **Step 7: Run all three amd64 versions**
 
 ```bash
 python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04 --scenario install,routing
@@ -415,7 +426,7 @@ python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04 --s
 
 Expected: PASS for each version.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add tests/podman/scenarios/install_test.py tests/podman/scenarios/routing_test.py tests/podman/run.py
