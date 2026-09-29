@@ -156,6 +156,20 @@ entry, because
 .B /run
 is a tmpfs and the group, the setgid bit and the default ACL do not survive a
 reboot.
+.PP
+One further directory is the exception and is not in that set:
+.BR /run/mosdns/watchdog ,
+which is
+.BR root:root " 0700"
+with no default ACL. It holds the resolver watchdog's failure record and nothing
+else. The record is 0600 and this directory is 0700 because unlink and rename are
+decided by the containing directory and not by a file's own mode, so a 0600 file
+in the group\-writable
+.B /run/mosdns
+above could still be deleted, or replaced with a streak that has already reached
+its window, by
+.BR mosdns\-cdn .
+No other identity in this package reads the record.
 .SH ACCOUNTS AND REMOVAL
 A purge removes
 .BR /var/lib/mosdns ,

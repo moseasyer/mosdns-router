@@ -48,7 +48,9 @@ order at the head of the transaction section before changing anything in it.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import errno
 import ipaddress
 import json
 import os
@@ -180,6 +182,101 @@ STATE_GROUP_PERMISSIONS = "rwx"
 CONTROL_LOCK = "/var/lib/mosdns/runtime/control.lock"
 LOCK_MODE = 0o640
 LOCK_MODE_OCTAL = "640"
+
+
+class LockUnavailable(Exception):
+    """Somebody else holds the control lock, or it could not be taken.
+
+    A reason rather than a boolean, because every caller of the lock has to say
+    something an operator can act on, and the three callers are in different
+    positions: a transaction that cannot take it refuses before changing
+    anything, a rollback that cannot take it says so beside the failure it is
+    already reporting, and a watchdog that cannot take it declines and says what
+    it saw.
+    """
+
+
+@contextlib.contextmanager
+def _try_control_lock(root: Path):
+    """Hold `CONTROL_LOCK` for the duration of the block, or say it is held.
+
+    **This is the package's mutual exclusion and it is now used by the transaction
+    and the watchdog as well as by the Go commands.** The optimizer, the health
+    check and `update-lists` take it through `internal/filelock`; this is the
+    same path, the same mode and the same `flock`, so the two languages exclude
+    each other rather than each keeping its own idea of what "busy" means.
+
+    Taken WITHOUT waiting, and that is the whole design. A caller that blocked
+    would be a caller that hangs: the transaction runs inside `postinst`, so
+    waiting there would hang `dpkg` on a lock this package's own `update-lists`
+    might be holding; and the watchdog runs on a one-minute timer, so waiting
+    there would mean sitting for the length of a transaction and then acting
+    anyway. Both decline instead, and both say so in words that name the lock.
+
+    The descriptor is read-only, as in the bridge's own lock: a process holding
+    this lock has no way to modify the state it protects, and closing it releases
+    the lock. The mode is pinned on every acquire, not only on creation, because
+    the umask narrows the mode argument and a lock at 0600 would be a lock the
+    other service identity could not take -- which presents as "somebody else
+    holds it", for ever.
+    """
+    path = root / CONTROL_LOCK.lstrip("/")
+    descriptor = None
+    try:
+        import fcntl
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(path, os.O_CREAT | os.O_RDONLY, LOCK_MODE)
+            os.fchmod(descriptor, LOCK_MODE)
+        except OSError as error:
+            raise LockUnavailable(
+                f"{CONTROL_LOCK} could not be opened ({error}), so whether some other operation "
+                f"is mutating this machine's DNS right now cannot be established"
+            ) from None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise LockUnavailable(
+                    f"{CONTROL_LOCK} is held by another operation, so something else is changing "
+                    f"this machine's DNS right now"
+                ) from None
+            raise LockUnavailable(f"{CONTROL_LOCK} could not be locked ({error})") from None
+        yield
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextlib.contextmanager
+def _hold_control_lock(root: Path):
+    """`CONTROL_LOCK` for a caller that MUST have it, refusing if it cannot.
+
+    The transaction's half. It refuses rather than proceeding unlocked, because
+    the whole of the exclusion is that the watchdog stands down while this
+    machine's DNS is being moved, and a transaction that proceeded without the
+    lock would remove that guarantee for the length of an install while still
+    reporting that it held it.
+
+    **A transaction that cannot take the lock changes nothing**, so this raises
+    :class:`InstallRefused` and the caller's own rollback path runs -- which
+    finds no undos registered, because nothing was done.
+    """
+    try:
+        with _try_control_lock(root):
+            yield
+    except LockUnavailable as error:
+        raise InstallRefused(
+            f"{error}. The install transaction is the one thing in this package that moves this "
+            "machine's DNS, and it does not do that while something else is: another control "
+            "operation is running (a pin, an apply, an update-lists, or the resolver watchdog "
+            "itself), and this install will not race it. Nothing has been changed. The control "
+            "lock is advisory, so nothing is holding it by accident -- if this machine is idle "
+            "and the lock is still held, the process holding it is still running, and "
+            "`fuser -v "
+            f"{CONTROL_LOCK}` says which. Re-run the install once it has finished."
+        ) from None
 
 # The marker an installation of this package leaves. It is what tells a
 # re-install -- an upgrade, where an already-active router is the expected state
@@ -390,15 +487,36 @@ class RealCommandRunner(CommandRunner):
     constant, because a default argument is evaluated once and a test that
     changed the constant afterwards would be testing something the signature no
     longer says.
+
+    ``kill_group`` exists for that same caller, and it is the difference between a
+    budget and a lie. The command it runs is not the work: ``mosdns-cdnctl
+    emergency-rollback`` is a launcher that execs THIS program's own
+    ``emergency-rollback`` verb, and the verb is what rewrites the connection. A
+    timeout that killed only the launcher would leave the restore running
+    unsupervised on a machine whose record already says the action has been
+    performed -- so nothing would ever report its outcome, and the write-ahead
+    latch means nothing would ever run it again. So a runner asked to kill its
+    group starts the command in a new session and kills the whole group on
+    timeout, which leaves the one state this program can describe truthfully: the
+    restore is not running.
+
+    Every other caller leaves it off. A read-only question to a running manager
+    has no grandchild to strand, and ``start_new_session`` is not free -- a child
+    in a new session is not in the caller's process group, so a terminal interrupt
+    that would have reached it does not. The watchdog's action is a background
+    process with no terminal and the read-only commands are not.
     """
 
-    def __init__(self, timeout: float = COMMAND_TIMEOUT_SECONDS):
+    def __init__(self, timeout: float = COMMAND_TIMEOUT_SECONDS, kill_group: bool = False):
         self.timeout = timeout
+        self.kill_group = kill_group
 
     def run(self, args: Sequence[str], check: bool = True) -> Completed:
         import subprocess
 
         command = list(args)
+        if self.kill_group:
+            return self._run_a_group(command, check)
         try:
             completed = subprocess.run(
                 command,
@@ -427,6 +545,57 @@ class RealCommandRunner(CommandRunner):
                 completed.returncode, command, completed.stdout, completed.stderr
             )
         return Completed(completed.returncode, completed.stdout, completed.stderr)
+
+    def _run_a_group(self, command: list, check: bool) -> Completed:
+        """Run one command in a session of its own, and kill all of it on timeout.
+
+        The same contract as :meth:`run` -- an argument array, a status, two
+        streams, 124 for a command that outran its budget -- reached with an
+        explicit process group so the budget can end the whole thing rather than
+        the launcher alone. This is inside the class a caller substitutes, so an
+        injected runner still sees every command and this is still the module's
+        one process boundary.
+
+        The kill is SIGKILL and not SIGTERM, deliberately. A restore that has
+        already begun writing a connection cannot be asked politely to stop half
+        way, and a SIGTERM the process ignores -- or handles by carrying on --
+        would leave the outcome unknown, which is the one state this program must
+        not leave a machine in while reporting that it acted.
+        """
+        import signal
+        import subprocess
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = process.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                # Already gone, which is the outcome this wanted. The status is
+                # still 124: this program did not watch the command finish, and
+                # reporting anything else would be a claim it cannot make.
+                pass
+            out, err = process.communicate()
+            # 124 is `KILLED_AT_BUDGET`, the status the whole watchdog treats as
+            # "stopped at the budget"; spelled numerically here because the runner
+            # is not the watchdog and is not allowed to depend on it.
+            return Completed(
+                124,
+                out or "",
+                f"{command[0]} was still running {self.timeout:g}s after it was started and every "
+                f"process in its group has been killed, so nothing it started is still running. "
+                f"It printed: {(err or '').strip() or '(nothing)'}",
+            )
+        if check and process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, command, out, err)
+        return Completed(process.returncode, out, err)
 
 
 def _ok(runner: CommandRunner, args: Sequence[str]) -> Optional[Completed]:
@@ -3494,47 +3663,74 @@ def _run_transaction(
         "publishing the Cloudflare prefix list, which the router refuses to start without",
     )
 
-    restarted = [
-        unit
-        for unit, _port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT))
-        if unit not in unreadable and states[unit][UNIT_ACTIVE]
-    ]
-    for unit, port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT)):
-        _start(runner, transaction, unit, states, unreadable)
-        if not wait_for_dns(LOCAL_DNS, port, ask, deadline_seconds, poll_seconds):
-            raise InstallRefused(
-                f"{unit} was started but nothing answered a DNS query at {LOCAL_DNS}:{port} within "
-                f"{deadline_seconds:g}s, so the machine has no local resolver to point "
-                "NetworkManager at; nothing has been pointed at anything and the transaction is "
-                "being undone"
+    # The control lock, held across the window in which this machine's DNS is
+    # actually moving, and NOT across the publication above.
+    #
+    # The window is this one: from restarting the two units that serve
+    # 127.0.0.1:53, through waiting for them, through pointing NetworkManager at
+    # the loopback, to the marker. While the lock is held the resolver watchdog
+    # declines to count and declines to act, because during a restart
+    # 127.0.0.1:53 is not answering BY CONSTRUCTION -- this transaction creates
+    # that failure deliberately, for up to `deadline_seconds` per unit -- and a
+    # watchdog that read it as a fault would fire an emergency rollback underneath
+    # a running install. That is the same hazard the timer's `OnBootSec=3min`
+    # guards at boot, arriving through a different door, so it gets the mechanism
+    # this package already has rather than a fourth one.
+    #
+    # The publication is OUTSIDE, and that is forced rather than chosen:
+    # `PUBLISH_PREFIXES` is `mosdns-cdnctl update-lists --refresh-ranges`, and
+    # `update-lists` takes this same lock. Holding it across that step would be
+    # the transaction refusing its own child, and the install would fail at a step
+    # that has nothing to do with DNS. One critical section, with the seam above
+    # it, is the shape that respects that.
+    #
+    # The enables are outside the lock too, and nothing is lost by that:
+    # `systemctl enable` writes a symlink under /etc and starts nothing, so
+    # 127.0.0.1:53 is not affected by it and there is nothing for a watchdog to
+    # misread.
+    with _hold_control_lock(root):
+        restarted = [
+            unit
+            for unit, _port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT))
+            if unit not in unreadable and states[unit][UNIT_ACTIVE]
+        ]
+        for unit, port in ((RESOLVER_UNIT, RESOLVER_PORT), (ROUTER_UNIT, DNS_PORT)):
+            _start(runner, transaction, unit, states, unreadable)
+            if not wait_for_dns(LOCAL_DNS, port, ask, deadline_seconds, poll_seconds):
+                raise InstallRefused(
+                    f"{unit} was started but nothing answered a DNS query at {LOCAL_DNS}:{port} "
+                    f"within {deadline_seconds:g}s, so the machine has no local resolver to point "
+                    "NetworkManager at; nothing has been pointed at anything and the transaction "
+                    "is being undone"
+                )
+        if restarted:
+            notes.append(
+                " and ".join(restarted)
+                + " were already running, so they were RESTARTED rather than started: everything "
+                "verified below describes the binaries and the configuration this package just "
+                "installed, and not the ones that were running before it"
             )
-    if restarted:
-        notes.append(
-            " and ".join(restarted)
-            + " were already running, so they were RESTARTED rather than started: everything "
-            "verified below describes the binaries and the configuration this package just "
-            "installed, and not the ones that were running before it"
-        )
 
-    # The barrier. Everything above is reversible by stopping two units; the three
-    # properties below are the ones that can leave a machine with no resolver at all,
-    # and they are not touched until a real query has come back from the machine's own
-    # resolver AND that query came back resolved rather than as a SERVFAIL from a
-    # chain whose upstream is unreachable. The second half is what the waits cannot
-    # do: a SERVFAIL is an answer, and reading it as proof the machine can resolve
-    # is how this check would hand a machine to a chain that cannot.
-    if not ask(LOCAL_DNS, DNS_PORT).resolves:
-        raise InstallRefused(
-            f"the router answered at {LOCAL_DNS}:{DNS_PORT} but did not resolve "
-            f"{INSTALL_PROBE_NAME} -- a SERVFAIL, a REFUSED or silence all mean the chain cannot "
-            "reach a resolver, and this install will not point a working machine at a chain it has "
-            "seen fail; nothing has been changed on the machine's connection"
-        )
+        # The barrier. Everything above is reversible by stopping two units; the
+        # three properties below are the ones that can leave a machine with no
+        # resolver at all, and they are not touched until a real query has come
+        # back from the machine's own resolver AND that query came back resolved
+        # rather than as a SERVFAIL from a chain whose upstream is unreachable.
+        # The second half is what the waits cannot do: a SERVFAIL is an answer,
+        # and reading it as proof the machine can resolve is how this check would
+        # hand a machine to a chain that cannot.
+        if not ask(LOCAL_DNS, DNS_PORT).resolves:
+            raise InstallRefused(
+                f"the router answered at {LOCAL_DNS}:{DNS_PORT} but did not resolve "
+                f"{INSTALL_PROBE_NAME} -- a SERVFAIL, a REFUSED or silence all mean the chain "
+                "cannot reach a resolver, and this install will not point a working machine at a "
+                "chain it has seen fail; nothing has been changed on the machine's connection"
+            )
 
-    _apply_nm(runner, transaction, connection, document)
-    _reconnect(runner, transaction, connection)
-    _verify(runner, ask, connection)
-    _commit_marker(root, transaction)
+        _apply_nm(runner, transaction, connection, document)
+        _reconnect(runner, transaction, connection)
+        _verify(runner, ask, connection)
+        _commit_marker(root, transaction)
     notes.append(
         f"{connection.name} ({connection.device}, {connection.uuid}) now uses the loopback address "
         f"{LOCAL_DNS}; the original settings are recorded in {BACKUP_PATH}"
@@ -3606,7 +3802,7 @@ def install(
             root, run, connection, ask, transaction, now, deadline_seconds, poll_seconds, notes
         )
     except InstallRefused as error:
-        failures = transaction.rollback()
+        failures = _roll_back_under_the_lock(root, transaction, notes)
         return _failed(transaction, report, notes, str(error), failures)
     except Exception as error:  # noqa: BLE001 - see below
         # A step that fails in a way this program did not predict -- a bug here, a
@@ -3617,7 +3813,7 @@ def install(
         # loopback address, which is the single worst outcome available here, and
         # the exit status of an uncaught exception is the same 1 a refusal uses,
         # so a script would read a half-applied install as a clean refusal.
-        failures = transaction.rollback()
+        failures = _roll_back_under_the_lock(root, transaction, notes)
         return _failed(
             transaction,
             report,
@@ -3636,6 +3832,35 @@ def install(
         recovery=None,
         left_running=[],
     )
+
+
+def _roll_back_under_the_lock(root: Path, transaction: Transaction, notes: List[str]) -> list:
+    """Undo the transaction, holding the control lock while it does.
+
+    A rollback STOPS the same two units the install started, so it makes
+    `127.0.0.1:53` stop answering in exactly the way the install does -- and a
+    watchdog that acted during one would be doing to a machine being put RIGHT the
+    thing it does to a machine being left broken. So the same lock, for the same
+    reason, over the same window.
+
+    The lock is taken WITHOUT waiting and a refusal to take it does not stop the
+    rollback, because that would be the worst possible answer: the machine is in a
+    half-applied state and the one thing that can fix it is the code in front of
+    us. Instead the failure is recorded as an undo failure, which is what the
+    result already carries, and a note says why. An operator reading this gets
+    both facts -- the rollback did not finish, AND something else is holding the
+    lock -- rather than a traceback and a machine left where it was.
+    """
+    try:
+        with _try_control_lock(root):
+            return transaction.rollback()
+    except LockUnavailable as error:
+        notes.append(
+            f"the rollback ran WITHOUT the control lock: {error}. It was not made to wait, because "
+            "a half-applied install is worse than an unlocked rollback, and the undos below were "
+            "attempted anyway"
+        )
+        return transaction.rollback()
 
 
 def _failed(transaction: Transaction, report: Preflight, notes: List[str], error: str, failures) -> InstallResult:
@@ -5235,20 +5460,86 @@ WATCHDOG_DEFAULT_MINIMUM_MINUTES = 10
 # asserted in `installer/tests/test_watchdog.py`: the first failure is stamped by
 # the run that observed it, and the record carries no field that could be read as
 # a verdict.
-WATCHDOG_RECORD = "/run/mosdns/watchdog.json"
-WATCHDOG_RECORD_MODE = 0o640
-WATCHDOG_RECORD_SCHEMA_VERSION = 1
+#
+# `/run` being a tmpfs is the Linux default and not a guarantee, so the record also
+# names the boot it belongs to and a record from another boot is re-seeded rather
+# than believed -- otherwise the first failed probe after every reboot would find
+# a boot-relative stamp from the last one and satisfy the elapsed window. See
+# `_boot_id`.
+WATCHDOG_RECORD = "/run/mosdns/watchdog/watchdog.json"
+WATCHDOG_RECORD_DIR = "/run/mosdns/watchdog"
+# 0600 root:root, in a directory that is ALSO 0700 root:root, and both halves
+# are load-bearing.
+#
+# The mode: the 0640 this had came from the backup's rationale -- "a document the
+# other service identities may have to read" -- and nothing in this package reads
+# this record but the root watchdog. A record no other identity needs to read is
+# not a document to share.
+#
+# The directory: `/run/mosdns` is 2770 root:mosdns with a default ACL granting the
+# group `w`, deliberately (ruling 142, measured -- `mosdns_dhcp_bridge` publishes
+# `dhcp-upstreams.json` there as `mosdns-cdn` and needs directory `w`). Unlink and
+# rename are decided by the CONTAINING directory and not by the file's own mode, so
+# a 0600 file in that directory could still be deleted, and still be replaced with
+# a document claiming a threshold of 99 and a first failure long past. `mosdns-cdn`
+# is the identity the Go health check runs as, and either of those switches the
+# only automatic DNS protection on the machine off. So the record gets a
+# root-owned subdirectory of its own, and the two are asserted together in
+# `installer/tests/test_watchdog.py` -- a case that reads the shipped tmpfiles
+# entry and the shipped `postinst`, and two that actually try the unlink and the
+# rename as the real `mosdns-cdn` uid.
+WATCHDOG_RECORD_MODE = 0o600
+WATCHDOG_RECORD_DIR_MODE = 0o700
+WATCHDOG_RECORD_SCHEMA_VERSION = 2
 
 # The action, as the operator types it, and the budget it gets.
+#
 # `COMMAND_TIMEOUT_SECONDS` is 30 and that is right for the read-only questions
 # this program asks a running manager; it is wrong here, because
 # `nmcli connection up` inside the rollback re-runs DHCP and a rollback killed
-# half way through a restore is the worst thing this mechanism could do. So the
-# action runs through a runner built with its own budget, and the unit's
-# `TimeoutStartSec` is above that budget so this program prints its own report
-# rather than being killed inside the restore.
+# half way through a restore is the worst thing this mechanism could do.
 WATCHDOG_ACTION = (CDNCTL, "emergency-rollback")
-WATCHDOG_ACTION_TIMEOUT_SECONDS = 150
+
+# **The budget is derived from the work, because the previous number was not.**
+# It was 150 seconds, chosen, and it was smaller than the work: the action is a
+# launcher whose grandchild is this program's own `emergency_rollback` verb,
+# which issues up to `ROLLBACK_COMMAND_BUDGET` commands on a runner built with
+# the DEFAULT per-command budget. So the worst case was
+# `ROLLBACK_COMMAND_BUDGET * COMMAND_TIMEOUT_SECONDS` plus a probe -- above 150 --
+# and at 150 the watchdog killed the launcher, the restore kept running
+# unsupervised, and the journal said `exited 124, which is not a status this
+# package defines`. The unit claimed the opposite ("so that the watchdog prints
+# its own report rather than being killed part way through a restore") and the
+# gate that held the claim up compared two constants, so raising the budget or
+# adding a sixth command left it green. Ruling 151's shape.
+#
+# So: the command count is the count, the per-command budget is the constant
+# every other command in this package uses, and the slack is for the Go launcher
+# and the group teardown. Every one of those three is an input, so changing any
+# of them changes the budget -- and the gate in
+# `installer/tests/test_watchdog.py` re-derives the arithmetic and the unit's
+# `TimeoutStartSec` from them, and MEASURES the command count by running the
+# rollback against a counting runner. A sixth command fails the gate.
+ROLLBACK_COMMAND_BUDGET = (
+    len(RECORDED_PROPERTIES)  # one `nmcli -g <prop> connection show` per recorded property
+    + len(NM_MUTATIONS)  # one `nmcli connection modify` per property this install changed
+    + 1  # `nmcli connection up`, which re-runs DHCP and is the slow one
+    + 1  # `resolvectl dns`, the check that the device took the restored values
+)
+# Enough for the launcher to start, hand over, and be torn down with its group.
+# Not a margin for a slow restore: the restore's own budget is the arithmetic
+# above, and a margin that absorbed it would be the same unearned number in a
+# different place.
+WATCHDOG_ACTION_SLACK_SECONDS = 30
+WATCHDOG_ACTION_TIMEOUT_SECONDS = (
+    ROLLBACK_COMMAND_BUDGET * COMMAND_TIMEOUT_SECONDS
+    + int(PROBE_TIMEOUT_SECONDS)
+    + WATCHDOG_ACTION_SLACK_SECONDS
+)
+# The status `RealCommandRunner` answers for a command that outran its budget.
+# Named because the watchdog's messages branch on it, and because a bare 124 in
+# a message at three in the morning is a number nobody can act on.
+KILLED_AT_BUDGET = 124
 
 # The three verdicts. They are a separate type from `Answer` because the answer
 # is a fact about a packet and the verdict is a fact about the MACHINE, and the
@@ -5283,6 +5574,19 @@ WATCHDOG_ACTION_STATUSES = {
        "this package set, so it changed nothing",
     6: "a restore was attempted and did not finish: the values the backup recorded may still be on "
        "the connection and the units this package installs have NOT been stopped",
+    # Not a status any verb in this package returns, and the one the watchdog is
+    # most likely to produce. `RealCommandRunner` answers 124 for a command that
+    # outran its budget, so this is what the journal shows when the restore took
+    # longer than `WATCHDOG_ACTION_TIMEOUT_SECONDS` allowed. Before this entry the
+    # watchdog printed "not a status this package defines", which is exactly
+    # backwards -- it is a status this program itself chose, and what it means is
+    # specific: the launcher was killed, and (because the action runs in a
+    # process group of its own) nothing it started is still running. That is NOT
+    # the same as a failed restore, and it is not the same as a successful one.
+    124: "KILLED at this program's own budget rather than having finished. Nothing it started is "
+         "still running, so this is not a restore that is still going -- but it is also not a "
+         "restore that finished, so what state this machine's connection is in cannot be said "
+         "from here and must be looked at",
 }
 WATCHDOG_ACTION_STATUS_UNKNOWN = (
     "not a status this package defines, so nothing can be said about what it means"
@@ -5319,23 +5623,34 @@ class WatchdogRecord(NamedTuple):
     could not be recorded afterwards would otherwise be run again a minute later,
     and for ever, which is the one behaviour of this mechanism that could make a
     machine steadily worse rather than once.
+
+    ``first_failure_boot_seconds`` is the same instant on a clock nobody can step,
+    and it is the field the window's M arm reads. ``first_failure_utc`` is kept
+    because a person reads a UTC timestamp and a bare number of seconds since boot
+    means nothing to a person; it is a *report*, and the decision is made from the
+    other field. See :func:`window_reached` for why a wall clock may not be one of
+    them.
     """
 
     consecutive_failures: int
     first_failure_utc: Optional[str]
+    first_failure_boot_seconds: Optional[float]
+    first_failure_boot_id: Optional[str]
     last_failure_utc: Optional[str]
     action_utc: Optional[str]
     action_status: Optional[int]
 
     @classmethod
     def empty(cls) -> "WatchdogRecord":
-        return cls(0, None, None, None, None)
+        return cls(0, None, None, None, None, None, None)
 
     def as_document(self) -> dict:
         return {
             "schema_version": WATCHDOG_RECORD_SCHEMA_VERSION,
             "consecutive_failures": self.consecutive_failures,
             "first_failure_utc": self.first_failure_utc,
+            "first_failure_boot_seconds": self.first_failure_boot_seconds,
+            "first_failure_boot_id": self.first_failure_boot_id,
             "last_failure_utc": self.last_failure_utc,
             "action_utc": self.action_utc,
             "action_status": self.action_status,
@@ -5345,10 +5660,12 @@ class WatchdogRecord(NamedTuple):
 class Window(NamedTuple):
     """Whether the window is reached, and -- in the reasons -- why it is.
 
-    ``elapsed_seconds`` is clamped at zero and ``clock_note`` says so when it was,
-    because "10m have passed since the first failure" is a lie on a machine whose
-    clock has moved backwards and the record is the only memory of when the first
-    failure was.
+    ``elapsed_seconds`` is measured on the boot-relative clock, so it is not a
+    function of any clock an operator or a boot can step; ``clock_note`` says so
+    out loud when the wall clock and the boot clock disagree about how long ago
+    the first failure was, because "10m have passed since the first failure" and a
+    UTC timestamp in the same message have to be reconcilable by whoever reads it
+    at three in the morning.
     """
 
     reached: bool
@@ -5394,6 +5711,86 @@ def _parse_utc(text: Optional[str]) -> Optional[datetime.datetime]:
         )
     except (TypeError, ValueError):
         return None
+
+
+def _boot_seconds() -> float:
+    """Seconds since boot, on a clock an operator cannot step.
+
+    **This is the clock the window's elapsed arm is measured on, and it is
+    deliberate that it is not the wall clock.** A wall clock is stepped by a boot
+    that has not synchronised, by a host or a VM hypervisor adjusting it, and by a
+    person running ``hwclock``; the first version of this arm subtracted the
+    recorded UTC first failure from the current UTC time and clamped only the
+    *backwards* direction, and a *forward* step therefore satisfied the window on
+    a single failed probe. Measured against the shipped defaults, a record stamped
+    ``1970-01-01T00:03:00Z`` and one run now both acted, with the reason
+    "29844177m0s have passed since the first failure".
+
+    That combines with this package's own text to make a guaranteed unattended
+    teardown: `packaging/systemd/mosdns-watchdog.service` and
+    `packaging/config/watchdog.yaml` both say that **a cold boot before NTP has
+    synchronised** is why the window exists at all, and a cold boot with a wrong
+    clock IS a forward step past three minutes.
+
+    ``CLOCK_BOOTTIME`` is the right source for two reasons, and the second is the
+    one that matters here:
+
+    * it is not settable, so no step of the wall clock reaches the decision; and
+    * it keeps counting across a *suspend*, which is the case the arm exists for
+      at all -- a machine that was suspended for an hour comes back with one
+      recorded failure and an hour of unavailability, and consecutive counting
+      cannot see that.
+
+    ``time.monotonic()`` is ``CLOCK_MONOTONIC``, which stops during a suspend, so
+    it would lose exactly the case the arm was written for. It is the fallback
+    for a platform without ``CLOCK_BOOTTIME``, which on Linux is none; a fallback
+    that is merely worse rather than wrong.
+    """
+    boot_clock = getattr(time, "CLOCK_BOOTTIME", None)
+    if boot_clock is None:  # pragma: no cover - no Linux this is true on
+        return time.monotonic()
+    return time.clock_gettime(boot_clock)
+
+
+def _boot_id() -> Optional[str]:
+    """The kernel's own identifier for THIS boot, or None if it cannot be read.
+
+    ``/proc/sys/kernel/random/boot_id`` is a random UUID the kernel generates once
+    per boot. It is the only identifier of a boot that needs no state from this
+    package to be correct, which is what makes it the right thing to put in the
+    record: **the record is about one boot, and this is how a record from a
+    different one is recognised.**
+
+    That matters because the record's whole design rests on ``/run`` being a
+    tmpfs, and that is the Linux default rather than a guarantee. A host with
+    ``/run`` on a disk carries the record across a reboot, and then a
+    boot-relative stamp taken during the PREVIOUS boot is a very large positive
+    number of seconds in the past on this one -- so the elapsed half of the window
+    would be satisfied by the first failed probe of a freshly booted machine, and
+    the count would start from wherever the last boot left it. A reboot is
+    precisely the moment this mechanism must not act: the first minutes after a
+    boot are when a machine most produces a failure that is not a fault.
+
+    ``None`` is the safe answer and not a degraded one. A record written while this
+    could not be read carries no boot id, and a record with no boot id is
+    re-seeded rather than trusted -- see :func:`read_watchdog_record`. So a machine
+    that cannot read this file gets no elapsed arm and no carried count, which is
+    the patient direction, and this never becomes a reason to act.
+    """
+    try:
+        return BOOT_ID.read_text(encoding="utf-8").strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+
+# How far the wall clock and the boot clock may disagree before the messages say
+# so. The UTC stamp is written to the second and the boot stamp is a float, so a
+# steady drift between the two clocks -- NTP slewing is normal and bounded at
+# 500ppm, so about 0.3s over this window -- is not a thing to report. Two seconds
+# is a wide margin around that and a narrow one around any step worth naming.
+WATCHDOG_CLOCK_SKEW_SECONDS = 2.0
 
 
 def local_resolvability(root: Path, probe=None) -> LocalVerdict:
@@ -5567,7 +5964,7 @@ def read_watchdog_setting(root: Path) -> tuple:
     return parse_watchdog_setting(contents, WATCHDOG_SETTING)
 
 
-def read_watchdog_record(root: Path) -> tuple:
+def read_watchdog_record(root: Path, boot_id: Optional[str] = None) -> tuple:
     """The record as it is on disk, and a note when it is not what it should be.
 
     An absent record is the normal state of a machine on which nothing has failed
@@ -5576,7 +5973,19 @@ def read_watchdog_record(root: Path) -> tuple:
     a record nothing can vouch for must not be able to make the next failure look
     like the Nth. What neither can do is skip a probe, because the probe has
     already happened by the time this is called.
+
+    **A record from another boot is the same case**, and it is the third thing
+    checked here. The record is about one boot -- that is what the tmpfs it lives
+    on buys, and what the window's elapsed arm is measured in -- but ``/run``
+    being a tmpfs is the Linux default and not a guarantee, so a host with it on a
+    disk carries a streak across a reboot. Left alone, the first failed probe of
+    the new boot would read a boot-relative stamp from the old one as an enormous
+    amount of elapsed time and act, which is the one moment this mechanism must
+    not act at. A record that names a different boot, or names none at all, is
+    therefore re-seeded at one and says which of the two it was.
     """
+    if boot_id is None:
+        boot_id = _boot_id()
     path = root / WATCHDOG_RECORD.lstrip("/")
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -5603,10 +6012,34 @@ def read_watchdog_record(root: Path) -> tuple:
     status = document.get("action_status")
     if status is not None and (not isinstance(status, int) or isinstance(status, bool)):
         status = None
+    boot = document.get("first_failure_boot_seconds")
+    if isinstance(boot, bool) or not isinstance(boot, (int, float)):
+        # A boot stamp that is not a number is the same as no boot stamp at all,
+        # and both are handled by refusing to use the elapsed arm rather than by
+        # falling back to a clock somebody can step.
+        boot = None
+    recorded_boot = _as_text(document.get("first_failure_boot_id"))
+    if recorded_boot != boot_id:
+        named = (
+            f"it was written during another boot ({recorded_boot}, and this boot is {boot_id})"
+            if recorded_boot
+            else f"it names no boot ({document.get('first_failure_boot_id')!r}, and this boot is "
+            f"{boot_id})"
+        )
+        return WatchdogRecord.empty(), (
+            f"the failure record at {WATCHDOG_RECORD} is not about this boot: {named}. A record "
+            "measures one boot, and a reboot is exactly the moment this mechanism must not act -- "
+            "the first minutes after a boot are when a machine most produces a failure that is not "
+            "a fault -- so the count starts again from this failure rather than continuing a "
+            "streak, and an elapsed time measured across a reboot, or in a clock from a boot that "
+            "is gone, is not a time at all."
+        )
     return (
         WatchdogRecord(
             consecutive_failures=count,
             first_failure_utc=_as_text(document.get("first_failure_utc")),
+            first_failure_boot_seconds=float(boot) if boot is not None else None,
+            first_failure_boot_id=recorded_boot,
             last_failure_utc=_as_text(document.get("last_failure_utc")),
             action_utc=_as_text(document.get("action_utc")),
             action_status=status,
@@ -5637,7 +6070,22 @@ def write_watchdog_record(root: Path, record: WatchdogRecord) -> Optional[str]:
     path = root / WATCHDOG_RECORD.lstrip("/")
     staged = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
+        # `mode=` on `mkdir` is narrowed by the process umask, and this unit runs
+        # with `UMask=0007`, so the explicit `chmod` is what actually pins the
+        # mode. The directory is 0700 for the reason at WATCHDOG_RECORD_MODE: a
+        # 0600 file inside a group-writable parent is still replaceable.
+        #
+        # ONLY when this call created it, and that is not a detail. An
+        # unconditional chmod would repair a directory whose permissions had been
+        # narrowed on purpose, which is exactly the state in which a record that
+        # cannot be written has to be REPORTED rather than worked around: the
+        # write-ahead latch depends on that failure being visible, and a program
+        # that quietly fixes the permissions hides the thing the operator needs
+        # to see.
+        created = not path.parent.is_dir()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if created:
+            os.chmod(path.parent, WATCHDOG_RECORD_DIR_MODE)
         with open(staged, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(record.as_document(), indent=2, sort_keys=True) + "\n")
             handle.flush()
@@ -5665,7 +6113,12 @@ def clear_watchdog_record(root: Path) -> Optional[str]:
     return None
 
 
-def window_reached(record: WatchdogRecord, now: datetime.datetime, setting: WatchdogSetting) -> Window:
+def window_reached(
+    record: WatchdogRecord,
+    now: datetime.datetime,
+    setting: WatchdogSetting,
+    boot_seconds: Optional[float] = None,
+) -> Window:
     """Whether the window is reached, and the two conditions that can reach it.
 
     `>=` in both comparisons, so at exactly N the action runs and at exactly M it
@@ -5673,6 +6126,22 @@ def window_reached(record: WatchdogRecord, now: datetime.datetime, setting: Watc
     operator could tune into uselessness by reading it as a minimum. Both reasons
     are returned, not just the one that fired first, because a run that met both
     has to be able to say so.
+
+    **The M arm is measured on the boot clock and never on the wall clock**, which
+    is what :func:`_boot_seconds` is for and why `first_failure_boot_seconds` is in
+    the record. A forward step of the wall clock must not satisfy this window: a
+    mechanism that tears a machine down because somebody's clock moved is worse
+    than one that never tears anything down. The UTC stamp is still read, for two
+    things that are not the decision -- a record whose UTC stamp is unreadable is
+    worth saying out loud, and a disagreement between the two clocks is worth
+    saying out loud too, since the message quotes both.
+
+    A record with no boot stamp -- written before this field existed, or truncated
+    -- does NOT fall back to the wall clock, which would be the hole. The arm does
+    not fire for it, the note says so, and :func:`watchdog` re-stamps the record
+    with this run's boot time, so the arm is available again from the next
+    failure. That is the patient direction and it is one failure of delay on a
+    machine that has to be wrong twice.
     """
     reasons = []
     if record.consecutive_failures >= setting.consecutive_failures:
@@ -5682,34 +6151,77 @@ def window_reached(record: WatchdogRecord, now: datetime.datetime, setting: Watc
         )
     elapsed = 0.0
     note = ""
-    first = _parse_utc(record.first_failure_utc)
-    if record.first_failure_utc and first is None:
-        note = (
-            f"the recorded first failure ({record.first_failure_utc}) is not a UTC timestamp this "
-            "program can read, so no time has elapsed since it"
-        )
-    elif first is not None:
-        raw = (now - first).total_seconds()
+    if record.first_failure_boot_seconds is None:
+        if record.consecutive_failures:
+            stamped = (
+                f" ({record.first_failure_utc})" if record.first_failure_utc else ""
+            )
+            note = (
+                f"the failure record carries no boot-relative stamp for its first failure"
+                f"{stamped}, so no time has been counted as having passed since it and the "
+                "elapsed half of the window did not apply to this run. The record is being stamped "
+                "again now, so the next failure starts a measured window. This is deliberately "
+                "NOT calculated from the UTC timestamp, because a clock a boot or an operator can "
+                "step is not a clock this mechanism is allowed to tear a machine down on."
+            )
+    else:
+        here = _boot_seconds() if boot_seconds is None else boot_seconds
+        raw = here - record.first_failure_boot_seconds
         if raw < 0:
             note = (
-                f"the recorded first failure ({record.first_failure_utc}) is LATER than now "
-                f"({_utc(now)}), so no time has elapsed since it and this machine's clock has moved"
+                "the recorded boot-relative stamp for the first failure is LATER than this run's, "
+                "so no time has been counted as having passed since it. A boot-relative clock "
+                "does not move backwards on a running machine, so either the record was written "
+                "by a boot this one is not, or something has tampered with the record."
             )
         else:
             elapsed = raw
             if elapsed >= setting.minimum_minutes * 60:
                 reasons.append(
-                    f"{_duration(elapsed)} have passed since the first failure at "
-                    f"{record.first_failure_utc}, and the window is {setting.minimum_minutes}m"
+                    f"{_duration(elapsed)} have passed on this machine's boot clock since the first "
+                    f"failure at {record.first_failure_utc}, and the window is "
+                    f"{setting.minimum_minutes}m"
                 )
+            note = _clock_skew_note(record, now, elapsed)
     return Window(bool(reasons), reasons, elapsed, note)
+
+
+def _clock_skew_note(record: WatchdogRecord, now: datetime.datetime, elapsed: float) -> str:
+    """Say so when the two clocks disagree about how long ago the first failure was.
+
+    Both numbers are already in the message the operator reads, so a message that
+    quietly ignored a 30 minute step would be showing two facts that do not go
+    together. The note says which of them decided nothing, which is the one
+    worth saying.
+    """
+    first = _parse_utc(record.first_failure_utc)
+    if first is None:
+        return ""
+    wall = (now - first).total_seconds()
+    if abs(wall - elapsed) <= WATCHDOG_CLOCK_SKEW_SECONDS:
+        return ""
+    direction = "forwards" if wall > elapsed else "backwards"
+    return (
+        f"this machine's wall clock has moved {_duration(abs(wall - elapsed))} {direction} "
+        f"since the first failure was recorded ({_duration(max(wall, 0.0))} by the wall clock "
+        f"against {_duration(elapsed)} by the boot clock), and the elapsed half of the window was "
+        f"decided on the boot clock alone, so that step changed nothing about this run. A wall "
+        "clock that cannot be trusted is still worth fixing: every other timestamp in this "
+        "message comes from it."
+    )
 
 
 def _watchdog_action_line() -> str:
     return f"sudo {WATCHDOG_ACTION[0]} {WATCHDOG_ACTION[1]}"
 
 
-def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOutcome:
+def watchdog(
+    root: Path,
+    run: CommandRunner,
+    probe=None,
+    now=None,
+    boot_seconds: Optional[float] = None,
+) -> WatchdogOutcome:
     """One watchdog run: probe, count, and act only when the window says so.
 
     The order of this function is the safety argument, and each step is a
@@ -5717,25 +6229,44 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
 
     1. **read the setting**, and stop if it cannot be read -- a mechanism that
        does not know what it is allowed to do does nothing;
-    2. **probe**, through :func:`local_resolvability`, before anything else is
+    2. **take the shared control lock**, and stop if it is held -- an install
+       transaction restarts the two units that serve `127.0.0.1:53`, so during an
+       upgrade the local resolver is not answering BY CONSTRUCTION, and a watchdog
+       that read that as a fault would fire a rollback underneath a running
+       install. This is the exclusion the optimizer, the health check and
+       `update-lists` already use, not a fourth mechanism;
+    3. **probe**, through :func:`local_resolvability`, before anything else is
        believed, so no path through this function reaches a conclusion about the
        machine without having asked it;
-    3. **read the record**, treating an absent or unreadable one as no failures
+    4. **read the record**, treating an absent or unreadable one as no failures
        recorded and saying so;
-    4. **stop there** if the resolver answered, or if the switch is off (which
+    5. **stop there** if the resolver answered, or if the switch is off (which
        also clears a record, so re-enabling the mechanism starts its window
        again rather than resuming a streak somebody interrupted on purpose);
-    5. **count the failure** and write the record, and refuse to go further if it
+    6. **count the failure** and write the record, and refuse to go further if it
        cannot be written;
-    6. **stop** below the window, naming the count, the threshold, the elapsed
+    7. **stop** below the window, naming the count, the threshold, the elapsed
        time and the first failure;
-    7. **stamp the attempt into the record**, and stop without acting if that
+    8. **stamp the attempt into the record**, and stop without acting if that
        cannot be written -- write-ahead, so an action that ran and could not be
        recorded is not repeated;
-    8. **run the action** the operator runs, and report what it said, its status,
+    9. **run the action** the operator runs, and report what it said, its status,
        and -- on success -- exactly what came back and what did not.
+
+    The lock is taken and RELEASED before the action runs, and is not held across
+    it. That is deliberate: `emergency-rollback` is the operator's own command and
+    this package does not get to fence it, and a lock held across a restore that
+    can take minutes would stop the optimizer and the health check for those same
+    minutes. What the lock is for is narrower and does not need the restore: it
+    stops a watchdog from reading a deliberate restart as a fault.
+
+    ``boot_seconds`` is the seam for the clock the elapsed arm is measured on --
+    see :func:`_boot_seconds` -- and it exists for the same reason ``now`` does: a
+    window cannot be tested by sleeping, and neither can a clock step.
     """
     moment = now or datetime.datetime.now(datetime.timezone.utc)
+    here = _boot_seconds() if boot_seconds is None else boot_seconds
+    boot_id = _boot_id()
     setting, refusal = read_watchdog_setting(root)
     if setting is None:
         return WatchdogOutcome(
@@ -5754,7 +6285,24 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
         )
 
     verdict = local_resolvability(root, probe)
-    record, note = read_watchdog_record(root)
+
+    # The control lock, taken AFTER the probe and before anything is believed.
+    #
+    # After the probe, because the probe is a two-second query and it is the one
+    # thing this mechanism must always do: an exclusion that skipped it would
+    # report "something else is mutating this machine" about a machine nobody
+    # asked, and the operator would learn that from a watchdog that had not
+    # looked. Before the record, because a streak counted while a transaction is
+    # deliberately restarting the two units that serve 127.0.0.1:53 is the
+    # upgrade's failure streak, not this machine's -- and the first probe after
+    # the upgrade would then reach a threshold the upgrade manufactured.
+    try:
+        with _try_control_lock(root):
+            pass
+    except LockUnavailable as error:
+        return _deferred(verdict, error)
+
+    record, note = read_watchdog_record(root, boot_id)
     problems = [note] if note else []
 
     if not setting.automatic:
@@ -5836,8 +6384,12 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
         status_text = (
             f"and exited {record.action_status}"
             if record.action_status is not None
-            else "and its exit status was not recorded, which means the record could not be "
-            "written after it ran, so nothing about that action's outcome can be said from here"
+            else "and its exit status was not recorded. That has two possible causes and they are "
+            "not the same problem: this program's write of the record failed after the action ran, "
+            "OR this process was killed before it could write anything at all -- by systemd at the "
+            "unit's `TimeoutStartSec`, or by a reboot -- and a killed process is not a failed "
+            "write and not a failed restore either. Either way nothing about that action's outcome "
+            "can be said from here"
         )
         return WatchdogOutcome(
             status=EXIT_REFUSED,
@@ -5852,7 +6404,9 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
                     f"{status_text}, so this run did not perform it again: one unattended rollback "
                     "per failure streak is the whole of this mechanism, and a rollback repeated "
                     "every minute is how it would make a machine worse than it found it. Nothing "
-                    "has been changed by this run. Run the action by hand, and read what it says:",
+                    "has been changed by this run. Whether anything from that attempt is still "
+                    f"running: `pgrep -af {WATCHDOG_ACTION[1]}`. Otherwise run the action by hand, "
+                    "and read what it says:",
                     f"watchdog:   {_watchdog_action_line()}",
                 ]
                 + [f"watchdog: {problem}" for problem in problems]
@@ -5861,30 +6415,42 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
         )
 
     first = record.first_failure_utc or _utc(moment)
+    # The boot stamp is written by the run that observed the FIRST failure of this
+    # streak, and by no other run: a later run that stamped it would move the
+    # window's origin forward every minute, so the arm could never reach it. A
+    # record that carries none is stamped now, which re-seeds the streak's origin
+    # and makes the arm available again from the next failure.
+    first_boot = record.first_failure_boot_seconds
+    if record.consecutive_failures == 0 or first_boot is None:
+        first_boot = here
     counted = WatchdogRecord(
         consecutive_failures=record.consecutive_failures + 1,
         first_failure_utc=first,
+        first_failure_boot_seconds=first_boot,
+        first_failure_boot_id=boot_id or record.first_failure_boot_id,
         last_failure_utc=_utc(moment),
         action_utc=None,
         action_status=None,
     )
-    window = window_reached(counted, moment, setting)
+    window = window_reached(counted, moment, setting, here)
+    if window.clock_note:
+        # Carried as a problem rather than folded into the reason below, so that
+        # it is printed on every path the run can take from here -- including the
+        # two that act. A note that only appeared on the path that did NOT act
+        # would be a note that disappears exactly when the operator most needs to
+        # know their clock moved.
+        problems = problems + [window.clock_note]
 
     if not window.reached:
         problem = write_watchdog_record(root, counted)
         if problem is not None:
             return _unwatched(verdict, problems + [problem])
-        reasons = []
-        if window.clock_note:
-            reasons.append(window.clock_note)
-        reasons.append(
+        reasons = [
             f"this is consecutive failure {counted.consecutive_failures} of the "
-            f"{setting.consecutive_failures} this machine is configured to act on"
-        )
-        reasons.append(
+            f"{setting.consecutive_failures} this machine is configured to act on",
             f"{_duration(window.elapsed_seconds)} of the {setting.minimum_minutes}m window has "
-            f"passed since the first failure at {counted.first_failure_utc}"
-        )
+            f"passed since the first failure at {counted.first_failure_utc}",
+        ]
         return WatchdogOutcome(
             status=EXIT_REFUSED,
             verdict=NOT_RESOLVING,
@@ -5971,18 +6537,55 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
         if status is not None
         else f"could not be started at all, so nothing is known about what it would have done ({said})"
     )
-    err = [
-        f"watchdog: {verdict.detail}.",
-        f"watchdog: the window was reached: {reach}. This run performed the emergency rollback "
-        f"unattended and IT FAILED: `{_watchdog_action_line()}` {status_text}. Nothing about this "
-        "machine's DNS can be promised from here, and this run has proved nothing about the "
-        "machine beyond what the action said.",
-        "watchdog: run the action by hand, and read what it says:",
-        f"watchdog:   {_watchdog_action_line()}",
-        "watchdog: the watchdog will not try again until a probe succeeds: one unattended "
-        "rollback per failure streak is the whole of this mechanism, and repeating it every "
-        "minute is how it would make a machine worse than it found it.",
-    ]
+    if status == KILLED_AT_BUDGET:
+        # Its own message, and not the shared "IT FAILED" one, because the two
+        # facts an operator needs are opposite. A failed restore left a machine
+        # to go and look at. A killed one left a QUESTION -- what state is this
+        # connection in, given the action stopped in the middle of writing it --
+        # and the honest thing this program can add is that nothing it started is
+        # still running, which is the part it actually knows.
+        headline = (
+            f"was KILLED at this program's own budget, {WATCHDOG_ACTION_TIMEOUT_SECONDS:g}s after "
+            "it was started, rather than having finished"
+        )
+        err = [
+            f"watchdog: {verdict.detail}.",
+            f"watchdog: the window was reached: {reach}. This run performed the emergency rollback "
+            f"unattended and it did not finish: `{_watchdog_action_line()}` exited {status}, which "
+            f"means it {headline}.",
+            "watchdog: WHAT THIS DOES AND DOES NOT SAY. It does not say the restore failed: the "
+            "action was stopped, so it neither finished nor reported a failure, and every process "
+            "in its group was killed, so nothing it started is still running -- there is no "
+            "restore in progress to wait for. It does not say the restore succeeded, and it does "
+            f"not say what state {BACKUP_PATH}'s values are in on this machine's connection: the "
+            "action can have written some of them and not others before it was killed, and this "
+            "program cannot see which. Nothing about this machine's DNS can be promised from here.",
+            "watchdog: this is a different situation from an action that ran and refused, and the "
+            "difference matters: a refusal changed nothing, and this may have changed something. "
+            "Look at the connection before deciding what to do.",
+            f"watchdog: what is on it right now: `nmcli -g ipv4.dns,ipv6.dns connection show <the "
+            f"uuid in {BACKUP_PATH}>`",
+            f"watchdog: and whether anything is still running: `pgrep -af {WATCHDOG_ACTION[1]}`",
+            "watchdog: run the action by hand once you have looked, and read what it says:",
+            f"watchdog:   {_watchdog_action_line()}",
+            "watchdog: the watchdog will not try again until a probe succeeds: one unattended "
+            "rollback per failure streak is the whole of this mechanism, and repeating it every "
+            "minute is how it would make a machine worse than it found it. A machine killed at "
+            "its budget needs a person, which is the whole reason that latch exists.",
+        ]
+    else:
+        err = [
+            f"watchdog: {verdict.detail}.",
+            f"watchdog: the window was reached: {reach}. This run performed the emergency rollback "
+            f"unattended and IT FAILED: `{_watchdog_action_line()}` {status_text}. Nothing about "
+            "this machine's DNS can be promised from here, and this run has proved nothing about "
+            "the machine beyond what the action said.",
+            "watchdog: run the action by hand, and read what it says:",
+            f"watchdog:   {_watchdog_action_line()}",
+            "watchdog: the watchdog will not try again until a probe succeeds: one unattended "
+            "rollback per failure streak is the whole of this mechanism, and repeating it every "
+            "minute is how it would make a machine worse than it found it.",
+        ]
     if completed is not None:
         words = [
             f"watchdog: the action's own words follow, because they are the report: {line}"
@@ -5998,6 +6601,48 @@ def watchdog(root: Path, run: CommandRunner, probe=None, now=None) -> WatchdogOu
         reason=reach,
         stdout="",
         stderr="\n".join(err) + "\n",
+    )
+
+
+def _deferred(verdict: LocalVerdict, refusal: str) -> WatchdogOutcome:
+    """A run that stood down because something else is changing this machine.
+
+    **Nothing is counted and nothing is acted on**, and both halves of that are
+    deliberate. Counting is the subtler one: a transaction restarts the two units
+    that serve `127.0.0.1:53`, so for up to a minute or three the local resolver
+    is not answering *by construction*, and counting those probes would hand the
+    next run a streak this machine never had. The transaction's own window is
+    then a streak the upgrade manufactured, and the first probe after it could
+    tear the machine down.
+
+    The status is this program's `EXIT_REFUSED` and not zero, and that is the
+    opposite of the `NO_VERDICT` case above -- which exits 0 while
+    `verify-local` exits 1 on the same condition, deliberately, because a
+    health unit that failed is the signal an operator acts on. The watchdog has
+    the opposite relationship to its unit: `mosdns-watchdog.service` carries no
+    `SuccessExitStatus` at all, so a non-zero exit is something to read, and a
+    run that stood down for a reason has to say so in the status as well as in
+    the journal. A refusal here is not a fault; it is a mechanism that knows what
+    it is waiting for.
+    """
+    return WatchdogOutcome(
+        status=EXIT_REFUSED,
+        verdict=verdict.verdict,
+        acted=False,
+        reason="the control lock was held, so this run stood down",
+        stdout="",
+        stderr=(
+            f"watchdog: {verdict.detail}.\n"
+            f"watchdog: {refusal}. This run therefore did nothing at all: no failure was counted "
+            "and no action was taken, and the failure record was not read and not written. That is "
+            "not a machine with no DNS -- it is a machine somebody is deliberately changing, and "
+            "the resolver not answering while a unit restarts is the change rather than a fault in "
+            "it. The count restarts from one on the first run after the lock is free, so nothing "
+            "this transaction does can reach this mechanism's window.\n"
+            "watchdog: if that lock is held on a machine that is doing nothing, the process "
+            f"holding it is still running: `fuser -v {CONTROL_LOCK}`. An advisory lock is not "
+            "held by anything that has exited.\n"
+        ),
     )
 
 
@@ -6292,16 +6937,19 @@ def main(
     if arguments == ["verify-local"]:
         return _run_verify_local(root, probe)
     if arguments == ["watchdog"]:
-        # The only verb that starts a process with a budget of its own, and the
-        # reason is in `WATCHDOG_ACTION_TIMEOUT_SECONDS`: the action it runs
-        # reactivates a NetworkManager connection, which can take a DHCP
-        # transaction, and `COMMAND_TIMEOUT_SECONDS` is the budget for the
-        # read-only questions this program asks a running manager. A rollback
-        # killed part way through a restore is the worst thing this package can
-        # do unattended.
+        # The only verb that starts a process with a budget of its own, in a
+        # process group of its own, and the reason for both is in
+        # `WATCHDOG_ACTION_TIMEOUT_SECONDS`: the action it runs reactivates a
+        # NetworkManager connection, which can take a DHCP transaction, and
+        # `COMMAND_TIMEOUT_SECONDS` is the budget for the read-only questions this
+        # program asks a running manager. A rollback killed part way through a
+        # restore is the worst thing this package can do unattended -- and the
+        # command here is a LAUNCHER for the work, so the group is what gets
+        # killed rather than just the launcher.
         return _run_watchdog(
             root,
-            run or RealCommandRunner(timeout=WATCHDOG_ACTION_TIMEOUT_SECONDS),
+            run
+            or RealCommandRunner(timeout=WATCHDOG_ACTION_TIMEOUT_SECONDS, kill_group=True),
             probe,
             now=now,
         )

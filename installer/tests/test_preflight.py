@@ -2239,7 +2239,40 @@ class ArgumentArrayDisciplineTests(unittest.TestCase):
     # None of the four can start a process, reach the environment, or act on a
     # path the program was not handed, which is the property this allowlist
     # exists to keep.
-    OS_ALLOWED = {"readlink", "lstat", "stat", "chmod", "fsync", "getpid", "replace"}
+    #   * `getpid`/`killpg` -- the staged name, and the process group the
+    #     watchdog's action is started in. `killpg` is the reason that group
+    #     exists: the action is a launcher for `emergency-rollback`, so a budget
+    #     that killed only the launcher would leave the restore running on a
+    #     machine whose record already says the action was performed, and
+    #     nothing would ever report its outcome. It signals a group, never a
+    #     single pid, and the group is one this program created with
+    #     `start_new_session` a few lines earlier.
+    #   * `open`/`close`/`O_CREAT`/`O_RDONLY`/`fchmod` -- the control lock.
+    #     `flock` is taken through a descriptor, so a lock is an open file; the
+    #     flags are the bridge's own (`O_CREAT | O_RDONLY`, never `O_WRONLY`,
+    #     so a process holding this lock has no way to modify the state it
+    #     protects), and `fchmod` pins the mode on every acquire because the
+    #     umask narrows the creation mode and a lock at 0600 would be a lock the
+    #     other service identity could never take. None of the five can start a
+    #     process, reach the environment, or name a path of its own: the path is
+    #     `CONTROL_LOCK` under the `root` a caller was handed, exactly as every
+    #     other path in this module is.
+    OS_ALLOWED = {
+        "readlink",
+        "lstat",
+        "stat",
+        "chmod",
+        "fsync",
+        "getpid",
+        "getpgid",
+        "killpg",
+        "replace",
+        "open",
+        "close",
+        "O_CREAT",
+        "O_RDONLY",
+        "fchmod",
+    }
     # Every attribute of `os` and `pty` that starts a process, named rather than
     # inferred. The needle list above missed all of them: `os` is imported at
     # module scope, so `os.posix_spawn`, `os.fork` and `pty.spawn` would have

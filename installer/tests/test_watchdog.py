@@ -43,12 +43,17 @@ is a parameter.
 """
 
 import contextlib
+import fcntl
 import io
 import json
+import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,20 +77,41 @@ VERB = "watchdog"
 # `installer.WATCHDOG_RECORD` proved that the module agrees with itself; these
 # are the strings an operator reads in a journal and in a message.
 SETTING_PATH = "/etc/mosdns/watchdog.yaml"
-RECORD_PATH = "/run/mosdns/watchdog.json"
-RECORD_DIR = "/run/mosdns"
+# The record's own directory, and why it is not simply `/run/mosdns`. That
+# directory is 2770 root:mosdns on purpose (ruling 142, measured: the DHCP bridge
+# publishes `dhcp-upstreams.json` there as `mosdns-cdn` and needs directory `w`),
+# and a `0600` file inside a group-WRITABLE directory is still deletable and
+# replaceable, because unlink and rename are the containing directory's decision
+# and not the file's. So the record gets a root-owned subdirectory with no
+# default ACL, and the only identity that can reach it is the one that writes it.
+RECORD_PATH = "/run/mosdns/watchdog/watchdog.json"
+RECORD_DIR = "/run/mosdns/watchdog"
 CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
 INSTALLER = "/usr/lib/mosdns-router/mosdns_installer.py"
 BACKUP_PATH = "/var/lib/mosdns/installer/network-manager-backup.json"
+# The package's shared control lock, the mechanism that answers "is somebody else
+# mutating this machine's DNS right now" for the optimizer, the health check and
+# `update-lists` -- and now for the install transaction and the watchdog.
+CONTROL_LOCK = "/var/lib/mosdns/runtime/control.lock"
 ACTION = (CDNCTL, "emergency-rollback")
 LOCAL_DNS = "127.0.0.1"
 DNS_PORT = 53
 PROBE_NAME = "install-probe.example"
-RECORD_MODE = 0o640
+# The record is 0600 root:root, and the reason is a privilege, not tidiness:
+# `/run/mosdns` is a directory a group member can traverse, and the ONLY
+# identity in this package that reads the record is the root watchdog. A 0640
+# record in a group-*writable* directory is a file `mosdns-cdn` -- the identity
+# the Go health check runs as -- can delete to disable the mechanism for ever,
+# or replace with a threshold of 99 and a first failure in the past, so the very
+# next run tears the machine down with no window in front of it. See
+# `RecordOwnershipTests` and `DirectoryModeTests`.
+RECORD_MODE = 0o600
 RECORD_KEYS = {
     "schema_version",
     "consecutive_failures",
     "first_failure_utc",
+    "first_failure_boot_seconds",
+    "first_failure_boot_id",
     "last_failure_utc",
     "action_utc",
     "action_status",
@@ -200,15 +226,37 @@ class WatchdogFixture(unittest.TestCase):
 
         return ask
 
-    def run_watchdog(self, now: datetime | None = None):
+    def run_watchdog(self, now: datetime | None = None, boot: datetime | None = None):
         """One watchdog run, as the verb itself computes it.
 
         The outcome carries both streams verbatim, so a case reads the product's
         own text rather than a restatement of it, and
         `test_the_verb_writes_exactly_what_the_outcome_carries` holds that the
         command line writes these and nothing else.
+
+        `boot` is the boot-relative clock, as a datetime, because a datetime is
+        what a case can state exactly: the module converts it to boot seconds and
+        the elapsed arm is computed entirely in that unit.
+
+        **`boot` defaults to `now`**, and that default is load-bearing. A case
+        that moved the wall clock but not the boot clock is describing a machine
+        whose wall clock was stepped, which is a case in its own right
+        (`WallClockStepTests`) and not something a case should do by accident --
+        and when it happened by accident it looked like a mechanism failure: two
+        runs ten minutes apart on the wall clock and microseconds apart on the
+        real boot clock is an enormous forward step, which the new code correctly
+        reads as a clock nobody can step disagreeing with one that can. Passing
+        both together by default means a case that only cares about the count says
+        nothing about either clock.
         """
-        return installer.watchdog(self.root, self.runner, probe=self.probe(), now=now or self.now)
+        moment = now or self.now
+        return installer.watchdog(
+            self.root,
+            self.runner,
+            probe=self.probe(),
+            now=moment,
+            boot_seconds=(boot or moment).timestamp(),
+        )
 
     def run_cli(self):
         out, err = io.StringIO(), io.StringIO()
@@ -268,9 +316,13 @@ class WindowTests(WatchdogFixture):
         # two runs to set up, because the run that records the first failure is
         # the run that stamps its time -- elapsed time on that run is zero by
         # construction, which is the honest answer and not an omission.
+        #
+        # **Both clocks move together here**, and that is the point: the elapsed
+        # arm is measured on a clock an operator cannot step, so a case that
+        # moves only the wall clock would be testing nothing.
         self.arm()
         self.run_watchdog()
-        outcome = self.run_watchdog(now=at(minutes=10))
+        outcome = self.run_watchdog(now=at(minutes=10), boot=at(minutes=10))
         self.assertEqual(self.actions(), [ACTION], "ten minutes passed and the count never reached 3")
         self.assertIn("10m", outcome.stdout)
         self.assertIn("the window is 10m", outcome.stdout)
@@ -278,28 +330,272 @@ class WindowTests(WatchdogFixture):
     def test_a_minute_short_of_the_elapsed_window_does_not_act(self):
         self.arm()
         self.run_watchdog()
-        outcome = self.run_watchdog(now=at(minutes=9, seconds=59))
+        outcome = self.run_watchdog(now=at(minutes=9, seconds=59), boot=at(minutes=9, seconds=59))
         self.assertEqual(self.actions(), [])
         self.assertIn("9m59s", outcome.stderr)
 
     def test_both_conditions_met_are_both_named_and_the_action_runs_once(self):
         self.arm(failures=2, minutes=5)
         self.run_watchdog()
-        outcome = self.run_watchdog(now=at(minutes=5))
+        outcome = self.run_watchdog(now=at(minutes=5), boot=at(minutes=5))
         self.assertEqual(
             self.actions(), [ACTION], "both conditions were met and the action ran twice"
         )
         self.assertIn("2 consecutive failures", outcome.stdout)
         self.assertIn("5m", outcome.stdout)
 
-    def test_a_clock_that_moved_backwards_reports_no_elapsed_time_and_does_not_act(self):
-        # Every message must be true, and "10m have passed since the first
-        # failure" is false when the recorded first failure is later than now.
+
+class WallClockStepTests(WatchdogFixture):
+    """A wall clock an operator can step must not decide whether a machine is torn down.
+
+    **The first version of the elapsed arm subtracted the recorded UTC
+    first-failure from the current UTC now**, guarded only in the *backwards*
+    direction, and a forward step satisfied the window on a single failed probe.
+    Measured in-process against the shipped defaults, both of these acted:
+
+      * a record stamped ``1970-01-01T00:03:00Z`` and one run at the current
+        time -- "29844177m0s have passed since the first failure";
+      * a plain +20 minute step with one failure.
+
+    That is reachable on a machine whose boot clock is wrong past the three-minute
+    mark, on a host whose clock is adjusted, and on a manual ``hwclock`` step. It
+    is the sharpest form of the failure this whole mechanism exists to prevent,
+    and this package's own text names the condition: the unit's header and the
+    shipped setting both say **"a cold boot before NTP has synchronised"** is
+    precisely why the window exists. A cold boot is a forward clock step. The two
+    facts combine into a guaranteed unattended teardown.
+
+    So the elapsed arm no longer reads the wall clock at all. It reads a
+    **boot-relative** clock (``CLOCK_BOOTTIME``), which an operator cannot step,
+    which survives a suspend -- which is the case the arm exists for -- and which
+    is gone at a reboot, which is exactly the lifetime the record has.
+    """
+
+    def arm(self, failures: int = 3, minutes: int = 10):
+        self.setUp()
+        self.setting(
+            automatic="true",
+            consecutive_failures=failures,
+            minimum_minutes=minutes,
+        )
+        return self
+
+    def test_a_record_stamped_at_the_epoch_does_not_tear_a_machine_down(self):
+        # The review's own measurement, as a case. One failed probe, a first
+        # failure recorded in 1970, and a run now: the count is 1 of 3 and the
+        # elapsed arm must say nothing.
+        self.arm()
+        first = at(minutes=-60 * 24 * 365 * 56)
+        self.run_watchdog(now=first, boot=at(minutes=0))
+        outcome = self.run_watchdog(now=at(minutes=1), boot=at(minutes=1))
+        self.assertEqual(
+            self.actions(),
+            [],
+            "a first failure stamped in 1970 satisfied the elapsed window, so a wall clock that "
+            "steps forward is a single-probe teardown",
+        )
+        self.assertIn("consecutive failure 2 of the 3", outcome.stderr)
+
+    def test_a_twenty_minute_forward_step_does_not_satisfy_the_window_either(self):
+        self.arm()
+        self.run_watchdog(now=at(), boot=at())
+        outcome = self.run_watchdog(now=at(minutes=20), boot=at(seconds=60))
+        self.assertEqual(
+            self.actions(),
+            [],
+            "a twenty-minute forward wall-clock step satisfied the ten-minute window on a boot "
+            "clock that has advanced one minute",
+        )
+        self.assertIn("1m0s", outcome.stderr)
+
+    def test_the_decision_is_the_same_however_wrong_the_wall_clock_is(self):
+        # The property the fix is for, stated as an equality rather than as two
+        # examples: the elapsed arm is not a function of the wall clock at all.
+        # A wildly wrong clock and the right one must reach the same decision.
+        self.arm(failures=3, minutes=10)
+        self.run_watchdog(now=at(), boot=at())
+        honest = self.run_watchdog(now=at(minutes=3), boot=at(minutes=3))
+        self.arm(failures=3, minutes=10)
+        self.run_watchdog(now=at(), boot=at())
+        wrong = self.run_watchdog(now=at(days=400), boot=at(minutes=3))
+        self.assertEqual(self.actions(), [], "a 400-day-old clock tore the machine down")
+        self.assertEqual(
+            [line for line in honest.stderr.splitlines() if "consecutive failure" in line],
+            [line for line in wrong.stderr.splitlines() if "consecutive failure" in line],
+            "the two runs disagree about the count, so the wall clock reaches the decision "
+            "somewhere",
+        )
+
+    def test_a_clock_that_moved_backwards_no_longer_changes_the_decision(self):
+        # The previous version's backwards guard is gone, and deliberately: with
+        # the elapsed arm on a boot-relative clock there is nothing to guard, and
+        # a guard that clamped a *decision* input to zero was the shape of the
+        # forward hole. The wall clock still appears in the message, so a reader
+        # is not misled by a timestamp that moved -- and the case below holds the
+        # DECISION is unaffected either way.
+        self.arm()
+        self.run_watchdog(now=at(), boot=at())
+        backwards = self.run_watchdog(now=at(minutes=-30), boot=at(minutes=30))
+        self.assertEqual(
+            self.actions(),
+            [ACTION],
+            "thirty minutes of boot clock passed and the arm did not fire, so the M arm is dead "
+            "or the count reached its threshold",
+        )
+        self.assertIn("clock", (backwards.stdout + backwards.stderr).lower())
+
+    def test_the_elapsed_arm_fires_on_a_real_advance_with_only_one_failure(self):
+        # The review's second requirement: the fix must not make the M arm dead.
+        # One failure, ten minutes of BOOT clock, the count still at 1 of 3, and
+        # the action runs.
+        self.arm(failures=3, minutes=10)
+        self.run_watchdog(now=at(), boot=at())
+        self.assertEqual(self.record()["consecutive_failures"], 1)
+        self.run_watchdog(now=at(minutes=10), boot=at(minutes=10))
+        self.assertEqual(self.actions(), [ACTION], "ten minutes on a clock nobody can step did not act")
+
+    def test_a_record_with_no_boot_stamp_does_not_satisfy_the_elapsed_arm(self):
+        # A record written before the boot stamp existed, or truncated. The
+        # patient answer: the elapsed arm does not fire for it and this run
+        # re-stamps it, so the arm is available again from the next failure. What
+        # it must never do is fall back to the wall clock, which is the hole.
         self.arm()
         self.run_watchdog()
-        outcome = self.run_watchdog(now=at(minutes=-30))
+        document = self.record()
+        document["first_failure_boot_seconds"] = None
+        self.write(RECORD_PATH, json.dumps(document) + "\n", mode=RECORD_MODE)
+        outcome = self.run_watchdog(now=at(days=400), boot=at(seconds=61))
+        self.assertEqual(self.actions(), [], "a record with no boot stamp fell back to the wall clock")
+        self.assertIn("boot", (outcome.stdout + outcome.stderr).lower())
+        self.assertIsNotNone(
+            self.record().get("first_failure_boot_seconds"),
+            "the record was not re-stamped, so the elapsed arm stays dead for ever on this machine",
+        )
+
+    def test_the_boot_stamp_is_stamped_by_the_run_that_observed_the_failure(self):
+        self.arm()
+        self.run_watchdog(now=at(), boot=at(minutes=2))
+        document = self.record()
+        self.assertIsNotNone(document.get("first_failure_boot_seconds"))
+        self.assertEqual(
+            document["first_failure_boot_seconds"],
+            at(minutes=2).timestamp(),
+            "the boot stamp is not the one this run was given, so the elapsed arm is measuring "
+            "something other than the gap between the two runs",
+        )
+        self.assertIn("first_failure_boot_seconds", RECORD_KEYS)
+
+
+class AnotherBootTests(WatchdogFixture):
+    """A record is about one boot, and a clock nobody can step is still only one boot deep.
+
+    The record lives on the tmpfs at ``/run/mosdns``, and the whole of the design
+    rests on that: a reboot takes the streak with it, because the first minutes
+    after a boot are exactly when a machine produces a failure that is not a fault.
+    **That rests on ``/run`` being a tmpfs**, which is the Linux default and not a
+    guarantee -- a host with ``/run`` on a disk carries the record across, and then
+    a boot-relative stamp from the PREVIOUS boot is a huge positive number of
+    seconds ago on this one, so the elapsed arm fires on the first failed probe of
+    a freshly booted machine. The count arm carries over for the same reason.
+
+    So the record names the boot it was written in, and a record from another boot
+    -- or from before this field existed -- is re-seeded at one and says so, which
+    is the same treatment an unreadable record already gets and the patient
+    direction. ``first_failure_boot_id`` is the kernel's own per-boot UUID at
+    ``/proc/sys/kernel/random/boot_id``: it is the only identifier of a boot that
+    needs no state from this package, and reading it cannot fail in a way that
+    matters (a machine that cannot read it gets a record with no boot id, which is
+    re-seeded, which is safe).
+    """
+
+    def arm(self, failures: int = 3, minutes: int = 10):
+        self.setUp()
+        self.setting(
+            automatic="true",
+            consecutive_failures=failures,
+            minimum_minutes=minutes,
+        )
+        return self
+
+    def rewrite(self, **fields):
+        document = self.record()
+        document.update(fields)
+        self.write(RECORD_PATH, json.dumps(document) + "\n", mode=RECORD_MODE)
+
+    def test_a_record_from_another_boot_never_satisfies_the_elapsed_arm(self):
+        self.arm()
+        self.run_watchdog(now=at(), boot=at())
+        self.rewrite(first_failure_boot_id="00000000-0000-0000-0000-000000000000")
+        outcome = self.run_watchdog(now=at(minutes=30), boot=at(minutes=30))
+        self.assertEqual(
+            self.actions(),
+            [],
+            "a streak from another boot satisfied this boot's elapsed window, so a machine with "
+            "/run on a disk tears itself down on its first failure after every reboot",
+        )
+        self.assertIn("another boot", (outcome.stdout + outcome.stderr).lower())
+        self.assertEqual(self.record()["consecutive_failures"], 1, "the streak was carried over")
+
+    def test_a_record_from_another_boot_does_not_carry_the_count_either(self):
+        self.arm(failures=3, minutes=10)
+        for _ in range(2):
+            self.run_watchdog(now=at(), boot=at())
+        self.assertEqual(self.record()["consecutive_failures"], 2)
+        self.rewrite(first_failure_boot_id="00000000-0000-0000-0000-000000000000")
+        self.run_watchdog(now=at(seconds=60), boot=at(seconds=60))
+        self.assertEqual(
+            self.record()["consecutive_failures"],
+            1,
+            "two failures from a boot that has been gone for hours still counted, so the third "
+            "probe after a reboot performs a rollback with two failures of this boot behind it",
+        )
+
+    def test_a_record_with_no_boot_id_is_re_seeded_rather_than_trusted(self):
+        # The forward-compatible reading of a record written by an older version
+        # of this file. It is the same question as the one above -- is this record
+        # about this boot? -- and it has to be asked before the record is used, not
+        # afterwards.
+        self.arm()
+        self.run_watchdog(now=at(), boot=at())
+        self.rewrite(first_failure_boot_id=None)
+        outcome = self.run_watchdog(now=at(minutes=30), boot=at(minutes=30))
         self.assertEqual(self.actions(), [])
-        self.assertIn("clock", (outcome.stdout + outcome.stderr).lower())
+        self.assertIn("boot", (outcome.stdout + outcome.stderr).lower())
+        self.assertEqual(self.record()["consecutive_failures"], 1)
+
+    def test_the_record_names_the_boot_this_run_is_in(self):
+        self.arm()
+        self.run_watchdog(now=at(), boot=at())
+        self.assertEqual(
+            self.record()["first_failure_boot_id"],
+            installer._boot_id(),
+            "the record does not name the boot it was written in, so nothing can tell a record "
+            "from this boot from one from another",
+        )
+        self.assertIn("first_failure_boot_id", RECORD_KEYS)
+
+    def test_the_boot_id_is_this_machines_own_and_not_a_constant(self):
+        identifier = installer._boot_id()
+        self.assertIsInstance(identifier, str)
+        self.assertRegex(
+            identifier,
+            r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$",
+            "the boot id is not the kernel's UUID format, so a placeholder has been substituted "
+            "for a value that identifies a boot",
+        )
+
+
+class ResetTests(WatchdogFixture):
+    """A success ends a streak rather than pausing it."""
+
+    def arm(self, failures: int = 3, minutes: int = 10):
+        self.setUp()
+        self.setting(
+            automatic="true",
+            consecutive_failures=failures,
+            minimum_minutes=minutes,
+        )
+        return self
 
     def test_a_successful_probe_resets_the_count_and_says_that_it_did(self):
         self.arm(failures=2)
@@ -436,6 +732,50 @@ class ActionMessagesTests(WatchdogFixture):
         self.assertNotIn("SERVFAIL", silent.stderr)
         self.assertIn("nothing at all answered", silent.stderr)
 
+    def test_an_action_killed_at_its_budget_is_told_from_a_failed_restore(self):
+        # 124 is what the runner returns for a command that outran its budget,
+        # and it is NOT a status this package's verbs return -- so before this
+        # fix the journal said "exited 124, which is not a status this package
+        # defines", which is exactly backwards: the honest reading is that the
+        # launcher was killed at a budget and the restore may never have run at
+        # all. The distinction matters because the two need different things from
+        # the operator: a failed restore leaves a machine to inspect, and a killed
+        # one leaves a question about whether a restore is still in progress.
+        self.assertIn(
+            124,
+            installer.WATCHDOG_ACTION_STATUSES,
+            "a command killed at its budget has no sentence, so the most confusing status this "
+            "mechanism can produce is the one it prints a bare number for",
+        )
+        outcome = self.reached(status=124, stderr="")
+        self.assertIn("124", outcome.stderr)
+        self.assertIn("killed", outcome.stderr.lower())
+        self.assertNotIn("not a status this package defines", outcome.stderr)
+
+    def test_a_killed_action_does_not_claim_to_know_the_machines_state(self):
+        # A launcher killed at its budget has observed nothing. Whatever sentence
+        # this prints must not assert that the machine was left half-restored,
+        # because that is exactly the claim it cannot make -- and it must not
+        # claim the opposite either.
+        outcome = self.reached(status=124)
+        for claim in (
+            "some of this package's settings may still be on this machine's connection",
+            "was restored",
+            "was not restored",
+            "the restore completed",
+        ):
+            with self.subTest(claim=claim):
+                self.assertNotIn(claim, outcome.stderr)
+
+    def test_a_killed_action_tells_the_operator_how_to_find_out(self):
+        # "May still be in progress" is only useful if it comes with the thing to
+        # look at. `pgrep` is the answer, and the message has to name it,
+        # because an operator told that something may be running and given no way
+        # to check has been told nothing.
+        outcome = self.reached(status=124)
+        self.assertIn("pgrep", outcome.stderr)
+        self.assertIn("emergency-rollback", outcome.stderr)
+
     def test_every_status_this_program_defines_has_a_sentence_the_watchdog_can_print(self):
         # The action is a process, so its status is a number this program did not
         # choose. A status with no sentence would print a bare number at 3am.
@@ -483,6 +823,11 @@ class ActionMessagesTests(WatchdogFixture):
     def test_the_watchdog_asks_the_local_resolver_and_nothing_else(self):
         self.reached()
         self.assertEqual(self.asked, [(LOCAL_DNS, DNS_PORT)])
+
+
+def RealCommandRunnerDefault():
+    """A runner built the way every verb but the watchdog builds one."""
+    return installer.RealCommandRunner()
 
 
 class ActionTests(WatchdogFixture):
@@ -571,15 +916,103 @@ class ActionTests(WatchdogFixture):
         self.assertEqual(len(self.actions()), 1, "a second action ran after an unrecorded outcome")
         self.assertIn("not recorded", second.stderr)
 
-    def test_the_action_gets_a_budget_of_its_own_and_the_unit_bounds_the_rest(self):
-        # `COMMAND_TIMEOUT_SECONDS` is 30, and `nmcli connection up` inside the
+    def test_the_action_budget_is_derived_from_the_work_the_action_does(self):
+        # `COMMAND_TIMEOUT_SECONDS` is 30 and `nmcli connection up` inside the
         # rollback re-runs DHCP; killing the rollback half way through a restore
         # is the worst thing this mechanism could do. So the action gets its own
-        # budget, and the unit's `TimeoutStartSec` is above it so that the
-        # watchdog prints its own report rather than being killed mid-restore.
-        self.assertGreater(
-            installer.WATCHDOG_ACTION_TIMEOUT_SECONDS, installer.COMMAND_TIMEOUT_SECONDS
+        # budget -- and the budget is **computed from the work**, not chosen:
+        #
+        #   the work is `emergency_rollback`, which issues at most
+        #   `ROLLBACK_COMMAND_BUDGET` commands, each on a runner built with the
+        #   default `COMMAND_TIMEOUT_SECONDS`, plus one 2-second probe;
+        #   the watchdog's budget is that, plus slack for the Go launcher and the
+        #   process-group teardown.
+        #
+        # The previous version of this gate compared two constants -- the action's
+        # budget against `COMMAND_TIMEOUT_SECONDS` -- so raising the budget, or
+        # adding a sixth command to the rollback, left it green while the unit's
+        # `TimeoutStartSec` became a lie. That is ruling 151's shape: the worst
+        # outcome in the package, guarded by a check that cannot fail.
+        budget = installer.ROLLBACK_COMMAND_BUDGET
+        self.assertEqual(
+            budget,
+            len(installer.RECORDED_PROPERTIES)
+            + len(installer.NM_MUTATIONS)
+            + 1  # `nmcli connection up`
+            + 1,  # `resolvectl dns`
+            "the declared worst-case command count no longer describes the rollback, so the "
+            "budget is derived from a number that is not the work",
         )
+        self.assertEqual(
+            installer.WATCHDOG_ACTION_TIMEOUT_SECONDS,
+            budget * installer.COMMAND_TIMEOUT_SECONDS
+            + int(installer.PROBE_TIMEOUT_SECONDS)
+            + installer.WATCHDOG_ACTION_SLACK_SECONDS,
+            "the action's budget is not the work's bound plus slack, so a command that hangs "
+            "takes the restore past the budget that exists to protect it",
+        )
+        self.assertGreater(
+            installer.WATCHDOG_ACTION_SLACK_SECONDS, 0, "there is no room for the launcher itself"
+        )
+
+    def test_the_rollback_issues_no_more_commands_than_its_declared_budget(self):
+        # The measurement the derivation rests on, and the reason it is a test
+        # rather than a comment: this RUNS the rollback, against a runner that
+        # counts, over a backup in which every recorded property needs putting
+        # back. If a sixth command is added -- one more `nmcli connection modify`,
+        # another probe, a re-read -- the count here rises above the declared
+        # budget and the budget gate above goes red, which is the point.
+        issued = []
+
+        class Counting:
+            def run(self, args, check=True):
+                issued.append(tuple(args))
+                if args[:2] == ("nmcli", "-g"):
+                    return installer.Completed(0, f"{uuid}.example\n", "")
+                if args[:3] == ("nmcli", "connection", "modify"):
+                    return installer.Completed(0, "", "")
+                if args[:3] == ("nmcli", "connection", "up"):
+                    return installer.Completed(0, "", "")
+                if args[:2] == ("resolvectl", "dns"):
+                    return installer.Completed(0, f"{device}.example: 1.1.1.1\n", "")
+                return installer.Completed(0, "", "")
+
+        uuid, device = "11111111-2222-3333-4444-555555555555", "eth0"
+        # The record the install itself writes: every recorded property, with the
+        # shape `_read_backup` requires of each -- a list for the two address
+        # lists and a yes-or-no for the two ignore flags. A hand-written document
+        # that skipped that shape would be refused before a single command was
+        # issued, and this case would then be measuring zero and passing.
+        original = {}
+        for prop in installer.RECORDED_PROPERTIES:
+            if prop in installer.ADDRESS_LISTS:
+                original[prop] = {"raw": "", "value": ["1.1.1.1"], "set_by": "dhcp"}
+            else:
+                original[prop] = {"raw": "no", "value": "no", "set_by": "manual"}
+        document = {
+            "schema_version": installer.BACKUP_SCHEMA_VERSION,
+            "managed_by": installer.MANAGED_BY_VALUE,
+            "package_version": "0.0.0",
+            "created_at": "2026-09-29T03:00:00Z",
+            "connection": {"uuid": uuid, "device": device, "name": "wired"},
+            "original": original,
+        }
+        self.write(BACKUP_PATH, json.dumps(document) + "\n")
+        result = installer.emergency_rollback(self.root, Counting(), probe=self.probe())
+        self.assertTrue(
+            (result.ok, result.restored),
+            f"the rollback under test issued no commands at all, so this case is measuring "
+            f"nothing: {result.error}",
+        )
+        self.assertEqual(
+            len(issued),
+            installer.ROLLBACK_COMMAND_BUDGET,
+            f"the rollback issued {len(issued)} commands but the budget declares "
+            f"{installer.ROLLBACK_COMMAND_BUDGET}, so the watchdog's budget is derived from a "
+            f"count that is no longer the work's: {issued}",
+        )
+
+    def test_the_units_budget_is_above_the_work_derived_one(self):
         unit = (UNIT_DIR / WATCHDOG_UNIT).read_text(encoding="utf-8")
         seconds = int(re.search(r"^TimeoutStartSec=(\d+)$", unit, re.M).group(1))
         self.assertGreater(
@@ -588,6 +1021,121 @@ class ActionTests(WatchdogFixture):
             f"{WATCHDOG_UNIT} allows {seconds}s, which is not above the action's own "
             f"{installer.WATCHDOG_ACTION_TIMEOUT_SECONDS}s budget, so systemd kills the restore "
             "instead of letting the watchdog report it",
+        )
+
+    def test_the_group_kill_works_and_is_not_only_written_down(self):
+        # The mechanism, exercised. A real `sleep`, started through the real
+        # runner with `kill_group=True` and a budget of a fraction of a second,
+        # with a child of its own that writes a file after a delay -- so the case
+        # can tell the difference between "the launcher was killed" and "nothing
+        # it started is still running". The second is the whole claim.
+        self.assertEqual(
+            installer.KILLED_AT_BUDGET,
+            installer.RealCommandRunner(timeout=0.4, kill_group=True)
+            .run(["/bin/sleep", "30"])
+            .returncode,
+            "a command that outran its budget was not reported as killed",
+        )
+
+    def test_a_group_killed_at_its_budget_leaves_nothing_of_its_own_running(self):
+        # The same mechanism, with a grandchild, which is the shape the action
+        # actually has: `mosdns-cdnctl` is a launcher and the work is below it.
+        # A shell that spawns a child and then sleeps is the closest thing to it
+        # this host can run, and if the group is not killed the child outlives
+        # the call and writes its marker -- which is exactly the unsupervised
+        # restore the fix is for.
+        marker = self.root / "grandchild-ran"
+        script = f"/bin/sh -c 'sleep 2; touch {marker}; sleep 30'"
+        outcome = installer.RealCommandRunner(timeout=0.5, kill_group=True).run(
+            ["/bin/sh", "-c", script]
+        )
+        self.assertEqual(outcome.returncode, installer.KILLED_AT_BUDGET)
+        # Long enough for the grandchild to have written the marker if it were
+        # going to, and short enough not to make the suite slow.
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.1)
+        self.assertFalse(
+            marker.exists(),
+            "the grandchild outlived the budget and ran to completion, so a restore killed at its "
+            "budget would keep mutating this machine with nobody watching",
+        )
+
+    def test_a_runner_without_the_group_flag_leaves_the_default_alone(self):
+        # The flag is opt-in and only the watchdog opts in. Asserted rather than
+        # assumed, because the default is the other kind of wrong: a read-only
+        # question in a new session cannot be interrupted by the terminal an
+        # operator is holding.
+        self.assertFalse(installer.RealCommandRunner().kill_group)
+
+    def test_the_action_runs_in_its_own_process_group_so_the_budget_kills_the_restore(self):
+        # The launcher is not the work. `mosdns-cdnctl emergency-rollback` execs
+        # this program's own `emergency-rollback` verb, and THAT is what rewrites
+        # the connection, so killing the launcher at its budget would leave a
+        # restore running unsupervised on a machine whose latch says the action
+        # has already been performed: nobody would ever report its outcome, and
+        # nobody would ever run it again. So the action is started in a new session
+        # and the timeout kills the whole group.
+        body = _function_body(SOURCE, "_run_a_group")
+        self.assertIn("start_new_session", body, "the action does not get a process group of its own")
+        self.assertIn("killpg", body, "the budget kills the launcher and leaves the restore running")
+        self.assertIn("SIGKILL", body, "the budget does not actually kill the process group")
+        # `killpg` on the child's own group, and nothing else. A `kill` of a pid
+        # that came from anywhere but `Popen` is a way for this program to kill
+        # something it did not start, and this one runs as root.
+        self.assertIn("os.getpgid(process.pid)", body)
+
+    def test_the_watchdogs_own_runner_is_the_one_asked_to_kill_the_group(self):
+        # The runner takes the flag; the verb has to pass it. A budget with no
+        # group behind it is the state this whole fix exists to remove, and it is
+        # a default argument away.
+        self.assertIn("kill_group=True", _function_body(SOURCE, "main"))
+        self.assertFalse(
+            RealCommandRunnerDefault().kill_group,
+            "the default runner kills its group, so every read-only question this program asks a "
+            "running manager is now a process that cannot be interrupted by a terminal",
+        )
+
+    def test_the_latch_names_both_ways_a_status_can_go_unrecorded(self):
+        # The previous version said an unrecorded status means the record could
+        # not be written after the action ran -- as if that were the only cause.
+        # A unit SIGKILLed by systemd is the other one, and it is the more
+        # alarming: the machine is not known to be in any particular state AND
+        # this program was killed rather than having finished. A message that
+        # misdiagnoses that sends the operator to look at a filesystem permission
+        # instead of at a process that may still be restoring.
+        self.setUp()
+        self.runner = RecordingRunner(status=0)
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.run_watchdog()
+        document = self.record()
+        document["action_status"] = None
+        self.write(RECORD_PATH, json.dumps(document) + "\n", mode=RECORD_MODE)
+        outcome = self.run_watchdog()
+        self.assertIn("not recorded", outcome.stderr)
+        self.assertIn(
+            "killed",
+            outcome.stderr.lower(),
+            "an unrecorded status is read as a failed write, and a unit systemd killed is not that",
+        )
+        self.assertIn("pgrep", outcome.stderr)
+
+    def test_a_killed_action_still_does_not_run_again(self):
+        # The write-ahead latch, held against the new status. A unit SIGKILLed
+        # mid-restore is precisely the case where a second attempt would be a
+        # second mutation on a machine whose first one may still be running, and
+        # the latch is the only thing preventing it.
+        self.setUp()
+        self.runner = RecordingRunner(status=124)
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.run_watchdog()
+        for _ in range(3):
+            self.run_watchdog()
+        self.assertEqual(
+            len(self.actions()),
+            1,
+            "an action killed at its budget was attempted again, which on a machine whose restore "
+            "may still be running is a second mutation",
         )
 
     def test_the_action_runs_as_the_verb_an_operator_runs_not_through_a_helper(self):
@@ -599,15 +1147,466 @@ class ActionTests(WatchdogFixture):
         self.assertIn("effectiveUID", source)
 
 
+class RecordOwnershipTests(WatchdogFixture):
+    """Nothing that is not the root watchdog may be able to reach the record.
+
+    The file mode alone is not the question, and the previous version of this
+    suite asked only that. `/run/mosdns` is `2770 root:mosdns` with
+    `default:group::rwx` -- deliberately, per ruling 142, because the DHCP bridge
+    publishes `dhcp-upstreams.json` there as `mosdns-cdn` and needs directory
+    `w`. So a `0640 root:mosdns` record sits in a directory whose GROUP can
+    create, delete and rename anything in it, and `mosdns-cdn` -- the identity the
+    Go health check runs as -- could therefore:
+
+      * **delete** `/run/mosdns/watchdog.json` and switch this mechanism off for
+        as long as it liked, with no trace; or
+      * **replace** it with a document saying `consecutive_failures: 99` and a
+        first failure long past, so that the very next run tears the machine down
+        with no window in front of it.
+
+    Both are one filesystem primitive away from a 0640 record, and no test that
+    reads `stat` on the file can see either. So the cases here are at the level of
+    the DIRECTORY, and the one that matters is measured rather than read: an
+    actual unprivileged uid, in a real directory with the shipped mode and ACL,
+    attempting the two operations.
+    """
+
+    TMPFILES = REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf"
+    POSTINST = REPO / "packaging" / "debian" / "postinst"
+
+    def test_the_record_is_not_readable_by_any_other_identity(self):
+        self.setUp()
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.run_watchdog()
+        mode = self.record_mode()
+        self.assertEqual(mode, RECORD_MODE)
+        self.assertEqual(
+            mode & 0o077,
+            0,
+            "the record is reachable by the group or the world, and nothing in this package but "
+            "the root watchdog reads it",
+        )
+
+    def test_the_record_is_not_writable_by_its_own_group_either(self):
+        self.setUp()
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.run_watchdog()
+        self.assertEqual(
+            self.record_mode() & 0o022,
+            0,
+            "a group-writable record is a record `mosdns-cdn` can rewrite into a threshold of 99 "
+            "and a first failure in the past",
+        )
+
+    def test_an_unprivileged_member_of_the_group_cannot_delete_the_record(self):
+        # The measured version, and the one a mode check cannot make. It builds
+        # the directory the package actually ships -- mode and default ACL, in
+        # the order the tmpfiles entry and `postinst` apply them -- drops to the
+        # real `mosdns-cdn` uid, and tries the unlink.
+        if os.geteuid() != 0:
+            self.skipTest("changing uid needs root, and this suite must not require it")
+        record = self._shipped_directory_with_a_record()
+        self._as_mosdns_cdn(lambda: os.unlink(record))
+        self.assertTrue(
+            record.exists(),
+            "a member of the record's own group deleted it, so the mechanism's only automatic "
+            "protection can be switched off by the unprivileged identity in this package with no "
+            "trace and no journal entry",
+        )
+
+    def test_an_unprivileged_member_of_the_group_cannot_replace_the_record(self):
+        if os.geteuid() != 0:
+            self.skipTest("changing uid needs root, and this suite must not require it")
+        record = self._shipped_directory_with_a_record()
+        # Staged in the SAME directory, because that is the only place a group
+        # member could stage it: a rename across directories needs write on both.
+        replacement = record.with_name("watchdog.json.replacement")
+        replacement.write_text('{"consecutive_failures": 99}\n')
+        replacement.chmod(0o600)
+        self._as_mosdns_cdn(lambda: os.replace(replacement, record))
+        self.assertEqual(
+            json.loads(record.read_text())["consecutive_failures"],
+            1,
+            "a member of the record's own group replaced it, so the next run reads a threshold of "
+            "99 and tears this machine down with no window in front of it",
+        )
+
+    def test_the_record_lives_in_a_directory_no_group_member_can_write(self):
+        # The structural half, and the one that can be observed without root. A
+        # `0600` file inside a group-WRITABLE directory is still deletable and
+        # still replaceable, because unlink and rename are governed by the
+        # containing directory and not by the file's own mode. So the record gets
+        # a root-owned subdirectory of its own, and this case reads the shipped
+        # tmpfiles entry and the shipped `postinst` for the mode they give it.
+        #
+        # It is a SUBdirectory rather than a change to `/run/mosdns` itself,
+        # because that directory is 2770 on purpose: ruling 142 measured that the
+        # DHCP bridge publishes `dhcp-upstreams.json` there as `mosdns-cdn` and
+        # needs directory `w`, and no argument here is better than that
+        # measurement. The bridge's file and the watchdog's record are two
+        # different things that happen to share a parent, and only one of them
+        # has an unprivileged writer.
+        for path, needle in ((self.TMPFILES, "d "), (self.POSTINST, None)):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertIn(
+                    RECORD_DIR,
+                    text,
+                    f"nothing in {path.name} creates the record's own directory, so after a "
+                    "reboot -- when /run is empty -- the watchdog has nowhere to write and "
+                    "refuses to count anything",
+                )
+                self.assertNotRegex(
+                    text,
+                    rf"a {re.escape(RECORD_DIR)} .*d:g::rwx",
+                    f"{path.name} gives the record's directory a default group ACL, which hands a "
+                    "group member the ability to replace a 0600 root file inside it",
+                )
+        entry = next(
+            line
+            for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
+            if line.startswith(f"d {RECORD_DIR} ")
+        ).split()
+        mode, owner, group = entry[2], entry[3], entry[4]
+        self.assertEqual(mode, "0700", f"the record's directory is {mode}, not 0700")
+        self.assertEqual(owner, "root")
+        self.assertEqual(group, "root", "the record's directory is group-owned, so it is reachable")
+        self.assertEqual(int(mode, 8) & 0o077, 0, "the record's directory is reachable by others")
+
+    def test_the_units_writable_path_is_the_records_own_directory(self):
+        # The unit can only write where it is told it may, so the path in
+        # `ReadWritePaths` is the enforcement, not a description of it. A unit
+        # granted `/run/mosdns` would be granted the bridge's directory -- and
+        # with it the ability to remove the DHCP generation the router reads.
+        entries = _unit_sections(
+            (UNIT_DIR / WATCHDOG_UNIT).read_text(encoding="utf-8")
+        )["Service"]["ReadWritePaths"].split()
+        self.assertEqual(entries, [f"-{RECORD_DIR}"])
+
+    def test_the_control_stands_up_and_reports_nothing_when_it_is_held(self):
+        # A guard that cannot fail is a comment. The same two operations, as
+        # root, in the same shipped directory: both succeed, so the two cases
+        # above are reading the ownership and not a typo in a path.
+        if os.geteuid() != 0:
+            self.skipTest("changing uid needs root, and this suite must not require it")
+        record = self._shipped_directory_with_a_record()
+        os.unlink(record)
+        self.assertFalse(record.exists(), "root could not unlink the record in its own directory")
+
+    def _shipped_directory_with_a_record(self) -> Path:
+        """A `/run/mosdns` built the way the package builds it, with a record in it.
+
+        The mode and the ACL come from the shipped tmpfiles entry and the shipped
+        `postinst` rather than from constants here, so a change to either of them
+        is a change to what this case exercises -- and so that the case fails if
+        the packaging and the record's mode ever stop agreeing.
+        """
+        directory = self.root / "run" / "mosdns"
+        directory.mkdir(parents=True)
+        os.chown(directory, 0, self._mosdns_gid())
+        os.chmod(directory, self._shipped_directory_mode())
+        self._apply_shipped_default_acl(directory)
+        record = directory / "watchdog.json"
+        self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
+        self.run_watchdog()
+        return record
+
+    def _shipped_directory_mode(self) -> int:
+        line = next(
+            line
+            for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
+            if line.startswith(f"d {RECORD_DIR} ")
+        )
+        return int(line.split()[2], 8)
+
+    def _apply_shipped_default_acl(self, directory: Path) -> None:
+        entry = next(
+            line
+            for line in self.TMPFILES.read_text(encoding="utf-8").splitlines()
+            if line.startswith(f"a {RECORD_DIR} ")
+        )
+        fields = entry.split()[6:]
+        if not any(field.startswith("d:g:") for field in fields):
+            return
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            self.skipTest("setfacl is not installed, so the shipped ACL cannot be reproduced")
+        subprocess.run(
+            [setfacl, "-d", "-m", ",".join(fields), str(directory)],
+            check=True,
+            capture_output=True,
+        )
+
+    def _entry(self, name: str):
+        """The passwd entry for a packaged identity, or None where there is none.
+
+        None rather than a made-up uid: a case that cannot find `mosdns-cdn` has
+        no business running as some other account and reporting what it did.
+        """
+        import pwd
+
+        try:
+            return pwd.getpwnam(name)
+        except KeyError:
+            return None
+
+    def _mosdns_gid(self) -> int:
+        """The gid of the `mosdns` group, or a fallback for a build host without it."""
+        import grp
+
+        try:
+            return grp.getgrnam("mosdns").gr_gid
+        except KeyError:
+            return self._entry("mosdns-cdn").pw_gid if self._entry("mosdns-cdn") else 4242
+
+    def _as_mosdns_cdn(self, work) -> None:
+        """Run one callable as `mosdns-cdn`, and put this process back afterwards.
+
+        Both halves of the id are restored even if the callable raises, because a
+        test that leaves the suite running as another uid turns every later case
+        into a mystery. The order is setgid last, since dropping the privilege is
+        the direction that cannot be undone.
+        """
+        account = self._entry("mosdns-cdn")
+        if account is None:
+            self.skipTest("this host has no mosdns-cdn account, so there is nothing to be")
+        euid, egid = os.geteuid(), os.getegid()
+        try:
+            os.setegid(account.pw_gid)
+            os.seteuid(account.pw_uid)
+            work()
+        finally:
+            os.seteuid(euid)
+            os.setegid(egid)
+
+
+class TransactionExclusionTests(WatchdogFixture):
+    """The watchdog must not tear a machine down underneath a running install.
+
+    On an upgrade the watchdog's timer is already enabled -- `postinst`'s own arm
+    says so and defers to the transaction -- and the transaction then
+    `try-restart`s the two units that serve `127.0.0.1:53`. While they are
+    restarting, `127.0.0.1:53` is not answering **by construction**, and the
+    watchdog reads that as a failure. At the shipped defaults three failed probes
+    are two minutes, and the transaction's own wait deadline is 60 s plus a 30 s
+    command budget per unit, so the threshold is reachable inside the window the
+    transaction deliberately creates.
+
+    Nothing stopped it: the watchdog takes no lock -- it deliberately does not
+    inherit the health unit's `SuccessExitStatus=4`, because a declined run is
+    information -- and nothing stops the timer before the transaction. The
+    consequence is bounded, because `emergency_rollback` only restores recorded
+    values, but a rollback underneath an install is a double mutation nobody asked
+    for and a latch burned on a streak that was never a fault.
+
+    **The mechanism is the control lock this package already has.**
+    `/var/lib/mosdns/runtime/control.lock` is what the optimizer, the health
+    check and `update-lists` all take, and "somebody else is mutating this
+    machine right now" is precisely what it means. So the transaction takes it
+    across the windows in which the machine's DNS is moving, and the watchdog
+    takes it before it acts and declines when it cannot.
+
+    Two things about that shape are load-bearing and are asserted below:
+
+    * **The lock is taken WITHOUT waiting.** A watchdog that blocked on it would
+      sit for the length of a transaction, and a transaction that blocked on it
+      would hang `dpkg`. Both callers decline, loudly, and the caller that has
+      already changed the machine says so in terms of what it is doing.
+    * **The publish step is outside the lock**, because `update-lists
+      --refresh-ranges` takes the lock itself. A transaction that held it across
+      that step would deadlock against its own child, which is why the critical
+      section is two sections and not one around everything.
+    """
+
+    def arm(self, failures: int = 3, minutes: int = 10):
+        self.setUp()
+        self.setting(automatic="true", consecutive_failures=failures, minimum_minutes=minutes)
+        return self
+
+    def hold_the_lock(self):
+        """Take the shared control lock, as another process would."""
+        self.holder = self._open_lock()
+        fcntl.flock(self.holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(self._release)
+        return self.holder
+
+    def _open_lock(self):
+        path = self.rooted(CONTROL_LOCK)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(mode=0o640)
+        return os.open(path, os.O_CREAT | os.O_RDONLY, 0o640)
+
+    def test_the_watchdog_takes_no_action_while_a_transaction_holds_the_lock(self):
+        self.arm()
+        outcome = None
+        for _ in range(4):
+            self.hold_the_lock()
+            outcome = self.run_watchdog()
+            self._unlock_only()
+        self.assertEqual(
+            self.actions(),
+            [],
+            "the watchdog performed an emergency rollback underneath something else that was "
+            "mutating this machine's DNS, which is a double mutation and a burned latch on a "
+            "failure streak that was never a fault",
+        )
+        self.assertEqual(outcome.status, installer.EXIT_REFUSED)
+
+    def test_it_says_the_lock_is_held_rather_than_just_not_acting(self):
+        # A watchdog that declines SILENTLY is indistinguishable from one that is
+        # broken, and the operator reading the journal has to be able to tell the
+        # difference between "nothing was wrong" and "something else was in the
+        # middle of changing this machine".
+        self.arm()
+        self.hold_the_lock()
+        outcome = self.run_watchdog()
+        self.assertIn(CONTROL_LOCK, outcome.stderr)
+        self.assertIn("held", outcome.stderr)
+        self.assertIn("did nothing at all", outcome.stderr)
+
+    def test_it_does_not_count_the_failure_while_the_lock_is_held(self):
+        # Counting is not acting, and the argument for counting is that the
+        # streak is a property of the MACHINE. It is not, while a transaction is
+        # deliberately making the local resolver stop answering: those failures
+        # are the transaction's, and carrying them means the FIRST probe after an
+        # upgrade can reach a threshold that the upgrade manufactured.
+        self.arm()
+        self.hold_the_lock()
+        for _ in range(3):
+            self.run_watchdog()
+        self.assertIsNone(
+            self.record(),
+            "a transaction's own restarts were counted as this machine's resolver failing, so the "
+            "streak that survives the upgrade is the upgrade's",
+        )
+
+    def test_the_streak_resumes_from_nothing_once_the_transaction_is_over(self):
+        # The other direction: the exclusion must not leave the machine unwatched
+        # for ever. After the lock is released the counting starts again at one,
+        # which is the patient direction -- one failure of delay, not a machine
+        # that stopped being watched.
+        self.arm()
+        self.hold_the_lock()
+        for _ in range(3):
+            self.run_watchdog()
+        self.assertEqual(self.record(), None)
+        self._release()
+        self.run_watchdog()
+        self.assertEqual(self.record()["consecutive_failures"], 1)
+        self.assertEqual(self.actions(), [], "a first failure acted with the lock free")
+
+    def test_it_acts_normally_when_the_lock_is_free(self):
+        # The control. A guard that cannot be distinguished from a mechanism that
+        # never acts is not a guard.
+        self.arm(failures=1, minutes=10)
+        self._open_lock()
+        outcome = self.run_watchdog()
+        self.assertEqual(self.actions(), [ACTION], "a free control lock stopped the action")
+        self.assertEqual(outcome.status, installer.EXIT_OK)
+
+    def test_a_lock_it_cannot_open_declines_rather_than_acting_without_one(self):
+        # The lock is a guarantee only while it can be taken. A machine whose
+        # control lock cannot be opened -- a directory that is not there, a lock
+        # that is a directory, a filesystem that will not let it be created -- is
+        # a machine where "nobody else is mutating this" cannot be established,
+        # and the patient answer is to do nothing and say so.
+        self.arm(failures=1, minutes=10)
+        self.rooted(CONTROL_LOCK).mkdir(parents=True)
+        outcome = self.run_watchdog()
+        self.assertEqual(
+            self.actions(),
+            [],
+            "the action ran with no way to know whether a transaction was in flight",
+        )
+        self.assertIn(CONTROL_LOCK, outcome.stderr)
+
+    def test_the_lock_is_taken_without_waiting(self):
+        # Asserted on the source, and it matters in both directions: a watchdog
+        # that waited would sit for the length of a transaction, and a transaction
+        # that waited would hang dpkg. `LOCK_NB` is the whole of it.
+        self.assertIn("LOCK_EX | fcntl.LOCK_NB", _function_body(SOURCE, "_try_control_lock"))
+
+    def test_the_transaction_holds_the_same_lock_while_it_moves_the_machines_dns(self):
+        # The other half, and without it the watchdog's half excludes nothing.
+        # Read from the source because the transaction is the most delicate code
+        # in the project and a case that ran it would be asserting the order of
+        # forty commands rather than this one fact about it.
+        body = _function_body(SOURCE, "_run_transaction")
+        self.assertIn("with _hold_control_lock(root):", body)
+        # The window has to CONTAIN the restart of the units that serve
+        # 127.0.0.1:53, or it excludes nothing that matters.
+        critical = body[body.index("with _hold_control_lock(root):") :]
+        for step in ("_start(", "_apply_nm(", "_reconnect(", "_verify(", "_commit_marker("):
+            with self.subTest(step=step):
+                self.assertIn(step, critical, f"{step} runs outside the control lock")
+
+    def test_the_publish_step_is_outside_the_lock_or_the_transaction_deadlocks(self):
+        # `PUBLISH_PREFIXES` is `mosdns-cdnctl update-lists --refresh-ranges`,
+        # and `update-lists` takes the control lock itself. A transaction holding
+        # that lock across this step would be refusing its own child, and the
+        # install would fail at a step that has nothing to do with DNS. So there
+        # are two critical sections and this is the seam between them.
+        body = _function_body(SOURCE, "_run_transaction")
+        publish = body.index("PUBLISH_PREFIXES,")
+        first = body.index("with _hold_control_lock(root):")
+        self.assertLess(
+            publish,
+            first,
+            "the prefix publication is inside the control lock, so the transaction refuses its own "
+            "`update-lists --refresh-ranges`, which takes that lock",
+        )
+
+    def test_the_rollback_holds_the_lock_too(self):
+        # A rollback stops the same two units, so it makes `127.0.0.1:53` stop
+        # answering in exactly the way the install does, and a watchdog that acted
+        # during one would be doing to a machine being put RIGHT what it does to a
+        # machine being left broken.
+        self.assertIn("_roll_back_under_the_lock(root, transaction, notes)", _function_body(SOURCE, "install"))
+        self.assertIn("with _try_control_lock(root):", _function_body(SOURCE, "_roll_back_under_the_lock"))
+
+    def test_a_rollback_that_cannot_take_the_lock_still_rolls_back(self):
+        # The one place the discipline is deliberately broken, and it is worth
+        # being explicit about why. A rollback is the response to a half-applied
+        # install; making it wait for a lock would be the worst possible answer,
+        # because the machine is already in the state the rollback exists to leave.
+        # So it proceeds unlocked, and says so in a note beside the failure it is
+        # already reporting.
+        self.assertIn("LockUnavailable", _function_body(SOURCE, "_roll_back_under_the_lock"))
+        self.assertIn(
+            "WITHOUT the control lock",
+            _function_body(SOURCE, "_roll_back_under_the_lock"),
+            "a rollback that ran without the lock did not say so",
+        )
+
+    def _unlock_only(self):
+        fcntl.flock(self.holder, fcntl.LOCK_UN)
+
+    def _release(self):
+        """Drop the lock and close the descriptor, tolerating being called twice.
+
+        The cases release it mid-test and the cleanup releases it again, so this
+        has to be idempotent rather than raising out of a cleanup and burying the
+        assertion that failed.
+        """
+        try:
+            fcntl.flock(self.holder, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self.holder)
+        except OSError:
+            pass
+
+
 class RecordTests(WatchdogFixture):
     """Where the failure record lives, and what an absent one is allowed to mean."""
 
-    def test_the_record_is_written_under_the_run_directory_and_nowhere_else(self):
+    def test_the_record_is_written_under_its_own_directory_and_nowhere_else(self):
         self.setUp()
         self.setting(automatic="true", consecutive_failures=1, minimum_minutes=10)
         self.run_watchdog()
         self.assertIsNotNone(self.record(), "no record was written, so nothing can be counted")
-        self.assertEqual(RECORD_PATH, "/run/mosdns/watchdog.json")
+        self.assertEqual(RECORD_PATH, "/run/mosdns/watchdog/watchdog.json")
         written = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*.json"))
         self.assertEqual(written, [RECORD_PATH.lstrip("/")])
 
@@ -1015,9 +2014,16 @@ def _function_body(source: str, name: str) -> str:
     parenthesis on its own column when the signature is long.
     """
     lines = source.splitlines()
+    # Both spellings, because the module has a module-level function and a
+    # method of the same shape and a gate that could only see one of them would
+    # be a gate that quietly stopped holding.
+    starts = [
+        f"def {name}(",
+        f"    def {name}(",
+    ]
     start = None
     for index, line in enumerate(lines):
-        if line.startswith(f"def {name}("):
+        if any(line.startswith(prefix) for prefix in starts):
             start = index
             break
     if start is None:
@@ -1027,6 +2033,12 @@ def _function_body(source: str, name: str) -> str:
     body = []
     for line in lines[start + 1:]:
         if line and not line[0].isspace():
+            break
+        # A method ends where the next `def` at the SAME indentation begins,
+        # which is one level in from the `def` that opened it -- not at the next
+        # unindented line, which for a method is the end of the whole class and
+        # would hand every method in it the body of every method after it.
+        if line.startswith("    def ") or line.startswith("    @"):
             break
         body.append(line)
     return "\n".join(body)

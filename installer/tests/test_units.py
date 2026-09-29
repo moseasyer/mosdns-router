@@ -119,6 +119,14 @@ def _watchdog_record_path() -> str:
 
 
 WATCHDOG_RECORD = _watchdog_record_path()
+# The directory that record lives in, read out of the program the same way, so
+# the unit's write permission and the program's own path cannot drift apart. It
+# is its own directory and not RUN_DIR because /run/mosdns is group-writable by
+# design (ruling 142: the DHCP bridge publishes there as mosdns-cdn), and unlink
+# and rename are the containing directory's decision rather than a file's mode --
+# so a 0600 record in there could be deleted, or replaced with a streak that has
+# already reached its window, by the one unprivileged identity in this package.
+WATCHDOG_RECORD_DIR = os.path.dirname(WATCHDOG_RECORD)
 
 # The sandbox every service in this package gets, as (key, value) pairs. It is one
 # list for all six services on purpose: short-lived or long-lived programs that
@@ -189,11 +197,13 @@ WRITE_TABLE = {
     HEALTH: (RUNTIME_DIR,),
     LIST_CHECK: (),
     DNSCRYPT: (),
-    # One file, on the tmpfs: the consecutive-failure record at
-    # /run/mosdns/watchdog.json. The row is derived from `WATCHDOG_RECORD` below
-    # rather than written out, because a table row that restates a constant is a
-    # second answer to the question the constant already answers.
-    WATCHDOG: (RUN_DIR,),
+    # One file, on the tmpfs: the consecutive-failure record, in a root-owned
+    # subdirectory of its own rather than in /run/mosdns. The row is derived from
+    # `WATCHDOG_RECORD` below rather than written out, because a table row that
+    # restates a constant is a second answer to the question the constant already
+    # answers -- and the derivation is what keeps the unit's write permission and
+    # the program's record path from drifting apart.
+    WATCHDOG: (WATCHDOG_RECORD_DIR,),
 }
 # The bridge's row: it has no unit, so it appears in no table above, and the only
 # thing a test can say about it is where it writes.
@@ -490,12 +500,21 @@ UNIT_DIRECTIVES = {
             ("User", "root"),
             ("Group", "root"),
             ("ExecStart", f"{INSTALLER} watchdog"),
-            # Above the action's own 150-second budget, on purpose: a watchdog
-            # killed part way through a restore prints nothing, and a rollback
-            # killed mid-restore is the worst thing this package can do
-            # unattended. The budget itself is `WATCHDOG_ACTION_TIMEOUT_SECONDS`
-            # in the program, and a case holds the two in that order.
-            ("TimeoutStartSec", "180"),
+            # Above the action's own budget, on purpose: a watchdog killed part
+            # way through a restore prints nothing, and a rollback killed
+            # mid-restore is the worst thing this package can do unattended.
+            #
+            # That budget is 302s -- `ROLLBACK_COMMAND_BUDGET` (9) x
+            # `COMMAND_TIMEOUT_SECONDS` (30) + a 2s probe + 30s of slack -- and
+            # this is 330. It was 180, against a 150s action budget that was
+            # itself smaller than the work (9 x 30 = 270s), so the unit's claim
+            # and its number disagreed with the program's. The number here is
+            # pinned AND re-derived: `test_watchdog.py` measures how many
+            # commands the rollback actually issues, recomputes 302 from that and
+            # the per-command budget, and requires this to exceed it -- so a
+            # sixth command or a longer per-command timeout fails that gate
+            # rather than leaving this table quietly stale.
+            ("TimeoutStartSec", "330"),
             # No SuccessExitStatus, and that is the difference from the health
             # check's exit 4. Every non-zero exit here is something an operator
             # has to read: this program's own 1 (not resolving and the window not
@@ -513,12 +532,15 @@ UNIT_DIRECTIVES = {
             # exactly: no interface is enumerated and no netlink socket is
             # opened.
             ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"),
-            # Exactly one directory, and the `-` prefix is load-bearing: /run is
-            # a tmpfs, so this directory is gone after a reboot, and an
-            # unprefixed entry naming a path that is not there fails the unit's
+            # Exactly one directory, the record's OWN 0700 root:root
+            # subdirectory rather than /run/mosdns -- which is group-writable by
+            # design, and a 0600 file inside a group-writable directory is still
+            # deletable and replaceable. The `-` prefix is load-bearing: /run is
+            # a tmpfs, so this directory is gone after a reboot, and an unprefixed
+            # entry naming a path that is not there fails the unit's
             # mount-namespace setup -- so the machine's only automatic DNS
             # protection would be the retry loop.
-            ("ReadWritePaths", f"-{RUN_DIR}"),
+            ("ReadWritePaths", f"-{WATCHDOG_RECORD_DIR}"),
         ),
     },
     WATCHDOG_TIMER: {
@@ -2228,8 +2250,8 @@ class WriteSetEvidenceTests(unittest.TestCase):
                 for path in self._writable(name):
                     self.assertIn(
                         path,
-                        (RUNTIME_DIR, LISTS_DIR, RUN_DIR),
-                        f"{name} makes {path} writable, which is not one of the three state "
+                        (RUNTIME_DIR, LISTS_DIR, RUN_DIR, WATCHDOG_RECORD_DIR),
+                        f"{name} makes {path} writable, which is not one of the state "
                         "directories this package provisions",
                     )
                 for path in WRITE_TABLE[name]:
@@ -2238,6 +2260,26 @@ class WriteSetEvidenceTests(unittest.TestCase):
                         self._writable(name),
                         f"{name} writes {path}, so it must be writable in {name}",
                     )
+
+    def test_the_watchdogs_writable_directory_is_the_record_s_own_and_nothing_broader(self):
+        # The rule the other six units follow, and the one the watchdog is most
+        # able to break: it runs as ROOT, so every directory it is granted is a
+        # directory root can write anywhere in. It writes one file, so it is
+        # granted one directory -- and that directory is the record's own 0700
+        # root:root one rather than /run/mosdns, which is group-writable by
+        # design and holds the DHCP generation the router reads.
+        self.assertEqual(self._writable(WATCHDOG), [WATCHDOG_RECORD_DIR])
+        self.assertNotIn(
+            RUN_DIR,
+            self._writable(WATCHDOG),
+            "the watchdog is granted the bridge's group-writable directory, so a compromise of it "
+            "can remove the DHCP generation the router follows as well as the failure record",
+        )
+        self.assertEqual(
+            os.path.dirname(WATCHDOG_RECORD),
+            WATCHDOG_RECORD_DIR,
+            "the record is not in the directory the unit is granted write access to",
+        )
 
 
 if __name__ == "__main__":

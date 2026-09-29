@@ -38,9 +38,10 @@
 # ## 3. It is a TIMER, so it inherits the packaged hardening
 #
 # The same sandbox as mosdns-cdn-health.service, the same bounding set, the same
-# umask, and one writable directory: /run/mosdns, for the failure record at
-# /run/mosdns/watchdog.json and nothing else. A per-unit subset would be a
-# privilege decision nobody can review at a glance.
+# umask, and one writable directory: /run/mosdns/watchdog, for the failure record
+# at /run/mosdns/watchdog/watchdog.json and nothing else. It is that subdirectory
+# and not /run/mosdns, which is group-writable by design, and a per-unit subset
+# would be a privilege decision nobody can review at a glance.
 #
 # ## What it does NOT claim
 #
@@ -70,13 +71,25 @@ User=root
 Group=root
 ExecStart=/usr/lib/mosdns-router/mosdns_installer.py watchdog
 # The probe is one 2-second query. The action is not: it reactivates a
-# NetworkManager connection, which re-runs DHCP, and it gets its own 150-second
-# budget inside the verb -- `COMMAND_TIMEOUT_SECONDS` is 30 and is right for the
-# read-only questions the rest of this package asks a running manager. This
-# budget is above the action's on purpose, so that the watchdog prints its own
-# report rather than being killed part way through a restore. A rollback killed
-# mid-restore is the worst thing this package can do unattended.
-TimeoutStartSec=180
+# NetworkManager connection, which re-runs DHCP, and it gets its own budget
+# inside the verb -- one that is DERIVED rather than chosen, because the previous
+# one (150s) was smaller than the work it was supposed to bound.
+#
+# The work is the action's GRANDCHILD: `mosdns-cdnctl emergency-rollback` is a
+# launcher that execs the installer's own `emergency-rollback` verb, and that verb
+# issues up to 9 commands (four property reads, three property writes, one
+# `nmcli connection up`, one `resolvectl dns`) on a runner with the package's
+# default 30-second per-command budget. 9 x 30 + a 2s probe + 30s of slack = 302s,
+# which is the budget the verb gives it. THIS is above that, so the watchdog
+# prints its own report rather than being killed part way through a restore. A
+# rollback killed mid-restore is the worst thing this package can do unattended.
+#
+# The number below is not decorative and the gate over it is not a comparison of
+# two constants: `installer/tests/test_watchdog.py` measures how many commands
+# the rollback actually issues, re-derives 302 from that measurement and the
+# per-command budget, and requires this to be above the result. A sixth command
+# or a longer per-command timeout makes that gate red here.
+TimeoutStartSec=330
 # No SuccessExitStatus. Every non-zero exit is something an operator has to
 # read: 1 is this program's own refusal (the resolver is not answering and the
 # window has not been reached, or the setting could not be read, or the record
@@ -85,8 +98,11 @@ TimeoutStartSec=180
 # that changed nothing. A watchdog that reported success on a run where it did
 # not act would be the defect this package keeps correcting.
 CapabilityBoundingSet=
-# 0007 for the same reason as the health check's: the record is a document the
-# other service identities may have to read, and 0640 is its mode.
+# 0007, inherited from the health check's, and it does NOT describe this record:
+# the record is 0600 and its directory is 0700 root:root, because nothing in this
+# package but this unit reads it. The umask is the packaged one -- a per-unit
+# privilege decision nobody can review at a glance -- and the record's own mode is
+# pinned explicitly rather than inherited from it, since a umask can only narrow.
 UMask=0007
 
 # The same sandbox the router and the health check get. This verb reads two
@@ -117,10 +133,15 @@ SystemCallArchitectures=native
 # is opened, so this is the health check's list exactly.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# Exactly one directory, and it is the one the failure record lives in. The `-`
-# prefix is what makes a missing path tolerated: /run is a tmpfs, so this
-# directory is gone after a reboot and an unprefixed entry naming it would fail
-# this unit's mount-namespace setup on a host that has not created it yet -- and
-# the retry that follows would be the machine's only automatic DNS protection
-# coming up and going down.
-ReadWritePaths=-/run/mosdns
+# Exactly one directory, and it is the one the failure record lives in: its own,
+# 0700 root:root subdirectory rather than /run/mosdns itself. /run/mosdns is
+# 2770 root:mosdns with a default ACL on purpose, because the DHCP bridge
+# publishes there as mosdns-cdn and needs directory w -- and unlink and rename
+# are the containing directory's decision, not the record's mode, so a 0600 file
+# in there could still be deleted or replaced by that identity. The `-` prefix is
+# what makes a missing path tolerated: /run is a tmpfs, so this directory is gone
+# after a reboot and an unprefixed entry naming it would fail this unit's
+# mount-namespace setup on a host that has not created it yet -- and the retry that
+# follows would be the machine's only automatic DNS protection coming up and going
+# down. The tmpfiles entry and `postinst` both create it for the same reason.
+ReadWritePaths=-/run/mosdns/watchdog

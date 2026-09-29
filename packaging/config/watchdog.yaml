@@ -71,11 +71,26 @@
 # intermittently slow. A value of `0` is refused.
 #
 # The watchdog keeps a record of the current failure streak at
-# /run/mosdns/watchdog.json, at mode 0640. It is on a tmpfs, so it does not
-# survive a reboot -- deliberately: the first minutes after a boot are when the
-# router is still coming up, and a machine that has just been rebooted gets its
-# window again rather than inheriting one. An absent record never means "healthy";
-# it means nothing has failed yet.
+# /run/mosdns/watchdog/watchdog.json, at mode 0600, in a directory of its own at
+# 0700 root:root. Both are deliberate. /run/mosdns is group-writable by design,
+# because the DHCP bridge publishes there as mosdns-cdn, and unlink and rename are
+# the containing directory's decision rather than a file's mode -- so a 0600 file
+# in there could still be deleted, or replaced with a streak that has already
+# reached its window, by the one unprivileged identity in this package. Nothing
+# here but the watchdog reads the record, so nothing else needs to reach it.
+#
+# The record is on a tmpfs, so it does not survive a reboot: the first minutes
+# after a boot are when the router is still coming up, and a machine that has just
+# been rebooted gets its window again rather than inheriting one. The record also
+# names the boot it belongs to, so a machine whose /run is a disk rather than a
+# tmpfs treats a carried-over streak as not its own rather than acting on a
+# window that was measured against a clock that no longer exists. An absent record
+# never means "healthy"; it means nothing has failed yet.
+#
+# The window's elapsed half is measured on the machine's BOOT clock, not on the
+# wall clock, so a machine whose clock steps -- a cold boot before NTP has
+# synchronised, a hypervisor adjusting it, an operator running hwclock -- cannot
+# satisfy the window by having its clock moved.
 #
 # ## If this file cannot be read
 #

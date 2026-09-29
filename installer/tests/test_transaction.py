@@ -178,6 +178,15 @@ STATE_DIRECTORIES = (
     "/var/lib/mosdns/lists",
     "/run/mosdns",
 )
+# The shared control lock, its mode, and the owner and group preflight requires
+# it to have. The transaction now TAKES this lock -- it is the exclusion that
+# stops the resolver watchdog firing an emergency rollback underneath a running
+# install -- so a test that runs a transaction leaves a real lock file in the
+# fake root and the next run's preflight stats it.
+CONTROL_LOCK = "/var/lib/mosdns/runtime/control.lock"
+LOCK_MODE_OCTAL = "640"
+STATE_OWNER = "root"
+STATE_GROUP = "mosdns"
 # The units whose states the preflight reads, and the fixture's own list rather
 # than the module's: this suite asserts the exact sequence of commands a
 # transaction issues, and a sequence derived from the constant under test would
@@ -938,6 +947,19 @@ class TransactionFixture(unittest.TestCase):
             self.returncodes[("systemctl", "is-active", unit)] = 3
         for relative in STATE_DIRECTORIES:
             answers[STAT_FIELDS + (str(self.rooted(relative)),)] = f"2770 root mosdns {stat.S_IFDIR | 0o2770:x}"
+        # The control lock, stat-able. The transaction now TAKES this lock (it is
+        # the exclusion that stops the resolver watchdog acting underneath an
+        # install), so a test that runs the transaction twice leaves a real lock
+        # file in the fake root, and the second run's preflight stats it. Without
+        # an answer here the fake runner reports "could not be stat'd" and
+        # preflight refuses a machine it should accept -- which is a fixture that
+        # does not know about a file the program now creates, not a product
+        # defect. `LOCK_MODE` and not the directory's 2770: the lock is a regular
+        # file, and preflight checks its mode, owner and group.
+        answers[STAT_FIELDS + (str(self.rooted(CONTROL_LOCK)),)] = (
+            f"{LOCK_MODE_OCTAL} {STATE_OWNER} {STATE_GROUP} "
+            f"{stat.S_IFREG | int(LOCK_MODE_OCTAL, 8):x}"
+        )
         answers.update(self.answers)
         answers.update(outputs or {})
         codes = dict(self.returncodes)

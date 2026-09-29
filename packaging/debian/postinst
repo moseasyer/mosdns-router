@@ -140,6 +140,32 @@ setfacl -d -m g::rwx /var/lib/mosdns/lists
 install -d -o root -g mosdns -m 2770 /run/mosdns
 setfacl -d -m g::rwx /run/mosdns
 
+# ...and the ONE directory in this step that is not 2770 root:mosdns with a
+# default ACL: the resolver watchdog's failure record, in a directory of its own.
+#
+# `mosdns-cdn` is in the `mosdns` group and the directory above gives that group
+# `w`, and a `0600` file inside a group-WRITABLE directory is still deletable and
+# still replaceable -- unlink and rename are the containing directory's decision,
+# not the file's. So in `/run/mosdns` that identity could delete the record, which
+# switches off the only automatic DNS protection on the machine with nothing
+# written anywhere, or replace it with a document claiming a threshold of 99 and a
+# first failure long past, which tears the machine down on the next run with no
+# window in front of it. 0700 root:root, no setfacl, because unlike the four above
+# nothing here is read by any other identity: the watchdog runs as root and is
+# the only reader.
+#
+# A subdirectory rather than a change to `/run/mosdns` itself, because the 2770
+# above is measured, not preferred: the DHCP bridge publishes as `mosdns-cdn` and
+# needs directory `w`. Both directories are needed and they are not the same
+# directory.
+#
+# This one is here as well as in the tmpfiles.d entry, and both is right for the
+# reason the entry exists at all: /run is a tmpfs, so the mode and the ownership
+# are gone after a reboot and only the tmpfiles entry brings them back. The
+# watchdog starts three minutes after boot and would otherwise refuse to count
+# anything on every boot.
+install -d -o root -g root -m 0700 /run/mosdns/watchdog
+
 # --- STEP 3: the pinned China list, placed once and never re-pinned ----------
 
 # Two files under /var/lib/mosdns/lists are the OPERATOR's, not this package's:

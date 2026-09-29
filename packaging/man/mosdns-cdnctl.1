@@ -155,11 +155,27 @@ unattended, and the consecutive\-failure count and elapsed\-time window it waits
 for. Ships with
 .BR "automatic: true" .
 .TP
-.I /run/mosdns/watchdog.json
-The watchdog's failure streak, mode 0640. It is on a tmpfs and does not survive a
-reboot, deliberately: the first minutes after a boot are when the router is still
-coming up, and a machine that has just been rebooted gets its window again. An
-absent record never means "healthy"; it means nothing has failed yet.
+.I /run/mosdns/watchdog/watchdog.json
+The watchdog's failure streak, mode 0600, in a directory of its own at 0700
+.BR root:root .
+Both are deliberate:
+.BR /run/mosdns " itself is"
+.BR root:mosdns " 2770 with a default ACL, because the DHCP bridge publishes"
+there as
+.BR mosdns-cdn ,
+and unlink and rename are the containing directory's decision rather than a
+file's, so a 0600 file in that directory could still be deleted or replaced by
+that identity. Nothing but the watchdog reads this record.
+.PP
+It is on a tmpfs and does not survive a reboot, deliberately: the first minutes
+after a boot are when the router is still coming up, and a machine that has just
+been rebooted gets its window again. The record also names the boot it belongs
+to, so a machine whose
+.B /run
+is a disk rather than a tmpfs treats a carried-over streak as not its own. An
+absent record never means "healthy"; it means nothing has failed yet. The
+elapsed half of the window is measured on the machine's boot clock, so a wall
+clock that steps cannot satisfy it.
 .TP
 .I /var/lib/mosdns/runtime/control.lock
 The shared control lock, mode 0640, created on first acquire.
