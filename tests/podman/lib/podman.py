@@ -355,6 +355,36 @@ POLICED_CONTAINER_FLAGS = tuple(
 # not an argument for having policed the word.
 ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 
+# **The ceiling is not the policy.** `ALLOWED_CAPABILITIES` above is the widest
+# set any container this harness starts may hold -- it is what a `--cap-add` in a
+# scenario's `extra_args` is checked against. This is the narrower question: which
+# container holds which of them. They are separate because a ceiling read as a
+# policy is how a container that needs nothing is handed four capabilities: the
+# mock router ran with all four while `run_container` was shared, and the reason
+# it needed none is short.
+#
+# | role | why |
+# |---|---|
+# | `target` | all four. `SYS_ADMIN` and `NET_ADMIN` for systemd and a netavark bridge, `SYS_PTRACE` for `journalctl` in the target, and `NET_RAW` measured necessary for NetworkManager's `AF_PACKET` DHCP client (see `ALLOWED_CAPABILITIES`). |
+# | `mock-router` | **none.** dnsmasq answers DHCP and DNS on the run's own bridge inside the container's own network namespace. It opens no raw socket, spawns nothing that needs to be traced, and runs no init. `port=53` binds below 1024 and does not need `--cap-add` for it: podman's default bounding set already carries `NET_BIND_SERVICE` (bit 10, present in `CapEff: 00000000802c15fb`). |
+#
+# A capability a container did not need and cannot be shown to need is not a
+# measured ceiling, it is a default nobody looked at -- and the default is what a
+# reader of the emitted array takes as the requirement. The measurement that put
+# `NET_RAW` in the *target* is the argument for the target; it says nothing about
+# dnsmasq, and applying it there was the defect.
+#
+# **The cost of this table is one line per container,** which is the cost of any
+# per-container policy and is why a shared array is tempting. The alternative --
+# one array for every container -- is free until the first container that does not
+# need what the others do, and then it is wrong in a way nothing reports, because
+# a capability that is granted and not needed is not an error podman or the kernel
+# will ever mention.
+CONTAINER_CAPABILITIES = {
+    "target": ALLOWED_CAPABILITIES,
+    "mock-router": (),
+}
+
 
 class PodmanError(RuntimeError):
     """A Podman command failed, was refused, or could not be built."""
@@ -1165,26 +1195,45 @@ class Podman:
         name: str,
         network: str,
         extra_args: Sequence[str] = (),
+        capabilities: Sequence[str] = ALLOWED_CAPABILITIES,
     ) -> str:
-        """Start a target container and return its id.
+        """Start a container and return its id.
 
         The flags are the ones measured to work on this host: systemd as the
-        init, a private cgroup namespace, the four measured capabilities, and the
-        cgroup filesystem bound in. `--cgroupns=host` and `--privileged` are not
-        here and must not be added -- the first does not start, the second reaches
-        the host this harness is required not to touch.
+        init, a private cgroup namespace, the capabilities this container was
+        measured to need, and the cgroup filesystem bound in. `--cgroupns=host`
+        and `--privileged` are not here and must not be added -- the first does
+        not start, the second reaches the host this harness is required not to
+        touch.
 
-        **`--cap-add=NET_RAW` is in this list because a DHCP lease needs it, and
-        the plan's three flags are not enough.** The measurement is written out
-        at `ALLOWED_CAPABILITIES`; the short version is that NetworkManager's
-        built-in DHCP client opens an `AF_PACKET` socket, podman's default
-        bounding set does not carry `NET_RAW`, and without it every DHCP
-        transaction in the target fails with `dhcp4 (eth0): error -1 dispatching
-        events` while the mock router sits on the other side of the bridge with
-        an empty pool. It is here rather than in a scenario's `extra_args` because
-        the target is *one* container for the whole cell: a capability a later
-        scenario needs and an earlier one does not is a property of the run, not
-        of the scenario that happens to be looking.
+        **The capabilities are a per-container argument, and the default is the
+        target's four.** `ALLOWED_CAPABILITIES` is the *ceiling* -- the widest set
+        any container here may hold -- and `CONTAINER_CAPABILITIES` is the policy
+        that says which container holds how much of it. They are different
+        questions and one answer for both is how the mock router came to be given
+        `NET_RAW`: `run_container` is shared, so before this was a parameter every
+        container got whatever the target needed, and the router -- which is
+        dnsmasq, needs no `AF_PACKET` socket, opens no raw socket and has never
+        asked for a capability -- was handed four. A capability the target needed
+        and was measured to need is defensible; one the router never needed is
+        only defensible if the code says why, and it did not.
+
+        The cost of the shared array was a ceiling that read as a policy: a
+        reader of `ALLOWED_CAPABILITIES` would conclude the router needs
+        `NET_RAW`, and would carry that belief into the next container the plan
+        adds. So the per-container answer is in the code, next to the flags.
+
+        **`--cap-add=NET_RAW` is in the *target's* set because a DHCP lease needs
+        it, and the plan's three flags are not enough.** The measurement is written
+        out at `ALLOWED_CAPABILITIES`; the short version is that NetworkManager's
+        built-in DHCP client opens an `AF_PACKET` socket, podman's default bounding
+        set does not carry `NET_RAW`, and without it every DHCP transaction in the
+        target fails with `dhcp4 (eth0): error -1 dispatching events` while the
+        mock router sits on the other side of the bridge with an empty pool. It is
+        a parameter rather than a scenario's `extra_args` because the target is
+        *one* container for the whole cell: a capability a later scenario needs and
+        an earlier one does not is a property of the run, not of the scenario that
+        happens to be looking.
         """
         args = [
             "run",
@@ -1193,11 +1242,8 @@ class Podman:
             "--network", network,
             "--systemd=always",
             "--cgroupns=private",
-            "--cap-add=SYS_ADMIN",
-            "--cap-add=NET_ADMIN",
-            "--cap-add=SYS_PTRACE",
-            "--cap-add=NET_RAW",
         ]
+        args += [f"--cap-add={capability}" for capability in capabilities]
         args += self.mount_arguments()
         args += list(extra_args)
         args.append(image)

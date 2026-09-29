@@ -337,6 +337,51 @@ class CellCompositionTest(EntryPoint):
             f"mosdns-{RUN_ID}-target-24.04": TARGET_ADDRESS,
         })
 
+    def test_the_router_gets_none_of_the_capabilities_the_target_needs(self):
+        """**A shared array handed dnsmasq four capabilities it has never used.**
+
+        `run_container` builds one argument array and both containers went through
+        it, so the router was started with the target's `--cap-add` set: `SYS_ADMIN`,
+        `NET_ADMIN`, `SYS_PTRACE` and `NET_RAW`. dnsmasq needs none of them. It
+        opens no raw socket -- the `AF_PACKET` socket that made `NET_RAW` necessary
+        is NetworkManager's, in the *target* -- spawns no init, and is not traced.
+        `port=53` is below 1024 and does not need the flag either, because podman's
+        default bounding set already carries `NET_BIND_SERVICE`.
+
+        So this is the case that separates the **ceiling** from the **policy**.
+        `ALLOWED_CAPABILITIES` is the widest set any container here may hold, and
+        it is what a scenario's `--cap-add` is checked against; `CONTAINER_CAPABILITIES`
+        says which container holds which. Reading the ceiling as the policy is what
+        made this a defect rather than a style question: the emitted array is the
+        thing a reader consults, and it said the router needs `NET_RAW` because a
+        DHCP lease needs `NET_RAW` -- which is true, of the *other* container.
+
+        The two halves, because either alone would be half a claim: the target
+        still gets all four (asserted here too, so a fix that emptied both would
+        pass a case about the router alone), and the router's own array carries no
+        `--cap-add` at all.
+        """
+        fake = self.passing_fake()
+        self.cell(fake)
+        granted = {
+            argv[argv.index("--name") + 1]: [
+                token for token in argv if token.startswith("--cap-add=")
+            ]
+            for argv in fake.invocations() if argv[:2] == ["run", "-d"]
+        }
+        self.assertEqual(
+            granted.get(f"mosdns-{RUN_ID}-mock-router-24.04"), [],
+            "the mock router is started with capabilities it does not need: dnsmasq opens no "
+            "raw socket and has never been measured to need one. The measurement that made "
+            "NET_RAW necessary was NetworkManager's, in the target",
+        )
+        self.assertEqual(
+            granted.get(f"mosdns-{RUN_ID}-target-24.04"),
+            ["--cap-add=SYS_ADMIN", "--cap-add=NET_ADMIN", "--cap-add=SYS_PTRACE", "--cap-add=NET_RAW"],
+            "the target lost a capability it was measured to need, so a DHCP lease would fail "
+            "with 'IP configuration could not be reserved'",
+        )
+
     def test_every_container_the_cell_starts_is_named_from_this_runs_prefix(self):
         fake = self.passing_fake()
         self.cell(fake)

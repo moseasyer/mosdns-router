@@ -57,6 +57,7 @@ import dhcp_test  # noqa: E402
 import images  # noqa: E402
 import snapshot  # noqa: E402
 from podman import (  # noqa: E402
+    CONTAINER_CAPABILITIES,
     DEFAULT_NETWORK_SUBNET,
     CleanupFailed,
     NetworkManagerDeviceError,
@@ -199,6 +200,10 @@ def run_target(
                 name=router,
                 network=network,
                 extra_args=["--ip", dhcp_test.MOCK_ROUTER_ADDRESS],
+                # dnsmasq needs none of the target's four, and handing it all
+                # four made the emitted array say the router needs `NET_RAW`.
+                # The reason is in `CONTAINER_CAPABILITIES`.
+                capabilities=CONTAINER_CAPABILITIES["mock-router"],
             )
             container = run.track_container(run.container_name("target", version))
             podman.run_container(

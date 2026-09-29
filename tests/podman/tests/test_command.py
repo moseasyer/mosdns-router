@@ -47,6 +47,8 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +67,7 @@ from podman import (  # noqa: E402
     PODMAN_FLAG_ALIASES,
     POLICED_CONTAINER_FLAGS,
     ALLOWED_CAPABILITIES as ALLOWED_CAPS,
+    CONTAINER_CAPABILITIES as CONTAINER_CAPS,
     CleanupFailed,
     ContainerPolicyError,
     MountPolicyError,
@@ -77,6 +80,7 @@ from podman import (  # noqa: E402
     canonical_flag_name,
     new_run_id,
     podman_session,
+    wait_for_networkmanager_device,
 )
 from report import EXIT_TEST_FAILURE, ScenarioResult  # noqa: E402
 
@@ -321,9 +325,13 @@ FORWARDED_ENV_NAMES = (
 
 SECRET_ENV_NAME = "MOSDNS_PODMAN_HARNESS_SECRET"
 
-# The production clock, captured before any case replaces it, so
-# `use_the_real_clock` puts back the real thing rather than another case's.
-_REAL_CLOCK = run.scenario_clock()
+# The production clock factory, captured before any case replaces it, so
+# `use_the_real_clock` puts back the real thing rather than another case's. The
+# *factory* and not one dict from it: `scenario_clock()` is called once per run
+# and per cell, and comparing against a single captured dict would compare two
+# different objects where the claim is about the function.
+_REAL_CLOCK = run.scenario_clock
+_REAL_CLOCK_VALUES = _REAL_CLOCK()
 
 
 class FakePodmanBinary:
@@ -447,12 +455,30 @@ class PodmanTestCase(unittest.TestCase):
             "now": lambda: clock["now"],
             "sleep": lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
         }
+        # Recorded so `ClockSeamTest` can assert this really happened. A refactor
+        # that left the real clock in place would otherwise make this file's
+        # stated premise false while every case in it stayed green -- and the
+        # symptom is a suite that quietly takes twenty minutes.
+        self._virtual_now = run.scenario_clock()["now"]
         return clock
 
     def use_the_real_clock(self):
-        """Put the real clock back, for a case that is about elapsed time."""
+        """Put the real clock back, for a case that is about elapsed time.
+
+        **One case uses this**, and it is about the seam rather than about the
+        wait: `test_a_wait_consults_the_clock_the_runner_gave_it`. Every other
+        case in this file runs on a virtual clock because the bounds are in
+        minutes, so this is the only place the real `time.monotonic` is exercised
+        and the only place the two clocks are compared to each other.
+
+        The alternative -- documenting it and leaving it unused -- was the state
+        this replaced, and it is a bad state for a helper: the first contributor
+        to reach for it would be the first to find out whether it works, and a
+        helper that has never been called is a helper whose name is the only
+        evidence it exists.
+        """
         run.scenario_clock = _REAL_CLOCK
-        return _REAL_CLOCK
+        return _REAL_CLOCK()
 
 
 class ArgumentArrayTest(PodmanTestCase):
@@ -1709,6 +1735,28 @@ class MountAllowlistTest(PodmanTestCase):
 # it.
 ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 
+# **The per-container policy, written out here for the same reason the ceiling
+# is: so it cannot change silently.** `ALLOWED_CAPS` above is the ceiling -- the
+# widest set any container may hold. This is the narrower question, which the
+# ceiling cannot answer: which container holds which of them.
+#
+# The router's entry is empty and that is the finding, not an oversight.
+# `run_container` built one argument array and both containers went through it,
+# so dnsmasq was started holding the target's four. It needs none: the
+# `AF_PACKET` socket that made `NET_RAW` necessary is NetworkManager's, in the
+# target; dnsmasq runs no init and is not traced; and `port=53` binds below 1024
+# without the flag because podman's default bounding set already carries
+# `NET_BIND_SERVICE` (bit 10, present in `CapEff: 00000000802c15fb`).
+#
+# The cost of the table is one line per container, which is the cost of any
+# per-container policy. A shared array is free until the first container that
+# does not need what the others do, and then it is wrong invisibly: a capability
+# granted and not needed is not something podman or the kernel ever reports.
+PER_CONTAINER_CAPS = {
+    "target": ALLOWED_CAPS,
+    "mock-router": (),
+}
+
 # Every flag family refused in `extra_args`, in the two spellings pflag accepts
 # and in both positions, written as one table so the sweep is the table. If a
 # later task needs one of these, the honest move is to measure why the ceiling
@@ -2124,6 +2172,62 @@ class ContainerPolicyTest(PodmanTestCase):
         message = self.refused(["--cap-add=SYS_BOOT"])
         for cap in ALLOWED_CAPS:
             self.assertIn(cap, message)
+
+    def test_the_cap_ceiling_and_the_per_container_policy_are_two_different_questions(self):
+        """A ceiling read as a policy is how dnsmasq was handed four capabilities.
+
+        `ALLOWED_CAPABILITIES` answers "what is the widest set any container here
+        may hold", and that is what a scenario's `--cap-add` is checked against.
+        `CONTAINER_CAPABILITIES` answers "which container holds which", and the
+        ceiling cannot answer it -- a target that needs `NET_RAW` says nothing
+        about dnsmasq, which needs none of the four.
+
+        Merging the two is what made the router's emitted array carry
+        `--cap-add=NET_RAW`, and the cost of that is a *reader*: the emitted array
+        is what somebody consults when a container misbehaves, so an array saying
+        the router needs a capability is a claim about the router that nothing can
+        falsify and nothing will report. So the two are separate constants and
+        this case holds the relationship between them.
+
+        Three properties, and the third is the one that would catch a regression:
+        the policy's widest entry **is** the ceiling (so the policy cannot quietly
+        exceed what the guard allows), the router's is empty, and the target's is
+        the ceiling (so a fix that emptied both would fail).
+        """
+        self.assertEqual(
+            set(PER_CONTAINER_CAPS), set(CONTAINER_CAPS),
+            "the per-container policy and the module's have drifted apart, so this file's copy "
+            "is asserting about a table the code does not use",
+        )
+        self.assertEqual(
+            max((len(caps) for caps in CONTAINER_CAPS.values()), default=0),
+            len(ALLOWED_CAPS),
+            "no container is granted the full ceiling, so the target's own measured set has been "
+            "lost and a DHCP lease would fail with 'IP configuration could not be reserved'",
+        )
+        for role, caps in sorted(CONTAINER_CAPS.items()):
+            with self.subTest(role=role):
+                self.assertLessEqual(
+                    set(caps), set(ALLOWED_CAPS),
+                    f"{role} is granted a capability the ceiling does not allow, so the policy "
+                    f"and the guard disagree about what may be granted",
+                )
+        self.assertEqual(
+            CONTAINER_CAPS["mock-router"], (),
+            "the mock router is granted capabilities again. dnsmasq needs none of them: the "
+            "AF_PACKET socket that made NET_RAW necessary is NetworkManager's, in the target",
+        )
+        self.assertEqual(
+            CONTAINER_CAPS["target"], ALLOWED_CAPS,
+            "the target is no longer granted the four capabilities it was measured to need",
+        )
+        # And the two are genuinely different objects, so the distinction cannot
+        # be a naming accident that a later edit papers over.
+        self.assertIsNot(
+            CONTAINER_CAPS["mock-router"], CONTAINER_CAPS["target"],
+            "both roles resolve to the same tuple, so a container that needs nothing is given "
+            "everything again",
+        )
 
     def test_the_measured_target_runs_with_net_raw_because_dhcp_needs_it(self):
         """The emitted array carries the capability DHCP needs, not only the allowed ones.
@@ -4305,6 +4409,140 @@ class CommandLineTest(EntryPointTestCase):
         for recorded in fake.invocations():
             self.assertNotIn("machine", recorded, f"a machine subcommand was emitted: {recorded!r}")
 
+
+class ClockSeamTest(EntryPointTestCase):
+    """The one case in the suite that runs a wait on the **real** clock.
+
+    `PodmanTestCase.setUp` puts every case in `test_command.py` on a virtual
+    clock, and the reason is written there: the bounds are in minutes, and about a
+    dozen cases drive a whole cell, so the real thing grew the suite from seven
+    minutes to twenty. That is the right default and it has a cost: the real
+    `time.monotonic` is never exercised, and neither is the seam that replaces it.
+
+    So this is where both are. It is small on purpose -- **one real sleep of
+    `NM_DEVICE_POLL_INTERVAL` is not affordable on every cell**, but one is
+    affordable once, and once is what it takes to know the seam works in the
+    direction that matters: that `use_the_real_clock` puts back something the
+    runner will actually consult, and that a wait on it terminates on its own
+    rather than only because a test told it the time had passed.
+
+    The three properties, and why a case that only asserted one would be half a
+    claim:
+
+    * the runner's clock is the real one after the call, and the virtual one
+      before it (so `setUp` is really doing what its comment says);
+    * a wait on the real clock **returns** when the condition is met, which a
+      virtual clock makes look instantaneous;
+    * and a wait on the real clock **gives up** at its budget, which is the
+      property a virtual clock cannot show at all -- on the virtual clock "timed
+      out" and "asked once" are indistinguishable, because the clock is whatever
+      the case said it was.
+    """
+
+    def test_a_wait_consults_the_clock_the_runner_gave_it(self):
+        self.assertIsNot(
+            run.scenario_clock()["now"], self._virtual_now,
+            "setUp did not install a virtual clock, so every case in this file was about to "
+            "spend the real bounds and this file's premise does not hold",
+        )
+        self.use_the_real_clock()
+        # `scenario_clock()` is a factory: a *call* returns the clock the runner
+        # would hand a scenario. So this compares the fresh dict against the
+        # factory, which is what "the runner's clock is the real one" means --
+        # and it is asserted on the values rather than on identity, because a
+        # factory may legitimately return an equal dict each time.
+        self.assertIs(run.scenario_clock, _REAL_CLOCK)
+        self.assertEqual(
+            sorted(run.scenario_clock()), ["now", "sleep"],
+            "the real clock does not carry the two values a bounded wait is driven with",
+        )
+
+        answered = {"calls": 0}
+
+        def read():
+            # Satisfied on the third read, so the wait must have slept twice on
+            # the real clock rather than returning on its first look.
+            answered["calls"] += 1
+            return "yes" if answered["calls"] >= 3 else "no"
+
+        started = time.monotonic()
+        value = wait_for_networkmanager_device(
+            _FakeDevice(read), "mosdns-x-target-24.04", interval=0.05, timeout=30.0,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(value, "yes")
+        self.assertEqual(answered["calls"], 3, "the wait did not read until the condition held")
+        # Two real sleeps of 50ms. The assertion is a floor and a generous
+        # ceiling, not a measurement: the claim is that *time passed*, which a
+        # virtual clock would report as a number the case itself chose.
+        self.assertGreaterEqual(
+            elapsed, 0.1,
+            "the wait returned without sleeping, so it cannot have consulted the real clock",
+        )
+        self.assertLess(elapsed, 10.0, f"the wait slept for {elapsed:.1f}s against a 30s budget")
+
+    def test_a_wait_that_never_succeeds_gives_up_at_its_own_budget(self):
+        """The property only the real clock can show.
+
+        On the virtual clock, a timeout is indistinguishable from a single read:
+        the clock is a number the case incremented, so "gave up after 0.3s" and
+        "gave up immediately" print the same. Here the budget is 0.3s of *real*
+        time and the read never succeeds, so the wait has to stop on its own --
+        and the message has to carry the read count and the interval, because
+        those are what tell a reader the answer was not a race.
+
+        **It runs on a thread, and that is load-bearing.** A wait that stopped
+        consulting its budget would otherwise loop forever, and the failure this
+        case exists to catch would be a *hung suite* rather than a red one -- the
+        worst possible shape for a case, because the reader who triggered it is
+        not there to see it. So the wait is joined with a ceiling several times
+        its own budget: a wait that overruns is reported, and the thread is a
+        daemon so the case does not wait for it either way.
+        """
+        self.use_the_real_clock()
+        finished = threading.Event()
+        outcome: dict = {}
+
+        def run_the_wait():
+            try:
+                outcome["value"] = wait_for_networkmanager_device(
+                    _FakeDevice(lambda: "no"), "mosdns-x-target-24.04",
+                    interval=0.05, timeout=0.3,
+                )
+            except NetworkManagerDeviceError as error:
+                outcome["error"] = error
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run_the_wait, daemon=True)
+        worker.start()
+        self.assertTrue(
+            finished.wait(30.0),
+            "the wait did not give up within 30s against a 0.3s budget, so it is not "
+            "consulting the clock it was given",
+        )
+        self.assertNotIn(
+            "value", outcome,
+            "the wait returned instead of raising, so an unmanaged device was accepted",
+        )
+        message = str(outcome["error"])
+        self.assertIn("0.3s", message)
+        self.assertIn("reads 0.05s apart", message)
+        self.assertIn("answered 'no'", message)
+
+
+class _FakeDevice:
+    """The one method `wait_for_networkmanager_device` calls on a `Podman`.
+
+    A whole fake podman would be a second thing to keep right for a case about
+    the clock, and the wait uses exactly one method of the client.
+    """
+
+    def __init__(self, answer):
+        self._answer = answer
+
+    def nm_managed(self, container, device):
+        return self._answer()
 
 
 class MatrixProducesEvidenceTest(EntryPointTestCase):
