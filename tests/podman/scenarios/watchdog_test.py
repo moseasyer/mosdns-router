@@ -244,6 +244,18 @@ def build_scenario(
         except PodmanError as error:
             return f"(not readable: {str(error).splitlines()[-1]})"
 
+    def _dpkg_exit_from(output: str) -> int:
+        """dpkg's own status, out of the one string its output came in.
+
+        The marker is printed by the same shell that ran the install, so the
+        number cannot disagree with the words beside it -- which is the whole
+        point of running `dpkg -i` once. A `try_read` that could not run at all
+        returns a string that is not a document, and that is a zero rather than
+        a guess: the assertion on the state below is where a failed read shows.
+        """
+        match = re.search(r"DPKG_EXIT=(\d+)", output or "")
+        return int(match.group(1)) if match else 0
+
     def unit_state(unit: str) -> str:
         """A unit's `ActiveState`, read with a command that exits 0 for every state.
 
@@ -557,18 +569,30 @@ def build_scenario(
             document["package_bytes"] = int(
                 try_read("stat", "-c", "%s", "/tmp/mosdns-router.deb").strip() or 0
             )
-            # `dpkg -i` through `sh -c` so the installer's own stdout AND stderr
-            # are captured. `exec_status` keeps no output, and the previous
-            # version used it -- which is why the evidence document had the dpkg
-            # exit status and nothing that said WHY. That gap is what let the
-            # first version of this report call the resulting state `unpacked`
-            # when a live run measures `half-configured`: the transaction's own
-            # refusal, which names the step it stopped at, is in this string.
+            # **ONE install, and both facts about it from that one.**
+            #
+            # The previous version ran `dpkg -i` twice -- once through `sh -c`
+            # for captured output and once through `exec_status` for the exit
+            # status -- so the install transaction executed twice and every
+            # recorded state described the SECOND run. The fixture modelled both
+            # invocations with disjoint rules, so the cell stayed green while the
+            # evidence document quietly became a record of two installs.
+            #
+            # It is run once, through `sh -c`, and the status comes out of the
+            # SAME invocation: the script prints a marker carrying `$?` after the
+            # install, so one string holds both the installer's own words and
+            # dpkg's status, and the state read below is that install's.
+            # `sh -c` is what makes the output capturable at all -- `exec_status`
+            # keeps none, which is how the first version of this document had a
+            # status and nothing that said WHY.
             document["dpkg_output"] = try_read(
-                "sh", "-c", "dpkg -i /tmp/mosdns-router.deb 2>&1 || true"
+                "sh",
+                "-c",
+                "dpkg -i /tmp/mosdns-router.deb 2>&1; printf 'DPKG_EXIT=%s\\n' \"$?\"",
             )[:4000]
-            installed = podman.exec_status(target, "dpkg", "-i", "/tmp/mosdns-router.deb")
+            installed = _dpkg_exit_from(document["dpkg_output"])
             document["dpkg_exit"] = installed
+            document["dpkg_runs"] = 1
             document["package_state"] = try_read(
                 "sh", "-c", "dpkg-query -W -f='${db:Status-Status}\\n' mosdns-router 2>&1 || true"
             ).strip()

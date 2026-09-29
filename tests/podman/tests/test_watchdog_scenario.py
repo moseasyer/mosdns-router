@@ -93,16 +93,17 @@ CDNCTL = "/usr/lib/mosdns-router/mosdns-cdnctl"
 # of a command would be a rule matching nothing.
 DPKG_STATE_QUERY = "dpkg-query -W -f='${db:Status-Status}\\n' mosdns-router 2>&1 || true"
 DPKG_STATUS_QUERY = "dpkg-query -W -f='${Status}\\n' mosdns-router 2>&1 || true"
-DPKG_INSTALL = "dpkg -i /tmp/mosdns-router.deb 2>&1 || true"
-# dpkg's own output, trimmed to what makes the point. The real string on a cell
-# where the transaction refuses carries the installer's whole refusal with it,
-# which is the most useful thing in the document and the reason `dpkg -i` is now
-# run through `sh -c` rather than through `exec_status` at all.
+DPKG_INSTALL = "dpkg -i /tmp/mosdns-router.deb 2>&1; printf 'DPKG_EXIT=%s\\n' \"$?\""
+# dpkg's own output, trimmed to what makes the point, WITH the status marker the
+# scenario reads. The real string on a cell where the transaction refuses carries
+# the installer's whole refusal with it, which is the most useful thing in the
+# document and the reason `dpkg -i` is run through `sh -c` at all.
 DPKG_OUTPUT = (
     "dpkg: error processing package /tmp/mosdns-router.deb (--install):\n"
     " postinst script for package mosdns-router returned error exit status 1.\n"
     "Errors were encountered while processing:\n"
     " /tmp/mosdns-router.deb\n"
+    "DPKG_EXIT=1\n"
 )
 
 BACKUP = json.dumps(
@@ -270,16 +271,15 @@ def watchdog_rules(
         # the word; the table answers the word a real dpkg used.
         {"match": ["sh", "-c", DPKG_STATE_QUERY], "stdout": "half-configured\n"},
         {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": "install ok half-configured\n"},
-        # `dpkg -i` runs TWICE: once through `sh -c '... || true'` for the
-        # captured output, and once through `exec_status` for the exit status.
-        # The two rules are disjoint -- the `sh -c` form is one argv token, so
-        # `["dpkg", "-i"]` cannot match it -- and they carry DIFFERENT exit
-        # statuses, because the `|| true` really does make the shell exit 0 while
-        # `exec_status` sees dpkg's own 1. That difference is the point of
-        # running it through a shell: the output is captured without the read
-        # raising.
+        # `dpkg -i` runs ONCE now, through `sh -c`, and the status comes out of
+        # the same string as the output: the script prints `DPKG_EXIT=<n>` after
+        # the install. The previous fixture had two rules -- one for the `sh -c`
+        # form and one for the bare `dpkg -i` the scenario used to call through
+        # `exec_status` -- because the scenario ran the install TWICE, so the
+        # transaction executed twice and the recorded state described the second
+        # run. The cell was green throughout, which is the point: a fixture that
+        # models a defect faithfully reports the defect as normal.
         {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0, "stdout": DPKG_OUTPUT},
-        {"match": ["dpkg", "-i"], "returncode": 1, "stdout": DPKG_OUTPUT},
         {"match": ["dpkg-reconfigure"],
          "stdout": "/usr/sbin/dpkg-reconfigure: mosdns-router is broken or not fully installed\n"},
         # The setting's own mode, NAMED rather than matched on the bare
@@ -468,10 +468,12 @@ class ScenarioPassesTest(WatchdogScenarioHarness):
         )
         for argv in copied:
             self.assertRegex(argv[-1], rf"^{TARGET}:/tmp/mosdns-router\.deb$")
-        self.assertIn(
-            ["dpkg", "-i", "/tmp/mosdns-router.deb"],
-            [argv[2:] for argv in fake.invocations() if argv[:2] == ["exec", TARGET]],
-            "the package was copied and not installed, so nothing in the package was exercised",
+        self.assertTrue(
+            any("dpkg -i /tmp/mosdns-router.deb" in " ".join(argv) for argv in fake.invocations()),
+            "the package was copied and not installed, so nothing in the package was exercised. "
+            "The install is a `sh -c` script rather than a bare argv so that dpkg's own output and "
+            "its status come from ONE invocation; the script text is what to look for here, not "
+            "the argv shape",
         )
 
     def test_the_record_is_read_after_the_first_probe_and_its_count_asserted(self):
@@ -731,7 +733,38 @@ class WithoutARecordTest(WatchdogScenarioHarness):
                     "install that did not happen",
                 )
 
-    def test_the_record_lives_in_a_directory_the_group_cannot_write(self):        # The finding 3 property, observed on a real target rather than only in
+    def test_the_cell_installs_the_package_exactly_once(self):
+        # The scenario used to call `dpkg -i` twice -- once through `sh -c` for the
+        # output and once through `exec_status` for the status -- so the install
+        # transaction ran twice and every recorded state described the second run.
+        # The fixture modelled both invocations faithfully and the cell stayed
+        # green, which is the whole hazard: a fixture that reproduces a defect
+        # reports it as the normal shape.
+        #
+        # So the count is asserted, from the fake's own log of what it was asked
+        # to do. One install, and the status recorded in the document is that
+        # install's.
+        fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        # The install is a script now, so `dpkg` and `-i` are inside ONE argv
+        # token rather than being tokens of their own -- which is exactly the
+        # thing a substring filter is for, and the reason the previous
+        # `["dpkg", "-i", …]` assertion had to be rewritten.
+        installs = [
+            argv for argv in fake.invocations() if "dpkg -i" in " ".join(argv)
+        ]
+        self.assertEqual(
+            len(installs),
+            1,
+            f"the cell ran dpkg -i {len(installs)} times, so the evidence document describes the "
+            f"last of several installs rather than the one the scenario performed: {installs}",
+        )
+        written = self.record(result)
+        self.assertEqual(written["dpkg_runs"], 1)
+        self.assertEqual(written["dpkg_exit"], 1, "the status in the document is not dpkg's own")
+
+    def test_the_record_lives_in_a_directory_the_group_cannot_write(self):
+        # The finding 3 property, observed on a real target rather than only in
         # the unit tests. The record's own mode is the half anyone would check;
         # the directory is the half that matters, because a 0600 file inside a
         # group-WRITABLE directory can still be unlinked and renamed by
