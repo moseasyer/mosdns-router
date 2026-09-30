@@ -104,6 +104,21 @@ BACKUP_PATH = "/var/lib/mosdns/installer/network-manager-backup.json"
 ARTIFACT_DNSCrypt_TMP = "/tmp/mosdns-router-artifact-dnscrypt-proxy.toml"
 MARKER_PATH = "/var/lib/mosdns/installer/managed-by"
 
+# **The ROUTER's document, and the one shipped copy of it the cell compares the
+# target's against.** The DNSCrypt document is the foreign branch's; this one is
+# the DOMESTIC branch's, and until this constant existed the plan's "Production
+# shipped config and packaged DNSCrypt config remain unchanged and are asserted
+# separately" had an assertion for the second half only -- MEASURED,
+# `grep -rn "/etc/mosdns/mosdns" tests/podman/` returned nothing.
+#
+# The failure that absence permits is not hypothetical. The override's purpose is
+# to point a *foreign forward address* at a mock; if the harness ever wrote the
+# ROUTER document to do that instead, every counter would still read correctly
+# and the split would be an artefact of the test's own configuration. So this is
+# digested and required EQUAL, read through the same read-only source mount the
+# override is built from.
+ROUTER_CONFIG = "/etc/mosdns/mosdns.yaml"
+
 # The origin the range document comes from, and the four timers postinst enables
 # after a successful transaction. Both are named here rather than read out of the
 # package so a reader can see what the cell is asserting without opening a file.
@@ -646,11 +661,23 @@ def build_scenario(
         Empty rather than a fabricated value, because every comparison below is
         an equality between two of these and a placeholder would make an absent
         file look like a file whose digest happens to be nothing.
+
+        **And only a digest.** `sha256sum` prints `<digest>  <path>`, and taking
+        the first whitespace-separated field of a line that is *only* a path --
+        which is what a wrapper that lost stdout, or an `sha256sum` that failed
+        and printed its argument, would give -- returns the path. So the field is
+        required to be 64 hex characters, and anything else is the empty string
+        for the reason above: a comparison between two malformed answers is not a
+        comparison, and the one below this function's callers is the one that says
+        whether the router's own policy is the one this repository renders.
         """
         try:
-            return read("sha256sum", path).split()[0]
+            field = read("sha256sum", path).split()[0]
         except (PodmanError, IndexError):
             return ""
+        if len(field) != 64 or any(character not in "0123456789abcdef" for character in field):
+            return ""
+        return field
 
     def evidence(document: dict) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1411,6 +1438,62 @@ def build_scenario(
                 "reason, which this scenario must not report as the override's doing",
             )
             document["shipped_documents_unchanged"] = True
+
+            # -- 9b. and the ROUTER document, which the override does not touch
+            # **The DNSCrypt document is the FOREIGN branch's. The domestic branch
+            # runs on `/etc/mosdns/mosdns.yaml`, and until this section existed
+            # nothing in this harness read that file at all** -- MEASURED,
+            # `grep -rn "/etc/mosdns/mosdns" tests/podman/ --include=*.py` returned
+            # nothing, so the plan's "Production shipped config and packaged DNSCrypt
+            # config remain unchanged and are asserted separately" had an assertion
+            # for the second half of the sentence and none for the first.
+            #
+            # The failure that absence permits is specific and quiet. This
+            # override's whole purpose is to point a *foreign forward address* at a
+            # mock; if the harness ever wrote the ROUTER document to do that
+            # instead, the foreign branch would keep working, the domestic branch
+            # would stop being this project's real policy, and **every counter in
+            # Step 6 would still read correctly**. A cell that cannot tell a real
+            # split from a manufactured one is worse than no cell, because it is
+            # green.
+            #
+            # So the target's copy is digested and required EQUAL to the
+            # repository's, read through the same read-only `/workspace` mount the
+            # override is built from -- a mount that cannot be written, which is
+            # what `NO-HOST-MUTATION.md`'s premise rests on and what makes the
+            # repository's side of the comparison trustworthy.
+            document["router_document_path"] = ROUTER_CONFIG
+            document["router_document_shipped_from"] = foreign_override.SHIPPED_ROUTER
+            document["router_document_sha256"] = digest_of(ROUTER_CONFIG)
+            document["router_document_shipped_sha256"] = digest_of(
+                foreign_override.SHIPPED_ROUTER
+            )
+            _require(
+                document["router_document_sha256"] != "",
+                f"{ROUTER_CONFIG} could not be digested in {target} (sha256sum read "
+                f"{document['router_document_sha256']!r}), so this cell has NOT measured whether the "
+                f"router's own document is the one this repository renders. An absent digest is not "
+                f"an equal digest, and the domestic branch's policy is exactly what a cell that "
+                f"cannot read it has nothing to say about",
+            )
+            _require(
+                document["router_document_shipped_sha256"] != "",
+                f"the repository's own {foreign_override.SHIPPED_ROUTER} could not be digested through "
+                f"the read-only source mount, so there is nothing to compare "
+                f"{ROUTER_CONFIG} against and the comparison below would be between two placeholders",
+            )
+            _require(
+                document["router_document_sha256"] == document["router_document_shipped_sha256"],
+                f"the router's document {ROUTER_CONFIG} in {target} is "
+                f"{document['router_document_sha256'] or '(no digest)'} and the repository's own "
+                f"{foreign_override.SHIPPED_ROUTER} is "
+                f"{document['router_document_shipped_sha256'] or '(no digest)'}, and they must be "
+                f"the same bytes. This is the DOMESTIC branch's policy, and a cell where it was "
+                f"changed -- to point a forward at this run's mock, say -- would still resolve every "
+                f"test name and every query counter would still read correctly. A split measured "
+                f"against a document the test wrote is not a split",
+            )
+            document["router_document_matches_the_repository"] = True
 
             evidence(document)
             return ScenarioResult(

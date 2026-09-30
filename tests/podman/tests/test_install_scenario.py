@@ -596,6 +596,15 @@ OVERRIDE_DNSCRYPT_SHA = hashlib.sha256(
     OVERRIDE_DNSCRYPT_TEXT.encode("utf-8")
 ).hexdigest()
 
+# **The router document, and the digest of the repository's own copy.** This is
+# the document the DOMESTIC branch runs on, and before the assertion it had none:
+# `grep -rn "/etc/mosdns/mosdns" tests/podman/` returned nothing, so "the shipped
+# config remains unchanged" was a property of a file no assertion touched. Read
+# and hashed here for the same reason as the document above -- a literal digest
+# would let a re-render and this file disagree while every assertion passed.
+SHIPPED_MOSDNS_TEXT = (REPO / "configs" / "mosdns.yaml").read_text(encoding="utf-8")
+SHIPPED_MOSDNS_SHA = hashlib.sha256(SHIPPED_MOSDNS_TEXT.encode("utf-8")).hexdigest()
+
 # A shipped document with a listener and a selection and no `[static.*]` table at
 # all. This project renders one, so no real cell produces it -- it is here because
 # it is the input `build_override` names first in its refusal ("the shipped
@@ -688,6 +697,14 @@ def install_rules(**overrides):
         "override_dnscrypt": OVERRIDE_DNSCRYPT_SHA,
         # The artifact's own copy, which has to be the repository's own bytes.
         "artifact_dnscrypt": SHIPPED_DNSCRYPT_SHA,
+        # **The ROUTER document in the target, which has to be the repository's
+        # own bytes too** -- the domestic branch's policy, and the half of the
+        # plan's "production shipped config remains unchanged" that had no
+        # assertion before this one. Named separately from the DNSCrypt digests
+        # because it is a different file answering a different question: nothing
+        # writes it, so a disagreement is not an override and has to be read as a
+        # defect.
+        "router_dnscrypt": SHIPPED_MOSDNS_SHA,
         # The refusal case, and the state it leaves behind.
         "corrupt": CORRUPT_OUTPUT,
         "pin_restore": PIN_RESTORE_OUTPUT,
@@ -779,6 +796,20 @@ def install_rules(**overrides):
         # from the shipped one, and a case changes this answer to make it not.
         {"match": ["sha256sum", foreign_override.DNSCRYPT_CONFIG],
          "stdout": f"{answers['override_dnscrypt']}  {foreign_override.DNSCRYPT_CONFIG}\n"},
+        # **The ROUTER document, twice, and these two answers are the whole of
+        # "the production shipped config remains unchanged".** Before the
+        # assertion they did not exist, and the plan's Step 5 sentence had half of
+        # it unbacked: nothing in this harness read `/etc/mosdns/mosdns.yaml` at
+        # all. One digest is the target's file and one is the repository's own
+        # through the read-only mount, and they have to be EQUAL -- a cell where
+        # the harness had written the domestic branch's policy would still resolve
+        # every name and every counter would still read correctly. A case changes
+        # `router_dnscrypt` to make them disagree, and the scenario must refuse it
+        # by name.
+        {"match": ["sha256sum", install.ROUTER_CONFIG],
+         "stdout": f"{answers['router_dnscrypt']}  {install.ROUTER_CONFIG}\n"},
+        {"match": ["sha256sum", foreign_override.SHIPPED_ROUTER],
+         "stdout": f"{SHIPPED_MOSDNS_SHA}  {foreign_override.SHIPPED_ROUTER}\n"},
         # The `chmod` the scenario runs after the `cp`, and the read-back out of
         # the artifact. Both are `sh -c`, so both are matched on the one line that
         # distinguishes them from every other script the scenario runs.
@@ -861,7 +892,6 @@ def install_rules(**overrides):
          "returncode": answers["corrupt_present"]},
         {"match": ["test", "-e", "/var/lib/mosdns/lists/cloudflare-prefixes.txt"],
          "returncode": answers["corrupt_present"]},
-        # The two daemons the transaction owns, both active because it committed.
         # Recorded rather than asserted -- the scenario's claims about the two
         # units are the loopback hand-over and the enabled timers, and those are
         # things the transaction said about itself; a unit's `ActiveState` read
@@ -1149,6 +1179,136 @@ class ScenarioPassesTest(InstallScenarioHarness):
         self.assertEqual(record["artifact_dnscrypt_sha256"], SHIPPED_DNSCRYPT_SHA)
         self.assertEqual(
             record["artifact_dnscrypt_sha256"], record["foreign_override"]["shipped_sha256"]
+        )
+
+    def test_the_router_document_the_domestic_branch_runs_on_is_untouched(self):
+        """**The DNSCrypt document is not the only shipped document, and the other
+        one is the one the DOMESTIC branch runs on.**
+
+        The plan's Step 5 says "Production shipped config and packaged DNSCrypt
+        config remain unchanged and are asserted separately." Only the second half
+        had an assertion: this scenario digested
+        `/etc/mosdns/dnscrypt-proxy.toml` three ways and read nothing at all of
+        `/etc/mosdns/mosdns.yaml` -- `grep -rn "/etc/mosdns/mosdns" tests/podman/`
+        returned nothing.
+
+        So "the domestic branch stayed real" was a property of a file no assertion
+        touched. The concrete failure is not hypothetical: the override's whole
+        purpose is to point a *foreign forward address* at a mock, and if the
+        harness ever wrote the ROUTER document to do that instead, nothing would
+        fail, the domestic branch would stop being the project's real policy, and
+        **every counter would still read correctly** -- the split would look
+        perfect while being an artefact of the test's own configuration. A test
+        that cannot tell a real split from a manufactured one is worse than no
+        test, because it is green.
+
+        So the target's `/etc/mosdns/mosdns.yaml` is digested and required equal
+        to the repository's `configs/mosdns.yaml`, read through the same
+        read-only source mount the override is built from.
+        """
+        _fake, result = self.run_scenario()
+        record = self.record(result)
+        self.assertTrue(
+            record["router_document_matches_the_repository"],
+            f"the cell did not record the router document's digest: {sorted(record)}",
+        )
+        self.assertEqual(record["router_document_sha256"], SHIPPED_MOSDNS_SHA)
+        self.assertEqual(record["router_document_shipped_sha256"], SHIPPED_MOSDNS_SHA)
+        # And the read is a read of a PATH in the target -- a record with a digest
+        # and no path is a claim with nothing behind it.
+        self.assertEqual(record["router_document_path"], install.ROUTER_CONFIG)
+        self.assertEqual(record["router_document_shipped_from"], foreign_override.SHIPPED_ROUTER)
+
+    def test_a_router_document_that_is_not_the_shipped_one_fails_the_cell(self):
+        """**The control, and it is the whole point of the case above.**
+
+        A digest comparison nobody has watched fail is a green gate a real defect
+        walks through. So the router document is changed to something that is NOT
+        the shipped one -- here, a document whose forward points at the mock's own
+        address, which is exactly the defect the assertion exists for -- and the
+        cell must refuse it by name, with both digests, and must not report
+        `shipped_documents_unchanged`.
+        """
+        _fake, result = self.run_scenario(router_dnscrypt="0" * 64)
+        self.assertEqual(result.status, "failed")
+        self.assertIn(install.ROUTER_CONFIG, result.detail)
+        self.assertIn("0" * 64, result.detail)
+        self.assertIn(SHIPPED_MOSDNS_SHA, result.detail)
+        record = self.record(result)
+        self.assertNotIn("router_document_matches_the_repository", record)
+
+    def test_a_router_document_that_cannot_be_read_is_refused_rather_than_assumed(self):
+        """**An absent digest is not an equal digest.**
+
+        `digest_of` returns the empty string for a file it cannot read -- on
+        purpose, so a comparison between two placeholders cannot agree -- and this
+        is the case that holds the empty string from ever being compared to
+        anything. A router document the target cannot produce a digest for is a
+        cell that did not measure the thing it claims to measure, and it must not
+        pass for the same reason an unreadable listener table must not pass.
+        """
+        _fake, result = self.run_scenario(router_dnscrypt="")
+        self.assertEqual(result.status, "failed")
+        self.assertIn(install.ROUTER_CONFIG, result.detail)
+        self.assertIn("could not be", result.detail)
+
+    def test_a_digest_that_is_not_a_digest_is_not_read_as_one(self):
+        """**`sha256sum` prints `<digest>  <path>`, and a line that is only a path
+        is not a digest.**
+
+        `digest_of` took the first whitespace-separated field and stopped. A
+        wrapper that lost stdout, or an `sha256sum` that failed and printed its
+        argument, would then hand back **the path** as though it were the file's
+        hash -- and the comparison two hundred lines down, the one that says
+        whether the DOMESTIC branch is running this project's real policy, would
+        have compared a path with a digest and refused for a reason nobody could
+        read. A digest is 64 hex characters or it is nothing.
+
+        Three shapes, because the interesting one is the middle: a genuinely
+        wrong digest is a *different* failure and a different message, and a case
+        that could not tell them apart would pass for the wrong reason.
+        """
+        for answer, what in (
+            (f"{install.ROUTER_CONFIG}\n", "only the path, with no digest in front of it"),
+            (f"not-a-digest  {install.ROUTER_CONFIG}\n", "a field that is not 64 hex characters"),
+            (f"{'0' * 63}  {install.ROUTER_CONFIG}\n", "a digest one character short"),
+            (f"{'0' * 64}x  {install.ROUTER_CONFIG}\n", "a 65-character field"),
+        ):
+            with self.subTest(answer=what):
+                _fake, result = self.run_scenario(
+                    rules=[
+                        rule for rule in install_rules()
+                        if rule["match"] != ["sha256sum", install.ROUTER_CONFIG]
+                    ] + [{"match": ["sha256sum", install.ROUTER_CONFIG], "stdout": answer}],
+                )
+                self.assertEqual(result.status, "failed", f"{what} passed the cell")
+                self.assertIn(
+                    "could not be digested", result.detail,
+                    f"{what} was read as a digest rather than refused, and the message says so",
+                )
+
+    def test_a_digest_with_no_path_after_it_is_still_a_digest(self):
+        """**The control for the case above, and the reason the rule is 64 hex
+        characters and not a two-field line.**
+
+        `sha256sum <path>` normally prints `<digest>  <path>`, and the wrapper
+        strips trailing whitespace from stdout, so a case's rule table has to
+        decide what the second field is for. Refusing a bare digest would be
+        refusing the answer a `sha256sum` reading from stdin gives, and the shape
+        a BusyBox implementation gives -- so the rule is about what a digest IS
+        and not about how many fields arrived. A bare 64-hex line is a digest of
+        the file that was asked about.
+        """
+        _fake, result = self.run_scenario(
+            rules=[
+                rule for rule in install_rules()
+                if rule["match"] != ["sha256sum", install.ROUTER_CONFIG]
+            ] + [{"match": ["sha256sum", install.ROUTER_CONFIG],
+                  "stdout": f"{SHIPPED_MOSDNS_SHA}\n"}],
+        )
+        self.assertEqual(result.status, "passed", result.detail)
+        self.assertEqual(
+            self.record(result)["router_document_sha256"], SHIPPED_MOSDNS_SHA
         )
 
     def test_the_stamp_was_read_out_of_the_mocks_own_container(self):
