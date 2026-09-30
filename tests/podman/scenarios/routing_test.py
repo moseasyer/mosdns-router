@@ -16,10 +16,27 @@ required at the domestic listener and required **absent** from the foreign one,
 and the foreign name the other way round. A total would be satisfied by both
 branches being the same branch; a per-name count cannot be.
 
-**Both transports, and both vantage points.** UDP and TCP are asked separately
-from inside the target and from the client container, and a name that arrived
-only over UDP fails the cell -- a scenario that dropped TCP would still resolve
-every name it asked, and Step 6 asks for the repeat.
+**Both transports, and the vantage points the configuration can serve.** UDP and
+TCP are asked separately, and a name that arrived only over UDP fails the cell: a
+scenario that dropped TCP would still resolve every name it asked, and Step 6
+asks for the repeat.
+
+The *vantage points* are whatever the target's own listener table says it can
+serve, which against the configuration this project ships is **one**: the router
+binds `127.0.0.1:53` and nothing else, so a client container on this bridge
+cannot ask it anything. The plan's Task 4 Step 3 asks for loopback listeners only,
+so Step 6's client half and Step 3 cannot both hold; the plan's own Global
+Constraints say what to do with a requirement a container cannot close, and this
+is that -- record it as a REQUIRED SKIP carrying the requirement's exact wording,
+run the rest of the step for real, and let the run be `incomplete`.
+
+**A cell that refuses before it asks anything cannot tell a working split from a
+broken one.** The first version of this file refused at the reachability check, so
+one plan contradiction cost the substance of the whole step: the per-name,
+per-transport counters below were written, were green against the fake, and had
+never been measured on a live cell on any release. So the reachability read is a
+*classification* and not a verdict, the rest of the step runs either way, and the
+evidence document records which vantage points produced the numbers.
 
 **How a client's answer is known to have come through the target.** A client
 container on the private network has the mock router available to it, so an
@@ -27,10 +44,9 @@ answer it receives is not by itself evidence about the target. The scenario
 therefore puts the *target's* address in the client's `/etc/resolv.conf` -- the
 one resolver the client can ask is the target -- and then reads the two mocks'
 counters, which are what the target's own forwarding reached. The client's
-`resolv.conf` is read and recorded, so a reader of the evidence document sees
-which resolver was asked rather than trusting that the answer came from the right
-place, and a client whose resolver is *not* the target is refused rather than
-measured.
+`resolv.conf` is read and recorded whether or not the client ends up being asked,
+so a reader of the evidence document sees which resolver it *could* have asked;
+and a client whose resolver is *not* the target is refused rather than measured.
 
 **The two names, and where they come from.** The China-set name is read out of
 the *published* `/var/lib/mosdns/lists/cn-domains.txt`, not written down here: a
@@ -56,7 +72,7 @@ from pathlib import Path
 from typing import Callable
 
 from podman import PodmanError
-from report import ScenarioResult
+from report import ScenarioResult, Skip
 
 SCENARIO_NAME = "routing"
 
@@ -136,13 +152,42 @@ FOREIGN_ANSWER = "198.51.100.7"
 DOMESTIC_ANSWER = "192.168.123.53"
 
 # The marker `try_read` puts on a read podman could not do, and which is
-# therefore not a reading. The refusal in section 1b is a claim about the
-# configuration this project ships, and a claim made on a read that failed is
-# worse than no claim at all: it sends a reader to the plan with a reason that
-# was never measured. MEASURED -- the read had no container in it, podman was
-# asked for one named `sh`, and the text that does not contain the address being
-# looked for satisfied the check. See the comment at the read.
+# therefore not a reading. The reachability classification in section 1b is a
+# claim about the configuration this project ships, and a claim made on a read
+# that failed is worse than no claim at all: it sends a reader to the plan with a
+# reason that was never measured. MEASURED -- the read had no container in it, so
+# podman was asked for one named `sh`, and the text that does not contain the
+# address being looked for satisfied the check. See the comment at the read.
 READ_FAILED = "(not readable:"
+
+# **The requirement this scenario cannot close, in the plan's exact words.**
+#
+# The Global Constraints say "A requirement a container cannot close is recorded
+# SKIPPED with its exact wording", so the wording is a **copy** of the plan's
+# Task 4 Step 6 sentence and not a summary of it: a reader checking the claim
+# against the requirement is the whole point, and a paraphrase would make them
+# check their memory of the requirement instead. The plan's sentence is the one
+# below, the first half of which is what the shipped configuration forbids.
+#
+# **Why the wording stops at "names".** Step 6's sentence is two sentences joined
+# by "and", and the second one ("Assert query counters at mock domestic and mock
+# foreign listeners. Repeat over UDP and TCP.") IS closed, from inside the
+# target. So the requirement recorded as skipped is the vantage point, not the
+# step -- a skip of the whole step would be false, and a skip that claimed the
+# counters were unmeasured would be false in the other direction.
+CLIENT_VANTAGE_POINT_REQUIREMENT = (
+    "From a separate client container and from inside the target, query "
+    "China-set and foreign test names."
+)
+
+# The word the reason carries, and the record's own name for it. Two spellings of
+# one fact in two files is how they drift, and this one has already been wrong
+# once: the first version of this section's message said the queries asked from
+# inside the target "do move both listeners' counters", which was a claim about a
+# measurement nobody had taken, one level below the unfounded refusal the read
+# above is about. Now the counters ARE measured, so the sentence is earned -- and
+# the evidence document says which vantage points produced them.
+CLIENT_VANTAGE_POINT_REASON = "not bound on the bridge"
 
 # How long to wait for a counter to move. A bounded poll of a real fact, like every
 # other wait in this harness: the mock writes the document on the query path, so
@@ -405,6 +450,13 @@ def build_scenario(
             # about the target only if the client could ask nobody else. A client
             # on this network has the mock router reachable, so "the client got
             # an answer" is not by itself evidence about the target.
+            #
+            # **Required whether or not the client is asked**, and the record keeps
+            # it either way: the harness points the client at the target before any
+            # scenario runs, so a client whose resolver is not the target is a
+            # broken cell and not an unmeasurable one. Section 1b decides whether
+            # the client can be asked anything; this decides whether it was pointed
+            # anywhere useful.
             client_resolver = try_read(client, "cat", "/etc/resolv.conf")
             document["client_resolver"] = client_resolver
             _require(
@@ -432,79 +484,104 @@ def build_scenario(
                 "measured a different configuration",
             )
 
-            # -- 1b. whether a client container can ask the target at all ----
+            # -- 1b. WHICH vantage points this configuration can serve --------
             # **This project ships a router that binds `127.0.0.1:53` and nothing
             # else, and its own package Description says so: "no listener in this
             # package is reachable from another host".** So a client container on
             # this bridge cannot ask the target anything -- `dig @10.89.0.10 -p 53`
             # is `exited 9`, "no reply from server", because nothing is bound to
             # that address. MEASURED on 24.04 and 26.04, and the target's own
-            # `ss -lntup` is quoted below in every cell that refuses.
+            # `ss -lntup` is recorded in every cell below.
             #
-            # The plan's Task 4 Step 6 asks for the client vantage point as well as
-            # the target's, and the two cannot both hold against a loopback-only
-            # router. That is a finding, not something to work around by binding a
-            # port this project refuses to expose -- and it is read from the
-            # target's own listener table rather than inferred from a timeout, so
-            # the cell is refused with the sentence a reader needs rather than
-            # with "the mock router's query log does not carry a query" sixty
-            # seconds later.
+            # **This is a CLASSIFICATION and not a refusal, and the difference is
+            # the whole of the fix.** The plan's Task 4 Step 6 asks for the client
+            # vantage point AND the target's, and the first cannot exist against
+            # the configuration this project ships. The Global Constraints say
+            # what to do with a requirement a container cannot close: record it
+            # **SKIPPED with its exact wording**, and never report a skip as a
+            # pass. So that is what happens -- and then **the rest of the step
+            # runs**, because the counters, the split, both transports and the
+            # answer/branch match are all closable from inside the target.
             #
-            # **The table is a measurement or this check is nothing, and the two
-            # ways it can fail to be one are refused as themselves.** MEASURED on
-            # the first three-release run: this read had no container in it, so
-            # podman was asked for a container named `sh` and answered
+            # The first version of this refused here, before asking anything. So
+            # one plan contradiction cost the substance of the whole step: the
+            # per-name, per-transport counters were written, were green against
+            # the fake, and had never been measured on a live cell on any
+            # release. **A cell that refuses before it asks anything cannot tell a
+            # working split from a broken one**, and that is a worse defect than
+            # the one the refusal was reporting.
+            #
+            # **The table is a measurement or this classification is nothing, and
+            # the two ways it can fail to be one are refused as themselves.**
+            # MEASURED on the first three-release run: this read had no container
+            # in it, so podman was asked for a container named `sh` and answered
             #
             #     (not readable: Error: no container with name or ID "sh" found:
             #     no such container)
             #
             # -- a string that does not contain `10.89.0.10:53`, which is exactly
-            # what the check below looks for. The refusal that followed was TRUE
-            # and UNFOUNDED at the same time, which is the worst of both: a cell
-            # whose router did bind the bridge address would have been refused for
-            # the same reason. An empty table is the same defect wearing a
+            # what the check below looks for. The conclusion that followed was
+            # TRUE and UNFOUNDED at the same time, which is the worst of both: a
+            # cell whose router did bind the bridge address would have been
+            # classified the same way. An empty table is the same defect wearing a
             # different mask -- `ss -lntup` prints a header whether or not
-            # anything is bound, and the `|| true` in the command means a missing
-            # `ss` looks like an empty one. Neither is a routing result, so
-            # neither is allowed to produce one.
+            # anything is bound, and the `|| true` on the command means a missing
+            # `ss` looks exactly like an empty one. Neither is a routing result, so
+            # neither is allowed to produce one -- and a classification built on
+            # either would file a SKIP of a requirement the cell could have closed.
             listeners = try_read(target, "sh", "-c", "ss -lntup 2>/dev/null || true")[:4000]
             document["target_listeners"] = listeners
             _require(
                 READ_FAILED not in listeners,
                 f"the target's own listener table could not be read in {target} -- podman said "
-                f"{listeners!r} -- so this scenario has NOT measured whether anything is bound to "
-                f"{TARGET_ADDRESS}:53, and the plan's client vantage point is therefore unmeasured "
-                f"rather than absent. That is a harness fault and not a routing result, and it is "
-                f"refused as one: a finding about this project's own packaging is not something to "
-                f"send a reader to the plan on the strength of a command that did not run",
+                f"{listeners!r} -- so this scenario has NOT established whether a client "
+                f"container can ask the target's resolver, and the plan's client vantage point "
+                f"is therefore UNMEASURED rather than unclosable. That is a harness fault and not "
+                f"a routing result, and it is refused as one: a SKIP is a claim about the "
+                f"configuration this project ships, and this scenario will not file one on the "
+                f"strength of a command that did not run",
             )
             _require(
                 bool(listeners.strip()),
                 f"`ss -lntup` printed nothing at all in {target}, and it prints a header whether or "
                 "not anything is bound -- so an empty table is a read that did not happen rather than "
                 "a table with no rows. The `|| true` on the command means a missing `ss` looks "
-                "exactly like this, so the cell cannot conclude anything about what is bound",
+                "exactly like this, so the cell cannot classify anything about what is bound",
             )
-            _require(
-                f"{TARGET_ADDRESS}:53" in listeners,
-                f"nothing is bound to {TARGET_ADDRESS}:53 in {target}, so a client container on "
-                f"this run's private network cannot ask the target's resolver anything -- and "
-                f"this project's own router does not bind it. `configs/mosdns.yaml` listens on "
-                f"127.0.0.1:53 and nothing else, and the package's Description says 'no listener "
-                f"in this package is reachable from another host'.\n"
-                f"So the CLIENT vantage point of the plan's Task 4 Step 6 -- 'from a separate "
-                f"client container AND from inside the target' -- cannot be measured against the "
-                f"configuration this project ships: `dig @{TARGET_ADDRESS} -p 53` is `exited 9` "
-                f"('no reply from server') on every query, MEASURED on 24.04 and 26.04.\n"
-                f"The queries asked from INSIDE the target do exercise both branches and do move "
-                f"both listeners' counters, so the split is measurable from one vantage point "
-                f"rather than two. Measuring the second would mean binding a listener this "
-                f"project's own packaging refuses to expose, and the plan's Task 4 Step 3 asks "
-                f"for loopback listeners only -- so the two requirements contradict each other "
-                f"and the resolution belongs to the plan, not to this scenario.\n"
-                f"The target's own listener table, which is what this refusal is based on:\n"
-                f"{listeners}",
-            )
+            client_reachable = f"{TARGET_ADDRESS}:{RESOLVER_PORT}" in listeners
+            document["client_vantage_point_measured"] = client_reachable
+            skips: list[Skip] = []
+            if client_reachable:
+                document["client_vantage_point_reason"] = "bound on the bridge"
+            else:
+                document["client_vantage_point_reason"] = CLIENT_VANTAGE_POINT_REASON
+                skips.append(
+                    Skip(
+                        requirement=CLIENT_VANTAGE_POINT_REQUIREMENT,
+                        reason=(
+                            f"nothing is bound to {TARGET_ADDRESS}:{RESOLVER_PORT} in {target}, and "
+                            f"this project's own router does not bind it. `configs/mosdns.yaml` "
+                            f"listens on 127.0.0.1:53 and nothing else, and the package's own "
+                            f"Description says 'no listener in this package is reachable from "
+                            f"another host'. A client container on this bridge therefore cannot ask "
+                            f"the target's resolver anything: `dig @{TARGET_ADDRESS} -p "
+                            f"{RESOLVER_PORT}` is `exited 9` ('no reply from server'), MEASURED on "
+                            f"24.04 and 26.04. The plan's Task 4 Step 3 asks for loopback listeners "
+                            f"only, so the two requirements cannot both hold; the vantage point is "
+                            f"recorded as skipped rather than substituted with a second network "
+                            f"namespace, whose 127.0.0.1 would be the target's own and therefore "
+                            f"not a second vantage point at all. The counters, the split, both "
+                            f"transports and the answer/branch match ARE closed, from inside "
+                            f"{target}. The target's listener table:\n{listeners}"
+                        ),
+                    )
+                )
+            # The vantage points that will be asked, in the order they are asked:
+            # one or two, and the record says which -- so a reader of the evidence
+            # document can tell an unmeasured vantage point from an unrecorded one.
+            vantage_points = ("target", "client") if client_reachable else ("target",)
+            document["vantage_points_measured"] = list(vantage_points)
+            containers = {"target": target, "client": client}
 
             # -- 2. the two names, and which branch each must reach ---------
             # The China name is read out of the *published* list, so it is a name
@@ -549,23 +626,31 @@ def build_scenario(
             document["foreign_name"] = FOREIGN_TEST_NAME
             document["china_set_entry"] = china_name
 
-            # -- 3. the queries, from both vantage points, over both transports
-            # Asked from inside the target and from the client container, and over
-            # UDP and TCP, with all four combinations asked. A scenario that asked
-            # one vantage point would leave the other's path unexercised, and a
-            # client is a different resolver stack (glibc, through resolved) from
-            # a direct `dig` inside the target.
-            answers: dict[str, dict[str, str]] = {}
-            for vantage, container in (("target", target), ("client", client)):
+            # -- 3. the queries, from the measured vantage points, both transports
+            # **From the vantage points section 1b established, and not from a
+            # fixed pair.** A cell that asked the client unconditionally would be
+            # asking a container nothing is listening for and would then report
+            # four empty answers as a routing failure; a cell that asked nothing at
+            # all because one vantage point was unclosable is what the first
+            # version did, and it measured nothing. So the loop is over
+            # `vantage_points`, which is one or two, and the record says which.
+            #
+            # A client is a different resolver stack (glibc, through resolved) from
+            # a direct `dig` inside the target, which is why the plan asked for
+            # both; over each vantage point, UDP and TCP are asked separately,
+            # because a scenario that dropped TCP would still resolve every name it
+            # asked.
+            answers: dict[str, str] = {}
+            for vantage in vantage_points:
                 for name_key, name in (("domestic", document["domestic_name"]),
                                        ("foreign", document["foreign_name"])):
                     for transport in TRANSPORTS:
                         key = f"{vantage}/{name_key}/{transport}"
-                        answers[key] = ask(container, name, transport)
+                        answers[key] = ask(containers[vantage], name, transport)
                         document.setdefault("answers", {})[key] = answers[key]
             _require(
                 all(value.strip() for value in answers.values()),
-                "at least one of the eight queries returned nothing, so a branch was not "
+                f"at least one of the {len(answers)} queries returned nothing, so a branch was not "
                 "exercised end to end. The answers were:\n"
                 + json.dumps(answers, indent=2, sort_keys=True)
                 + "\nAn empty answer here is not a routing result: it means a query was asked "
@@ -660,7 +745,11 @@ def build_scenario(
             # answer that came back is the one that listener answers with. A
             # resolver that asked the right listener and then answered from
             # somewhere else would satisfy the counters alone.
-            for vantage in ("target", "client"):
+            #
+            # **Over the measured vantage points**, for the reason section 3 gives:
+            # asking for a `client/...` answer the cell never collected would index
+            # a key that does not exist and report a KeyError as a routing failure.
+            for vantage in vantage_points:
                 for name_key, expected in (
                     ("domestic", DOMESTIC_ANSWER),
                     ("foreign", FOREIGN_ANSWER),
@@ -673,15 +762,36 @@ def build_scenario(
                             f"the {key} query returned {got!r}, which is not the address the "
                             f"{'domestic' if name_key == 'domestic' else 'foreign'} mock "
                             f"answers with ({expected}). So the answer did not come from the "
-                            "listener this scenario is counting, and the counters would be "
-                            "evidence about a listener that did not answer it",
+                            f"listener this scenario is counting, and the counters would be "
+                            f"evidence about a listener that did not answer it",
                         )
             document["answers_match_their_branch"] = True
 
             evidence(document)
+            # **The detail names the vantage points that were asked, and names the
+            # one that was not as NOT ASKED.** The first version's sentence here
+            # claimed that "the queries asked from INSIDE the target do exercise
+            # both branches and do move both listeners' counters" -- on a cell that
+            # had asked nothing, which is a claim about a measurement nobody had
+            # taken, one level below the unfounded refusal the listener-table read
+            # was. Now the counters ARE measured, so the sentence can be said, and
+            # it is said with the counts in it.
+            asked_from = ", ".join(containers[vantage] for vantage in vantage_points)
+            not_asked = (
+                ""
+                if client_reachable
+                else (
+                    f" The separate client container {client} was NOT asked anything: nothing is "
+                    f"bound to {TARGET_ADDRESS}:{RESOLVER_PORT} in the target "
+                    f"({CLIENT_VANTAGE_POINT_REASON}), so that vantage point of the plan's Step 6 "
+                    f"is recorded as a required SKIP with its exact wording, and the run is "
+                    f"therefore incomplete rather than passed. "
+                )
+            )
             return ScenarioResult(
                 name=SCENARIO_NAME,
                 status="passed",
+                skips=tuple(skips),
                 detail=(
                     f"the two branches reached two different listeners, and the counters say so: "
                     f"the China-set name {china!r} was asked of the mock router at "
@@ -691,14 +801,22 @@ def build_scenario(
                     f"({document['foreign_counters'].get(foreign_name, {}).get('udp', 0)} time(s)) "
                     f"and over TCP "
                     f"({document['foreign_counters'].get(foreign_name, {}).get('tcp', 0)} time(s)) "
-                    f"and never of the mock router. Asked from inside {target} and from the "
-                    f"separate client container {client}, whose only resolver is the target. "
-                    "Nothing here says anything about IPv6: no cell in this scenario asks an "
+                    f"and never of the mock router. Asked over UDP and TCP from {asked_from}."
+                    f"{not_asked}"
+                    " Nothing here says anything about IPv6: no cell in this scenario asks an "
                     "AAAA question"
                 ),
                 log=f"logs/{version}-{SCENARIO_NAME}.json",
             )
         except RoutingScenarioError as error:
+            # **A failure carries no skip.** A skip is a claim that a requirement
+            # cannot be closed by this configuration; a failure is a claim that
+            # something went wrong. Filing the skip here as well would make a cell
+            # that measured a broken split look like a cell that ran out of vantage
+            # points -- and would let a *failed* cell be reported as `incomplete`,
+            # which is a softer reading of the same red. The two are kept apart so
+            # a reader of the report can tell "could not be measured" from "was
+            # measured and was wrong".
             evidence(document)
             return ScenarioResult(
                 name=SCENARIO_NAME, status="failed", detail=str(error),
@@ -739,6 +857,8 @@ __all__ = [
     "FOREIGN_TEST_NAME",
     "MOCK_FOREIGN_ADDRESS",
     "MOCK_ROUTER_ADDRESS",
+    "CLIENT_VANTAGE_POINT_REASON",
+    "CLIENT_VANTAGE_POINT_REQUIREMENT",
     "PUBLISHED_CN_LIST",
     "READ_FAILED",
     "RoutingScenarioError",

@@ -38,6 +38,7 @@ sys.path.insert(0, str(SCENARIOS))
 
 import test_command  # noqa: E402
 
+import report  # noqa: E402
 from podman import Podman  # noqa: E402
 
 PodmanTestCase = test_command.PodmanTestCase
@@ -265,7 +266,8 @@ class RoutingScenarioHarness(PodmanTestCase):
 
 class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
     """**The plan's client half cannot be measured, and the reason is the
-    package's own headline property.**
+    package's own headline property — so it is a SKIP, and the rest of the step
+    still runs.**
 
     Task 4 Step 6 says "from a separate client container **and** from inside the
     target, query China-set and foreign test names". The second vantage point
@@ -288,13 +290,25 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
 
     `exited 9` is `dig`'s "no reply from server", on all four client queries.
 
-    So the scenario does not wait out its whole budget to report a symptom. It
-    reads the target's own listener table first and, when nothing is bound to the
-    bridge address, refuses **naming this**: the finding is that Step 6's client
-    half and the package's loopback-only property cannot both hold, and a reader
-    needs that sentence rather than a 60-second timeout followed by "the mock
-    router's query log does not carry a query", which is what the first version
-    produced.
+    **What the first version of this did was refuse the cell before asking
+    anything**, so one plan contradiction cost the substance of the whole step:
+    the per-name counters, the split, both transports and the answer/branch match
+    were all written, all green against the fake, and never measured on a live
+    cell on any release. A cell that refuses before it asks anything cannot tell
+    a working split from a broken one.
+
+    The plan's Global Constraint is explicit about this case — "A requirement a
+    container cannot close is recorded **SKIPPED with its exact wording**. It is
+    never closed by substituting a different kind of test, and a skip is never
+    reported as a pass" — and this plan's own implementer chose required-skip →
+    `incomplete` → exit 3 over `failed` → exit 1 in Task 4 Step 1, on the reasoning
+    that a red matrix for something that is not a defect is the wrong disposition.
+    The priority is not "how do I reach exit 0": a rule that exists so a run
+    cannot reach 0 by declining to file an unclosable requirement must not be used
+    as a reason not to file one.
+
+    So: the client half is a **required skip carrying the plan's exact wording**,
+    the target half runs for real, and the run is `incomplete` — never a pass.
     """
 
     LISTENERS_LOOPBACK_ONLY = (
@@ -307,39 +321,176 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
         "tcp   LISTEN 0      128       10.89.0.10:53       0.0.0.0:*\n"
     )
 
-    def test_a_router_bound_to_loopback_only_is_refused_and_says_why(self):
-        _fake, result = self.run_scenario(
+    def loopback_only(self, **overrides):
+        return self.run_scenario(
             rules=[
                 {"match": ["sh", "-c"], "match_contains": "ss -lntup",
                  "stdout": self.LISTENERS_LOOPBACK_ONLY},
-            ] + routing_rules(),
+            ] + routing_rules(**overrides),
         )
-        self.assertEqual(result.status, "failed")
-        self.assertIn("reachable from another host", result.detail)
-        self.assertIn("cannot be measured", result.detail)
-        self.assertIn(TARGET_ADDRESS, result.detail)
-        self.assertIn(f"nothing is bound to {TARGET_ADDRESS}:53", result.detail)
-        # And the listener table is in the evidence, because a reader who doubts
-        # the refusal needs the reading the refusal is based on.
+
+    def test_a_loopback_only_router_files_the_client_vantage_point_as_a_required_skip(self):
+        fake, result = self.loopback_only()
+        self.assertEqual(result.status, "passed", result.detail)
+        self.assertEqual(
+            len(result.skips), 1,
+            f"the client half is unclosable and nothing was filed for it: {result.skips}",
+        )
+        skip = result.skips[0]
+        self.assertTrue(skip.required, "a skip that is not required cannot refuse a pass")
+        # **The exact wording, from the plan.** A skip that paraphrases the
+        # requirement is a reader checking their memory of it rather than the
+        # requirement, and the Global Constraint asks for the exact words so the
+        # claim can be checked against the requirement and not against a summary.
+        self.assertEqual(skip.requirement, routing.CLIENT_VANTAGE_POINT_REQUIREMENT)
+        self.assertEqual(
+            skip.requirement,
+            "From a separate client container and from inside the target, query "
+            "China-set and foreign test names.",
+        )
+        # And the reason names the measurement, not the symptom.
+        self.assertIn(TARGET_ADDRESS, skip.reason)
+        self.assertIn("reachable from another host", skip.reason)
+        self.assertIn(self.LISTENERS_LOOPBACK_ONLY.splitlines()[0].split()[3], skip.reason)
+
+    def test_the_split_is_measured_even_though_the_client_half_is_not(self):
+        """**The substance of Step 6, measured, with the client half filed as a
+        skip rather than used as an excuse.**
+
+        This is the case the previous version could not have. A cell that refuses
+        at the reachability check records no counters, no answers and no split, so
+        on every release the assertions below were green against the fake and
+        unmeasured against a container. Here they are exercised end to end with
+        the listener table saying the client cannot be asked, and the four
+        target-side queries are the ones that ran.
+        """
+        fake, result = self.loopback_only()
+        self.assertEqual(result.status, "passed", result.detail)
         record = self.record(result)
+        self.assertTrue(
+            record["branches_distinguished"],
+            f"no split was measured: {sorted(record)}",
+        )
+        self.assertGreaterEqual(
+            record["domestic_counters"].get(CHINA_NAME, 0), 1,
+            f"the domestic listener never saw the China name: {record['domestic_counters']}",
+        )
+        for transport in ("udp", "tcp"):
+            self.assertGreaterEqual(
+                record["foreign_counters"].get(FOREIGN_NAME, {}).get(transport, 0), 1,
+                f"the foreign listener was not asked over {transport}: {record['foreign_counters']}",
+            )
+        self.assertNotIn(CHINA_NAME, record["foreign_counters"])
+        self.assertNotIn(FOREIGN_NAME, record["domestic_counters"])
+        self.assertTrue(record["answers_match_their_branch"])
+        # **Four queries, not eight**, and they are the target's: the client half
+        # is not recorded as asked and then ignored, it is not asked.
+        self.assertEqual(
+            sorted(record["answers"]),
+            sorted(
+                f"target/{name_key}/{transport}"
+                for name_key in ("domestic", "foreign")
+                for transport in ("udp", "tcp")
+            ),
+            f"the answers recorded are {sorted(record['answers'])}",
+        )
+        asked_client = [line for line in self.asked_in(fake, CLIENT) if "dig" in line]
+        self.assertEqual(
+            asked_client, [],
+            f"the client was asked {len(asked_client)} question(s) after the skip was filed: "
+            f"{asked_client}",
+        )
+        asked_target = [line for line in self.asked_in(fake, TARGET) if "dig" in line]
+        self.assertEqual(len(asked_target), 4, f"the target was asked {asked_target}")
+
+    def test_the_record_says_which_vantage_points_were_measured(self):
+        """A reader of the evidence document has to be able to tell that the client
+        half is unmeasured from the document alone, without reading the prose."""
+        _fake, result = self.loopback_only()
+        record = self.record(result)
+        self.assertEqual(record["vantage_points_measured"], ["target"])
+        self.assertEqual(record["client_vantage_point_measured"], False)
+        self.assertEqual(record["client_vantage_point_reason"], "not bound on the bridge")
         self.assertIn("127.0.0.1:53", record["target_listeners"])
         self.assertNotIn(TARGET_ADDRESS, record["target_listeners"])
+
+    def test_the_detail_does_not_claim_a_container_asked_nothing_was_asked(self):
+        """**The sentence a reader is sent to the plan with has to be true of what
+        the cell did.**
+
+        The first version's refusal said "The queries asked from INSIDE the target
+        do exercise both branches and do move both listeners' counters" — a claim
+        about a measurement nobody had taken, one level down from the unfounded
+        refusal `fc06e2a` fixed. Now the counters are measured, so the sentence is
+        earned; and the *client* is named only as the vantage point that was not
+        used, never as one that was.
+        """
+        _fake, result = self.loopback_only()
+        self.assertIn(TARGET, result.detail)
+        self.assertIn("skip", result.detail.lower())
+        self.assertIn("not bound", result.detail.lower())
+        self.assertNotIn(
+            f"from the separate client container {CLIENT}", result.detail,
+            "the detail says the client was asked when the cell did not ask it",
+        )
+        # And the measurement it now claims is in the record.
+        record = self.record(result)
+        self.assertIn(
+            str(record["domestic_counters"].get(CHINA_NAME, 0)), result.detail,
+            "the detail does not carry the count it claims was moved",
+        )
+
+    def test_a_version_with_this_skip_is_incomplete_and_never_passed(self):
+        """**The disposition, asserted on the type the gate reads.**
+
+        The plan says a skip is never reported as a pass, and `VersionResult.status`
+        is where that is enforced — so a case that only checked the scenario's own
+        `status` would leave the one thing a reader of the report sees unheld. This
+        drives the real type with the real result.
+        """
+        _fake, result = self.loopback_only()
+        version = report.VersionResult(
+            version=VERSION, arch="amd64", scenarios=(result,),
+            skips=tuple(result.skips), recorded=None,
+        )
+        self.assertEqual(version.status, report.STATUS_INCOMPLETE)
+        self.assertNotEqual(version.status, report.STATUS_PASSED)
+        # And the report's own exit-code mapping is what turns that into 3.
+        self.assertEqual(
+            report.EXIT_INCOMPLETE, 3,
+            "the run's exit code for an incomplete matrix is not 3, so a required skip would "
+            "not keep the run off a pass",
+        )
 
     def test_a_router_also_bound_to_the_bridge_address_is_not_refused_for_that(self):
         # The control: the refusal is about the BINDING, not about the client. A
         # cell whose router does listen on the bridge address -- which is a
         # configuration this project does not ship, and which the plan's Task 4
-        # Step 3 forbids -- must get past this check and on to the counters, or
-        # the case is a statement about the container rather than about the
-        # binding.
-        _fake, result = self.run_scenario(
+        # Step 3 forbids -- must get past this check, ask the client, and file no
+        # skip, or the case is a statement about the container rather than about
+        # the binding.
+        fake, result = self.run_scenario(
             rules=[
                 {"match": ["sh", "-c"], "match_contains": "ss -lntup",
                  "stdout": self.LISTENERS_ON_THE_BRIDGE},
             ] + routing_rules(),
         )
         self.assertEqual(result.status, "passed", result.detail)
-        self.assertIn(TARGET_ADDRESS, self.record(result)["target_listeners"])
+        self.assertEqual(result.skips, (), "a router that is reachable filed a skip")
+        record = self.record(result)
+        self.assertEqual(record["vantage_points_measured"], ["target", "client"])
+        self.assertTrue(record["client_vantage_point_measured"])
+        self.assertEqual(len(record["answers"]), 8)
+        self.assertEqual(
+            sorted(record["answers"]),
+            sorted(
+                f"{vantage}/{name_key}/{transport}"
+                for vantage in ("target", "client")
+                for name_key in ("domestic", "foreign")
+                for transport in ("udp", "tcp")
+            ),
+        )
+        self.assertIn(TARGET_ADDRESS, record["target_listeners"])
 
     def test_the_listener_table_is_read_from_the_target(self):
         """**The reading the refusal rests on is a reading, not a podman error.**
@@ -537,6 +688,37 @@ class RoutingScenarioTest(RoutingScenarioHarness):
 
 class TheCountersAreTheMeasurementTest(RoutingScenarioHarness):
     """What makes the counters load-bearing rather than decorative."""
+
+    def test_a_broken_split_is_a_failure_and_files_no_skip(self):
+        """**A skip and a failure are different claims and must not be conflated.**
+
+        A skip says a requirement cannot be closed by this configuration. A failure
+        says something went wrong. A cell that measured a broken split AND filed
+        the client-vantage-point skip would be reported `incomplete` -- a softer
+        reading of the same red, and one where the routing defect is filed as a
+        limitation of the environment.
+
+        The shape here is the one the counters exist to catch: both names reached
+        the foreign listener, so the split is not there. The listener table says
+        the client is unreachable, so the skip WOULD be filed on a passing run --
+        and the point is that it is not filed on a failing one.
+        """
+        rules = [
+            {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+             "stdout": TheClientCannotReachALoopbackOnlyRouterTest.LISTENERS_LOOPBACK_ONLY},
+        ] + routing_rules(
+            foreign=counters_document(
+                **{f"{FOREIGN_NAME}/udp": 1, f"{FOREIGN_NAME}/tcp": 1, f"{CHINA_NAME}/udp": 1},
+            ),
+        )
+        _fake, result = self.run_scenario(rules=rules)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            result.skips, (),
+            "a failed cell filed the unclosable-requirement skip, so a red routing result would "
+            "be reported as an incomplete matrix",
+        )
+        self.assertIn(CHINA_NAME, result.detail)
 
     def test_a_china_name_that_reached_the_foreign_listener_is_refused(self):
         """**The control for the whole scenario.**"""
