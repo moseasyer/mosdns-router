@@ -135,6 +135,15 @@ CHINA_TEST_NAME = "(read from the published China list)"
 FOREIGN_ANSWER = "198.51.100.7"
 DOMESTIC_ANSWER = "192.168.123.53"
 
+# The marker `try_read` puts on a read podman could not do, and which is
+# therefore not a reading. The refusal in section 1b is a claim about the
+# configuration this project ships, and a claim made on a read that failed is
+# worse than no claim at all: it sends a reader to the plan with a reason that
+# was never measured. MEASURED -- the read had no container in it, podman was
+# asked for one named `sh`, and the text that does not contain the address being
+# looked for satisfied the check. See the comment at the read.
+READ_FAILED = "(not readable:"
+
 # How long to wait for a counter to move. A bounded poll of a real fact, like every
 # other wait in this harness: the mock writes the document on the query path, so
 # a counter is there the moment the query has been answered, and a scenario that
@@ -429,7 +438,8 @@ def build_scenario(
             # package is reachable from another host".** So a client container on
             # this bridge cannot ask the target anything -- `dig @10.89.0.10 -p 53`
             # is `exited 9`, "no reply from server", because nothing is bound to
-            # that address. MEASURED on 24.04 and 26.04.
+            # that address. MEASURED on 24.04 and 26.04, and the target's own
+            # `ss -lntup` is quoted below in every cell that refuses.
             #
             # The plan's Task 4 Step 6 asks for the client vantage point as well as
             # the target's, and the two cannot both hold against a loopback-only
@@ -439,11 +449,44 @@ def build_scenario(
             # the cell is refused with the sentence a reader needs rather than
             # with "the mock router's query log does not carry a query" sixty
             # seconds later.
-            document["target_listeners"] = try_read(
-                "sh", "-c", "ss -lntup 2>/dev/null || true"
-            )[:4000]
+            #
+            # **The table is a measurement or this check is nothing, and the two
+            # ways it can fail to be one are refused as themselves.** MEASURED on
+            # the first three-release run: this read had no container in it, so
+            # podman was asked for a container named `sh` and answered
+            #
+            #     (not readable: Error: no container with name or ID "sh" found:
+            #     no such container)
+            #
+            # -- a string that does not contain `10.89.0.10:53`, which is exactly
+            # what the check below looks for. The refusal that followed was TRUE
+            # and UNFOUNDED at the same time, which is the worst of both: a cell
+            # whose router did bind the bridge address would have been refused for
+            # the same reason. An empty table is the same defect wearing a
+            # different mask -- `ss -lntup` prints a header whether or not
+            # anything is bound, and the `|| true` in the command means a missing
+            # `ss` looks like an empty one. Neither is a routing result, so
+            # neither is allowed to produce one.
+            listeners = try_read(target, "sh", "-c", "ss -lntup 2>/dev/null || true")[:4000]
+            document["target_listeners"] = listeners
             _require(
-                f"{TARGET_ADDRESS}:53" in document["target_listeners"],
+                READ_FAILED not in listeners,
+                f"the target's own listener table could not be read in {target} -- podman said "
+                f"{listeners!r} -- so this scenario has NOT measured whether anything is bound to "
+                f"{TARGET_ADDRESS}:53, and the plan's client vantage point is therefore unmeasured "
+                f"rather than absent. That is a harness fault and not a routing result, and it is "
+                f"refused as one: a finding about this project's own packaging is not something to "
+                f"send a reader to the plan on the strength of a command that did not run",
+            )
+            _require(
+                bool(listeners.strip()),
+                f"`ss -lntup` printed nothing at all in {target}, and it prints a header whether or "
+                "not anything is bound -- so an empty table is a read that did not happen rather than "
+                "a table with no rows. The `|| true` on the command means a missing `ss` looks "
+                "exactly like this, so the cell cannot conclude anything about what is bound",
+            )
+            _require(
+                f"{TARGET_ADDRESS}:53" in listeners,
                 f"nothing is bound to {TARGET_ADDRESS}:53 in {target}, so a client container on "
                 f"this run's private network cannot ask the target's resolver anything -- and "
                 f"this project's own router does not bind it. `configs/mosdns.yaml` listens on "
@@ -460,7 +503,7 @@ def build_scenario(
                 f"for loopback listeners only -- so the two requirements contradict each other "
                 f"and the resolution belongs to the plan, not to this scenario.\n"
                 f"The target's own listener table, which is what this refusal is based on:\n"
-                f"{document['target_listeners']}",
+                f"{listeners}",
             )
 
             # -- 2. the two names, and which branch each must reach ---------
@@ -697,6 +740,7 @@ __all__ = [
     "MOCK_FOREIGN_ADDRESS",
     "MOCK_ROUTER_ADDRESS",
     "PUBLISHED_CN_LIST",
+    "READ_FAILED",
     "RoutingScenarioError",
     "SCENARIO_NAME",
     "TARGET_ADDRESS",

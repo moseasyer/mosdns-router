@@ -341,6 +341,88 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
         self.assertEqual(result.status, "passed", result.detail)
         self.assertIn(TARGET_ADDRESS, self.record(result)["target_listeners"])
 
+    def test_the_listener_table_is_read_from_the_target(self):
+        """**The reading the refusal rests on is a reading, not a podman error.**
+
+        MEASURED on the first three-release matrix run: the cell's evidence
+        document carried
+
+            "target_listeners": "(not readable: Error: no container with name
+             or ID \"sh\" found: no such container)"
+
+        and the refusal that followed it was built on that string. The read had
+        no container in it -- `try_read` takes one first and the call did not
+        pass one -- so podman was asked for a container called `sh`, and the
+        text that does not contain `10.89.0.10:53` satisfied the check. The
+        refusal was true and it was unfounded at the same time, which is the
+        worst of both: a cell whose router *did* bind the bridge address would
+        have been refused for the same reason.
+
+        So the invocation has to name the target, and this is the case that says
+        so -- a scenario that went back to reading the wrong thing would fail
+        here rather than quietly re-deriving the same unfounded conclusion.
+        """
+        fake, result = self.run_scenario(
+            rules=[
+                {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+                 "stdout": self.LISTENERS_ON_THE_BRIDGE},
+            ] + routing_rules(),
+        )
+        self.assertEqual(result.status, "passed", result.detail)
+        asked = [line for line in self.asked_in(fake, TARGET) if "ss -lntup" in line]
+        self.assertTrue(
+            asked, f"the target's listener table was not read from {TARGET}: {self.asked_in(fake, TARGET)}"
+        )
+        every = [line for container in (TARGET, CLIENT, ROUTER, FOREIGN)
+                 for line in self.asked_in(fake, container)]
+        self.assertFalse(
+            [line for line in every if line.startswith("sh ")],
+            f"a command was run as though it were a container name: {every}",
+        )
+
+    def test_a_listener_table_that_cannot_be_read_is_a_fault_and_not_the_finding(self):
+        """**A failed read is not evidence.**
+
+        The refusal above is a strong claim -- that this project's own packaging
+        forbids the very vantage point the plan asks for -- and a strong claim
+        made on a read that did not happen is worse than no claim: it sends a
+        reader to the plan with a reason that was never measured. So an
+        unreadable table is refused as what it is, a harness fault, and the
+        message must not contain the finding.
+        """
+        _fake, result = self.run_scenario(
+            rules=[
+                {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+                 "returncode": 125, "stderr": "no such container"},
+            ] + routing_rules(),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("not readable", result.detail)
+        self.assertNotIn(
+            "reachable from another host", result.detail,
+            "a read that failed was reported as a measurement of the shipped configuration",
+        )
+        self.assertNotIn("cannot be measured", result.detail)
+        # And the failed read is recorded verbatim, so the evidence document says
+        # what was read rather than leaving a reader to infer it from the refusal.
+        self.assertIn(routing.READ_FAILED, self.record(result)["target_listeners"])
+        self.assertIn("no such container", result.detail)
+
+    def test_an_empty_listener_table_is_not_evidence_that_nothing_is_bound(self):
+        # The same class as the case above and a different symptom: `ss` printed
+        # nothing at all, which is not what `ss -lntup` does -- it prints a
+        # header whether or not anything is bound. An empty reading is a read
+        # that did not happen, and the `|| true` in the command means a missing
+        # `ss` looks exactly like this.
+        _fake, result = self.run_scenario(
+            rules=[
+                {"match": ["sh", "-c"], "match_contains": "ss -lntup", "stdout": ""},
+            ] + routing_rules(),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("printed nothing", result.detail)
+        self.assertNotIn("reachable from another host", result.detail)
+
 
 class RoutingScenarioTest(RoutingScenarioHarness):
     """A cell whose two branches reached two different listeners passes."""
