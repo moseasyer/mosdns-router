@@ -130,6 +130,21 @@ SOURCE_LOCK = DATA_DIRECTORY + "/source-lock.json"
 PUBLISHED_LIST = "/var/lib/mosdns/lists/cn-domains.txt"
 PUBLISHED_LOCK = "/var/lib/mosdns/lists/source-lock.json"
 
+# The pinned Cloudflare range document, and the lock that accounts for it. The
+# second of the two pairs this package carries, and the one that makes an
+# installation with no route to the internet possible: the prefix list the
+# response rewriter refuses to construct without comes from exactly one endpoint,
+# so without a snapshot of it a machine that cannot reach that endpoint has no way
+# to start this router at all.
+#
+# It is shipped and VERIFIED but never placed: the published artifacts under
+# /var/lib are written by `mosdns-cdnctl update-lists --refresh-ranges`, which is
+# the one program that knows how to publish them, and postinst writes neither.
+RANGES_SNAPSHOT = DATA_DIRECTORY + "/cloudflare-ranges.json"
+RANGES_SNAPSHOT_LOCK = DATA_DIRECTORY + "/cloudflare-ranges.lock.json"
+PUBLISHED_RANGES_CACHE = "/var/lib/mosdns/lists/cloudflare-ips.json"
+PUBLISHED_PREFIX_LIST = "/var/lib/mosdns/lists/cloudflare-prefixes.txt"
+
 # The four directories the package provisions. The mode is 2770 and the reason
 # is load-bearing: with an extended ACL present the mode's group field IS the
 # group-class mask, so 2750 would cap the group at r-x and no service identity
@@ -156,6 +171,8 @@ MODES = {
     DOC_DIRECTORY + "/copyright": 0o644,
     CHINA_LIST: 0o644,
     SOURCE_LOCK: 0o644,
+    RANGES_SNAPSHOT: 0o644,
+    RANGES_SNAPSHOT_LOCK: 0o644,
     **{document: 0o644 for document in EDITABLE_DOCUMENTS},
     **{BRIDGE_PACKAGE + "/" + module: 0o644 for module in BRIDGE_MODULES},
     **{UNIT_DIRECTORY + "/" + name: 0o644 for name in SHIPPED_UNITS},
@@ -713,7 +730,7 @@ def postinst_step_body(text, number):
     return text[start : following.start()]
 
 
-def sandboxed_postinst_step(number, published, source_pair, text=None):
+def sandboxed_postinst_step(number, published, source_pair, text=None, absent=()):
     """Run one `postinst` step's own lines in a throwaway tree, and return the tree.
 
     The point of this helper is that the DECISION is the script's own text. The
@@ -730,7 +747,10 @@ def sandboxed_postinst_step(number, published, source_pair, text=None):
     script's own, unrewritten.
 
     `published` maps an absolute destination path to bytes, or is `{}` to plant
-    nothing there; `source_pair` maps the two shipped paths to their bytes.
+    nothing there; `source_pair` maps each shipped path the step reads to its
+    bytes; and `absent` names shipped paths to remove after planting, which is
+    how the "the file this package ships is not there" case is run through the
+    same path as every other one rather than beside it.
     """
     text = text if text is not None else POSTINST.read_text()
     body = postinst_step_body(text, number)
@@ -759,14 +779,30 @@ def sandboxed_postinst_step(number, published, source_pair, text=None):
     for name, value in variables.items():
         if value.startswith("/"):
             variables[name] = str(root) + value
-    for name in ("SOURCE_LIST", "SOURCE_LOCK"):
-        path = Path(variables[name])
+    # **Every** shipped file this step reads is planted, not just the China pair.
+    # The set is derived from the step's own variable assignments and the shipped
+    # data directory rather than named here, because a name missing from a list is
+    # a file the step decides something about without ever seeing it -- and a step
+    # that verified nothing at all would pass every assertion in the suite. So a
+    # shipped file the step reads and this fixture has no bytes for is a failure
+    # of the harness, raised before the step runs.
+    for name, value in sorted(variables.items()):
+        if not value.startswith(str(root) + DATA_DIRECTORY + "/"):
+            continue
+        if name not in source_pair:
+            raise AssertionError(
+                f"postinst reads {name} ({value}) and this test supplies no bytes for it, so the "
+                "step would run against a file that is not there"
+            )
+        path = Path(value)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source_pair[name], encoding="utf-8")
     for destination, contents in published.items():
         path = root / destination.lstrip("/")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(contents, encoding="utf-8")
+    for name in absent:
+        Path(variables[name]).unlink()
     for name in ("PUBLISHED_LIST", "PUBLISHED_LOCK"):
         Path(variables[name]).parent.mkdir(parents=True, exist_ok=True)
 
@@ -2090,6 +2126,122 @@ class _Staged(unittest.TestCase):
 # --- the payload -------------------------------------------------------------
 
 
+class PinnedRangeSnapshotTests(_Staged):
+    """The range document this package ships, and the lock that accounts for it.
+
+    These are the tests that make the offline install honest. Every other part of
+    this step is machinery for publishing a file; these hold that the file is
+    Cloudflare's, that nothing can change it unnoticed, and that it says how old
+    it is -- because a selector classifying over somebody else's ranges resolves
+    every query the machine makes and tells nobody.
+    """
+
+    # The IPv4 ranges Cloudflare published on the day the snapshot was taken.
+    # Written out as literals, and not derived from the snapshot, because the
+    # whole question is whether the shipped file holds Cloudflare's ranges and not
+    # a plausible set of somebody else's: a test that computed its expectation
+    # out of the file under test would agree with any file at all. These fifteen
+    # were compared, one for one, with the list Cloudflare publishes separately at
+    # https://www.cloudflare.com/ips-v4 -- the same ranges by a different route.
+    PUBLISHED_RANGES = (
+        "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
+        "104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
+        "162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
+        "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    )
+    # The prefix list those ranges render to: masked, deduplicated, ascending,
+    # one per line. The form the rewriter reads and the form the lock's second
+    # digest covers, so it is written out rather than rendered here -- a renderer
+    # in this file would be a second implementation of the one under test and
+    # would agree with it by construction.
+    PUBLISHED_RANGES_TEXT = "".join(f"{prefix}\n" for prefix in PUBLISHED_RANGES)
+
+    def snapshot_lock(self):
+        return json.loads(self.read(RANGES_SNAPSHOT_LOCK))
+
+    def test_the_shipped_snapshot_is_the_document_the_published_api_answers_with(self):
+        """Byte for byte, in the shape this project's own reader accepts.
+
+        A snapshot in any other shape is a file the reader refuses, so a snapshot
+        in one of them would be a package whose install cannot complete offline --
+        which is the one state this whole step exists to end. So the shape is
+        asserted here rather than discovered by an install failing.
+        """
+        document = json.loads(self.read(RANGES_SNAPSHOT))
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(
+            document["url"], "https://api.cloudflare.com/client/v4/ips",
+            "the snapshot names an endpoint other than the one this project reads, so the reader "
+            "would refuse it as a document of another endpoint",
+        )
+        self.assertTrue(document["etag"], "the snapshot records no validator, so there would be "
+                                         "nothing to revalidate it against on the next run")
+        body = document["body"]
+        self.assertIs(body["success"], True)
+        self.assertTrue(body["result"]["etag"], "the document records no revision marker")
+        self.assertTrue(body["result"]["ipv6_cidrs"], "the document carries no IPv6 half, so it is "
+                                                       "not the document the API publishes")
+
+    def test_the_shipped_snapshot_holds_the_ranges_cloudflare_published(self):
+        body = json.loads(self.read(RANGES_SNAPSHOT))["body"]
+        self.assertEqual(
+            sorted(set(body["result"]["ipv4_cidrs"])), list(self.PUBLISHED_RANGES),
+            "the shipped snapshot does not hold Cloudflare's published IPv4 ranges, so a router "
+            "that classified over it would be classifying over somebody else's space",
+        )
+        # And the shape a reader needs of each entry: a prefix, and one this
+        # project will sample from. A range this project refuses to publish must
+        # not be in a file it is going to publish.
+        for entry in body["result"]["ipv4_cidrs"]:
+            with self.subTest(entry=entry):
+                self.assertRegex(entry, r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+
+    def test_the_lock_accounts_for_both_artifacts_of_the_snapshot(self):
+        # Two digests, and the reason is the two files: `sha256` is the snapshot
+        # this package carries and `prefix_list_sha256` is the plain prefix list
+        # that document renders to, which is the file the response rewriter reads
+        # and the only one a router ever sees. A lock that recorded only the first
+        # would account for a document and say nothing about the selector.
+        lock = self.snapshot_lock()
+        self.assertEqual(
+            hashlib.sha256(self.read_bytes(RANGES_SNAPSHOT)).hexdigest(), lock["sha256"],
+            "the shipped snapshot is not the bytes its lock records, so this package cannot account "
+            "for the ranges in it",
+        )
+        self.assertEqual(
+            hashlib.sha256(self.PUBLISHED_RANGES_TEXT.encode("utf-8")).hexdigest(),
+            lock["prefix_list_sha256"],
+            "the shipped lock does not record the prefix list Cloudflare's published ranges render to",
+        )
+
+    def test_the_lock_dates_the_pin_because_an_unmeasured_stale_pin_is_a_silent_one(self):
+        # A three-month-old pin is a perfectly good input for a selector. A pin
+        # whose age is written down nowhere is not, and there is no way to notice
+        # the difference later: the machine resolves, the timer reports nothing,
+        # and the ranges drift away from Cloudflare's one prefix at a time. So the
+        # date is required, and it is a date this project can check the shape of.
+        lock = self.snapshot_lock()
+        pinned_at = lock.get("fetched_at", "")
+        self.assertRegex(
+            pinned_at, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+            f"the shipped lock's fetched_at is {pinned_at!r}, which is not an RFC 3339 UTC time, so "
+            "nothing can measure the age of this pin",
+        )
+        self.assertEqual(lock.get("source"), "https://api.cloudflare.com/client/v4/ips")
+        self.assertEqual(lock.get("revision"), json.loads(self.read(RANGES_SNAPSHOT))["body"]["result"]["etag"])
+        self.assertEqual(lock.get("schema_version"), 1)
+
+    def test_the_manifest_names_the_pinned_ranges_beside_the_pinned_list(self):
+        # The manifest is where an operator looks to find out what a .deb was
+        # built from. A pin it does not mention is a pin nobody can check against
+        # the archive they were given.
+        text = self.read(BUILD_MANIFEST)
+        self.assertIn(hashlib.sha256(self.read_bytes(RANGES_SNAPSHOT)).hexdigest(), text)
+
+
+# --- the payload -------------------------------------------------------------
+
+
 class PayloadTests(_Staged):
     """What the package puts on a machine, and at what mode."""
 
@@ -2747,10 +2899,18 @@ class MaintainerScriptTests(_Staged):
                 self.assertIn(source, text, f"postinst never places {source} at {destination}")
 
     def shipped_pair(self):
-        """The two files the package carries, as the staged tree holds them."""
+        """The pinned files the package carries, as the staged tree holds them.
+
+        All four, and the name is historical: STEP 3 reads the China pair and the
+        range pair, and the sandbox plants every shipped file the step names, so a
+        fixture that supplied two of the four would fail before the step ran
+        rather than quietly verifying nothing.
+        """
         return {
             "SOURCE_LIST": self.read(CHINA_LIST),
             "SOURCE_LOCK": self.read(SOURCE_LOCK),
+            "SOURCE_RANGES": self.read(RANGES_SNAPSHOT),
+            "SOURCE_RANGES_LOCK": self.read(RANGES_SNAPSHOT_LOCK),
         }
 
     def test_postinst_leaves_a_pair_an_operator_re_pinned_alone(self):
@@ -2832,6 +2992,126 @@ class MaintainerScriptTests(_Staged):
                 shipped[source],
                 f"the pair was not placed even though the lock was unreadable ({name})",
             )
+
+    def test_postinst_verifies_the_pinned_range_snapshot_and_refuses_a_mismatch(self):
+        """The digest check the China list has, applied to the ranges.
+
+        A snapshot whose bytes the lock does not record is a file of ranges this
+        project cannot account for, and the router classifies every query it
+        answers against exactly that file. So a mismatch stops the install before
+        the transaction touches anything -- the same position, and for the same
+        reason, as a list that does not verify: a machine left exactly as it was.
+
+        The control is beside the case rather than implied by it, because a check
+        that would pass against any input is not a check.
+        """
+        shipped = self.shipped_pair()
+        cases = (
+            # The control: the pair the package ships has to pass, or the check
+            # would be one that refuses everything.
+            ("the shipped snapshot", shipped["SOURCE_RANGES"], 0),
+            (
+                "a snapshot with one range changed",
+                shipped["SOURCE_RANGES"].replace("104.16.0.0/13", "104.16.0.0/12"),
+                1,
+            ),
+            ("a snapshot that is not a document", "{}\n", 1),
+            ("a snapshot that is empty", "", 1),
+        )
+        for label, snapshot, want in cases:
+            with self.subTest(snapshot=label):
+                _root, variables, completed = sandboxed_postinst_step(
+                    3, {}, dict(shipped, SOURCE_RANGES=snapshot),
+                    text=SCRIPTS["postinst"].read_text(),
+                )
+                self.assertEqual(
+                    completed.returncode, want,
+                    f"STEP 3 exited {completed.returncode} for {label}, want {want} -- 0 for a pair "
+                    f"it can account for and 1 for one it cannot: "
+                    f"{completed.stdout}{completed.stderr}",
+                )
+                if want == 0:
+                    continue
+                for named in (variables["SOURCE_RANGES"], variables["SOURCE_RANGES_LOCK"]):
+                    self.assertIn(
+                        named, completed.stderr,
+                        f"the refusal for the {label} does not name {named}, so an operator cannot "
+                        "tell which of the two files to look at",
+                    )
+                self.assertIn("cannot account for", completed.stderr)
+                # And the claim that nothing was touched, which is the whole
+                # point of refusing here rather than one step later.
+                self.assertIn("Nothing has been changed on this machine's DNS", completed.stderr)
+
+    def test_postinst_refuses_when_the_shipped_range_snapshot_is_absent(self):
+        """A package that cannot account for its own reference data does not run a
+        transaction that classifies against it.
+
+        This is a refusal and not a fallback, on purpose and against the obvious
+        argument: a machine with a published document of its own needs no snapshot,
+        so it would install. But this step is what PROMISES the install, and a
+        package that ships a file and cannot verify it is a package whose other
+        promises are worth exactly as much -- so it refuses before the machine's
+        DNS is touched, exactly as it does for a China list that does not verify.
+        The remedy is named and is not a re-pin: `dpkg` owns both files, so
+        `apt install --reinstall` puts them back.
+
+        Both files are tried, and the control is the same run with them present,
+        because a check that refuses everything is not a check.
+        """
+        shipped = self.shipped_pair()
+        _root, variables, present = sandboxed_postinst_step(
+            3, {}, shipped, text=SCRIPTS["postinst"].read_text(),
+        )
+        self.assertEqual(
+            present.returncode, 0,
+            f"STEP 3 refused the pair the package ships: {present.stdout}{present.stderr}",
+        )
+        for absent in (("SOURCE_RANGES",), ("SOURCE_RANGES_LOCK",), ("SOURCE_RANGES", "SOURCE_RANGES_LOCK")):
+            with self.subTest(absent=absent):
+                _root, variables, completed = sandboxed_postinst_step(
+                    3, {}, shipped, text=SCRIPTS["postinst"].read_text(), absent=absent,
+                )
+                self.assertNotEqual(
+                    completed.returncode, 0,
+                    f"STEP 3 accepted a package whose {', '.join(absent)} is not on disk, so an "
+                    "install would publish whatever the transaction found -- and on a machine with "
+                    "no published document of its own that is nothing at all",
+                )
+                self.assertIn(
+                    variables["SOURCE_RANGES"], completed.stderr,
+                    "the refusal does not name the snapshot it could not find",
+                )
+                self.assertIn(
+                    "reinstall", completed.stderr,
+                    "the refusal names no way out, and the way out is reinstalling the package",
+                )
+
+    def test_postinst_never_writes_the_published_ranges(self):
+        """A carried-forward document survives a `dpkg` upgrade.
+
+        The published envelope and the published prefix list are what a machine's
+        selector is actually classifying against, and the only program that writes
+        them is `mosdns-cdnctl update-lists --refresh-ranges` -- which is also the
+        one that consults a machine's own document before the package's snapshot,
+        so an upgrade offline republishes exactly what was there. `postinst`
+        writing either of them would be the re-pinning this project's own rule
+        forbids, done by the script whose whole argument is that it does not do
+        it for the China list.
+        """
+        run = "\n".join(executed_lines(SCRIPTS["postinst"].read_text()))
+        for path in (PUBLISHED_RANGES_CACHE, PUBLISHED_PREFIX_LIST):
+            with self.subTest(path=path):
+                self.assertNotIn(
+                    path, run,
+                    f"postinst RUNS something naming {path}, so an install or an upgrade would "
+                    "replace the range list a selector was built against",
+                )
+        # And the one that is named: the snapshot is READ here and published by
+        # the transaction, so a reader of this file can tell which is which.
+        text = SCRIPTS["postinst"].read_text()
+        self.assertIn(RANGES_SNAPSHOT, text)
+        self.assertIn("sha256sum", text)
 
     def test_postinst_provisions_before_it_runs_the_install_transaction(self):
         """`postinst` provisions, then the transaction enables and starts; that

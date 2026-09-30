@@ -34,11 +34,20 @@
 # tmpfiles.d entry is the only thing that brings it back after a reboot, because
 # /run is a tmpfs and the group, the setgid bit and the default ACL are all gone.
 #
-# STEP 3 is the pinned China list. It is placed and its digest is verified against
-# the list_sha256 in the lock that describes it, and it is NEVER re-pinned here. A
-# re-pin at install time is how an operator's reviewed pin becomes something nobody
-# reviewed, and a refusal to install because a reviewed list cannot be verified is a
-# machine that is left exactly as it was.
+# STEP 3 is the pinned data this package ships. It is TWO pairs now. The China
+# list is placed and its digest is verified against the list_sha256 in the lock
+# that describes it; the Cloudflare range document is verified against the sha256
+# in the lock beside it and is never written at all. NEITHER is ever re-pinned
+# here. A re-pin at install time is how an operator's reviewed pin becomes
+# something nobody reviewed, and a refusal to install because a reviewed pin
+# cannot be verified is a machine that is left exactly as it was.
+#
+# The range pair is what makes an installation on a machine with no route to the
+# internet possible at all: the prefix list the response rewriter refuses to
+# construct without comes from one endpoint, so a package that ships no snapshot
+# of it cannot be installed offline. Every container cell of this project's own
+# test matrix refused for exactly that reason, and nothing downstream of the
+# refusal ever ran.
 #
 # STEP 4 is the install transaction, and it is after everything above because
 # everything above is a prerequisite for it: a ReadWritePaths entry naming a
@@ -72,6 +81,8 @@ RESOLVER_USER=dnscrypt-proxy
 INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
 SOURCE_LIST=/usr/share/mosdns-router/cn-domains.txt
 SOURCE_LOCK=/usr/share/mosdns-router/source-lock.json
+SOURCE_RANGES=/usr/share/mosdns-router/cloudflare-ranges.json
+SOURCE_RANGES_LOCK=/usr/share/mosdns-router/cloudflare-ranges.lock.json
 PUBLISHED_LIST=/var/lib/mosdns/lists/cn-domains.txt
 PUBLISHED_LOCK=/var/lib/mosdns/lists/source-lock.json
 
@@ -166,9 +177,14 @@ setfacl -d -m g::rwx /run/mosdns
 # anything on every boot.
 install -d -o root -g root -m 0700 /run/mosdns/watchdog
 
-# --- STEP 3: the pinned China list, placed once and never re-pinned ----------
+# --- STEP 3: the pinned data this package ships ------------------------------
 
-# Two files under /var/lib/mosdns/lists are the OPERATOR's, not this package's:
+# Two pairs are verified here and NEITHER is ever re-pinned, and the second pair
+# is what makes an installation on a machine with no route to the internet
+# possible at all.
+#
+# The first is the China list. Two files under /var/lib/mosdns/lists are the
+# OPERATOR's, not this package's:
 # `mosdns-cdnctl update-lists --pin-remote HEAD` writes both of them there, and
 # the render reads the list. Replacing them with the snapshot this package ships
 # is the same act as re-pinning them -- it is how a pin somebody reviewed becomes
@@ -229,6 +245,93 @@ if [ "$actual_digest" != "$expected_digest" ]; then
 	echo "postinst: mosdns-cdnctl(1) for how an operator re-pins the list deliberately." >&2
 	exit 1
 fi
+
+# ...and the second is the Cloudflare range document, which the response rewriter
+# refuses to CONSTRUCT without: it builds its prefix watcher before anything else
+# and returns the error, so a router with no published ranges binds nothing on
+# port 53. Its only producer fetches from one endpoint, so without a snapshot of
+# that document in the package a machine with no route to that endpoint cannot
+# start this router at all -- which is what made every installation in this
+# project's own test matrix refuse, and what left nothing downstream of the
+# refusal ever running.
+#
+# It is VERIFIED HERE AND WRITTEN NOWHERE IN THIS SCRIPT, and the two halves of
+# that sentence have separate reasons.
+#
+# Verified, because the file is the input to every classification the rewriter
+# makes: a snapshot whose bytes the lock beside it does not record is a set of
+# prefixes this project cannot name, and a router answering over prefixes
+# nobody can name resolves every query the machine makes and tells nobody. The
+# lock's `sha256` is checked with the same `sha256sum` and the same fatal
+# mismatch the China pair uses, and a lock that records no digest or no date is
+# refused for the same reason a missing list_sha256 is: a record of nothing is not
+# a record. The DATE is not decoration beside it. A three-month-old pin is a fine
+# input for a selector, and a pin whose age is written down nowhere is not, and
+# there is no way to notice the difference later -- the machine resolves, no timer
+# complains, and the ranges drift away one prefix at a time. `mosdns-cdnctl
+# update-lists --check` prints it, and this is the file it reads it from.
+#
+# Never written here, because the published artifacts under /var/lib are not this
+# package's to replace any more than the China pair's are. `mosdns-cdnctl
+# update-lists --refresh-ranges` is the one program that publishes them, and it
+# reads THIS MACHINE's own document before it reads the package's snapshot, so a
+# `dpkg` upgrade on a machine that cannot reach the origin republishes exactly
+# what its selector was built against. A write here would be the same act as
+# re-pinning the China list, done by the script whose entire argument is that it
+# does not do that.
+#
+# The absence of the snapshot is a REFUSAL rather than a fallback, on purpose and
+# against the obvious argument: a machine that has published a document of its
+# own needs no snapshot and would install without one. But this step is what
+# PROMISES the installation, and a package that ships a file and cannot verify it
+# is a package whose other promises are worth exactly as much -- so it refuses
+# here, before the machine's DNS is touched, and names the way out. `dpkg` owns
+# both files, so the way out is reinstalling the package and is NOT a re-pin.
+if [ ! -r "$SOURCE_RANGES" ] || [ ! -r "$SOURCE_RANGES_LOCK" ]; then
+	echo "postinst: $SOURCE_RANGES and $SOURCE_RANGES_LOCK are the pinned Cloudflare range" >&2
+	echo "postinst: document this package installs, and one or both of them is not" >&2
+	echo "postinst: readable at $SOURCE_RANGES. The response rewriter classifies every" >&2
+	echo "postinst: query it answers against exactly that file, so this package will not run" >&2
+	echo "postinst: an install transaction over a range list it cannot account for." >&2
+	echo "postinst: nothing has been changed on this machine's DNS. Both files belong to" >&2
+	echo "postinst: dpkg rather than to an operator's pin, so nothing has to be re-pinned:" >&2
+	echo "postinst: reinstall the package from wherever you install it, which puts both back," >&2
+	echo "postinst: and then:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+expected_ranges_digest=$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$SOURCE_RANGES_LOCK")
+expected_ranges_prefix_digest=$(sed -n 's/.*"prefix_list_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$SOURCE_RANGES_LOCK")
+expected_ranges_pinned_at=$(sed -n 's/.*"fetched_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SOURCE_RANGES_LOCK")
+if [ -z "$expected_ranges_digest" ] || [ -z "$expected_ranges_prefix_digest" ] || [ -z "$expected_ranges_pinned_at" ]; then
+	echo "postinst: $SOURCE_RANGES_LOCK records no sha256, no prefix_list_sha256 or no" >&2
+	echo "postinst: fetched_at, so the snapshot beside it is a file of ranges with nothing" >&2
+	echo "postinst: accounting for it -- and a pin nobody can measure the age of is a pin" >&2
+	echo "postinst: nobody is measuring. Nothing has been changed on this machine's DNS." >&2
+	echo "postinst: Run 'mosdns-cdnctl update-lists --check' after reinstalling the package." >&2
+	exit 1
+fi
+actual_ranges_digest=$(sha256sum "$SOURCE_RANGES" | cut -d' ' -f1)
+if [ "$actual_ranges_digest" != "$expected_ranges_digest" ]; then
+	echo "postinst: $SOURCE_RANGES is $actual_ranges_digest and $SOURCE_RANGES_LOCK records" >&2
+	echo "postinst: $expected_ranges_digest for it, so this package cannot account for the ranges" >&2
+	echo "postinst: in it. Refusing to install a selector over a range list this project cannot" >&2
+	echo "postinst: name. Nothing has been changed on this machine's DNS." >&2
+	echo "postinst: The lock also records the prefix list the snapshot renders to, as" >&2
+	echo "postinst: $expected_ranges_prefix_digest, and the revision it was taken at, which is" >&2
+	echo "postinst: dated $expected_ranges_pinned_at. Compare them with the two digests and the" >&2
+	echo "postinst: date 'mosdns-cdnctl update-lists --check' prints, and reinstall the package" >&2
+	echo "postinst: from wherever you install it, which puts both files back, if the pair is not" >&2
+	echo "postinst: what you expected:" >&2
+	echo "postinst:   sudo dpkg --configure mosdns-router" >&2
+	exit 1
+fi
+echo "postinst: the pinned range document at $SOURCE_RANGES is $actual_ranges_digest, as" >&2
+echo "postinst: $SOURCE_RANGES_LOCK records, taken at $expected_ranges_pinned_at. It is read" >&2
+echo "postinst: here and never written: 'mosdns-cdnctl update-lists --refresh-ranges' is what" >&2
+echo "postinst: publishes it, and it reads this machine's own published document first. Run" >&2
+echo "postinst: 'mosdns-cdnctl update-lists --check' to see how old the pin is and whether" >&2
+echo "postinst: what is published has drifted from it." >&2
 
 # --- STEP 4: the install transaction -----------------------------------------
 

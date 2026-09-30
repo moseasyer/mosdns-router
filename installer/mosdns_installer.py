@@ -1999,6 +1999,16 @@ RECORDED_PROPERTIES = IGNORED_AUTOMATICALLY + ADDRESS_LISTS
 # that is unreachable is exactly the case where the cached envelope is the answer.
 # Left to the publisher, the same array republishes from the cache with no network
 # at all.
+#
+# And with no cache -- which is every fresh installation, and every installation on
+# a machine with no route to the internet -- the publisher's LAST resort is the
+# range snapshot this package ships, beside the lock that accounts for it. It
+# verifies the snapshot against that lock, refuses rather than publishing a document
+# it cannot account for, and reads a machine's own published document ahead of it,
+# so an upgrade offline keeps what the selector was built against. That snapshot is
+# why this step can reach the router at all: before it, every installation with no
+# route to the origin refused here and everything downstream of this line was
+# unreachable on every machine this project had.
 PUBLISH_PREFIXES = ("/usr/lib/mosdns-router/mosdns-cdnctl", "update-lists", "--refresh-ranges")
 
 # The launcher an operator runs to put a machine's DNS back by hand. Named as a

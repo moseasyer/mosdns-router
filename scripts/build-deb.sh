@@ -386,6 +386,14 @@ place packaging/tmpfiles.d/mosdns-router.conf /usr/lib/tmpfiles.d/mosdns-router.
 place packaging/copyright "/usr/share/doc/$PACKAGE/copyright" 644
 place configs/cn-domains.txt /usr/share/mosdns-router/cn-domains.txt 644
 place configs/source-lock.json /usr/share/mosdns-router/source-lock.json 644
+# The pinned Cloudflare range document, and the lock that accounts for it. The
+# second of the two pairs this package carries and the reason an installation can
+# complete on a machine with no route to the internet: the prefix list the
+# response rewriter refuses to construct without comes from one endpoint, so a
+# package that ships no snapshot of it cannot be installed offline at all. It is
+# placed and verified, never re-pinned, exactly as the China pair is.
+place configs/cloudflare-ranges.json /usr/share/mosdns-router/cloudflare-ranges.json 644
+place configs/cloudflare-ranges.lock.json /usr/share/mosdns-router/cloudflare-ranges.lock.json 644
 
 # The manual pages, compressed the way a Debian package ships them. `gzip -9n` and
 # not plain gzip because gzip records the name and the timestamp by default, and a
@@ -500,6 +508,16 @@ fi
 	echo "cn-domains.txt sha256: $(sha256sum "$STAGE/usr/share/mosdns-router/cn-domains.txt" | cut -d' ' -f1)"
 	echo "The install verifies that digest against list_sha256 in source-lock.json and"
 	echo "never re-pins it; see /etc/mosdns/policy.yaml and mosdns-cdnctl(1)."
+	echo
+	echo "cloudflare-ranges.json sha256: $(sha256sum "$STAGE/usr/share/mosdns-router/cloudflare-ranges.json" | cut -d' ' -f1)"
+	echo "ranges-pinned-at: $(sed -n 's/.*"fetched_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAGE/usr/share/mosdns-router/cloudflare-ranges.lock.json")"
+	echo "ranges-pinned-revision: $(sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAGE/usr/share/mosdns-router/cloudflare-ranges.lock.json")"
+	echo "The install verifies that digest against sha256 in cloudflare-ranges.lock.json, and"
+	echo "refuses a snapshot it cannot account for rather than installing a selector over"
+	echo "ranges it cannot name. It is never re-pinned: the published artifacts under"
+	echo "/var/lib/mosdns/lists are written only by 'mosdns-cdnctl update-lists"
+	echo "--refresh-ranges', which reads a machine's own document before this one. Run"
+	echo "'mosdns-cdnctl update-lists --check' to see how old the pin is."
 } >"$STAGE/usr/share/doc/$PACKAGE/BUILD-MANIFEST"
 chmod 644 "$STAGE/usr/share/doc/$PACKAGE/BUILD-MANIFEST"
 

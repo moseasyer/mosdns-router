@@ -92,6 +92,11 @@ packaging/man/mosdns-cdnctl.1              /usr/share/man/man1/mosdns-cdnctl.1.g
 packaging/man/dnscrypt-proxy.8             /usr/share/man/man8/dnscrypt-proxy.8.gz
 configs/cn-domains.txt                    /usr/share/mosdns-router/cn-domains.txt
 configs/source-lock.json                  /usr/share/mosdns-router/source-lock.json
+# The pinned Cloudflare range document and the lock that accounts for it, which is
+# what lets this package install on a machine with no route to the internet. It is
+# verified at install and never re-pinned, exactly as the two files above are.
+configs/cloudflare-ranges.json            /usr/share/mosdns-router/cloudflare-ranges.json
+configs/cloudflare-ranges.lock.json       /usr/share/mosdns-router/cloudflare-ranges.lock.json
 
 # --- the state directories, empty --------------------------------------------
 # Shipped as directories and nothing else, and created at 2770 root:mosdns with a

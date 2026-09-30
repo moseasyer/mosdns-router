@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "source": "https://api.cloudflare.com/client/v4/ips",
+  "revision": "38f79d050aa027e3be3865e495dcc9bc",
+  "fetched_at": "2026-09-30T00:03:59Z",
+  "sha256": "fa80894eae91ea4b2240e8571048933eeb178f2a7757c5dcfe58c44acd0e5165",
+  "prefix_list_sha256": "db746a8739a51088c27d0b3c48679d21a69aab304d4c92af3ec0e89145b0cadd"
+}

@@ -70,6 +70,15 @@ Reports whether the pinned source has moved, and reports the published ranges re
 from disk without requesting them. Takes no lock, writes nothing, and cannot
 publish a missing prefix list. Scheduled daily by
 .BR mosdns\-list\-check.timer (5).
+.br
+It also reports the range snapshot this package ships: its two digests, the
+moment it was taken, how old it is, and whether the document published on this
+machine is still the one the snapshot holds. That is the only measurement of how
+stale the shipped pin is, and a three\-month\-old pin is a perfectly good input
+for a selector while a pin nobody measures is not. The report costs no request,
+so it is printed on the failure path as well \em on standard error, with standard
+output left empty, because a machine with no route to the internet is exactly the
+machine whose China\-list request fails.
 .TP
 .B \-\-pin\-remote\ \fIHEAD\fR
 Re\-pins the China domain list to the source's default branch and publishes the
@@ -86,6 +95,25 @@ published prefix list, so
 on a machine that has never run it binds nothing on port 53. An installation runs
 this with no origin named, so a valid cached range document republishes with no
 network at all.
+.br
+Where nothing is cached either, it publishes the snapshot the package installs at
+.IR /usr/share/mosdns\-router/cloudflare\-ranges.json ,
+beside the lock that accounts for it \em and only after verifying the snapshot
+against that lock. A snapshot whose bytes the lock does not record, a lock that
+records no date or no digest of the prefix list, and a snapshot taken from a
+different endpoint are all refusals, and nothing is published: a selector over
+ranges this project cannot name is worse than an installation that does not
+happen. The order is this machine's own published document, then the origin, then
+the package's snapshot, so an upgrade on a machine that cannot reach the origin
+keeps the ranges its selector was built against and never re\-pins them. The
+report says which of the three answered, and how old the snapshot is.
+.TP
+.B \-\-pinned\-ranges\ \fIPATH\fR
+.TQ
+.B \-\-pinned\-ranges\-lock\ \fIPATH\fR
+Where the two pinned files above are, defaulting to the paths this package
+installs them at. The installer runs this command with no paths at all, so the
+defaults are the only thing that makes an offline install possible.
 .SS test, pin, unpin
 The measurement. One invocation of
 .B test \-\-apply
@@ -209,6 +237,28 @@ The pinned China domain list, published by
 .B update\-lists
 and verified against
 .IR source\-lock.json .
+.TP
+.I /var/lib/mosdns/lists/cloudflare\-prefixes.txt
+The prefix list the response rewriter classifies against. It is a hard start
+requirement: the plugin refuses to CONSTRUCT without it, so a router with no
+published ranges binds nothing on port 53.
+.B \-\-refresh\-ranges
+publishes it, beside
+.IR /var/lib/mosdns/lists/cloudflare\-ips.json ,
+the document it was rendered from. Both are this machine's own state: the
+refresh reads them before it reads the package's snapshot, and nothing in an
+install or an upgrade replaces them.
+.TP
+.I /usr/share/mosdns\-router/cloudflare\-ranges.json
+The pinned range document this package ships, with its lock at
+.IR /usr/share/mosdns\-router/cloudflare\-ranges.lock.json .
+The lock records the endpoint it came from, the revision, when it was taken, and
+the digests of both the snapshot and the prefix list it renders to; the install
+verifies the snapshot's digest before it runs any transaction and refuses
+without touching the machine's DNS if it does not match. It is never re\-pinned:
+the published artifacts above are written only by
+.BR \-\-refresh\-ranges ,
+which reads them first.
 .SH EXIT STATUS
 .TP
 .B 0
