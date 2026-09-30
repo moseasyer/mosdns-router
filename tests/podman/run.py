@@ -700,8 +700,18 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
                 run_id=args.run_id,
                 router=names["mock-router"],
                 target=names["target"],
-                foreign=names["mock-foreign"],
-                client=names["client"],
+                # The two extra containers, and ONLY to the scenarios that use
+                # them. A builder that took them unconditionally would break every
+                # scenario that has no use for a client, and passing them
+                # conditionally on this set is the same kind of declaration as
+                # `PACKAGE_SCENARIOS`: the registration is the fact, and a builder
+                # that gained the parameters without joining the set would be
+                # handed no names and would say so.
+                **(
+                    {"foreign": names["mock-foreign"], "client": names["client"]}
+                    if name in MOCK_SCENARIOS
+                    else {}
+                ),
                 network=resources.network_name("testnet"),
                 results_dir=Path(args.results_dir),
                 now=clock["now"],

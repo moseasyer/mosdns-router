@@ -1801,6 +1801,15 @@ ALLOWED_CAPS = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 PER_CONTAINER_CAPS = {
     "target": ALLOWED_CAPS,
     "mock-router": ("NET_ADMIN", "NET_RAW"),
+    # **Empty, and that is a measurement rather than an oversight.** The foreign
+    # mock is a Go program that opens one UDP socket and one TCP listener, counts a
+    # query and writes a JSON file. It runs no init, is not traced, and neither
+    # sends nor receives at the link layer -- so unlike the mock router it opens no
+    # `AF_PACKET` socket and receives no DHCP transaction. Its port is 443, which
+    # looks privileged and is not: the same measurement the router's row records
+    # answers it, since podman's default rootless bounding set already carries
+    # `NET_BIND_SERVICE` (bit 10).
+    "mock-foreign": (),
 }
 
 # Every flag family refused in `extra_args`, in the two spellings pflag accepts
@@ -3753,20 +3762,33 @@ class CommandLineTest(EntryPointTestCase):
         scenario that is not registered is a configuration error: exit 2, the
         name in the message, and the reason.
 
-        The name is now `routing` rather than `dhcp`, because `dhcp` **is**
+        The name is now `routin` rather than `dhcp`, because `dhcp` **is**
         registered as of Task 3 and asking for it runs a cell. The refusal is
         about a name the registry does not hold, which is the only shape the
         defect takes; the case that a registered name runs is in
         `test_matrix_cell.py`.
+
+        **`routin` is a near-miss on purpose, and this case asked for `routing`
+        until Task 4 Step 6 registered that scenario.** A case whose requested
+        name the registry later grows stops testing the refusal and starts
+        testing a cell, and nothing reports the change -- so the name is asserted
+        unregistered right here. It is the same defect this file and
+        `test_matrix_cell.py` would otherwise both have, and asserting it in both
+        places is what stops a registry entry from quietly retiring a refusal case.
         """
+        self.assertNotIn(
+            "routin", run.SCENARIO_NAMES,
+            "this case asks for `routin`, which must not be registered, or it is no longer "
+            "testing the refusal",
+        )
         fake = self.fake([{"match": ["version"], "stdout": "5.7.0\n"}])
         code, output = self.invoke(
             self.base(fake, "--results-dir", str(self.directory / "results"),
                       "matrix", "--arch", "amd64", "--versions", "24.04",
-                      "--scenario", "routing")
+                      "--scenario", "routin")
         )
         self.assertEqual(code, run.EXIT_HARNESS_ERROR)
-        self.assertIn("routing", output)
+        self.assertIn("routin", output)
         self.assertIn("no such scenario is registered", output)
         # And the refusal says what *would* have worked, because the operator who
         # mistyped one of four names is not going to read the source to find the

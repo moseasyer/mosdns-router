@@ -189,7 +189,7 @@ class ScenarioRegistryTest(EntryPoint):
             "resolves a `.deb` for a cell that never runs",
         )
         self.assertEqual(
-            registered - set(run.SCENARIO_NAMES) - {"routing"},
+            registered - set(run.SCENARIO_NAMES),
             set(),
             "the registered names and the package set have drifted apart",
         )
@@ -224,14 +224,27 @@ class ScenarioRegistryTest(EntryPoint):
         silently ignoring it made that command report "no scenario is registered"
         -- which reads as though the harness looked for `dhcp` and did not find
         it, when in fact it never looked.
+
+        The name asked for is `routin`, a near-miss rather than a name that was
+        never plausible. It used to be `routing`, which was an unregistered
+        scenario at the time and became one when Task 4 Step 6 registered it -- so
+        this case silently stopped testing the refusal and started testing a cell,
+        which is the failure mode the file's own docstring warns about and which
+        nothing reported. A name nobody would write is what keeps this case
+        exercising the refusal after the registry grows.
         """
+        self.assertNotIn(
+            "routin", run.SCENARIO_NAMES,
+            "this case asks for `routin`, which must not be registered, or it is no longer "
+            "testing the refusal",
+        )
         fake = self.passing_fake()
         code, output = self.invoke(
             self.base(fake, "--results-dir", str(self.directory / "results"), "--run-id", RUN_ID,
-                      "matrix", "--arch", "amd64", "--versions", "24.04", "--scenario", "routing")
+                      "matrix", "--arch", "amd64", "--versions", "24.04", "--scenario", "routin")
         )
         self.assertEqual(code, run.EXIT_HARNESS_ERROR)
-        self.assertIn("routing", output)
+        self.assertIn("routin", output)
         self.assertIn("dhcp", output)
         self.assertEqual(
             [argv for argv in fake.invocations() if argv[:1] == ["run"]], [],
@@ -239,15 +252,26 @@ class ScenarioRegistryTest(EntryPoint):
         )
 
     def test_a_refusal_names_every_requested_scenario_not_only_the_first(self):
-        """`--scenario` is repeatable, and a caller who mistyped one of three is told so."""
+        """`--scenario` is repeatable, and a caller who mistyped one of three is told so.
+
+        One of the three is a real registered scenario and two are near-misses,
+        so the case cannot pass by reporting only the first name: the first is one
+        nobody would have mistyped, and a refusal that named only what it
+        recognised would satisfy the "it is in the output" assertion for it.
+        """
+        for near_miss in ("routin", "instal"):
+            self.assertNotIn(
+                near_miss, run.SCENARIO_NAMES,
+                f"this case asks for {near_miss!r}, which must not be registered",
+            )
         fake = self.passing_fake()
         code, output = self.invoke(
             self.base(fake, "--results-dir", str(self.directory / "results"), "--run-id", RUN_ID,
                       "matrix", "--arch", "amd64", "--versions", "24.04",
-                      "--scenario", "dhcp", "--scenario", "routing", "--scenario", "install")
+                      "--scenario", "dhcp", "--scenario", "routin", "--scenario", "instal")
         )
         self.assertEqual(code, run.EXIT_HARNESS_ERROR)
-        for name in ("routing", "install"):
+        for name in ("routin", "instal"):
             self.assertIn(name, output)
 
     def test_the_registry_is_the_one_the_refusal_and_the_runner_agree_on(self):
@@ -1030,23 +1054,63 @@ class ImageTagTest(unittest.TestCase):
         build does not read would rebuild the image for nothing, on every edit to
         anything in the directory; a tag that missed a file the build DOES read is
         the stale-image defect the case above is about.
+
+        **Two kinds of `COPY` are not build-context sources, and reading them as
+        ones is this case's own defect rather than a Containerfile's.** It was
+        found by the foreign mock's Containerfile, which is the first of these
+        images with a second stage:
+
+        * `COPY --from=build /out/mock-foreign /usr/local/bin/mock-foreign` names a
+          path inside a *previous stage*, not a file the context supplies, and a
+          tag cannot hash it. `images.copied_sources` skips such a line; if this
+          case did not, the two would disagree by construction and the case would
+          be asserting that the tag carries something the context does not contain.
+        * `COPY . .` names the context ROOT, which is a directory. The tag hashes
+          the *files* the build copies, and the whole checkout arriving in one
+          `COPY` is exactly the case `copied_sources` returns no file for -- so the
+          honest statement about that line is the next case's, not this one's.
+
+        So the assertion here is over the sources the function under test reports,
+        and what it checks is the direction that matters: every source it reports
+        really is named in a `COPY` line. The other direction -- a file a `COPY`
+        names and the tag omits -- is checked by the mutation in
+        `test_the_tag_changes_when_a_copied_file_changes`, which moves the tag when
+        a copied file's bytes change and so cannot pass if the file is not in the
+        key.
         """
         for role in images.IMAGE_ROLES:
             with self.subTest(role=role):
                 containerfile = images.containerfile(role)
-                copied = images.copied_sources(containerfile)
-                named = re.findall(
-                    r"(?mi)^\s*COPY\s+(?!\[)(.+)$", containerfile.read_text(encoding="utf-8")
+                copied = [
+                    str(path.relative_to(REPO))
+                    for path in images.copied_sources(containerfile)
+                ]
+                text = containerfile.read_text(encoding="utf-8")
+                for source in copied:
+                    with self.subTest(source=source):
+                        self.assertRegex(
+                            text,
+                            rf"(?mi)^\s*COPY\s+[^\n]*\b{re.escape(source)}\b",
+                            f"{role} reports {source} as a copied source and the Containerfile "
+                            f"has no COPY line naming it, so `copied_sources` and the file it "
+                            f"reads have drifted apart",
+                        )
+                # And the control, which is the half that catches a glob: a file
+                # that is in the checkout and named in no `COPY` line is NOT in
+                # the list. `Makefile` is the right subject because it exists in the
+                # repository root, beside every one of these Containerfiles, and
+                # none of them copies it -- so a reader that walked the directory
+                # would report it, and this one does not.
+                self.assertTrue(
+                    (REPO / "Makefile").is_file(),
+                    "the control subject is not in the checkout, so the control proves nothing",
                 )
-                for line in named:
-                    tokens = [token for token in line.split() if not token.startswith("--")]
-                    for source in tokens[:-1]:
-                        with self.subTest(source=source):
-                            self.assertIn(
-                                source,
-                                [str(path.relative_to(REPO)) for path in copied],
-                                f"{role} copies {source} and the tag does not carry it",
-                            )
+                self.assertNotIn(
+                    "Makefile", copied,
+                    f"{role}'s copied sources include the Makefile, and the Makefile is in the "
+                    f"context but named in no COPY line -- so this is reading the directory rather "
+                    f"than the Containerfile, which is the defect this case exists to catch",
+                )
 
     def test_every_copied_file_is_inside_the_build_context(self):
         """A `COPY` from outside the repository cannot be in the tag, and is not.
