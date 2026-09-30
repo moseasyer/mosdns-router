@@ -43,6 +43,14 @@ type RangeRefresh struct {
 	// Stale reports that the origin could not be read and the last document this
 	// build accepted stands in for it.
 	Stale bool
+	// Pinned reports that the document came from the snapshot the package ships
+	// rather than from a request or from a document this machine had published,
+	// and Pin is that snapshot. Stale is set as well, because the origin was not
+	// read either way: the two flags answer two different questions, and a report
+	// that printed only one of them would leave a reader guessing whether the
+	// origin had been reached and, if not, where these ranges came from.
+	Pinned bool
+	Pin    PinnedSnapshot
 	// CachePath and PrefixPath are the two files this refresh wrote.
 	CachePath  string
 	PrefixPath string
@@ -80,6 +88,8 @@ func (s *HTTPCloudflareSource) Refresh(ctx context.Context) (RangeRefresh, error
 		ETag:       fetched.Validator,
 		Prefixes:   prefixes,
 		Stale:      fetched.Stale,
+		Pinned:     fetched.Pinned,
+		Pin:        fetched.Pin,
 		CachePath:  s.cachePath,
 		PrefixPath: prefixPathFor(s.cachePath),
 	}, nil
@@ -92,10 +102,13 @@ func (s *HTTPCloudflareSource) Refresh(ctx context.Context) (RangeRefresh, error
 // more loosely than a sample would publish a list a measurement run would have
 // refused, and a router classifying against ranges this build does not understand
 // is worse than one that classifies against nothing.
+//
+// The one thing it consults beyond the origin and the cache is the snapshot a
+// package ships, and only when both of those have failed -- see standInFor.
 func (s *HTTPCloudflareSource) read(ctx context.Context) (cloudflareRanges, fetchedDocument, error) {
 	fetched, err := fetchDocument(ctx, s.client, s.baseURL, s.cachePath, validatorRequired)
 	if err != nil {
-		return cloudflareRanges{}, fetchedDocument{}, err
+		return s.standInFor(err)
 	}
 	document, err := parseCloudflareDocument(s.baseURL, fetched.Body)
 	if err != nil {
@@ -105,6 +118,73 @@ func (s *HTTPCloudflareSource) read(ctx context.Context) (cloudflareRanges, fetc
 		return cloudflareRanges{}, fetchedDocument{}, err
 	}
 	return document, fetched, nil
+}
+
+// standInFor answers the one question `read` cannot answer for itself: the origin
+// could not be read, so which document stands in for it.
+//
+// Three answers, in this order, and the order is the design:
+//
+//  1. **Nothing this source was pointed at** -- a source built without a pinned
+//     snapshot returns the cause unchanged, exactly as it did before the snapshot
+//     existed. That refusal is the recorded behaviour of this project, and a
+//     change here must not soften it.
+//  2. **The snapshot the package ships**, when the caller named one and it
+//     verifies. This is what makes an installation with no route to the internet
+//     possible, and it is the LAST answer rather than the first because a
+//     snapshot is months old by construction: a machine that has published a
+//     document of its own has something better, and replacing that with the
+//     package's older copy is re-pinning a range list a selector was built
+//     against.
+//  3. **A refusal naming all three**, because an operator whose machine refused
+//     to install has three questions and the message is the only place they get
+//     answered: could the origin be read, is there a document of my own, and is
+//     the snapshot the package carries usable. A message that mentioned only the
+//     first would leave a machine that ships a snapshot looking like a machine
+//     that has nothing.
+//
+// A document this build accepted is never substituted for one it did not: the
+// snapshot goes through the same reader a cache does, and a pin whose recorded
+// endpoint is not this source's is refused rather than published, because an
+// envelope carrying another endpoint's URL revalidates against the wrong origin
+// on the next run.
+func (s *HTTPCloudflareSource) standInFor(cause error) (cloudflareRanges, fetchedDocument, error) {
+	if s.pin.Snapshot == "" && s.pin.Lock == "" {
+		return cloudflareRanges{}, fetchedDocument{}, cause
+	}
+	pin, err := ReadPinnedSnapshot(s.pin)
+	if err != nil {
+		return cloudflareRanges{}, fetchedDocument{}, fmt.Errorf(
+			"%w; the pinned snapshot this package ships, %s with %s beside it, cannot stand in for it either: %v",
+			cause, s.pin.Snapshot, s.pin.Lock, err)
+	}
+	if pin.Source != s.baseURL {
+		return cloudflareRanges{}, fetchedDocument{}, fmt.Errorf(
+			"%w; the pinned snapshot %s is a document from %s and this source reads %s, so publishing it would leave "+
+				"an envelope that revalidates one endpoint's ranges against another: %s accounts for it",
+			cause, pin.SnapshotPath, pin.Source, s.baseURL, pin.LockPath)
+	}
+	ranges, err := parseCloudflareDocument(pin.Source, pin.Body)
+	if err != nil {
+		// Unreachable while ReadPinnedSnapshot holds: it parses the same body
+		// with the same function. It is here so a change that ever separates the
+		// two is a refusal rather than a publication of unvalidated ranges.
+		return cloudflareRanges{}, fetchedDocument{}, fmt.Errorf(
+			"%w; the pinned snapshot %s parsed when it was verified and does not parse now: %v", cause, pin.SnapshotPath, err)
+	}
+	// Stale, because the origin was not read and these are not today's ranges.
+	// NOT stored-as-nothing: a document standing in for a cache is already stored
+	// because that is where it was read, while this one has to be written, or the
+	// next offline run would have neither a cache nor a pin-published envelope to
+	// stand in with. `Pinned` is what tells the two apart.
+	return ranges, fetchedDocument{
+		Body:      pin.Body,
+		URL:       s.baseURL,
+		Validator: pin.Validator,
+		Stale:     true,
+		Pinned:    true,
+		Pin:       pin,
+	}, nil
 }
 
 // publish writes both artifacts of one accepted document and reports how many

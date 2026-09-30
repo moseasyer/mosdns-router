@@ -43,11 +43,20 @@ type cacheDocument struct {
 // fetchedDocument is one document a source read: the bytes, the URL they came
 // from, the validator that describes them, and whether they came from the cache
 // rather than from the origin.
+//
+// Pinned and Pin are the third source, which is neither: a document read from
+// the snapshot a package ships. It is carried here rather than beside the reader
+// so that the publication below can tell the three apart without being told,
+// because the difference is a side effect -- a document standing in for the cache
+// is already stored, and one standing in for a package's snapshot has to be
+// written or the next offline run has nothing to stand in with.
 type fetchedDocument struct {
 	Body      []byte
 	URL       string
 	Validator string
 	Stale     bool
+	Pinned    bool
+	Pin       PinnedSnapshot
 }
 
 // validatorPolicy is what a source expects of the origin it reads. There is one
@@ -152,8 +161,18 @@ func staleInsteadOf(cached cacheDocument, cachedOK bool, sourceURL string, cause
 // no validator is not stored at all: readCache would refuse it on the next run, so
 // the file could never be used for anything and would only be there to be
 // distrusted.
+//
+// A document read from a package's pinned snapshot is stored even though it is
+// stale, and that is the one exception here with a reason rather than a
+// workaround. "Stale" normally means "this is the document that was already in the
+// cache, and the cache is where it lives", so there is nothing to write; a pin's
+// document has never been stored anywhere on this machine, and the publication
+// this call belongs to exists precisely so that it is. Writing it is also what
+// makes the next offline run a cache stand-in rather than a second read of the
+// package's own copy, so a pin is consulted once per machine rather than once per
+// install.
 func storeDocument(cachePath string, fetched fetchedDocument) error {
-	if fetched.Stale || fetched.Validator == "" {
+	if (fetched.Stale && !fetched.Pinned) || fetched.Validator == "" {
 		return nil
 	}
 	return writeCache(cachePath, cacheDocument{
@@ -187,30 +206,48 @@ func readCache(cachePath, sourceURL string) (cacheDocument, bool) {
 // as published that the next fetch would refuse to use, which is the one thing a
 // report about a start requirement must not do.
 func readAnyCache(cachePath string) (cacheDocument, bool) {
-	contents, err := os.ReadFile(cachePath)
+	document, err := readEnvelopeFile(cachePath)
 	if err != nil {
 		return cacheDocument{}, false
+	}
+	return document, true
+}
+
+// readEnvelopeFile reads one envelope and reports why it cannot be used, so the
+// reader that has to explain a refusal and the reader that only wants to know
+// whether to revalidate apply one set of gates to one set of bytes.
+//
+// The gates are exactly readAnyCache's, which is why this is the function the
+// boolean is built from rather than a second implementation beside it: a snapshot
+// a package ships is a cache document, and a reader that held it to weaker rules
+// than a cache would accept a pinned file that the very next revalidation
+// discarded.
+func readEnvelopeFile(path string) (cacheDocument, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return cacheDocument{}, fmt.Errorf("%s: read: %w", path, err)
 	}
 	document := cacheDocument{}
 	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&document); err != nil {
-		return cacheDocument{}, false
+		return cacheDocument{}, fmt.Errorf("%s: decode: %w", path, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return cacheDocument{}, false
+		return cacheDocument{}, fmt.Errorf("%s: the document carries trailing content", path)
 	}
 	if document.SchemaVersion != cacheSchemaVersion {
-		return cacheDocument{}, false
+		return cacheDocument{}, fmt.Errorf("%s: the cache is schema version %d, and this build reads version %d",
+			path, document.SchemaVersion, cacheSchemaVersion)
 	}
 	if document.ETag == "" {
-		return cacheDocument{}, false
+		return cacheDocument{}, fmt.Errorf("%s: the cache records no validator, so there would be nothing to revalidate with", path)
 	}
 	if len(document.Body) == 0 || !json.Valid(document.Body) {
-		return cacheDocument{}, false
+		return cacheDocument{}, fmt.Errorf("%s: the cache records no document", path)
 	}
-	return document, true
+	return document, nil
 }
 
 // writeCache stores one document under the injected path, creating the directory

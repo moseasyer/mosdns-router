@@ -53,10 +53,17 @@ type CloudflareSource interface {
 
 // HTTPCloudflareSource reads the Cloudflare IP API over HTTP and keeps the
 // document it read under an injected cache path.
+//
+// `pin` is the snapshot a package ships, consulted only when the origin cannot
+// be read and there is no published document of this machine's own to stand in
+// for it. It is a field rather than a constructor argument every caller has to
+// pass, because a source that reaches for a package's snapshot when the caller did
+// not name one would publish ranges nobody pointed it at.
 type HTTPCloudflareSource struct {
 	client    *http.Client
 	baseURL   string
 	cachePath string
+	pin       PinnedSnapshotPaths
 }
 
 var _ CloudflareSource = (*HTTPCloudflareSource)(nil)
