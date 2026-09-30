@@ -1,31 +1,48 @@
-"""The install scenario's assertions: the property that has never been observed.
+"""The install scenario's assertions: the barrier, and the one it cannot pass.
 
-`install_test.py` is the first scenario in this harness that can fail on the
-install transaction itself, and it observes the property the whole of Task 4 was
-waiting for: with no route to the internet, `dpkg -i` of this package completes
-and the published Cloudflare range document is the snapshot the package ships.
+`install_test.py` observes the property Task 4 Step 1 was written to deliver --
+with no route to the internet at all, `update-lists --refresh-ranges` publishes
+the package's pinned range document, `postinst` verifies the pair, and the
+transaction's refusal names the *foreign resolver* rather than the range origin.
+And it observes the property it **cannot** deliver: the transaction reaching
+`install ok configured` with no route. That one is recorded as a required skip on
+the scenario, so the cell is `incomplete` and the run is exit 3 rather than a red
+matrix for something that is not a defect.
 
 These cases drive the real scenario module against the fake `podman` the rest of
-this suite uses, and there are two halves to them.
+this suite uses, and there are three halves to them.
 
-**The happy path**, which is three facts rather than one. dpkg recorded the
-package installed; the transaction's own words say it pointed NetworkManager at
-the loopback and wrote the marker; and the published range document's digest
-equals the shipped snapshot's. The third is the one that matters: a cell whose
-bridge NATs outward would publish from the origin and hold a *different*
-document, so the equality is what distinguishes "the pin made this install
-possible" from "the install happened to succeed".
+**The cell**, which is three facts rather than one: dpkg recorded the state a
+refused transaction leaves, the transaction's own words name the resolver's
+barrier and not the range step's, and the published range document's digest
+equals the snapshot the package ships. The third is the one that matters: a cell
+whose bridge NATs outward would publish from the origin and hold a *different*
+document, so the equality is what distinguishes "the pin made this install get
+that far" from "the install happened to succeed".
 
 **The refusals**, which a happy-path-only scenario leaves entirely unverified and
 which are what has been protecting every machine so far. A cell whose bridge
 reaches the origin is refused rather than passed, because every observation would
-otherwise read the same while measuring nothing; a shipped snapshot whose bytes
-its lock does not record has to stop the install *before* the transaction runs and
-publish nothing; and each of those refusals has to leave the cell as it was
-found, so one cell's failed case cannot be the next cell's starting state.
+otherwise read the same while measuring nothing; a cell where the *range* step is
+what refused is refused, because that is the state this step was written to end
+and only the absent-signature checks can tell the two refusals apart; a cell
+where the transaction completed is refused, because that is Task 4 Step 5's cell
+and a scenario that accepted both would prove nothing about either; a shipped
+snapshot whose bytes its lock does not record has to stop the install *before the
+transaction runs* and publish nothing; and each of those refusals has to leave the
+cell as it was found, so one cell's failed case cannot be the next cell's
+starting state.
+
+**The fakes**, which have to be able to disagree with the code. The route probe's
+answer is produced by running the scenario's own probe program with a real
+`OSError` substituted, so the fixture derives what it answers instead of writing
+down the string the assertion is looking for -- the defect this file's first
+version had, and the reason it could not see that the real cell answered a
+`gaierror` where the assertion wanted an `ENETUNREACH`.
 """
 
 import ast
+import base64
 import errno
 import importlib.util
 import io
@@ -99,18 +116,99 @@ DPKG_INSTALL = "dpkg -i /tmp/mosdns-router.deb 2>&1; printf 'DPKG_EXIT=%s\\n' \"
 DPKG_STATE_QUERY = "dpkg-query -W -f='${db:Status-Status}\\n' mosdns-router 2>&1 || true"
 DPKG_STATUS_QUERY = "dpkg-query -W -f='${Status}\\n' mosdns-router 2>&1 || true"
 
-# postinst's own words, for a cell where the transaction completed. Each is a
-# claim the script makes about the machine, so a cell that reached `installed`
-# without them would mean a different script had configured the package.
-COMPLETED_OUTPUT = """\
-postinst: /var/lib/mosdns/lists/cn-domains.txt and /var/lib/mosdns/lists/source-lock.json are already published and
-postinst: readable, so they are left exactly as they are.
+# dpkg's own output for the cell this scenario is written for: a routeless cell
+# in which the transaction got PAST the range publication and refused at the
+# resolver's own start-up barrier. **Verbatim from a 24.04 cell built from this
+# tree**, so every claim the scenario asserts is a sentence a real cell printed.
+#
+# The three parts that matter, and what each one would mean if it were absent:
+#
+#   * postinst's STEP 3 -- the shipped pair verified. Without it the package
+#     never got past its own pin, which is the state this step was written to
+#     end.
+#   * the installer's refusal naming the resolver's wait, and its rollback. This
+#     is the barrier: `dnscrypt-proxy` binds its loopback listener once its own
+#     reachability probe runs out and then answers nothing, because the DNSCrypt
+#     server it needs is on the internet.
+#   * postinst's own status-3 arm -- "refused this machine and rolled back" and
+#     "Nothing is enabled and nothing was started". The second is why the four
+#     timers are recorded rather than asserted enabled.
+REFUSED_OUTPUT = """\
+Selecting previously unselected package mosdns-router.
+Preparing to unpack /tmp/mosdns-router.deb ...
+Unpacking mosdns-router (0.1.0) ...
+Setting up mosdns-router (0.1.0) ...
 postinst: the pinned range document at /usr/share/mosdns-router/cloudflare-ranges.json is {shipped}, as
-postinst: /usr/share/mosdns-router/cloudflare-ranges.lock.json records {shipped} for it, taken at 2026-09-30T00:03:59Z.
+postinst: /usr/share/mosdns-router/cloudflare-ranges.lock.json records, taken at 2026-09-30T00:03:59Z. It is read
+postinst: here and never written: 'mosdns-cdnctl update-lists --refresh-ranges' is what
+postinst: publishes it, and it reads this machine's own published document first.
+install: dnscrypt-proxy.service was started but nothing answered a DNS query at 127.0.0.1:15353 within 60s, so the machine has no local resolver to point NetworkManager at; nothing has been pointed at anything and the transaction is being undone
+install: every change this run made has been rolled back, and /var/lib/mosdns/installer/network-manager-backup.json records what the connection was set to; nothing else is different about this machine
+postinst: the install transaction refused this machine and rolled back
+postinst: every change it made, so nothing on this machine's DNS
+postinst: configuration is different from how this script found it.
+postinst: Nothing is enabled and nothing was started: this was a first
+postinst: install, and the four timers are enabled only after this step
+postinst: succeeds, so there is nothing here for them to run against.
+dpkg: error processing package /tmp/mosdns-router.deb (--install):
+ installed mosdns-router package post-installation script subprocess returned error exit status 1
+Errors were encountered while processing:
+ mosdns-router
+DPKG_EXIT=1
+""".format(shipped=SHIPPED_PIN_SHA)
+
+# A cell where the RANGE step is what refused, which is the state this step was
+# written to end and the one a scenario that only asserted "the transaction
+# refused" could not tell from `REFUSED_OUTPUT`. Two of the words are required to
+# be ABSENT from the transaction's output, so this is the case that makes that
+# assertion load-bearing rather than decorative. The wording is `standInFor`'s
+# own, and postinst's.
+CDN_BARRIER_OUTPUT = """\
+postinst: the pinned range document at /usr/share/mosdns-router/cloudflare-ranges.json is {shipped}, as
+postinst: /usr/share/mosdns-router/cloudflare-ranges.lock.json records, taken at 2026-09-30T00:03:59Z.
+install: update-lists: https://api.cloudflare.com/client/v4/ips: unexpected status 503; the pinned
+install: snapshot this package ships, /usr/share/mosdns-router/cloudflare-ranges.json with
+install: /usr/share/mosdns-router/cloudflare-ranges.lock.json beside it, cannot stand in for it
+install: either: /usr/share/mosdns-router/cloudflare-ranges.json is
+install: d1235dc06af1c770ffee53ec9a53275a3aa7aca1349b95672d74aea06433de5d and
+install: /usr/share/mosdns-router/cloudflare-ranges.lock.json records {shipped} for it, so this
+install: package cannot account for the ranges in it
+postinst: the install transaction refused this machine before it changed
+postinst: anything. That is the installer's own refusal, and the list of
+postinst: what its preflight found is the messages above.
+dpkg: error processing package /tmp/mosdns-router.deb (--install):
+ installed mosdns-router package post-installation script subprocess returned error exit status 1
+DPKG_EXIT=1
+""".format(shipped=SHIPPED_PIN_SHA)
+
+# A cell whose transaction refused at the resolver's barrier AND carried a range
+# refusal with it. It is not a cell this suite can produce and it is not a cell
+# any matrix produced -- it is here because it is the only state in which the
+# ABSENT-signature checks are the only thing that can see it. A cell that
+# refused at the ranges alone is caught by the positive check; a cell that
+# refused at the resolver alone has no range wording in it. A cell carrying both
+# means the range step failed *and* the transaction carried on far enough to hit
+# the resolver's wait, and an evidence document that called that "the barrier"
+# would be describing a run that published nothing and installed nothing.
+BOTH_BARRIERS_OUTPUT = REFUSED_OUTPUT + """\
+update-lists: https://api.cloudflare.com/client/v4/ips: server misbehaving
+install: the pinned snapshot this package ships cannot stand in for it either
+"""
+
+# The first version of this file's happy path: a cell where the transaction
+# COMPLETED, with both daemons active and the four timers enabled. Kept as a
+# fixture value rather than deleted, because it is what the scenario must now
+# refuse -- it is Task 4 Step 5's cell, not this step's, and a scenario that
+# quietly accepted both would prove nothing about either.
+COMPLETED_OUTPUT = """\
+postinst: the pinned range document at /usr/share/mosdns-router/cloudflare-ranges.json is {shipped}, as
+postinst: /usr/share/mosdns-router/cloudflare-ranges.lock.json records, taken at 2026-09-30T00:03:59Z. It is read
+postinst: here and never written: 'mosdns-cdnctl update-lists --refresh-ranges' is what
+postinst: publishes it, and it reads this machine's own published document first.
 note: eth0-managed (eth0, f1480978-e49e-4ed7-953b-748d5d1c512d) now uses the loopback address 127.0.0.1; the original settings are recorded in /var/lib/mosdns/installer/network-manager-backup.json
 install: 53 and 15353 are served on loopback and NetworkManager has been pointed at 127.0.0.1; the ownership marker at /var/lib/mosdns/installer/managed-by has been written, so an uninstall will restore exactly what was changed
 Created symlink /etc/systemd/system/timers.target.wants/mosdns-cdn-optimizer.timer -> /usr/lib/systemd/system/mosdns-cdn-optimizer.timer.
-Created symlink /etc/systemd/system/timers.target.wants/mosdns-watchdog.timer -> /usr/lib/systemd/system/mosdns-watchdog.timer.
+DPKG_EXIT=0
 """.format(shipped=SHIPPED_PIN_SHA)
 
 # The refusal a corrupt shipped snapshot has to produce, and the sentence that
@@ -125,6 +223,18 @@ postinst: {shipped} for it, so this package cannot account for the ranges
 postinst: in it. Refusing to install a selector over a range list this project cannot
 postinst: name. Nothing has been changed on this machine's DNS.
 """.format(shipped=SHIPPED_PIN_SHA)
+
+# What the scenario writes back after the corrupt-snapshot case. Base64, because
+# the scenario reads the file that way: the wrapper's `.output` strips trailing
+# whitespace, so a text read loses the final newline and the restore would not
+# round-trip. **This constant is derived from the repository's own shipped
+# snapshot**, so if the pin is ever re-pinned the fixture follows it and the
+# restore case is testing a real round trip rather than a remembered string.
+SHIPPED_PIN_PATH = install.SHIPPED_PIN
+SHIPPED_PIN_BYTES = (
+    REPO / "configs" / "cloudflare-ranges.json"
+).read_bytes()
+SHIPPED_PIN_BASE64 = base64.b64encode(SHIPPED_PIN_BYTES).decode("ascii")
 
 # The no-route probe, and what a cell that cannot route answers it.
 #
@@ -249,7 +359,8 @@ ranges-pin-drift: none
 
 
 def install_rules(**overrides):
-    """The rule table a cell where the install completes and the pin is used.
+    """The rule table for the cell this scenario is written for: a routeless cell
+    in which the transaction got past the range step and refused at the resolver.
 
     Every override replaces one answer, so each case changes exactly the fact it
     is about -- which is the property that makes a case here evidence rather
@@ -260,20 +371,30 @@ def install_rules(**overrides):
         # fails. The precondition of the whole scenario.
         "route": "10.89.0.0/24 dev eth0 proto kernel scope link src 10.89.0.190 metric 100",
         "reachable": probe_failed(),
-        # The package, installed once.
+        # The package, installed once: the transaction refuses, so dpkg's word is
+        # one of the two and the exit is 1.
         "stat": "16205254",
-        "install": COMPLETED_OUTPUT,
-        "state": "installed",
-        "status": "install ok installed",
+        "install": REFUSED_OUTPUT,
+        "state": "half-configured",
+        "status": "install ok half-configured",
         # The two digests the property rests on.
         "shipped": SHIPPED_PIN_SHA,
         "published": PUBLISHED_PIN_SHA,
         "prefixes": PREFIX_LIST,
-        # The two files the transaction claims to have written.
+        # The lock's own digest. Recorded separately from `shipped` rather than
+        # written inline: the first version of this table carried an accidental
+        # `answers['corrupt'] and SHIPPED_PIN_SHA` here, which evaluated to the
+        # right value for the wrong reason and would have read a boolean to
+        # anybody who changed the `corrupt` answer.
+        "lock": SHIPPED_PIN_SHA,
+        # The record the transaction wrote before its first mutation, and the
+        # marker it did not write because it never committed.
         "backup": 0,
-        "marker": 0,
+        "marker": 1,
         "refresh": REFRESH_FROM_PIN,
         "check": CHECK_REPORT,
+        # The four timers: the unit files are there, the enable never ran.
+        "timer": "disabled",
         # The refusal case, and the state it leaves behind.
         "corrupt": CORRUPT_OUTPUT,
         "corrupt_state": "half-configured",
@@ -293,12 +414,13 @@ def install_rules(**overrides):
         # answer exactly the command that made this fix necessary.
         {"match": ["sh", "-c"], "match_contains": PROBE_NEEDLE, "stdout": answers["reachable"] + "\n"},
         {"match": ["stat", "-c", "%s", "/tmp/mosdns-router.deb"], "stdout": answers["stat"] + "\n"},
-        {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0, "stdout": answers["install"] + "DPKG_EXIT=0\n"},
+        {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0,
+         "stdout": answers["install"] + f"DPKG_EXIT={1 if 'DPKG_EXIT=0' not in answers['install'] else 0}\n"},
         {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": answers["status"] + "\n"},
         {"match": ["sha256sum", "/usr/share/mosdns-router/cloudflare-ranges.json"],
          "stdout": f"{answers['shipped']}  /usr/share/mosdns-router/cloudflare-ranges.json\n"},
         {"match": ["sha256sum", "/usr/share/mosdns-router/cloudflare-ranges.lock.json"],
-         "stdout": f"{answers['corrupt']and SHIPPED_PIN_SHA}  /usr/share/mosdns-router/cloudflare-ranges.lock.json\n"},
+         "stdout": f"{answers['lock']}  /usr/share/mosdns-router/cloudflare-ranges.lock.json\n"},
         {"match": ["sha256sum", "/var/lib/mosdns/lists/cloudflare-ips.json"],
          "stdout": f"{answers['published']}  /var/lib/mosdns/lists/cloudflare-ips.json\n"},
         {"match": ["sha256sum", "/var/lib/mosdns/lists/cloudflare-prefixes.txt"],
@@ -310,14 +432,28 @@ def install_rules(**overrides):
         {"match": ["test", "-e", "/var/lib/mosdns/installer/network-manager-backup.json"],
          "returncode": answers["backup"]},
         {"match": ["test", "-e", "/var/lib/mosdns/installer/managed-by"], "returncode": answers["marker"]},
-        # The refresh is asked twice: once to publish (the `sh -c` rule above
-        # carries the socket test, and this one carries the `rm` and the run) and
-        # once to read the report back.
+        # The refresh is asked ONCE, and the report is read out of that same
+        # invocation: a second `--refresh-ranges` finds the document the first
+        # one published and reports `ranges-source: cache`, which says nothing
+        # about the pin. The first version of this table answered BOTH
+        # invocations with the pin's report, which is how twenty cases were
+        # asserting the answer the fake was written with rather than the one a
+        # real cell produces. MEASURED, 24.04: the second invocation says
+        # `ranges-source: cache`.
         {"match": ["sh", "-c"], "match_contains": "update-lists --refresh-ranges",
-         "stdout": answers["refresh"]},
+         "stdout": answers["refresh"] + "REFRESH_EXIT=0\n"},
         {"match": ["sh", "-c"], "match_contains": "update-lists --check", "stdout": answers["check"]},
         {"match": ["cat", "/var/lib/mosdns/lists/cloudflare-prefixes.txt"], "stdout": answers["prefixes"]},
-        {"match": ["cat", "/usr/share/mosdns-router/cloudflare-ranges.json"],
+        # The shipped snapshot is read as base64 for the restore, not as text:
+        # the wrapper's `.output` strips trailing whitespace, so a text read
+        # loses the file's final newline and a heredoc restore glues its
+        # terminator onto the last line. MEASURED -- that restore produced
+        # `e249206b…` where the shipped pair is `fa80894e…`. The rule carries
+        # the base64 of the same bytes the `cat` rule used to carry, so a case
+        # that changes the shipped document changes both.
+        {"match": ["sh", "-c"], "match_contains": f"base64 -w0 {SHIPPED_PIN_PATH}",
+         "stdout": SHIPPED_PIN_BASE64 + "\n"},
+        {"match": ["cat", SHIPPED_PIN_PATH],
          "stdout": '{"schema_version":1,"url":"https://api.cloudflare.com/client/v4/ips"}\n'},
         # The refusal case, and it is a SEQUENCE rather than one answer: the
         # scenario runs `dpkg --configure` twice, once to plant the refusal's
@@ -330,11 +466,12 @@ def install_rules(**overrides):
              {"stdout": answers["corrupt"]},
          ]},
         # And the state the refusal leaves, which is a SEQUENCE of its own for
-        # the same reason and for the same property: the package was `installed`
-        # when the scenario read it after `dpkg -i`, and `half-configured` when it
-        # read it after the refusal. Exactly two reads, so exactly two answers --
-        # a third would be dead weight and a case reading it would be asserting
-        # against an entry nothing consults.
+        # the same reason and for the same property: the package was
+        # `half-configured` when the scenario read it after `dpkg -i`, and
+        # `half-configured` again when it read it after the corrupt-pin refusal.
+        # Exactly two reads, so exactly two answers -- a third would be dead
+        # weight and a case reading it would be asserting against an entry
+        # nothing consults.
         {"match": ["sh", "-c", DPKG_STATE_QUERY],
          "answers": [
              {"stdout": answers["state"] + "\n"},
@@ -349,16 +486,26 @@ def install_rules(**overrides):
          "returncode": answers["corrupt_present"]},
         {"match": ["test", "-e", "/var/lib/mosdns/lists/cloudflare-prefixes.txt"],
          "returncode": answers["corrupt_present"]},
+        # The two daemons the transaction started and then rolled back, so both
+        # are `inactive` in this cell -- a measured reading, and the one that
+        # tells a reader the rollback reached the units.
         {"match": ["systemctl", "show", "--property=ActiveState", "--value",
-                   "dnscrypt-proxy.service"], "stdout": "active\n"},
+                   "dnscrypt-proxy.service"], "stdout": "inactive\n"},
         {"match": ["systemctl", "show", "--property=ActiveState", "--value",
-                   "mosdns-router.service"], "stdout": "active\n"},
-        {"match": ["sh", "-c"], "match_contains": "ss -lntup", "stdout": (
-            "udp UNCONN 0 0 127.0.0.1:15353 0.0.0.0:* users:((\"dnscrypt-proxy\",pid=1060,fd=5))\n"
-            "udp UNCONN 0 0 127.0.0.1:53 0.0.0.0:* users:((\"mosdns-router\",pid=1068,fd=3))\n"
-        )},
+                   "mosdns-router.service"], "stdout": "inactive\n"},
+        # And no listener, because the resolver was stopped again. Recorded, not
+        # asserted -- the loopback-listener question is the plan's Task 4 Step 3,
+        # and this cell cannot answer it.
+        {"match": ["sh", "-c"], "match_contains": "ss -lntup", "stdout": ""},
     ] + [
         {"match": ["test", "-e", f"/usr/lib/systemd/system/{timer}"], "returncode": 0}
+        for timer in (
+            "mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer",
+            "mosdns-list-check.timer", "mosdns-watchdog.timer",
+        )
+    ] + [
+        {"match": ["sh", "-c"], "match_contains": f"systemctl is-enabled {timer}",
+         "stdout": f"{answers['timer']}\n"}
         for timer in (
             "mosdns-cdn-optimizer.timer", "mosdns-cdn-health.timer",
             "mosdns-list-check.timer", "mosdns-watchdog.timer",
@@ -406,39 +553,128 @@ class InstallScenarioHarness(PodmanTestCase):
 
 
 class ScenarioPassesTest(InstallScenarioHarness):
-    """The cell this step exists to produce, and what it records when it passes."""
+    """The cell this step produces, and what it records when it passes.
+
+    **A passing install scenario is a passing cell that is not a passed cell.**
+    The scenario proves what Task 4 Step 1 delivered -- the transaction gets past
+    the range publication with no route to the internet -- and it cannot prove
+    that the transaction then completes, so it records that requirement as a
+    required skip. The cases below cover both halves, and the shape case in
+    `ScenarioShapeTest` holds the docstring to the same two.
+    """
 
     def test_the_scenario_passes_with_no_route_to_the_internet(self):
         _fake, result = self.run_scenario()
         self.assertEqual(result.status, "passed", result.detail)
         self.assertEqual(result.log, f"logs/{VERSION}-install.json")
 
-    def test_the_record_carries_the_three_facts_the_claim_rests_on(self):
+    def test_the_record_carries_the_facts_the_claim_rests_on(self):
         _fake, result = self.run_scenario()
         self.assertEqual(result.status, "passed", result.detail)
         record = self.record(result)
-        # One: dpkg's own record. Both spellings, because a scenario that read
-        # only one could be satisfied by a package dpkg left half-configured.
-        self.assertEqual(record["package_state"], "installed")
-        self.assertEqual(record["package_status_phrase"], "install ok installed")
-        self.assertTrue(record["package_configured"])
-        # Two: the transaction's own account, and the two files it says it wrote.
-        self.assertIn("now uses the loopback address 127.0.0.1", record["dpkg_output"])
-        self.assertIn("the ownership marker at", record["dpkg_output"])
-        self.assertTrue(record["backup_present"])
-        self.assertTrue(record["marker_present"])
+        # One: dpkg's own record, and it is the REFUSING state. Both spellings,
+        # because a scenario that read only one could be satisfied by a package
+        # dpkg left unpacked. The two words dpkg uses are both accepted, and
+        # which one appeared is recorded rather than assumed.
+        self.assertEqual(record["package_state"], "half-configured")
+        self.assertEqual(record["package_status_phrase"], "install ok half-configured")
+        self.assertFalse(record["package_configured"])
+        # Two: postinst verified the pair, and said it is never re-pinned. The
+        # second is matched on the flattened output, because postinst writes that
+        # sentence across two `echo` lines -- which is exactly why the scenario
+        # flattens before it matches.
+        flat = install.flatten_output(record["dpkg_output"])
+        self.assertIn("the pinned range document at", flat)
+        self.assertIn("It is read here and never written", flat)
         # Three: the digest equality, which is the whole of "the pin made this
-        # install possible". A cell that reached the origin would hold a
+        # install get that far". A cell that reached the origin would hold a
         # different document here and every other observation would read the
         # same.
         self.assertEqual(record["published_ranges_sha256"], record["shipped_pin_sha256"])
         self.assertEqual(record["prefix_list_lines"], 3)
+        self.assertIn("ranges-source: pinned-snapshot", record["refresh_report"])
+
+    def test_the_record_says_the_refusal_is_the_resolver_and_not_the_ranges(self):
+        # **The property this step holds.** The transaction refuses in a
+        # routeless cell, and the point is WHICH refusal: this step was written
+        # to end the one that named the range origin, so a cell that still named
+        # it would be a cell this step did not fix. The positive half is the
+        # barrier's own sentence; the negative half is the two range refusals,
+        # asserted absent, which is the half that makes it load-bearing.
+        _fake, result = self.run_scenario()
+        record = self.record(result)
+        self.assertTrue(record["barrier_is_the_foreign_resolver"])
+        self.assertIn(install.CLAIM_RESOLVER_BARRIER, record["transaction_barrier"])
+        self.assertIn("dnscrypt-proxy.service", record["transaction_barrier"])
+        flat = install.flatten_output(record["dpkg_output"])
+        self.assertIn(install.CLAIM_ROLLED_BACK, flat)
+        self.assertIn(install.CLAIM_POSTINST_SAW_REFUSAL, flat)
+        self.assertIn(install.CLAIM_NOTHING_ENABLED, flat)
+        for signature in install.CDN_BARRIER_SIGNATURES:
+            self.assertNotIn(signature, flat)
+
+    def test_the_record_says_the_machines_dns_was_recorded_and_never_taken_over(self):
+        # Two facts that are the rollback, read as a pair. The record is written
+        # before the transaction's first mutation, so it exists whether or not the
+        # transaction gets further; the ownership marker is written only on
+        # commit, so its ABSENCE is what says the transaction never took the
+        # machine over. A marker left behind by a refused transaction would point
+        # a later uninstall at DNS the rollback undid.
+        _fake, result = self.run_scenario()
+        record = self.record(result)
+        self.assertTrue(record["backup_present"])
+        self.assertFalse(record["marker_present"])
+
+    def test_the_unclosed_requirement_is_recorded_as_a_named_required_skip(self):
+        # The requirement in the plan's own words, not a summary of it, so a
+        # reader can check the report against the plan. And `required=True`, so
+        # the cell is `incomplete` and the run is exit 3 -- a skip is never
+        # reported as a pass, and a `required=False` here would be filing a
+        # required requirement as a nicety.
+        _fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        self.assertEqual(len(result.skips), 1)
+        recorded = result.skips[0]
+        self.assertEqual(recorded.requirement, install.OFFLINE_CONFIGURED_REQUIREMENT)
+        self.assertTrue(recorded.required)
+        self.assertIn("install ok configured", recorded.requirement)
+        # The reason says which barrier refused and which step closes it, so a
+        # reader is not left with an open requirement and no road.
+        self.assertIn(install.CLAIM_RESOLVER_BARRIER, recorded.reason)
+        self.assertIn("Task 4 Step 5", recorded.reason)
+        self.assertIn("DNSCrypt server", recorded.reason)
+
+    def test_the_scenario_detail_says_the_state_and_the_barrier(self):
+        # The one line an operator reads on the terminal. It has to name the
+        # state dpkg recorded, the barrier, and the fact that the requirement is
+        # recorded rather than closed -- a detail that said "the install
+        # completed" would be the false claim the review found, and it would be
+        # the only sentence most readers see.
+        _fake, result = self.run_scenario()
+        self.assertIn("install ok half-configured", result.detail)
+        self.assertIn("got past the range step", result.detail)
+        self.assertIn("127.0.0.1:15353", result.detail)
+        self.assertIn("recorded as a required skip", result.detail)
+        self.assertIn("incomplete rather than passed", result.detail)
+        self.assertNotIn("the install transaction completed", result.detail)
+
+    def test_the_record_carries_the_skip_it_could_not_close(self):
+        # The evidence document is the one file a reader has, so the open
+        # requirement is in it as well as in the result: a report archived
+        # without the scenario's `detail` would otherwise be silent about it.
+        _fake, result = self.run_scenario()
+        record = self.record(result)
+        self.assertEqual(
+            [entry["requirement"] for entry in record["unclosed_requirements"]],
+            [install.OFFLINE_CONFIGURED_REQUIREMENT],
+        )
+        self.assertTrue(record["unclosed_requirements"][0]["required"])
 
     def test_the_record_says_the_cell_had_no_route_and_why_that_matters(self):
         # The precondition is recorded rather than assumed, so a reader of the
-        # evidence can tell that the install was possible BECAUSE the snapshot
-        # exists rather than in spite of a reachable origin. The errno is the
-        # fact, and it is recorded as the number the kernel gave.
+        # evidence can tell that the transaction got that far BECAUSE the
+        # snapshot exists rather than in spite of a reachable origin. The errno
+        # is the fact, and it is recorded as the number the kernel gave.
         _fake, result = self.run_scenario()
         record = self.record(result)
         self.assertTrue(record["no_route_established"])
@@ -468,6 +704,35 @@ class ScenarioPassesTest(InstallScenarioHarness):
         self.assertIn("reported no errno at all", result.detail)
         self.assertIn("it is a probe that did not run", result.detail)
 
+    def test_the_refresh_that_published_is_the_one_whose_report_is_read(self):
+        # A second `update-lists --refresh-ranges` on the same machine finds the
+        # document the first one published and reports `ranges-source: cache`,
+        # so a scenario that asked twice and asserted on the second was
+        # asserting on a report about its own first run. MEASURED, 24.04. The
+        # rule above matches both invocations with the pin's report, so this is
+        # about how many times the scenario asks.
+        fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        refreshes = [
+            line for line in self.asked(fake)
+            if "update-lists --refresh-ranges" in line and "rm -f" in line
+        ]
+        self.assertEqual(
+            len(refreshes), 1,
+            f"the publish was asked {len(refreshes)} times: {refreshes}",
+        )
+        self.assertEqual(self.record(result)["refresh_exit"], 0)
+
+    def test_a_refresh_that_published_nothing_is_refused(self):
+        # Exit 0 with `ranges-source: pinned-snapshot` is the whole of the claim.
+        # A refresh that failed publishes nothing, and a scenario that read the
+        # report of a LATER successful run would report an install that
+        # published a document it did not.
+        _fake, result = self.run_scenario(refresh=REFRESH_FROM_PIN + "REFRESH_EXIT=3\n")
+        self.assertEqual(result.status, "failed")
+        self.assertIn("exited 3", result.detail)
+        self.assertIn("it published nothing", result.detail)
+
     def test_the_record_carries_the_reports_an_operator_would_read(self):
         _fake, result = self.run_scenario()
         record = self.record(result)
@@ -478,16 +743,6 @@ class ScenarioPassesTest(InstallScenarioHarness):
         # fine input for a selector and a pin nobody measures is not.
         self.assertTrue(record["pin_age_reported"])
         self.assertIn("ranges-pin-age: 1h4m47", record["check_report"])
-
-    def test_the_record_says_which_barrier_refused_when_one_does(self):
-        # The record is written on the failure path too, and a reader of a failed
-        # cell needs dpkg's own words rather than a status.
-        _fake, result = self.run_scenario(state="half-configured", status="install ok half-configured")
-        self.assertEqual(result.status, "failed")
-        record = self.record(result)
-        self.assertEqual(record["package_state"], "half-configured")
-        self.assertIn("dpkg_output", record)
-        self.assertIn("postinst", record["dpkg_output"])
 
     def test_the_install_runs_exactly_once(self):
         # Two `dpkg -i` invocations run the transaction twice, and every recorded
@@ -573,6 +828,87 @@ class TheRefusalsTest(InstallScenarioHarness):
         self.assertIn("the published range document is", result.detail)
         self.assertIn("these are not equal", result.detail)
 
+    def test_a_cell_where_the_range_step_is_what_refused_is_refused(self):
+        # **The case that makes the "not the CDN one" assertion load-bearing.**
+        # This is the cell every matrix cell was before the pinned snapshot
+        # existed: postinst verified its pair, and the transaction refused
+        # because the origin could not be read and the pin could not stand in
+        # for it. Its dpkg output carries BOTH range refusals' signatures and not
+        # the resolver's barrier -- so a scenario that only asserted "the
+        # transaction refused" would pass against it and report a pass for a cell
+        # this step did not fix.
+        _fake, result = self.run_scenario(install=CDN_BARRIER_OUTPUT)
+        self.assertEqual(result.status, "failed")
+        self.assertIn(install.CLAIM_RESOLVER_BARRIER, result.detail)
+        self.assertIn("the resolver's own start-up barrier refused the transaction", result.detail)
+        self.assertIn("not the one this step delivered", result.detail)
+
+    def test_a_refusal_that_also_carries_a_range_refusal_is_refused(self):
+        # **The case the absent-signature checks exist for.** A cell that refused
+        # at the ranges alone is already caught by the requirement that the
+        # resolver's barrier be present, and a cell that refused at the resolver
+        # alone has no range wording in it. This one has both, and it is the only
+        # state in which dropping the absent-signature checks changes anything:
+        # a document that called it "the resolver's barrier" would be describing
+        # a run that published nothing and installed nothing while appearing to
+        # have got past the CDN step.
+        _fake, result = self.run_scenario(install=BOTH_BARRIERS_OUTPUT)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("what the RANGE step says when it refuses", result.detail)
+        self.assertIn("cannot stand in for it", result.detail)
+        self.assertIn("did not get past the CDN step", result.detail)
+
+    def test_a_cell_where_the_transaction_completed_is_refused(self):
+        # The mirror, and it is Task 4 Step 5's cell rather than this step's:
+        # with the test-only foreign override the transaction completes and
+        # dpkg records `install ok installed`. A scenario that accepted both
+        # would prove nothing about either, and the refusal says which step
+        # upgrades it rather than leaving the next implementer to guess.
+        _fake, result = self.run_scenario(
+            install=COMPLETED_OUTPUT, state="installed", status="install ok installed",
+            marker=0, backup=0, timer="enabled",
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("CONFIGURED", result.detail)
+        self.assertIn("Task 4 Step 5 adds the test-only foreign override", result.detail)
+        self.assertIn("upgrades", result.detail)
+
+    def test_a_refused_transaction_that_still_left_the_ownership_marker_is_refused(self):
+        # The marker is the rollback point a later uninstall reads. A transaction
+        # that rolled itself back and left one would have a marker pointing at DNS
+        # it never changed -- and the fixture's happy path is the only other place
+        # a marker appears, so this case isolates it.
+        _fake, result = self.run_scenario(marker=0)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("IS in", result.detail)
+        self.assertIn("owns the machine's DNS", result.detail)
+
+    def test_a_refused_transaction_that_recorded_nothing_is_refused(self):
+        _fake, result = self.run_scenario(backup=1)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("is not in", result.detail)
+        self.assertIn("nothing recording what it was", result.detail)
+
+    def test_a_postinst_that_never_reported_verifying_the_pair_is_refused(self):
+        # STEP 3's words are what say the package got past its own pin. Without
+        # them the cell is not this one, and the transaction's own output would be
+        # the only evidence -- which is the case where the interesting question
+        # is which step refused, and the answer would be unanswered.
+        _fake, result = self.run_scenario(
+            install=REFUSED_OUTPUT.replace("the pinned range document at", "no range document here"),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("does not contain", result.detail)
+        self.assertIn("postinst verified the shipped pair", result.detail)
+
+    def test_a_refusal_that_did_not_say_it_rolled_back_is_refused(self):
+        _fake, result = self.run_scenario(
+            install=REFUSED_OUTPUT.replace("every change this run made has been rolled back",
+                                           "the transaction is being undone"),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("the installer rolled the transaction back", result.detail)
+
     def test_a_missing_shipped_snapshot_is_refused(self):
         # A package that ships no pinned document cannot have installed from one,
         # and an unreadable file has to be distinguishable from a file whose
@@ -622,6 +958,26 @@ class TheRefusalsTest(InstallScenarioHarness):
         self.assertEqual(result.status, "passed", result.detail)
         record = self.record(result)
         self.assertEqual(record["pin_restored_sha256"], record["shipped_pin_sha256"])
+
+    def test_the_restore_round_trips_the_bytes_it_read(self):
+        # **The wrapper's `.output` strips trailing whitespace**, so the first
+        # version of this restore -- read the file as text, write it back through
+        # a heredoc -- put the heredoc's terminator on the end of the last line
+        # and produced `e249206b…` where the shipped pair is `fa80894e…`. The
+        # digest assertion above caught it on the first live run; this case
+        # holds the mechanism, so the next reader is not left guessing why the
+        # read is base64.
+        fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        restores = [line for line in self.asked(fake) if "base64 -d" in line]
+        self.assertEqual(len(restores), 1, f"the restore ran {len(restores)} times: {restores}")
+        self.assertNotIn("MOSDNS_PIN_EOF", restores[0])
+        # And the bytes the scenario writes back are the repository's own file,
+        # base64-encoded, so a case reading `restores[0]` can decode it and
+        # compare -- which is the round trip this case is about.
+        quoted = re.search(r"printf '%s' '([A-Za-z0-9+/=]+)'", restores[0])
+        self.assertIsNotNone(quoted, f"the restore is not a base64 write: {restores[0]!r}")
+        self.assertEqual(base64.b64decode(quoted.group(1)), SHIPPED_PIN_BYTES)
 
 
 class FakeSeamTest(InstallScenarioHarness):
@@ -699,9 +1055,41 @@ class ScenarioShapeTest(unittest.TestCase):
         }
         for name in (
             "CLAIM_PIN_PUBLISHED", "CLAIM_PIN_VERIFIED", "CLAIM_PIN_DRIFT_NONE",
-            "CLAIM_TRANSACTION_TOOK_OVER", "CLAIM_MARKER_WRITTEN",
+            "CLAIM_PIN_CHECKED_BY_POSTINST", "CLAIM_PIN_NEVER_REPINNED",
+            "CLAIM_RESOLVER_BARRIER", "CLAIM_ROLLED_BACK",
+            "CLAIM_POSTINST_SAW_REFUSAL", "CLAIM_NOTHING_ENABLED",
+            "CDN_BARRIER_SIGNATURES", "OFFLINE_CONFIGURED_REQUIREMENT",
+            "REFUSING_STATES", "CONFIGURED_STATES",
         ):
             self.assertIn(name, constants, f"{name} is asserted but not named at module scope")
+
+    def test_the_docstring_says_what_the_scenario_asserts_and_not_what_it_cannot(self):
+        # **The false claim the review found, held shut.** The first version's
+        # docstring said "It also does not claim the whole transaction is
+        # reachable with no route" while the file required `package_configured`
+        # and reported "the install transaction completed" -- so the file a
+        # future implementer reads told them the opposite of what it did, in the
+        # one document nobody skips.
+        #
+        # The requirement it cannot close is now IN the docstring, verbatim,
+        # because the docstring is where a reader looks for it, and the claims
+        # that were false are gone rather than softened.
+        source = self.source()
+        # Flattened, because postinst and the installer both write one sentence
+        # across several lines and the requirement in the docstring is written
+        # as the plan wrote it.
+        flat = " ".join(source.split())
+        self.assertIn(install.OFFLINE_CONFIGURED_REQUIREMENT, flat)
+        for gone in (
+            "1. **The transaction completes.**",
+            "2. **It completed because the shipped snapshot exists, not by luck.**",
+            "It also does not claim the whole transaction is reachable with no route",
+            "the property that **the install completes at all**",
+        ):
+            self.assertNotIn(gone, flat, f"install_test.py still says {gone!r}")
+        # And it names the step that closes the requirement, so a reader of the
+        # plan and a reader of this file are pointed at the same place.
+        self.assertIn("Task 4 Step 5 reads this", source)
 
     def test_the_no_route_assertion_is_a_number_and_not_a_sentence(self):
         # The first version named `CLAIM_NO_ROUTE = "Network is unreachable"` and
@@ -762,6 +1150,39 @@ class ScenarioShapeTest(unittest.TestCase):
         source = self.source()
         self.assertIn("corrupt_pin_refused", source)
         self.assertIn("no_route_established", source)
+
+    def test_the_scenario_asserts_the_range_step_is_not_what_refused(self):
+        # A later edit that dropped the two absent-signature checks would look
+        # like tidying: the scenario would still require the resolver's barrier,
+        # and the cell this step was written to end -- the one whose refusal
+        # names the origin -- would be reported as the barrier with the
+        # requirement skipped over it.
+        source = self.source()
+        self.assertIn("CDN_BARRIER_SIGNATURES", source)
+        self.assertIn("barrier_is_the_foreign_resolver", source)
+        self.assertIn(
+            "for signature in CDN_BARRIER_SIGNATURES:", source,
+            "the range refusals are no longer required to be ABSENT from the transaction's output, "
+            "which is the only thing that can see a cell carrying both refusals",
+        )
+        self.assertIn("signature not in flat", source)
+        self.assertEqual(
+            install.CDN_BARRIER_SIGNATURES,
+            ("cannot stand in for it", "cannot account for"),
+            "the two signatures changed; `Cannot stand in for it` is `standInFor`'s own wording and "
+            "`cannot account for` is postinst's, and a case that depends on them has to say so",
+        )
+
+    def test_the_scenario_does_not_assert_a_configured_package(self):
+        # The single assertion that made this scenario unable to go green in any
+        # cell, and it is the one the review found. Held here so that dropping it
+        # -- which would look like a simplification -- is a visible change.
+        source = self.source()
+        self.assertIn(
+            "not document[\"package_configured\"]", source,
+            "the scenario requires a CONFIGURED package again, which no routeless cell can produce",
+        )
+        self.assertIn("REFUSING_STATES", source)
 
 
 if __name__ == "__main__":
