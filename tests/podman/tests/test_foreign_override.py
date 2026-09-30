@@ -44,8 +44,21 @@ SHIPPED = (REPO / "configs" / "dnscrypt-proxy.toml").read_text(encoding="utf-8")
 ADDRESS = "10.89.0.40:443"
 PROVIDER = "2.dnscrypt-cert." + foreign_override.STATIC_NAME
 
+# **The stamp's address field is the BARE HOST, and that is what the mock
+# publishes.** MEASURED by decoding a live mock's stamp out of the run's counters
+# document: `addrLen = 10`, `addr = "10.89.0.40"`, and `pkLen` (0x20) follows it
+# immediately -- there is no port in the stamp, because
+# `go-dnsstamps`' `NewDNSCryptServerStampFromLegacy` writes the address as given
+# and a DNSCrypt client applies the default port to a stamp that carries none. So
+# `ADDRESS` is the `host:port` the *cell* knows the mock by, and `STAMP_HOST` is
+# what the *stamp* carries, and the two have to agree after the default is
+# applied. A fixture built with the port inside the field would be a shape no
+# cell produces, and the address check it feeds would be holding a gate against a
+# fiction.
+STAMP_HOST = "10.89.0.40"
 
-def dnscrypt_stamp(address: str = ADDRESS, provider: str = PROVIDER,
+
+def dnscrypt_stamp(address: str = STAMP_HOST, provider: str = PROVIDER,
                    provider_key: bytes = bytes(range(32)), props: int = 0b011) -> str:
     """A real DNSCrypt stamp, built the way go-dnsstamps builds one.
 
@@ -200,7 +213,13 @@ class TheOverrideIsASubstitutionTest(unittest.TestCase):
             "the fixture stamp names a provider the mock does not publish a certificate for",
         )
         self.assertEqual(fields["proto"], 0x01, "the fixture is not a DNSCrypt stamp")
-        self.assertEqual(fields["address"], ADDRESS)
+        self.assertEqual(
+            fields["address"], STAMP_HOST,
+            "the fixture's address field carries a port, and no stamp this project's mock "
+            "publishes does: `go-dnsstamps` writes the address as given and the client applies "
+            "the default. A fixture of the other shape would be holding the address check "
+            "against a form no cell produces",
+        )
         self.assertEqual(len(fields["key"]), 32, "a DNSCrypt stamp carries a 32-byte provider key")
         # And a stamp naming a *different* provider is refused, which is the case
         # that would otherwise reach a cell and fail there for a reason nothing in
@@ -213,6 +232,99 @@ class TheOverrideIsASubstitutionTest(unittest.TestCase):
         self.assertIn("provider name", message)
         self.assertIn("foreign-resolver barrier", message)
         self.assertIn("2.dnscrypt-cert.quad9-dnscrypt-ip4-filter-1", message)
+
+    def test_the_stamp_names_the_address_the_cell_asked_about(self):
+        """**The address is checked the same way the provider name is, because it
+        fails the same way.**
+
+        `build_override` decodes the stamp's provider name and refuses a stamp
+        naming another provider, on the reasoning that a client fetches the
+        resolver's certificate by querying `2.dnscrypt-cert.<that name>` and a
+        disagreement is a resolver that never gets one. The **address** is the
+        same failure with a different mechanism: a DNSCrypt client *dials* the
+        address the stamp carries, so a stamp naming somewhere the mock is not
+        listening is a resolver that is asked and never answers -- and the cell
+        spends its whole 60-second transaction budget learning that, from a
+        message about the *transaction's* barrier rather than about the stamp.
+
+        MEASURED, as the defect the gate's absence is: the last run was right by
+        luck. The mock published `10.89.0.40:443` and the cell read the address
+        out of the same document, so the two agreed -- and nothing in the module
+        would have said so if they had not. `address` appeared in
+        `build_override`'s signature, in its empty check and nowhere else: the
+        document it wrote carried whichever address the caller passed, and the
+        stamp inside it carried another.
+
+        The two spellings are compared as **decoded values**, not as substrings of
+        the base64, for the reason the provider case gives: a check on the text of
+        a stamp can pass and fail by accident.
+        """
+        self.assertEqual(
+            foreign_override.stamp_address(STAMP),
+            ADDRESS,
+            "the fixture stamp does not decode to the address the cell asks about once the "
+            "protocol's default port is applied, so the case below would be asserting against a "
+            "fixture that does not have the disagreement",
+        )
+        # And the decode is of the *field*, not of the text: the stamp carries a
+        # bare host and the pair a client dials is host plus the default.
+        self.assertEqual(decoded_stamp(STAMP)["address"], STAMP_HOST)
+        self.assertEqual(foreign_override.DNSCRYPT_DEFAULT_PORT, 443)
+        # The disagreement: the cell's address is not the stamp's.
+        with self.assertRaises(foreign_override.OverrideError) as raised:
+            self.override(address="10.89.0.99:443")
+        message = str(raised.exception)
+        self.assertIn("address", message)
+        self.assertIn("10.89.0.99:443", message)
+        self.assertIn(ADDRESS, message, "the message does not say what the stamp actually names")
+        self.assertIn("127.0.0.1:15353", message, "the message does not name the barrier a cell would report")
+        # And the control in the other direction: a stamp that names a *different*
+        # address than the cell, with the cell's address unchanged, is the same
+        # refusal -- the check is on the decoded value and not on which argument
+        # was passed first.
+        with self.assertRaises(foreign_override.OverrideError) as raised:
+            self.override(stamp=dnscrypt_stamp(address="10.89.0.99:443"))
+        self.assertIn("10.89.0.99:443", str(raised.exception))
+        self.assertIn(ADDRESS, str(raised.exception))
+        # And the shape is a host:port on both sides: a stamp whose address has no
+        # port, or whose port is not the one the mock serves, is a different
+        # disagreement and is named the same way.
+        for other in ("10.89.0.40:5353", "10.89.0.40"):
+            with self.subTest(address=other):
+                with self.assertRaises(foreign_override.OverrideError) as raised:
+                    self.override(address=other)
+                self.assertIn(ADDRESS, str(raised.exception))
+
+    def test_a_stamp_whose_address_cannot_be_read_is_refused_rather_than_trusted(self):
+        """A stamp whose address this module cannot decode is not a stamp it can
+        check, and the provider case's answer applies to the address too.
+
+        The provider check runs first and refuses a malformed stamp, so this is
+        defence in depth rather than a reachable path -- which is the point of
+        writing it down. `stamp_provider_name` and `stamp_address` are two readers
+        of one payload, and a future change to the layout check that let a stamp
+        through the first must not let it through the second.
+
+        **And a bare host is NOT one of them.** A stamp whose address field has no
+        port is the shape this project's mock publishes (MEASURED, above), and it
+        decodes to the cell's `host:port` with the protocol's default applied. A
+        case that treated "no port" as unreadable would be refusing the real thing
+        to protect against a shape nobody produces.
+        """
+        for stamp, what in (
+            (dnscrypt_stamp(address=""), "a stamp whose address field is empty"),
+            ("sdns://!!!!", "base64 that is not base64"),
+            ("not a stamp at all", "text that is not a stamp"),
+        ):
+            with self.subTest(stamp=what):
+                self.assertIsNone(foreign_override.stamp_address(stamp))
+        # The bare host is the real shape and it decodes.
+        self.assertEqual(foreign_override.stamp_address(dnscrypt_stamp()), ADDRESS)
+        # And a stamp that will not decode at all is refused by name, not by a
+        # decode error from inside the module.
+        with self.assertRaises(foreign_override.OverrideError) as raised:
+            self.override(stamp=dnscrypt_stamp(address=""))
+        self.assertIn("not a DNSCrypt stamp", str(raised.exception))
 
     def test_a_stamp_that_is_not_a_dnscrypt_one_is_refused(self):
         """A stamp this module cannot read is a stamp it cannot check, so it refuses.

@@ -72,6 +72,13 @@ DNSCRYPT_CONFIG = "/etc/mosdns/dnscrypt-proxy.toml"
 # a copy of them -- and the mount is read-only, so a cell cannot have changed it.
 WORKSPACE = "/workspace"
 SHIPPED_SOURCE = f"{WORKSPACE}/configs/dnscrypt-proxy.toml"
+# The same mount, the router's document. The override substitutes into the DNSCrypt
+# document; the ROUTER document is named here so a cell can assert it is *unchanged*,
+# which is the other half of the plan's "Production shipped config and packaged
+# DNSCrypt config remain unchanged and are asserted separately" -- and which, before
+# this constant, had no assertion at all. See `install_test.ROUTER_CONFIG` for why
+# the absence matters.
+SHIPPED_ROUTER = f"{WORKSPACE}/configs/mosdns.yaml"
 
 # Where the mock foreign resolver publishes its counters, inside its own
 # container. The harness reads it to learn the stamp the override has to carry,
@@ -92,6 +99,13 @@ STATIC_NAME = "mosdns-mock-foreign"
 # certificate that disagree is a resolver that answers nothing and says nothing
 # about why.
 PROVIDER_PREFIX = "2.dnscrypt-cert."
+
+# The port a DNSCrypt client uses when a stamp's address field carries none, which
+# is every stamp this project's mock publishes. MEASURED by decoding one: the
+# field is the bare text `10.89.0.40` and `pkLen` follows it immediately, so there
+# is no port in the stamp at all. See `stamp_address`, which is where the
+# measurement is.
+DNSCRYPT_DEFAULT_PORT = 443
 
 # The proto byte that says a stamp is DNSCrypt, and the property bits the shipped
 # document requires of a resolver: DNSSEC and NoLog. Both are go-dnsstamps'
@@ -167,18 +181,21 @@ def selected_names(document: str) -> list[str]:
     return re.findall(r"'([^']*)'", found.group(1))
 
 
-def stamp_provider_name(stamp: str) -> str | None:
-    """The provider name inside a DNSCrypt stamp, or `None` if it is not one.
+def _stamp_blob(stamp: str) -> bytes | None:
+    """The decoded payload of a DNSCrypt stamp, or `None` if it is not one.
 
-    **Decoded, not searched.** The name is inside the base64 payload, so
-    `PROVIDER_PREFIX in stamp` is a check that can pass by accident and fail by
-    accident: a stamp is `id props addr pk provider` in binary, and no case can
-    tell a stamp that names Quad9 from one that names the mock by looking at
-    base64. The layout is go-dnsstamps' `newDNSCryptServerStamp`:
+    **One decoder, because the two fields below are read out of one payload.**
+    The layout is go-dnsstamps' `newDNSCryptServerStamp`:
 
     ```text
     id(0x01) props(8, LE) addrLen(1) addr pkLen(1) pk(32) nameLen(1) name
     ```
+
+    A provider name and an address are two views of the same bytes, so checking
+    one and not the other is checking half a document -- and the two halves fail
+    *differently*, which is what made the omission invisible: a wrong provider
+    stops the resolver at its certificate fetch, while a wrong address is a
+    resolver that is dialled and never answers.
 
     `None` rather than an exception for a stamp that will not decode, because a
     cell that passed a truncated or non-DNSCrypt stamp wants a refusal naming the
@@ -194,12 +211,29 @@ def stamp_provider_name(stamp: str) -> str | None:
         return None
     if len(blob) < 11 or blob[0] != DNSCRYPT_PROTO:
         return None
+    # The address and the port have to be inside the payload before either can be
+    # read, and an address of length zero has no host to dial -- which is exactly
+    # the shape a caller produces by passing an empty string.
     address_length = blob[9]
-    cursor = 10 + address_length
-    if cursor >= len(blob):
+    if address_length == 0 or 10 + address_length + 1 >= len(blob):
         return None
-    key_length = blob[cursor]
-    cursor += 1 + key_length
+    return blob
+
+
+def stamp_provider_name(stamp: str) -> str | None:
+    """The provider name inside a DNSCrypt stamp, or `None` if it is not one.
+
+    **Decoded, not searched.** The name is inside the base64 payload, so
+    `PROVIDER_PREFIX in stamp` is a check that can pass by accident and fail by
+    accident: a stamp is `id props addr pk provider` in binary, and no case can
+    tell a stamp that names Quad9 from one that names the mock by looking at
+    base64. See :func:`_stamp_blob` for the layout.
+    """
+    blob = _stamp_blob(stamp)
+    if blob is None:
+        return None
+    cursor = 10 + blob[9]
+    cursor += 1 + blob[cursor]
     if cursor >= len(blob):
         return None
     name_length = blob[cursor]
@@ -210,6 +244,57 @@ def stamp_provider_name(stamp: str) -> str | None:
         return name.decode("ascii")
     except UnicodeDecodeError:
         return None
+
+
+def stamp_address(stamp: str) -> str | None:
+    """The `host:port` a DNSCrypt stamp's address field names, or `None`.
+
+    **The address a client DIALS, and that is the whole reason it is read here.**
+    A DNSCrypt stamp's address field is *where the resolver is*, so a stamp
+    carrying a different one from the cell is a resolver that is asked and answers
+    nothing -- the same failure shape as a wrong provider name and a different
+    symptom, which is why the two are checked the same way and why the check
+    cannot stop at the provider.
+
+    **The field is TEXT, and it carries no port.** `go-dnsstamps`
+    `NewDNSCryptServerStampFromLegacy` -- the constructor this project's mock uses
+    -- writes the address as given, and a DNSCrypt client applies the protocol's
+    default port to a stamp that carries none. MEASURED on a live mock's published
+    stamp, decoded from the run's own counters document:
+
+        addrLen = 10
+        addr    = "10.89.0.40"        (b'10.89.0.40')
+        next    = 20 2b 0e 3c ...     (pkLen = 32, then the provider key)
+
+    There is no port field at all: `pkLen` follows the address directly. So this
+    returns the field's own text, with the default port appended when the field
+    carries none -- which is the pair a client puts in a socket and therefore the
+    pair the cell's address is compared against.
+
+    **Not canonicalised, and that is deliberate.** A client dials the bytes the
+    stamp decodes to; it does not rewrite them through `ipaddress`. A check that
+    canonicalised would be *stricter* than the protocol it is checking, and could
+    refuse a stamp a real client would have used. So the port is taken from the
+    field when the field's last colon-separated component is all digits, and a
+    field with no such component is a bare host. `None` for anything that will
+    not decode, and for the reason :func:`_stamp_blob` gives.
+    """
+    blob = _stamp_blob(stamp)
+    if blob is None:
+        return None
+    field = blob[10 : 10 + blob[9]]
+    if len(field) != blob[9]:
+        return None
+    try:
+        text = field.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not text:
+        return None
+    host, separator, port = text.rpartition(":")
+    if separator and host and port.isdigit():
+        return f"{host}:{port}"
+    return f"{text}:{DNSCRYPT_DEFAULT_PORT}"
 
 
 def is_substitutable(line: str) -> bool:
@@ -434,6 +519,39 @@ def build_override(shipped: str, stamp: str, address: str) -> str:
             "the wrong resolver. A stamp naming another provider is the realistic "
             "mistake here -- a shipped Quad9 stamp with only its address changed -- so it "
             "is refused rather than written into the document"
+        )
+    # **The address the stamp names, against the address the cell asked about.**
+    # The provider check above reads one field of the stamp and this reads
+    # another, out of the same bytes, and a stamp that disagrees about the address
+    # is the same dead resolver reached by a different door: dnscrypt-proxy
+    # dials whatever the stamp carries, gets nothing, and the install transaction
+    # spends its whole 60-second barrier budget on a sentence about ITSELF
+    # ("nothing answered a DNS query at 127.0.0.1:15353 within 60s") that says
+    # nothing about an address nobody was listening on.
+    #
+    # MEASURED as the absence being the defect rather than a wrong result: the run
+    # was right by luck. The mock published its address in the same document the
+    # cell read it from, so the two agreed -- and `address` appeared in this
+    # function's signature, in its empty check and nowhere else, so a disagreement
+    # would have been written into the document silently.
+    named = stamp_address(stamp)
+    if named is None:
+        raise OverrideError(
+            f"the stamp's address field is not one this module can read, so the address the "
+            f"override was given ({address!r}) cannot be checked against it. A DNSCrypt client "
+            f"dials the address a stamp carries, so a stamp whose address cannot be read is a "
+            f"stamp this override would point somewhere it cannot verify -- which is a resolver "
+            f"that is asked and answers nothing. The stamp was: {stamp!r}"
+        )
+    if named != address:
+        raise OverrideError(
+            f"the stamp names the address {named!r} and the cell asked about {address!r}, and a "
+            f"DNSCrypt client dials whatever the stamp carries. The override would be written "
+            f"with one and the mock would be serving the other, so dnscrypt-proxy would ask "
+            f"{named!r}, get nothing, and the install transaction would refuse at its own "
+            f"barrier with 'nothing answered a DNS query at 127.0.0.1:15353 within 60s' -- a "
+            f"minute of a cell spent learning a disagreement between two strings this function "
+            f"held side by side and compared with nothing"
         )
     selection = selected_names(shipped)
     if selection and len(selection) != len(names):
