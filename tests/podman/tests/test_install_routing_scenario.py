@@ -840,6 +840,158 @@ def _dig_invocations(tree: ast.AST) -> list[tuple[str, str]]:
     return found
 
 
+class ThePlanAgreesWithTheRoutingCellTest(unittest.TestCase):
+    """**The plan is the file a reader of the diff alone sees, so the amendment
+    lives there and is held from here.**
+
+    Ruling 184: a claim that was stated and then corrected in place must be
+    corrected in the file a reader of the diff alone sees. The three task reports
+    live under `.superpowers/`, which `.gitignore` excludes and no commit carries,
+    so a correction in one of them is a blockquote appended *after* the sentence
+    it corrects. Ruling 178's precedent is the plan itself: Task 3's sentences
+    still said the opposite two lines below a corrected one, and a case now holds
+    the plan against the code over the WHOLE document rather than a region.
+
+    Two claims are corrected here, and each was a live defect:
+
+    * **Step 6 presented the client vantage point as a thing to do**, and it is
+      not one: Step 3 asserts loopback-only listeners, so nothing on this project
+      is reachable from another host. The step now says the two cannot both hold,
+      that the client vantage point is recorded as a required skip with its exact
+      wording, and that the rest of the step runs for real.
+    * **Step 5 named `/etc/mosdns/config.yaml`, a file this project does not
+      ship.** The two documents it ships are `mosdns.yaml` and
+      `dnscrypt-proxy.toml`, and it is the latter that names the foreign resolver.
+      A later task reading Step 5 would have looked for a file that has never
+      existed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plan = (
+            REPO / "docs" / "superpowers" / "plans" / "2026-09-25-podman-integration-matrix.md"
+        ).read_text(encoding="utf-8")
+
+    def test_the_requirement_the_scenario_skips_is_the_plans_own_sentence(self):
+        """**The skip carries the plan's exact words, so the two cannot drift.**
+
+        A `Skip` whose `requirement` is a transcription of the plan is a claim a
+        reader checks against the plan. If the plan's sentence is edited and the
+        constant is not, the skip is still a well-formed skip of a requirement
+        nobody wrote any more — and the Global Constraint's "with its exact
+        wording" becomes a promise about a string. So the constant is a substring
+        of the plan, and a case says so.
+        """
+        self.assertIn(
+            routing.CLIENT_VANTAGE_POINT_REQUIREMENT, self.plan,
+            "the requirement the routing cell records as a SKIP is not a sentence of the plan, so "
+            "'with its exact wording' is a promise about a transcription. Either the plan's Step 6 "
+            "was rewritten or the constant was typed from memory",
+        )
+
+    def test_the_plan_says_the_two_vantage_points_cannot_both_hold(self):
+        """**Step 6 must not present the client half as a thing to do.**
+
+        The defect is a *presentational* one and it is the kind that costs the
+        most: a next implementer reads Step 6, sees two vantage points, builds a
+        client, watches `dig @10.89.0.10` time out, and either concludes the
+        harness is broken or binds a listener the packaging forbids. So the step
+        says the contradiction, says which half is recorded as a skip, and says
+        the other half runs.
+        """
+        for needle, what in (
+            ("cannot both hold", "the plan does not say the two requirements contradict each other"),
+            ("required skip", "the plan does not say the client vantage point is recorded as a skip"),
+            ("incomplete", "the plan does not say what the run's disposition becomes"),
+            ("reachable from another host", "the plan does not cite the packaging's own reason"),
+        ):
+            with self.subTest(needle=what):
+                self.assertIn(needle, self.plan)
+
+    def test_the_plan_does_not_offer_a_workaround_the_packaging_forbids(self):
+        """**The two non-options are named as non-options, and so is why.**
+
+        Exposing the router on the bridge weakens a property
+        `packaging/debian/control` states in the package's own Description, and a
+        shared network namespace makes the client's `127.0.0.1` the target's own —
+        the same socket asked by the same `dig`, which is a second vantage point in
+        name only. Both were considered and both are wrong; a plan that records
+        only the conclusion leaves the next implementer to re-derive them, and the
+        namespace one looks like a solution until you say what it is.
+        """
+        self.assertIn("network namespace", self.plan)
+        self.assertIn("name only", self.plan)
+        self.assertIn("packaging/debian/control", self.plan)
+
+    def test_the_plans_step_3_says_why_its_loopback_clause_binds_step_six(self):
+        """**Step 3's "only loopback listeners" is a security property, and the
+        step says so.**
+
+        Step 3 is where the router's own configuration is validated, and its
+        loopback clause is what makes Step 6's client half unclosable. A reader
+        arriving at Step 6 has to be able to find the reason where it is written
+        down, and a reader arriving at Step 3 has to know that changing the clause
+        would change another step's outcome. A case on each sentence is cheap; the
+        two steps silently contradicting each other is not.
+        """
+        self.assertIn("load-bearing for Step 6", self.plan)
+        self.assertIn("security property rather than a convenience", self.plan)
+
+    def test_the_plans_step_5_names_a_document_this_project_ships(self):
+        """**`/etc/mosdns/config.yaml` is a file that has never existed here.**
+
+        The two documents this project installs are `mosdns.yaml` and
+        `dnscrypt-proxy.toml`, and it is the DNSCrypt document that names the
+        foreign resolver — the `mosdns.yaml` document is the router's own policy
+        and is what Step 6's domestic branch runs on. A later task reading Step 5
+        for a file that is not there would have no way to know the name was wrong
+        rather than that the step was out of date.
+
+        **The check is on the CLAIM, not on the path**, and that is the precedent
+        Task 2 set with the `dhcp-option` line: the amendment is allowed to name
+        the wrong path in order to say it is wrong, and a bare search for the
+        string would forbid the correction along with the error. So the
+        instruction is forbidden and the correction is required.
+        """
+        self.assertNotIn(
+            "copy a modified `/etc/mosdns/config.yaml`", self.plan,
+            "the plan still tells the next implementer to copy a document this project does not "
+            "ship. The two it installs are /etc/mosdns/mosdns.yaml and "
+            "/etc/mosdns/dnscrypt-proxy.toml",
+        )
+        self.assertIn("/etc/mosdns/dnscrypt-proxy.toml", self.plan)
+        # And the amendment says which of the two is the foreign branch's, and
+        # that the other is the one that must be left alone.
+        self.assertIn(
+            "is a file this project does not ship", self.plan,
+            "the plan no longer names the wrong document but does not say it was wrong, so the next "
+            "reader cannot tell an oversight from a decision",
+        )
+        self.assertIn("mosdns.yaml", self.plan)
+        self.assertIn(
+            "what Step 6's domestic branch runs on", self.plan,
+            "the plan does not say which of the two documents is the router's own policy, so "
+            "'copy a modified <document>' would still be ambiguous",
+        )
+
+    def test_the_plans_step_5_names_both_assertions_the_shipped_documents_get(self):
+        """**"Asserted separately" has to name the assertions, or it is a promise.**
+
+        The DNSCrypt document is digested three ways and the router document is
+        digested in the target and required byte-equal to the repository's — the
+        second of which is the assertion that was MISSING when the plan said
+        "Production shipped config and packaged DNSCrypt config remain unchanged
+        and are asserted separately", and the gap let the domestic branch's policy
+        be a file no assertion touched. So the step names both.
+        """
+        for needle, what in (
+            ("byte-equal", "the plan does not say the two digests must be equal"),
+            ("configs/mosdns.yaml", "the plan does not name the repository's router document"),
+        ):
+            with self.subTest(needle=what):
+                self.assertIn(needle, self.plan)
+
+
 class RoutingScenarioShapeTest(unittest.TestCase):
     """What the scenario must keep being, checked against its source."""
 
