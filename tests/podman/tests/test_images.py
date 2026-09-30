@@ -61,6 +61,7 @@ IMAGES = REPO / "tests" / "podman" / "images"
 TARGET_CONTAINERFILE = IMAGES / "target.Containerfile"
 MOCK_ROUTER_CONTAINERFILE = IMAGES / "mock-router.Containerfile"
 MOCK_CDN_CONTAINERFILE = IMAGES / "mock-cdn.Containerfile"
+MOCK_FOREIGN_CONTAINERFILE = IMAGES / "mock-foreign.Containerfile"
 ENTRYPOINT = IMAGES / "target-entrypoint.sh"
 NM_SETUP = IMAGES / "target-nm-setup.sh"
 NM_UNIT = IMAGES / "target-nm-setup.service"
@@ -742,12 +743,22 @@ class TargetContainerfileTest(unittest.TestCase):
     def test_no_containerfile_installs_the_project_package(self):
         """The rule over all three images, not just the target.
 
-        The mock router and the mock CDN are the images a scenario would be
-        *un*willing to trust if they carried the package, because a mock that
-        already had the thing it mocks answers differently from one that has to
-        have it installed into it.
+        The mock router, the mock CDN and the mock foreign resolver are the images
+        a scenario would be *un*willing to trust if they carried the package,
+        because a mock that already had the thing it mocks answers differently
+        from one that has to have it installed into it.
+
+        The foreign mock is the sharpest of the three: a resolver the mock had
+        already installed into it would be a resolver built from something other
+        than the digest-pinned archive this project ships, and the whole cell would
+        be measuring that pair rather than the packaged one.
         """
-        for containerfile in (TARGET_CONTAINERFILE, MOCK_ROUTER_CONTAINERFILE, MOCK_CDN_CONTAINERFILE):
+        for containerfile in (
+            TARGET_CONTAINERFILE,
+            MOCK_ROUTER_CONTAINERFILE,
+            MOCK_CDN_CONTAINERFILE,
+            MOCK_FOREIGN_CONTAINERFILE,
+        ):
             with self.subTest(containerfile=containerfile.name):
                 packages = installed_packages(read(containerfile))
                 self.assertFalse(
@@ -1073,6 +1084,63 @@ class MockCdnContainerfileTest(unittest.TestCase):
             f"the serving stage copies nothing out of the build stage: {serving}",
         )
 
+    def test_the_foreign_resolver_is_built_from_this_module_and_serves_only_a_binary(self):
+        """The foreign mock, and why "serves only a binary" is load-bearing here.
+
+        The same two properties `mock-cdn` is held to, and for a sharper reason.
+        This image has to be one the **packaged** resolver can complete a DNSCrypt
+        exchange with, and the packaged resolver is built from a digest-pinned
+        source archive. A package installed in this image's serving stage is a
+        package installed in the same release that resolver came from, so a cell
+        that passed because of it would be measuring a resolver and a mock built
+        against something extra rather than the pair this project ships.
+
+        The address and the port are held too, and they are held because of what
+        the override is: the shipped document's stamps all carry port 443, so an
+        override that also had to change the port would be changing more than the
+        forward address, and "only the foreign forward address changes" would be a
+        claim about something else.
+        """
+        stages = containerfile_stages(read(MOCK_FOREIGN_CONTAINERFILE))
+        build = stage_named(stages, "build")
+        self.assertIsNotNone(build, [name for name, _ in stages])
+        self.assertTrue(
+            any("golang" in line for line in build),
+            "the build stage does not install a Go toolchain, so nothing here is compiled",
+        )
+        self.assertTrue(
+            any(
+                "go build" in line and "tests/podman/mock-foreign" in line
+                for line in build
+            ),
+            f"the foreign resolver is not built from this module: {build}",
+        )
+        serving = stages[-1][1]
+        self.assertEqual(
+            [line for line in serving if "apt-get install" in line],
+            [],
+            f"the serving stage installs a package, and this image exists so the packaged "
+            f"resolver can reach a mock: {serving}",
+        )
+        self.assertTrue(
+            any("COPY --from=build" in line for line in serving),
+            f"the serving stage copies nothing out of the build stage: {serving}",
+        )
+        text = read(MOCK_FOREIGN_CONTAINERFILE)
+        self.assertIn("--listen=0.0.0.0:443", text)
+        self.assertIn("--counters=", text)
+        # And no published port, which is the rule every container in this harness
+        # is under: a mock whose answers are test addresses is not something the
+        # operator's host should be able to reach. Read from the *lines*, not the
+        # prose, because this file's comment above the CMD says "No EXPOSE" to
+        # explain the absence, and a check on the whole text would find the word
+        # in the explanation of the thing it forbids.
+        for line in text.splitlines():
+            self.assertFalse(
+                line.strip().upper().startswith("EXPOSE"),
+                f"the foreign resolver image publishes a port: {line.strip()!r}",
+            )
+
     def test_the_cdn_rule_can_fail(self):
         """The control: a Containerfile that installs caddy is reported.
 
@@ -1225,8 +1293,13 @@ class ResolverPackageAvailabilityTest(unittest.TestCase):
         """
         self.assertEqual(
             [path.name for path in containerfiles()],
-            ["mock-cdn.Containerfile", "mock-router.Containerfile", "target.Containerfile"],
-            "the images directory no longer holds the three files this suite was written "
+            [
+                "mock-cdn.Containerfile",
+                "mock-foreign.Containerfile",
+                "mock-router.Containerfile",
+                "target.Containerfile",
+            ],
+            "the images directory no longer holds the four files this suite was written "
             "against; a new image must be added to this list deliberately or not at all",
         )
         with tempfile.TemporaryDirectory() as scratch:
