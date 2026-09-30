@@ -3602,6 +3602,94 @@ class FailureInjectionTests(TransactionFixture):
         self.assertIn(LOCAL_DNS, result.error or "")
         self.assertIn(MODIFY + (UUID, "ipv4.dns", DHCP_UPSTREAM), self.commands)
 
+    def test_a_stub_that_answers_late_is_not_a_refused_machine(self):
+        """**A silent stub that starts answering is a machine that works.**
+
+        MEASURED, and it is the reason this case exists. On Ubuntu 22.04
+        (systemd 249, NetworkManager 1.36) `nmcli connection up` returns in
+        **0.18s** and resolved's own journal records the link's DNS server
+        changing to 127.0.0.1 in the same second -- and then the stub at
+        127.0.0.53:53 answers **nothing at all** for **31 seconds**:
+
+            20:34:46  eth0: Bus client set DNS server list to: 127.0.0.1
+            20:34:46  dig @127.0.0.53 install-probe.example
+                      -> communications error to 127.0.0.53#53: timed out
+                      -> no servers could be reached          (x11 samples, 0.5s apart)
+            20:35:02  Using degraded feature set UDP instead of UDP+EDNS0 for
+                      DNS server 127.0.0.1.
+            20:35:17  Using degraded feature set TCP instead of UDP for DNS
+                      server 127.0.0.1.
+            20:35:18  dig @127.0.0.53 install-probe.example
+                      -> status: NOERROR, ANSWER: 1, 198.51.100.7
+
+        Resolving the stub's *reconfiguration* is not the same moment as
+        NetworkManager's `connection up` returning, and on this release the two
+        are half a minute apart. The probe was `PROBE_TIMEOUT_SECONDS` (2s) and
+        it was asked ONCE, so the transaction refused and rolled back a machine
+        whose resolver was about to work -- and the sentence it refused with
+        ("so /etc/resolv.conf points at a chain that cannot resolve") was, for
+        those 31 seconds, true only of a question asked too early.
+
+        **A false refusal is the worse direction.** It denies this package to a
+        machine that is fine, and the operator has no way to tell that from a
+        genuine refusal -- so the wait is a wait, and the deadline is what keeps
+        it from becoming a hang.
+
+        24.04 and 26.04 answer on the first poll, which is why the matrix is the
+        only place this is visible: `TransactionOrderTests.expected_events` still
+        asks the stub exactly once on the happy path, and that is the control --
+        the extra polls cost nothing on a release that does not need them.
+        """
+        polls = {"stub": 0}
+
+        def probe(address, port):
+            self.events.append(("probe", address, port))
+            if (address, port) == (RESOLVED_STUB, DNS_PORT):
+                polls["stub"] += 1
+                # Silent for the first three polls, which is the first 30ms of a
+                # 31-second wait and the same shape as the measurement.
+                return answer(polls["stub"] > 3, polls["stub"] > 3)
+            return ANSWER_SHAPES[HEALTHY]
+
+        result = self.run_install(probe=probe, deadline=1.0, poll=0.01)
+        self.assertIsNone(result.error, f"a stub that answered on its fourth poll was refused: {result.error}")
+        self.assertIsNone(result.rollback_error)
+        self.assertTrue(result.ok)
+        self.assertGreaterEqual(
+            polls["stub"], 4,
+            f"the stub was asked {polls['stub']} time(s): the check gave up on a resolver that was "
+            "relearning its upstream, which is the whole of this case",
+        )
+
+    def test_a_stub_that_never_answers_is_still_refused_and_the_wait_is_bounded(self):
+        """The other half, and it is what stops the fix being a hang.
+
+        A poll is only the right thing if there is still an end to it: a stub that
+        never resolves must be refused, and refused within the budget rather than
+        after it. The two are asserted in one case because a fix that dropped the
+        deadline would satisfy "asked more than once" and break this.
+        """
+        polls = {"stub": 0}
+
+        def probe(address, port):
+            self.events.append(("probe", address, port))
+            if (address, port) == (RESOLVED_STUB, DNS_PORT):
+                polls["stub"] += 1
+                return ANSWER_SHAPES[SILENT]
+            return ANSWER_SHAPES[HEALTHY]
+
+        result = self.run_install(probe=probe, deadline=0.05, poll=0.01)
+        self.assertFalse(result.ok, "a stub that never answered passed the install")
+        self.assertIn(RESOLVED_STUB, result.error or "")
+        self.assertIn("0.05s", result.error or "", "the refusal does not say what the wait was bounded by")
+        self.assertGreater(polls["stub"], 1, "the stub was asked once, so nothing was waited for")
+        self.assertLess(
+            polls["stub"], 50,
+            f"the stub was asked {polls['stub']} times against a 0.05s deadline, so the wait is "
+            "not the bounded one it is documented to be",
+        )
+        self.assertFalse(self.rooted(MANAGED_BY).exists())
+
 
 class RollbackFailureTests(TransactionFixture):
     """The two failure statuses are different facts about the machine."""

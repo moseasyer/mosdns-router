@@ -2494,6 +2494,62 @@ def wait_for_dns(address: str, port: int, probe, deadline_seconds: float, poll_s
         time.sleep(poll_seconds)
 
 
+def wait_for_resolving(address: str, port: int, probe, deadline_seconds: float, poll_seconds: float) -> bool:
+    """Poll ``probe`` until the chain at ``address:port`` RESOLVES, or the deadline passes.
+
+    :func:`wait_for_dns` asks whether a resolver is LISTENING, because the
+    question there is whether a unit has bound its port. This one asks the other
+    question, and it is not a variation on the first: the whole point of the
+    check that calls it is "does this machine resolve", so a SERVFAIL in the
+    middle of a reconfiguration window is exactly the thing to be waited out
+    rather than the thing to fail the run on.
+
+    **A poll, because a resolver is reconfigured asynchronously and the command
+    that asked for the reconfiguration is not the moment it finished.**
+    MEASURED, on Ubuntu 22.04 (systemd 249, NetworkManager 1.36), for
+    `systemd-resolved`'s stub after this transaction points NetworkManager at the
+    loopback:
+
+        20:34:46  nmcli connection up returns, in 0.18s
+        20:34:46  resolved: eth0: Bus client set DNS server list to: 127.0.0.1
+        20:34:46  dig @127.0.0.53 install-probe.example
+                  -> communications error to 127.0.0.53#53: timed out
+                  -> no servers could be reached
+                  (eleven samples 0.5s apart: 20:34:46.7 through 20:35:15.7)
+        20:35:02  resolved: Using degraded feature set UDP instead of UDP+EDNS0
+                  for DNS server 127.0.0.1.
+        20:35:17  resolved: Using degraded feature set TCP instead of UDP for
+                  DNS server 127.0.0.1.
+        20:35:18  dig @127.0.0.53 install-probe.example
+                  -> status: NOERROR, ANSWER: 1, 198.51.100.7
+
+    Thirty-one seconds, and resolved is not idle through it: it is finding out
+    what the DNS server it has just been handed will answer, and it degrades
+    twice before it settles. 24.04 and 26.04 answer on the first poll (MEASURED,
+    the same install passing on both), which is why asking once worked on two
+    releases out of three and looked correct.
+
+    The direction this fails in is the reason it matters. A stub that had not
+    finished re-learning its upstream produced "so /etc/resolv.conf points at a
+    chain that cannot resolve" and a rollback, on a machine that was thirty
+    seconds from resolving perfectly well. A false refusal denies this package to
+    a healthy machine, and an operator cannot tell that from a real one.
+
+    The deadline is the same budget the two units' own waits get
+    (:data:`WAIT_DEADLINE_SECONDS`), and it is named in the refusal so the
+    number a reader is given is the number that was waited. A poll with no end is
+    a hang, and this is the one place in the transaction where a machine with a
+    broken resolver would otherwise be indistinguishable from a slow one.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        if probe(address, port).resolves:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_seconds)
+
+
 def _utcnow() -> datetime.datetime:
     """The time the backup is stamped with."""
     return datetime.datetime.now(datetime.timezone.utc)
@@ -3572,7 +3628,9 @@ def _reconnect(runner: CommandRunner, transaction: Transaction, connection: Conn
     )
 
 
-def _verify(runner: CommandRunner, ask, connection: Connection) -> None:
+def _verify(
+    runner: CommandRunner, ask, connection: Connection, deadline_seconds: float, poll_seconds: float
+) -> None:
     """Check that the machine is really using the loopback, and that it answers.
 
     Three questions, and each of them can fail the install. `resolvectl` has to
@@ -3585,6 +3643,16 @@ def _verify(runner: CommandRunner, ask, connection: Connection) -> None:
     This is the step that catches a NetworkManager which accepted the change and
     did not apply it -- the failure mode a successful `nmcli` and a correct backup
     both miss.
+
+    **The stub's question is waited for, and the other two are not.** The router
+    is on the loopback, nothing this transaction has just done touches it, and the
+    health check above has already polled it. The stub is the one thing here whose
+    readiness is not a moment this code controls: `nmcli connection up` returning
+    is NetworkManager's moment and not resolved's, and on 22.04 the two are 31
+    seconds apart. :func:`wait_for_resolving` is where that is measured, and the
+    third check therefore gets the transaction's own wait budget -- so a machine
+    whose stub is genuinely broken is refused at the end of that budget rather
+    than after it.
     """
     forwarding = _text(runner, ("resolvectl", "dns", connection.device))
     if forwarding is None:
@@ -3607,11 +3675,13 @@ def _verify(runner: CommandRunner, ask, connection: Connection) -> None:
             "transaction is being undone rather than leaving the machine's DNS pointing at a chain "
             "that cannot resolve"
         )
-    if not ask(RESOLVED_STUB_ADDRESS, DNS_PORT).resolves:
+    if not wait_for_resolving(RESOLVED_STUB_ADDRESS, DNS_PORT, ask, deadline_seconds, poll_seconds):
         raise InstallRefused(
             f"systemd-resolved's stub at {RESOLVED_STUB_ADDRESS}:{DNS_PORT} did not resolve "
-            f"{INSTALL_PROBE_NAME} after the reconnection, so /etc/resolv.conf points at a chain "
-            "that cannot resolve; the transaction is being undone"
+            f"{INSTALL_PROBE_NAME} within {deadline_seconds:g}s of the reconnection, so "
+            "/etc/resolv.conf points at a chain that cannot resolve; the transaction is being "
+            "undone. resolved is a separate process and the reconnection is not the moment it "
+            "finished reconfiguring, so a slow one is waited for rather than refused"
         )
 
 
@@ -3778,7 +3848,7 @@ def _run_transaction(
 
         _apply_nm(runner, transaction, connection, document)
         _reconnect(runner, transaction, connection)
-        _verify(runner, ask, connection)
+        _verify(runner, ask, connection, deadline_seconds, poll_seconds)
         _commit_marker(root, transaction)
     notes.append(
         f"{connection.name} ({connection.device}, {connection.uuid}) now uses the loopback address "
