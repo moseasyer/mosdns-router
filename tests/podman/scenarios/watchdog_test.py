@@ -79,6 +79,10 @@ WATCHDOG_UNIT = "mosdns-watchdog.service"
 WATCHDOG_TIMER = "mosdns-watchdog.timer"
 LOCAL_DNS = "127.0.0.1"
 DNS_PORT = 53
+# The resolver's own port, named because the transaction's barrier message
+# quotes it and a barrier that is named by a literal in two places is a barrier
+# one of them will forget.
+RESOLVER_PORT = 15353
 RESOLVED_STUB = "127.0.0.53"
 # The device the bridge gives a target and the profile the image's own setup unit
 # created for it. The profile is named here rather than read from the target: on
@@ -551,20 +555,37 @@ def build_scenario(
             # gets. A scenario that hand-copied those four files would be
             # testing a constructed approximation of it.
             #
-            # **AND IT ENDS `unpacked`, NOT `configured`, and that is asserted
-            # rather than left in the document for a reader to notice.**
+            # **AND IT ENDS `unpacked` OR `half-configured`, NOT `configured`, and
+            # that is asserted rather than left in the document for a reader to
+            # notice.**
             # `postinst` exits 1 when the install transaction refuses -- which it
-            # does in every cell of this matrix, because the transaction's
-            # `update-lists --refresh-ranges` step needs `api.cloudflare.com` and
-            # there is no route off the container bridge -- so dpkg records
-            # `install ok unpacked` and never reaches the enable step. The
-            # watchdog's evidence is unaffected: every file it needs is
+            # does in every cell of this matrix -- so dpkg records an
+            # unpacked-but-not-configured state and never reaches the enable
+            # step. The watchdog's evidence is unaffected: every file it needs is
             # unpacked, and the scenario starts the service by hand because the
             # timer was never enabled. But a cell whose install did not complete
             # must not read as a cell that tested an installed package, and
             # `postinst`'s own timer-enable path is therefore NOT exercised by
             # this scenario at all. Both facts are in the document, and both are
             # required.
+            #
+            # **WHICH BARRIER, and the answer is measured, not remembered.**
+            # This comment used to say the transaction refuses "because
+            # `update-lists --refresh-ranges` needs `api.cloudflare.com` and
+            # there is no route off the container bridge". Task 4 Step 1 made
+            # that false: it ships a pinned range snapshot, and the publication
+            # falls back to it with no network at all -- MEASURED, 24.04,
+            # `ranges-source: pinned-snapshot` in a cell whose only route is
+            # link-scope. What refuses in such a cell is the resolver's own
+            # start-up barrier: `dnscrypt-proxy` binds `127.0.0.1:15353` once its
+            # reachability probe runs out and then answers nothing, because the
+            # DNSCrypt server it needs is on the internet, and the transaction
+            # waits 60s for an answer and rolls itself back.
+            #
+            # A comment can be a fortnight out of date. A *test* asserting the
+            # stale reason is worse -- it is what made the prose load-bearing, and
+            # `test_watchdog_scenario.py` held exactly that string. Both the
+            # comment and the assertion are now the measured barrier's.
             podman.copy_to(target, str(deb), "/tmp/mosdns-router.deb")
             document["package_bytes"] = int(
                 try_read("stat", "-c", "%s", "/tmp/mosdns-router.deb").strip() or 0
@@ -620,10 +641,14 @@ def build_scenario(
             document["package_configured"] = configured
             document["package_state_explained"] = (
                 f"{document['package_state']!r}, NOT configured: postinst exits 1 when the install "
-                "transaction refuses, and it refuses in this matrix because `update-lists "
-                "--refresh-ranges` needs api.cloudflare.com and the container has no route off its "
-                "bridge. Everything this scenario observes was unpacked and is present; the timer "
-                "was never enabled by postinst, so the service is started by hand and postinst's "
+                "transaction refuses, and it refuses in this matrix at the resolver's own start-up "
+                "barrier -- dnscrypt-proxy was started and nothing answered a DNS query at "
+                f"127.0.0.1:{RESOLVER_PORT} within 60s, because without a route to a DNSCrypt server "
+                "the transaction's wait for it runs out and it rolls itself back. "
+                "It is NOT the range origin: the transaction publishes the Cloudflare prefix list from "
+                "the pinned snapshot the package ships (`ranges-source: pinned-snapshot`), which needs "
+                "no network at all. Everything this scenario observes was unpacked and is present; the "
+                "timer was never enabled by postinst, so the service is started by hand and postinst's "
                 "enable path is NOT exercised here. (dpkg's exact word for this state is measured "
                 "per run rather than asserted: it has been observed as both `unpacked` and "
                 "`half-configured` depending on how far dpkg's state machine got.)"
@@ -697,9 +722,12 @@ def build_scenario(
                 raise WatchdogScenarioError(
                     f"{BACKUP_PATH} does not exist in {target}, so there is no record for "
                     f"`emergency-rollback` to restore and the watchdog has nothing to act on. The "
-                    f"transaction refused before it wrote the record, which is earlier than the "
-                    f"cloud-ranges publication a container cannot reach -- dpkg exit was "
-                    f"{installed} and this document has the messages. Nothing about the watchdog's "
+                    f"transaction refused before it wrote the record, which is before anything this "
+                    f"cell measures about a barrier -- dpkg exit was "
+                    f"{installed} and this document has the messages. In a routeless cell that barrier "
+                    f"is the resolver's own start-up wait, which is well AFTER the record is written, "
+                    f"so a cell whose transaction got as far as that leaves one behind; this cell's "
+                    f"did not, and refusing here is the honest report. Nothing about the watchdog's "
                     "own behaviour is proved by a refusal."
                 )
             document["backup"] = json.loads(read("cat", BACKUP_PATH))
@@ -711,29 +739,46 @@ def build_scenario(
             )
             # **The transaction's refusal is recorded as a fact about the cell,
             # not worked around and not asserted away.** In a container the
-            # install refuses -- measured on 24.04 -- because publishing the
-            # Cloudflare prefix list needs a reachable api.cloudflare.com, and
-            # this target has no route off the bridge. The refusal happens AFTER
-            # the record is written and read back, which is why the record below
-            # exists and why the watchdog has something to act on; and it happens
-            # with the connection untouched, because the transaction rolls itself
-            # back before it points anything anywhere. So the machine this
-            # scenario builds is exactly the one the watchdog is for: a package
-            # installed, a record of the machine's original DNS, and a resolver
-            # that is not answering.
+            # install refuses -- measured on 24.04 -- at the **resolver's own
+            # start-up barrier**: `dnscrypt-proxy` starts, binds its loopback
+            # listener once its reachability probe runs out, and then answers
+            # nothing, because the DNSCrypt server it needs is on the internet
+            # and this target has no route off the bridge. The transaction waits
+            # 60s for an answer and rolls itself back.
+            #
+            # **It is NOT the range origin, and saying so is the point.** This
+            # string used to name `api.cloudflare.com` and say the transaction
+            # needed it; Task 4 Step 1 made that false by shipping a pinned range
+            # snapshot the publication falls back to with no network at all, and
+            # `tests/podman/tests/test_watchdog_scenario.py` asserted the old
+            # sentence, so the false claim was load-bearing. A reader sent to
+            # `api.cloudflare.com` by this string would go looking for a network
+            # problem this cell does not have.
+            #
+            # The refusal happens AFTER the record is written and read back,
+            # which is why the record below exists and why the watchdog has
+            # something to act on; and it happens with the connection untouched,
+            # because the transaction rolls itself back before it points anything
+            # anywhere. So the machine this scenario builds is exactly the one the
+            # watchdog is for: a package installed, a record of the machine's
+            # original DNS, and a resolver that is not answering.
             #
             # What the refusal does NOT give is a working router, and this
             # scenario does not claim one. The router unit is stopped below
             # deliberately rather than because a failed install stopped it.
             document["transaction_refused"] = (
-                "the install transaction refused this target: publishing the Cloudflare prefix list "
-                "needs a reachable api.cloudflare.com and this container has no route off the "
-                "bridge. The record above was written and read back before that point, and the "
-                "transaction rolled itself back before it changed any DNS setting, so the machine "
-                "is the one the watchdog exists for -- a record of the original DNS and a resolver "
-                "that is not answering. The router was NOT successfully started by this cell, it "
-                "is stopped deliberately below rather than because a failed install stopped it, "
-                "and nothing here claims otherwise."
+                "the install transaction refused this target at the RESOLVER's start-up barrier, not "
+                f"at the range origin: dnscrypt-proxy was started and nothing answered a DNS query at "
+                f"127.0.0.1:{RESOLVER_PORT} within 60s, because the DNSCrypt server it needs is on the "
+                "internet and this container has no route off the bridge. The Cloudflare prefix list is "
+                "NOT the reason -- the transaction published it from the pinned snapshot the package "
+                "ships, which needs no network (`ranges-source: pinned-snapshot`), and the install "
+                "scenario in this cell measures exactly that. The record above was written and read "
+                "back before the refusal, and the transaction rolled itself back before it changed any "
+                "DNS setting, so the machine is the one the watchdog exists for -- a record of the "
+                "original DNS and a resolver that is not answering. The router was NOT successfully "
+                "started by this cell, it is stopped deliberately below rather than because a failed "
+                "install stopped it, and nothing here claims otherwise."
             )
 
             # -- 5. point the machine at the local resolver ------------------

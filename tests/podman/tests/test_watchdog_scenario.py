@@ -835,18 +835,32 @@ class WithoutARecordTest(WatchdogScenarioHarness):
         self.assertIn("ok ", written["package_unpacked"])
         self.assertIn("NOT configured", written["package_state_explained"])
         self.assertIn("postinst's enable path is NOT", written["package_state_explained"])
+        # **And it names the reason the transaction actually gives.** It used to
+        # say `update-lists --refresh-ranges` needs `api.cloudflare.com`, which
+        # Task 4 Step 1 made false: that step falls back to the package's pinned
+        # snapshot, and the barrier a routeless cell hits is the resolver's wait
+        # for a listener that never answers.
+        self.assertIn(
+            "nothing answered a DNS query at 127.0.0.1:15353", written["package_state_explained"],
+        )
+        self.assertNotIn(
+            "api.cloudflare.com", written["package_state_explained"],
+            "the explanation still blames the range origin, which is a barrier this project removed",
+        )
         # And the transaction's own refusal is in the document, which is the
         # thing `dpkg -i` through `sh -c` was added for.
         self.assertIn("postinst", written["dpkg_output"])
         self.assertIn("exit status 1", written["dpkg_output"])
 
     def test_a_target_with_no_record_fails_rather_than_proving_anything(self):
-        # The transaction's LATER refusal still leaves a record -- it is written
-        # and read back before the first mutation -- so this case models the
-        # earlier one, where the transaction refused before it got that far. The
-        # distinction is the point: a container that cannot reach
-        # api.cloudflare.com refuses the transaction and still gives the watchdog
-        # a record to restore, and this case is the other machine entirely.
+        # The transaction's refusal still leaves a record -- it is written and
+        # read back before the first mutation, and the barrier it refuses at
+        # (the resolver's wait) is well after that point -- so this case models
+        # the other machine entirely: a transaction that refused before it got
+        # that far, which is a preflight or a DHCP-capture refusal.
+        # The distinction is the point: a container with no route to the internet
+        # refuses the transaction and still gives the watchdog a record to
+        # restore, and this case is the machine that does not.
         _fake, result = self.run_scenario(backup=None)
         self.assertEqual(result.status, "failed")
         self.assertIn("no record", result.detail)
@@ -863,10 +877,33 @@ class WithoutARecordTest(WatchdogScenarioHarness):
         # document says so, says WHY, and says explicitly that the router was not
         # successfully started. A document that recorded only successes is a
         # document nobody can read after a failure.
+        #
+        # **And the reason it gives is the measured one.** It used to name
+        # `api.cloudflare.com`, and `assertIn("api.cloudflare.com", ...)` held
+        # that text in place. Task 4 Step 1 made the claim false: the range
+        # publication now falls back to the package's pinned snapshot, and what
+        # refuses in a cell with no route is the resolver's own start-up barrier.
+        # Deferring prose is defensible; a *test* asserting the stale reason is
+        # not, because the assertion is what makes the prose load-bearing.
         record = self.record(self.run_scenario()[1])
         self.assertIn("refused this target", record["transaction_refused"])
-        self.assertIn("api.cloudflare.com", record["transaction_refused"])
+        # The measured barrier sentence, verbatim. It is the resolver's WAIT, not
+        # the router's own `did not resolve install-probe.example` probe: in a
+        # cell with no route the resolver never answers, so the transaction never
+        # gets as far as asking the router anything.
+        self.assertIn(
+            "nothing answered a DNS query at 127.0.0.1:15353", record["transaction_refused"],
+        )
+        self.assertIn("pinned snapshot", record["transaction_refused"])
         self.assertIn("NOT successfully started", record["transaction_refused"])
+        # And it does NOT still blame the range origin, which is the part that
+        # was made false: a reader sent to `api.cloudflare.com` by this string
+        # would go and look for a network problem the cell does not have.
+        self.assertNotIn(
+            "api.cloudflare.com", record["transaction_refused"],
+            "the recorded reason still blames the range origin, which Task 4 Step 1 ended: the "
+            "refresh now publishes the package's pinned snapshot with no route at all",
+        )
 
     def test_the_scenario_does_not_claim_the_router_works(self):
         # The router is stopped BY the scenario, deliberately, and the document
