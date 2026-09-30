@@ -212,16 +212,22 @@ def routing_rules(**overrides):
         # -- what the answers were, read from inside the target -------------
         {"match": ["exec", TARGET, "cat", routing.PUBLISHED_CN_LIST],
          "stdout": answers["published_cn"]},
-        # Each query's answer, and it is keyed by the NAME in the command so a case
-        # can make one branch answer with the other's address. `sh -c` carries the
-        # whole script as one argv token, so `match_contains` on the name is what
-        # tells two otherwise identical `dig` invocations apart.
-        {"match": ["exec", TARGET, "sh", "-c"], "match_contains": CHINA_NAME,
-         "stdout": routing.DOMESTIC_ANSWER + "\n"},
+        # Each query's answer, keyed by the NAME in the command so a case can make
+        # one branch answer with the other's address. `sh -c` carries the whole
+        # script as one argv token, so `match_contains` on the name is what tells
+        # two otherwise identical `dig` invocations apart.
+        #
+        # **The domestic answer is EMPTY, because that is what this project's mock
+        # router returns.** `dnsmasq.conf` carries `no-resolv` and one hardcoded
+        # test-only name, so a China-set name gets SERVFAIL and `dig +short` prints
+        # nothing — MEASURED on all three releases. The fixture used to answer
+        # `DOMESTIC_ANSWER` here, which asserted against a fiction the mock cannot
+        # produce, and the case that holds the answer check could not have caught
+        # that.
         {"match": ["exec", TARGET, "sh", "-c"], "match_contains": FOREIGN_NAME,
          "stdout": routing.FOREIGN_ANSWER + "\n"},
         {"match": ["exec", CLIENT, "sh", "-c"], "match_contains": CHINA_NAME,
-         "stdout": routing.DOMESTIC_ANSWER + "\n"},
+         "stdout": "\n"},
         {"match": ["exec", CLIENT, "sh", "-c"], "match_contains": FOREIGN_NAME,
          "stdout": routing.FOREIGN_ANSWER + "\n"},
     ]
@@ -516,6 +522,92 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
                     line,
                     f"{container} was asked an address it cannot reach: {line!r}",
                 )
+
+    def test_a_domestic_name_the_mock_router_cannot_answer_still_measures_the_split(self):
+        """**The domestic branch's ANSWER does not exist, and asking for one was
+        this scenario asking for a fixture.**
+
+        MEASURED, and it is the second thing the refusal was hiding. With the
+        queries finally going to an address that exists, the foreign name comes
+        back `198.51.100.7` over both transports and the China name comes back
+        **nothing** — on all three releases:
+
+            "answers": {"target/domestic/tcp": "", "target/domestic/udp": "",
+                        "target/foreign/tcp": "198.51.100.7",
+                        "target/foreign/udp": "198.51.100.7"}
+
+        and the cell reported "at least one of the 4 queries returned nothing, so a
+        branch was not exercised end to end". The reason is the mock's own
+        configuration and it is deliberate:
+        `tests/podman/mock-router/dnsmasq.conf` carries `no-resolv` — *"a mock
+        router that forwarded would answer a test's questions from off this host"*
+        — and exactly one hardcoded test-only name,
+
+            address=/install-probe.example/10.89.0.2
+
+        so every other name, a China-set one included, gets **SERVFAIL**: a
+        resolver that reached nobody, which is a correct answer and is precisely
+        what `emergency_rollback` checks for elsewhere in this project.
+
+        So `DOMESTIC_ANSWER` was a fixture this project's own mock cannot produce,
+        and requiring a non-empty answer for the domestic branch was the
+        **answers-not-counters** mistake this scenario's own docstring is written
+        against. The domestic branch's evidence is the mock's QUERY LOG, which is
+        what the counters are; the cell measures it, and the answer is recorded
+        beside it with the reason it is empty.
+        """
+        _fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        record = self.record(result)
+        for transport in ("udp", "tcp"):
+            with self.subTest(transport=transport):
+                self.assertEqual(
+                    record["answers"][f"target/domestic/{transport}"], "",
+                    "the fixture is answering the domestic queries and the real mock router "
+                    "cannot: `no-resolv` with one test-only name SERVFAILs everything else. A "
+                    "fixture that answers here is a fixture asserting against a fiction",
+                )
+                self.assertEqual(
+                    record["answers"][f"target/foreign/{transport}"], routing.FOREIGN_ANSWER,
+                )
+        # The split is measured, and it is the whole claim.
+        self.assertTrue(record["branches_distinguished"])
+        self.assertGreaterEqual(record["domestic_counters"].get(CHINA_NAME, 0), 1)
+        self.assertNotIn(FOREIGN_NAME, record["domestic_counters"])
+        self.assertNotIn(CHINA_NAME, record["foreign_counters"])
+        # And the record says why the domestic answers are empty, IN the record.
+        self.assertIn("no-resolv", record["domestic_answers_note"])
+        self.assertIn("SERVFAIL", record["domestic_answers_note"])
+        self.assertIn("query log", record["domestic_answers_note"])
+
+    def test_a_domestic_answer_carrying_the_foreign_branches_address_is_refused(self):
+        """**The answer check that IS load-bearing, and the control for it.**
+
+        A domestic query that came back with the FOREIGN branch's address would say
+        the name went down the wrong branch even if the counters were read
+        generously — so it is refused by answer as well as by counter. The third
+        state is the interesting one: a domestic answer that is neither mock's
+        address is ACCEPTED, because a SERVFAIL and an unrecognised address are both
+        "not the foreign branch's answer", and the counters are what say what
+        actually happened.
+        """
+        for answer, refused in (
+            (routing.FOREIGN_ANSWER, True),
+            ("", False),
+            ("203.0.113.9", False),
+        ):
+            with self.subTest(answer=answer or "(empty)"):
+                _fake, result = self.run_scenario(
+                    rules=[
+                        {"match": ["exec", TARGET, "sh", "-c"], "match_contains": CHINA_NAME,
+                         "stdout": answer + "\n"},
+                    ] + routing_rules(),
+                )
+                if refused:
+                    self.assertEqual(result.status, "failed")
+                    self.assertIn(routing.FOREIGN_ANSWER, result.detail)
+                else:
+                    self.assertEqual(result.status, "passed", result.detail)
 
     def test_a_router_also_bound_to_the_bridge_address_is_not_refused_for_that(self):
         # The control: the refusal is about the BINDING, not about the client. A

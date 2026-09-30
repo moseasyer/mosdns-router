@@ -159,11 +159,23 @@ FOREIGN_TEST_NAME = f"foreign-routing.{TEST_SUFFIX}"
 # only what the record says before the list has been read.
 CHINA_TEST_NAME = "(read from the published China list)"
 
-# The address the mock foreign resolver answers with, and the one the mock router
-# answers with. Two different addresses, from two different containers, and the
-# scenario asserts that the answer a query got is the one belonging to the branch
-# that was supposed to answer it -- so an answer from the wrong mock is caught
-# even before the counters are read.
+# **The address the mock foreign resolver answers with, and the one this project's
+# own mock router CANNOT answer with.**
+#
+# The foreign mock is this project's code and it answers every name with one fixed
+# test address, so a foreign query's answer is a real measurement and the scenario
+# asserts it exactly.
+#
+# The domestic mock is dnsmasq with `no-resolv` and one hardcoded test-only name,
+# so a China-set name gets **SERVFAIL** from it and `dig +short` prints nothing.
+# MEASURED on all three releases. So there is no domestic answer to assert, and
+# the constant below names the address a query would have to come back with for
+# this scenario to be wrong about the branch -- which is the FOREIGN one, and
+# section 3 and section 6 both check for its absence from a domestic query.
+#
+# It is kept as a name rather than deleted because a reader of the evidence document
+# needs to know what the domestic side was NOT allowed to answer, and because the
+# dnsmasq log line a query produces carries an address column.
 FOREIGN_ANSWER = "198.51.100.7"
 DOMESTIC_ANSWER = "192.168.123.53"
 
@@ -685,15 +697,56 @@ def build_scenario(
                             containers[vantage], name, transport, addresses[vantage]
                         )
                         document.setdefault("answers", {})[key] = answers[key]
-            _require(
-                all(value.strip() for value in answers.values()),
-                f"at least one of the {len(answers)} queries returned nothing, so a branch was not "
-                "exercised end to end. The answers were:\n"
-                + json.dumps(answers, indent=2, sort_keys=True)
-                + "\nAn empty answer here is not a routing result: it means a query was asked "
-                "and nothing came back, and the counters below are what say which listener "
-                "reached",
+            # **The FOREIGN answers are required; the DOMESTIC ones are recorded
+            # and not required, and the reason is the mock's own configuration.**
+            # `tests/podman/mock-router/dnsmasq.conf` carries `no-resolv` — "a mock
+            # router that forwarded would answer a test's questions from off this
+            # host" — and exactly one test-only name,
+            #
+            #     address=/install-probe.example/10.89.0.2
+            #
+            # so every other name, a China-set one included, gets SERVFAIL. MEASURED
+            # on all three releases with the queries finally going to an address that
+            # exists:
+            #
+            #     "answers": {"target/domestic/tcp": "", "target/domestic/udp": "",
+            #                 "target/foreign/tcp": "198.51.100.7",
+            #                 "target/foreign/udp": "198.51.100.7"}
+            #
+            # An empty answer from a resolver that reached nobody is a CORRECT
+            # answer — it is what `emergency_rollback` checks for elsewhere in this
+            # project — and requiring one was the **answers-not-counters** mistake
+            # this file's own docstring is written against. `DOMESTIC_ANSWER` was a
+            # fixture this project's mock cannot produce. The domestic branch's
+            # evidence is its query log, which is what the counters below are read
+            # from, and the answer is recorded beside them with the reason.
+            document["domestic_answers_note"] = (
+                f"the domestic queries' answers are expected to be EMPTY, and they are not "
+                f"checked for a value: the mock router at {MOCK_ROUTER_ADDRESS} is dnsmasq with "
+                f"`no-resolv` and one hardcoded test-only name "
+                f"(address=/install-probe.example/10.89.0.2), so a China-set name gets SERVFAIL "
+                f"from it -- a resolver that reached nobody, which is a correct answer and is not "
+                f"a routing result either way. The domestic branch's evidence is the mock's own "
+                f"query log, counted per name below."
             )
+            for transport in TRANSPORTS:
+                key = f"target/domestic/{transport}"
+                _require(
+                    FOREIGN_ANSWER not in answers[key],
+                    f"the {key} query came back with {FOREIGN_ANSWER!r}, the address the FOREIGN "
+                    f"mock answers with, so the China-set name went down the foreign branch. That "
+                    f"is a routing result and it is refused here as well as by the counters "
+                    f"below, because a counter read generously and an answer read exactly are "
+                    f"two different strengths of the same claim",
+                )
+                _require(
+                    answers[f"target/foreign/{transport}"].strip() == FOREIGN_ANSWER,
+                    f"the target/foreign/{transport} query returned "
+                    f"{answers[f'target/foreign/{transport}']!r} and the foreign mock answers "
+                    f"{FOREIGN_ANSWER!r}; `+short` prints the address and nothing else, so "
+                    f"anything else is a SERVFAIL, a REFUSED, or an answer from somewhere the "
+                    f"counters below will not have counted",
+                )
 
             # -- 4. THE MEASUREMENT: both listeners' own counters -----------
             # Read after the queries, and both required. This is the section the
@@ -786,22 +839,34 @@ def build_scenario(
             # **Over the measured vantage points**, for the reason section 3 gives:
             # asking for a `client/...` answer the cell never collected would index
             # a key that does not exist and report a KeyError as a routing failure.
+            # **The FOREIGN branch is checked against its answer; the DOMESTIC one
+            # is checked against the FOREIGN answer's absence.** The reason is
+            # section 3's: this project's own mock router cannot answer a China-set
+            # name, so `DOMESTIC_ANSWER` is a fixture rather than a measurement, and
+            # asserting that the domestic answer equals it would be asserting a
+            # fiction on every cell. What IS load-bearing is that a domestic answer
+            # is never the foreign branch's address -- which says the name did not
+            # come back down the wrong branch -- and that is checked, at both
+            # vantage points, over both transports.
             for vantage in vantage_points:
-                for name_key, expected in (
-                    ("domestic", DOMESTIC_ANSWER),
-                    ("foreign", FOREIGN_ANSWER),
-                ):
-                    for transport in TRANSPORTS:
-                        key = f"{vantage}/{name_key}/{transport}"
-                        got = answers[key].strip()
-                        _require(
-                            expected in got,
-                            f"the {key} query returned {got!r}, which is not the address the "
-                            f"{'domestic' if name_key == 'domestic' else 'foreign'} mock "
-                            f"answers with ({expected}). So the answer did not come from the "
-                            f"listener this scenario is counting, and the counters would be "
-                            f"evidence about a listener that did not answer it",
-                        )
+                for transport in TRANSPORTS:
+                    foreign_key = f"{vantage}/foreign/{transport}"
+                    _require(
+                        FOREIGN_ANSWER in answers[foreign_key],
+                        f"the {foreign_key} query returned {answers[foreign_key]!r}, which does "
+                        f"not carry the address the foreign mock answers with "
+                        f"({FOREIGN_ANSWER}). So the answer did not come from the listener this "
+                        f"scenario is counting, and the counters would be evidence about a "
+                        f"listener that did not answer it",
+                    )
+                    domestic_key = f"{vantage}/domestic/{transport}"
+                    _require(
+                        FOREIGN_ANSWER not in answers[domestic_key],
+                        f"the {domestic_key} query returned {answers[domestic_key]!r}, which "
+                        f"carries the FOREIGN branch's address ({FOREIGN_ANSWER}). The "
+                        f"China-set name came back down the wrong branch, and the counters below "
+                        f"would be the only thing saying so",
+                    )
             document["answers_match_their_branch"] = True
 
             evidence(document)
