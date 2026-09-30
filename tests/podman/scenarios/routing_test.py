@@ -162,27 +162,43 @@ def _require(condition: bool, message: str) -> None:
 def published_cn_domains(text: str) -> set[str]:
     """The China-set names in a published list, as a set of dotted names.
 
-    The list is one `domain:<name>` line per entry, which is the shape
-    `update-lists` publishes and the shape `domain_set` reads. Both are handled
-    so a reader of the failure does not have to know which one it got:
+    **Only a `domain:` line is a name, and a line that is not one is not a name
+    that happens to be malformed.** The list is one `domain:<name>` line per
+    entry, which is the shape `update-lists` publishes and the shape `domain_set`
+    reads; a leading `.` is also accepted, because a matcher may record a suffix
+    with one and two matchers that mean the same set would then mean different
+    keys.
 
-    * a `domain:` prefix is stripped, and
-    * a leading `.` is stripped too, because a matcher may record a suffix with
-      one and two matchers that mean the same set then mean different keys.
+    The first version accepted *any* line, splitting on the first `:`, and that is
+    a parser that reads an error message as a routing fact. A cell asked this for
+    a list the install had not published, `cat` answered
 
-    Comments and blank lines are dropped, and a line that is neither is ignored
-    rather than refused: this is evidence read out of a machine, and a machine's
-    published list may carry a comment this parser does not know. Refusing would
-    make the scenario fail on a comment rather than on a routing property.
+    ```text
+    cat: /var/lib/mosdns/lists/cn-domains.txt: no such file or directory
+    ```
+
+    and the parser produced the China-set name `cat: /var/lib/mosdns/lists/
+    cn-domains.txt: no such file or directory` -- a name the router cannot match
+    and cannot be asked about, carried into the evidence document as though it
+    were one of this project's own domains. So a line without a recognised prefix
+    is **skipped**, and a list that yields no names at all is refused by the
+    caller with the file it read attached, which is the message a reader needs.
+
+    Comments and blank lines are skipped for the same reason: this is evidence
+    read out of a machine, and a machine's published list may carry a comment this
+    parser does not know.
     """
     names: set[str] = set()
     for line in text.splitlines():
         text_line = line.strip()
         if not text_line or text_line.startswith("#"):
             continue
-        _, separator, value = text_line.partition(":")
-        name = value if separator else text_line
-        names.add(name.strip().lstrip(".").lower())
+        for prefix in ("domain:", "domain-set:"):
+            if text_line.lower().startswith(prefix):
+                name = text_line[len(prefix) :]
+                if name.strip():
+                    names.add(name.strip().lstrip(".").lower())
+                break
     return names
 
 

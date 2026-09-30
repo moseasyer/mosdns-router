@@ -251,6 +251,116 @@ class ScenarioRegistryTest(EntryPoint):
             "a refused scenario still started a container",
         )
 
+    def test_a_comma_separated_scenario_list_is_accepted(self):
+        """**The plan's own acceptance command, and it did not work.**
+
+        Task 4 Step 7's command is
+
+        ```text
+        python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04 \\
+            --scenario install,routing
+        ```
+
+        and `--scenario` was `action="append"`, so the whole string was one
+        argument, the name `install,routing` matched nothing, and the run refused
+        with exit 2 and a message about `install,routing`:
+
+        ```text
+        harness error: refusing --scenario install,routing: no such scenario is
+        registered in this build of the harness, so the requested one cannot be run.
+        The registered scenarios are dhcp, install, routing, and …
+        ```
+
+        Every one of those words is correct and the run is useless, because a
+        reader who then ran `--scenario install --scenario routing` -- which the
+        refusal's own message invites -- would conclude the plan's command was
+        wrong rather than the flag. `--versions` already takes a comma-separated
+        list for the same reason, and a caller writing both options in the same
+        style is being reasonable.
+
+        So a comma-separated `--scenario` is **split**, and the repeatable spelling
+        keeps working: both are how a Make target, a CI variable and a person each
+        spell the same request, and a flag that accepts only one of the three is
+        the flag that gets worked around.
+        """
+        for spelling in (
+            ["--scenario", "install,routing"],
+            ["--scenario", "install", "--scenario", "routing"],
+        ):
+            with self.subTest(spelling=" ".join(spelling)):
+                fake = self.passing_fake()
+                code, output = self.invoke(
+                    self.base(fake, "--results-dir", str(self.directory / "results"),
+                              "--run-id", RUN_ID, "matrix", "--arch", "amd64",
+                              "--versions", "24.04", *spelling)
+                )
+                # Not EXIT_OK: this suite's fake answers the *dhcp* scenario, so
+                # a cell that installs the package fails for want of an install
+                # fixture. What is being checked is that both scenarios RAN and in
+                # the load-bearing order, so the status is not the subject -- and
+                # asserting it would be asserting a fact about the fixture rather
+                # than about the flag.
+                self.assertNotEqual(
+                    code, run.EXIT_HARNESS_ERROR,
+                    f"a run naming two scenarios the way {spelling} spells them refused as a "
+                    f"configuration error:\n{output}",
+                )
+                document = json.loads(
+                    next((self.directory / "results").rglob("report.json")).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    [scenario["name"] for scenario in document["results"][0]["scenarios"]],
+                    ["install", "routing"],
+                    f"a scenario list spelled {' '.join(spelling)} did not run both, or ran "
+                    "them in the wrong order -- and the order is load-bearing: routing asks "
+                    "the router install put there",
+                )
+
+    def test_a_comma_separated_scenario_list_still_refuses_an_unknown_name(self):
+        """Splitting is not a way to smuggle a bad name past the refusal.
+
+        A split that dropped the check would let `--scenario install,nonsense` run
+        `install` and quietly ignore the half nobody could run -- which is the exact
+        defect `--scenario` being run-or-refused exists to prevent, arrived at from
+        the other direction.
+        """
+        fake = self.passing_fake()
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"), "--run-id", RUN_ID,
+                      "matrix", "--arch", "amd64", "--versions", "24.04",
+                      "--scenario", "install,nonsens")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        self.assertIn("nonsens", output)
+        self.assertEqual(
+            [argv for argv in fake.invocations() if argv[:1] == ["run"]], [],
+            "a refused scenario list still started a container",
+        )
+
+    def test_an_empty_element_in_a_comma_separated_list_is_refused(self):
+        """`install,` is a typo, and dropping it would be a run nobody asked for.
+
+        A split that filtered empties would accept `--scenario install,` and run
+        one scenario, reporting nothing about the empty element -- so a trailing
+        comma in a Make variable would look like a working command. The name it
+        would have to report is the one an operator can see, which is the whole
+        element as written.
+        """
+        fake = self.passing_fake()
+        code, output = self.invoke(
+            self.base(fake, "--results-dir", str(self.directory / "results"), "--run-id", RUN_ID,
+                      "matrix", "--arch", "amd64", "--versions", "24.04",
+                      "--scenario", "install,")
+        )
+        self.assertEqual(code, run.EXIT_HARNESS_ERROR, output)
+        self.assertIn("empty", output.lower())
+        self.assertEqual(
+            [argv for argv in fake.invocations() if argv[:1] == ["run"]], [],
+            "a refused scenario list still started a container",
+        )
+
     def test_a_refusal_names_every_requested_scenario_not_only_the_first(self):
         """`--scenario` is repeatable, and a caller who mistyped one of three is told so.
 

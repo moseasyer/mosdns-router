@@ -304,17 +304,32 @@ def run_target(
                 # A client on this private network can reach the mock router
                 # directly, so "the client got an answer" is not evidence about the
                 # target's routing unless the target is the only resolver it was
-                # asked. The target's DHCP lease is what publishes the address, so
-                # the target has to be on its own profile first -- which the
-                # scenarios do, and which is why this is a note here and not an
-                # `nmcli` call: a client pointed at an address nothing has a lease
-                # for would resolve nothing, and the failure would read as a
-                # routing defect.
+                # asked.
+                #
+                # **The symlink is removed first, and that is the whole of it.** The
+                # target image's own entrypoint points `/etc/resolv.conf` at
+                # resolved's stub on every container it starts -- the client
+                # included, because that is what makes a container's own resolver
+                # the stub. Writing *through* that path would either write the
+                # stub's own file (and change the stub) or fail, and the failure
+                # that showed up first was a client whose resolv.conf still read
+                # `nameserver 127.0.0.53`: its own stub, answering from its own
+                # NetworkManager state rather than from the target. So the client
+                # gets a real file.
+                #
+                # This is the one place in this harness where a container's own
+                # configuration is replaced, and it is the *client* and never the
+                # target -- because the client is being used as a witness to the
+                # target's routing, and a witness pointed at its own stub witnesses
+                # nothing. No lease is involved: the target's address is fixed by
+                # the plan, and a scenario reads the file back and refuses the cell
+                # if it does not name it.
                 podman.exec_script(
                     client,
                     "set -eu\n"
-                    f"mkdir -p /etc\n"
-                    f"printf 'nameserver {routing_test.TARGET_ADDRESS}\n' > /etc/resolv.conf\n",
+                    "rm -f /etc/resolv.conf\n"
+                    f"printf 'nameserver {routing_test.TARGET_ADDRESS}\\n' > /etc/resolv.conf\n"
+                    "cat /etc/resolv.conf\n",
                 )
             # Two gates, in this order, and the order is the fix.
             #
@@ -425,6 +440,46 @@ def run_target(
         skips=tuple(skip for result in results for skip in result.skips),
         detail=detail,
     )
+
+
+def _requested_scenarios(values) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The scenarios asked for, and the elements of the list that were empty.
+
+    **`--scenario` takes a comma-separated list as well as being repeatable**, and
+    the reason is that the plan's own acceptance command writes it that way:
+
+    ```text
+    python3 tests/podman/run.py matrix --arch amd64 --versions 22.04,24.04,26.04 \\
+        --scenario install,routing
+    ```
+
+    (Task 4 Step 7.) With `action="append"` and no split, that string was ONE
+    argument, the name `install,routing` matched nothing, and the run refused with
+    exit 2 and a message whose every word was true and whose conclusion was
+    useless -- because a reader who then repeated the flag, as the message
+    invites, would conclude the plan's command was wrong rather than the flag.
+    `--versions` has always taken a comma-separated list for exactly the same
+    reason, and a caller writing both options in the same style is being
+    reasonable rather than unlucky.
+
+    **The empty element is returned rather than dropped.** `install,` has a comma
+    and nothing after it; a split that filtered it would run `install` and say
+    nothing about the half that was empty, so a trailing comma in a Make variable
+    would look like a working command that ran less than it says. The two lists are
+    returned together because they are two different answers to one question and a
+    caller that conflated them would report an empty element as an unknown
+    scenario -- naming a name the reader never wrote.
+    """
+    names: list[str] = []
+    empty: list[str] = []
+    for value in values or ():
+        for part in str(value).split(","):
+            name = part.strip()
+            if name:
+                names.append(name)
+            else:
+                empty.append(str(value))
+    return tuple(names), tuple(empty)
 
 
 def _podman_from(args) -> Podman:
@@ -663,11 +718,20 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
     pinned to, on the one run nobody re-reads the lock.
     """
     # The order scenarios RUN in is the registry's, and not the order they were
-    # typed in: `install` has to run before `watchdog`, which observes units this
-    # package installed, and a cell asked for `watchdog,install` would otherwise
-    # document a package that was not there. Sorting by the registry rather than
-    # by the request keeps that true for every request and needs no second list.
-    requested = tuple(args.scenario or ()) or SCENARIO_NAMES
+    # typed in: `install` has to run before `routing`, which asks the router
+    # install put there to route a name the published China list contains, and both
+    # before `watchdog`, which observes units this package installed. Sorting by
+    # the registry rather than by the request keeps that true for every request and
+    # needs no second list.
+    #
+    # The list is split here too, and it has to be: the refusal above splits it to
+    # decide what is registered, and a `_run_cells` that read `args.scenario` raw
+    # would see the whole `install,routing` string again, match nothing against the
+    # registry, and run a cell with no scenarios at all -- which is reported as
+    # `incomplete` with an empty scenario list and no reason, the one disposition
+    # that says nothing about anything.
+    asked, _ = _requested_scenarios(args.scenario)
+    requested = tuple(asked) or SCENARIO_NAMES
     requested = tuple(name for name in SCENARIO_NAMES if name in requested)
     clock = scenario_clock()
     cells = []
@@ -750,7 +814,16 @@ def command_matrix(args) -> int:
     # refusal is explicit, names every scenario that was asked for, and is
     # exit 2.
     registered = build_scenarios()
-    requested = tuple(args.scenario or ())
+    requested, malformed = _requested_scenarios(args.scenario)
+    if malformed:
+        raise PodmanError(
+            f"refusing --scenario {', '.join(repr(item) for item in malformed)}: an empty "
+            f"scenario name. A list like `install,` has a comma and nothing after it, and "
+            f"dropping the empty element would run {registered and 'install'} and report "
+            "nothing about it -- so a trailing comma in a Make variable or a CI variable would "
+            "look like a working command that quietly ran less than it says. Spell the list "
+            "without the empty element, or repeat --scenario once per name"
+        )
     unknown = [name for name in requested if name not in registered]
     if unknown:
         raise PodmanError(

@@ -1,0 +1,56 @@
+# What does not go into a container build context.
+#
+# **The build context is the repository root**, so every file here would be sent
+# to the builder and copied into the image layer unless this file says otherwise --
+# and `mock-cdn.Containerfile` and `mock-foreign.Containerfile` both end their
+# build stage with `COPY . .`, which means "the whole context". This file is what
+# makes that line mean "the whole *checkout*".
+#
+# The first version of the foreign mock's Containerfile had no such file, and the
+# build failed on a full disk rather than on anything to do with the resolver:
+#
+# ```text
+# Error: committing container for step ... Command:copy Args:[. .]:
+#   writing blob: storing blob to file "/var/tmp/container_images_storage…/1":
+#   no space left on device
+# ```
+#
+# The context was 850 MB of which 850 MB was `build/` and a reviewer's Go cache --
+# neither of which any image reads. So the failure looked like a disk problem on
+# the operator's machine and the fix was a file, which is the shape of failure this
+# whole harness has been written against.
+#
+# Each entry says why, because a line here that nobody can justify is a line a
+# later reader will delete to make a build work -- and deleting it will put a
+# gigabyte back into every context.
+#
+# The exclusion is by path, and the paths are the ones the build genuinely does
+# not read. **The Go module's own sources are NOT excluded**: `COPY . .` is what
+# puts `tests/podman/mock-cdn` and `tests/podman/mock-foreign` into the build, and
+# a context that dropped them would fail at `go build` with a message about a
+# missing package rather than about the image.
+
+# Build outputs. `make package`, `make build` and every image build write here,
+# and the .deb alone is 16 MB. Nothing in the repository is *read* out of `build/`
+# by a Containerfile -- the images copy `configs/`, `packaging/` and
+# `tests/podman/`, and the .deb is built by the host, not inside a container.
+build/
+
+# A reviewer's Go build cache, which is 573 MB on this host and is nobody's source.
+# It is untracked, so nothing depends on it being in the context, and an
+# untracked directory is exactly the kind of thing that makes a build's size
+# depend on what someone happened to leave lying around.
+.gocache-review/
+
+# The worktree's own git file -- this is a linked worktree, so `.git` is a file
+# naming the real gitdir rather than a directory of objects -- and the gitdir
+# itself is outside the context anyway. A full `.git` is tens of megabytes and no
+# image reads it.
+.git
+
+# Python bytecode, which the local suites write and which no image needs.
+__pycache__/
+*.pyc
+
+# The review scratch directory, for the same reason as the Go cache.
+.tmp-review/

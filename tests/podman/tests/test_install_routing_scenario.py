@@ -122,6 +122,15 @@ CHINA_ENTRY = next(
 )
 CHINA_NAME = f"probe.{CHINA_ENTRY}"
 
+# Every entry of the repository's own published China list, for the shape case: it
+# reads the scenario's code and refuses any name that is one of these. Read rather
+# than typed, so a re-pin that changed the list changes what is forbidden with it.
+_PUBLISHED_ENTRIES = frozenset(
+    line.strip().removeprefix("domain:")
+    for line in (REPO / "configs" / "cn-domains.txt").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+)
+
 
 def routing_rules(**overrides):
     """Every answer a cell whose two branches are distinguishable needs.
@@ -501,10 +510,26 @@ class RoutingScenarioShapeTest(unittest.TestCase):
         # the published list, and a check over the raw text finds the explanation.
         self.assertIn("cn-domains.txt", self.source())
         code = _executable_code(self.source())
-        self.assertNotIn(
-            "domain:", code,
-            "routing_test.py's code writes a `domain:` literal, so the China-set test name is "
-            "a name this file chose rather than one the published list carries",
+        # **No China-set NAME is written down, and the check is for a name rather
+        # than for the string `domain:`** -- because `domain:` is the published
+        # list's own line prefix and the parser that reads it has to spell it. A
+        # name is a dotted domain; the one this scenario asks about is
+        # `probe.<entry>` out of the list, so a literal name here would be a dotted
+        # name that is not of that form.
+        for name in sorted(set(re.findall(r"[\"']([a-z0-9-]+(?:\.[a-z0-9-]+)+)[\"']", code))):
+            with self.subTest(name=name):
+                self.assertNotIn(
+                    name, _PUBLISHED_ENTRIES,
+                    f"routing_test.py's code contains the name {name!r}, which is an entry of "
+                    "this project's own published China list -- so the China-set test name is a "
+                    "name this file chose rather than one the list carries, and a re-pin that "
+                    "dropped it would leave the cell asking about a name the router routes down "
+                    "the foreign branch",
+                )
+        self.assertIn(
+            "probe.", code,
+            "the name the scenario asks about should be built as `probe.<entry>` out of the "
+            "published list rather than written down",
         )
         # And the name it does use comes from the list, read at run time.
         self.assertIn(routing.PUBLISHED_CN_LIST, code)
