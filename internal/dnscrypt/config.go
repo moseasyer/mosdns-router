@@ -26,6 +26,34 @@ import (
 const (
 	listenAddress = "127.0.0.1:15353"
 	netprobeHost  = "9.9.9.9:443"
+
+	// netprobeTimeoutSeconds bounds how long the resolver waits for the network
+	// before it binds its listener, and it has to be SHORT for a measured reason.
+	//
+	// dnscrypt-proxy's own default is 60 seconds, and so is this project's
+	// `WAIT_DEADLINE_SECONDS`: the install transaction starts this unit and then
+	// waits up to 60 seconds for 127.0.0.1:15353 to answer. With the two equal,
+	// the collision is exact and it is only visible on a machine that cannot
+	// reach the probe address -- which is every machine with no route to the
+	// internet, and which is the whole case this project is trying to make
+	// installable. MEASURED in a container cell on the first install that ever
+	// reached this step:
+	//
+	//     [NOTICE] Network not available yet -- waiting...
+	//     [ERROR] Timeout while waiting for network connectivity
+	//     [NOTICE] Now listening to 127.0.0.1:15353 [UDP]
+	//
+	// sixty seconds after start, and the transaction had given up at the same
+	// second: "dnscrypt-proxy.service was started but nothing answered a DNS
+	// query at 127.0.0.1:15353 within 60s".
+	//
+	// The probe is KEPT rather than switched off with 0, because it is what
+	// reports a captive portal or a blackholed network, and upstream calls 0
+	// "not recommended" for that reason. Five seconds is long enough for a
+	// healthy machine to answer a UDP connect and short enough that the
+	// transaction's remaining budget is not spent waiting for a network that is
+	// never coming.
+	netprobeTimeoutSeconds = 5
 )
 
 // bootstrapResolvers resolve DNSCrypt provider names, and nothing else. They are
@@ -205,7 +233,18 @@ bootstrap_resolvers = ['%s']
 # blackholed network is reported before the router claims to resolve anything.
 # It is pinned rather than defaulted to the first bootstrap resolver, which
 # would probe plain DNS on port 53 where a portal happily answers.
+#
+# The timeout is five seconds and NOT dnscrypt-proxy's own default of 60, and
+# the reason is measured rather than preferred. This document is read by a unit
+# the install transaction starts and then waits up to 60s for, so a 60s probe
+# means a machine that cannot reach Quad9 -- which is a machine with no route to
+# the internet, and is the machine this package has to be installable on -- binds
+# its listener at the exact second the transaction stops waiting for it. The
+# probe is not switched off: 0 is what "not report a blackholed network" looks
+# like, and a resolver that binds with no idea whether there is a network is a
+# resolver this project cannot tell apart from a healthy one.
 netprobe_address = '%s'
+netprobe_timeout = %d
 
 # No cache and no query log here. The foreign cache belongs to MOSDNS, which is
 # the only component that knows when an answer has been superseded; a second
@@ -234,5 +273,6 @@ require_nofilter = false
 		strings.Join(names, "', '"),
 		strings.Join(bootstrapResolvers, "', '"),
 		netprobeHost,
+		netprobeTimeoutSeconds,
 	)
 }

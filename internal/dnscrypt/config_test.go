@@ -67,6 +67,7 @@ type foreignConfig struct {
 	IgnoreSystemDNS *bool    `toml:"ignore_system_dns"`
 	Bootstrap       []string `toml:"bootstrap_resolvers"`
 	NetprobeAddress string   `toml:"netprobe_address"`
+	NetprobeTimeout *int     `toml:"netprobe_timeout"`
 	Cache           *bool    `toml:"cache"`
 	ForceTCP        *bool    `toml:"force_tcp"`
 	IPv4Servers     *bool    `toml:"ipv4_servers"`
@@ -349,11 +350,43 @@ func TestRenderLeavesCachingToMOSDNS(t *testing.T) {
 // break it catches is a probe that silently follows the bootstrap list into
 // plain DNS on port 53, where a captive portal answers it and the router reports
 // a working network it does not have.
+//
+// The timeout is here rather than in a separate case because the two are one
+// decision: WHAT is probed and HOW LONG the resolver waits for it are both about
+// the same sentence of the rendered document, and the break this catches is a
+// document that probes the right address for so long that the listener arrives
+// after the install transaction has stopped waiting for it. Measured: with the
+// timeout at dnscrypt-proxy's own default of 60, a container cell with no route
+// to the internet logged "Timeout while waiting for network connectivity" and
+// bound 127.0.0.1:15353 at the same 60s the transaction gave up waiting, so the
+// install refused on a machine whose only fault was that the transaction's
+// budget equalled the resolver's own start-up budget.
+//
+// Zero is refused for a reason rather than as a constant: it switches the probe
+// off, and a resolver that binds with no idea whether there is a network behind
+// it is one this project cannot tell apart from a healthy one. The upper bound
+// is `WAIT_DEADLINE_SECONDS` in installer/mosdns_installer.py, which is where
+// the transaction's own budget lives and which the case in
+// installer/tests/test_transaction.py reads BOTH sides of, because a bound
+// written in this file and a budget written in that one can be changed in step
+// and leave either file's own test green.
 func TestRenderProbesReachabilityOverTLS(t *testing.T) {
 	rendered := renderDefaults(t)
 
 	if rendered.NetprobeAddress != "9.9.9.9:443" {
 		t.Errorf("netprobe_address = %q, want %q", rendered.NetprobeAddress, "9.9.9.9:443")
+	}
+	if rendered.NetprobeTimeout == nil {
+		t.Fatal("netprobe_timeout is absent, so the resolver uses dnscrypt-proxy's own default of 60 seconds")
+	}
+	if *rendered.NetprobeTimeout <= 0 {
+		t.Errorf("netprobe_timeout = %d, which switches the probe off: a blackholed network would then be reported by nothing at all", *rendered.NetprobeTimeout)
+	}
+	if *rendered.NetprobeTimeout >= 60 {
+		t.Errorf(
+			"netprobe_timeout = %d, which is not shorter than the 60s the install transaction waits for this listener; a machine that cannot reach Quad9 binds the port at the moment the transaction stops waiting",
+			*rendered.NetprobeTimeout,
+		)
 	}
 }
 

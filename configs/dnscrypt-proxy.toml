@@ -29,7 +29,18 @@ bootstrap_resolvers = ['9.9.9.9:53', '149.112.112.9:53']
 # blackholed network is reported before the router claims to resolve anything.
 # It is pinned rather than defaulted to the first bootstrap resolver, which
 # would probe plain DNS on port 53 where a portal happily answers.
+#
+# The timeout is five seconds and NOT dnscrypt-proxy's own default of 60, and
+# the reason is measured rather than preferred. This document is read by a unit
+# the install transaction starts and then waits up to 60s for, so a 60s probe
+# means a machine that cannot reach Quad9 -- which is a machine with no route to
+# the internet, and is the machine this package has to be installable on -- binds
+# its listener at the exact second the transaction stops waiting for it. The
+# probe is not switched off: 0 is what "not report a blackholed network" looks
+# like, and a resolver that binds with no idea whether there is a network is a
+# resolver this project cannot tell apart from a healthy one.
 netprobe_address = '9.9.9.9:443'
+netprobe_timeout = 5
 
 # No cache and no query log here. The foreign cache belongs to MOSDNS, which is
 # the only component that knows when an answer has been superseded; a second
