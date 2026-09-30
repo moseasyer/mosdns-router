@@ -2823,11 +2823,45 @@ class MaintainerScriptTests(_Staged):
             "the preflight has to require the resolved DAEMON to be running, whatever the "
             "dependency calls the package that carries it",
         )
-        # **And the image makes the same substitution**, for the same reason. Two
-        # files spelling one fact is how they drift, and this is the third time
-        # that has been the defect in this project.
-        containerfile = (REPO / "tests" / "podman" / "images" / "target.Containerfile").read_text()
-        self.assertIn("libnss-resolve", containerfile)
+        # **And the one thing this substitution costs, said out loud.** On 26.04 the
+        # daemon is a `Recommends` of `libnss-resolve`, not a hard `Depends` --
+        # MEASURED, `dpkg -s libnss-resolve` reads `Depends: libc6 (>= 2.39)` and
+        # `Recommends: systemd-resolved` (`docs/measured-environment.md:555`) -- so a
+        # hard dependency on the *package* became a soft one on the *daemon* on the
+        # newest of the three releases.
+        #
+        # Nothing is *accepted* that was not accepted before: `check_managers` still
+        # refuses unless `systemd-resolved.service` is ACTIVE, and every cell measured
+        # here had it active (24.04 and 26.04 both report the unit active, and 22.04
+        # has no separate package at all). But a `--no-install-recommends` install of
+        # this package on a fresh 26.04 machine would get the NSS module and no
+        # daemon behind it -- which is a fact about the CHOICE, and a reader has to be
+        # able to find it rather than infer it. So the record that says so is
+        # required to still say so, and the image is required to install the daemon
+        # explicitly where the release has it as a package, which is what makes the
+        # soft dependency safe inside a cell.
+        measured = (REPO / "docs" / "measured-environment.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "Recommends", measured,
+            "the measured-environment record no longer says that the daemon is a Recommends of "
+            "libnss-resolve on 26.04, so the cost of this substitution is not written down "
+            "anywhere a reader would look for it",
+        )
+        containerfile = (
+            REPO / "tests" / "podman" / "images" / "target.Containerfile"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "libnss-resolve", containerfile,
+            "the target image and the control file must make the same substitution, for the same "
+            "reason: two files spelling one fact is how they drift, and this is the third time "
+            "that has been the defect in this project",
+        )
+        self.assertIn(
+            "systemd-resolved", containerfile,
+            "the target image no longer installs the daemon where the release has it as a package, "
+            "so a cell on 26.04 has the NSS module and nothing behind it -- which is the exact "
+            "failure Task 2 found and the soft dependency makes possible",
+        )
 
     def test_every_maintainer_script_handles_every_call_dpkg_can_make(self):
         """Debian Policy 6.5, compared in both directions and against a table
