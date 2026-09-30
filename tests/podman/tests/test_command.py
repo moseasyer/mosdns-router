@@ -265,6 +265,17 @@ def main():
             for index, rule in enumerate(json.load(handle).get("rules", [])):
                 if not contains(argv, rule["match"]):
                     continue
+                # `match_contains` matches on a SUBSTRING of one token rather than
+                # on a token sequence, because the commands a scenario runs
+                # through `sh -c` arrive as a single argument: the whole script is
+                # one argv token, so a rule that matched tokens would either have
+                # to repeat the script exactly or match every `sh -c` at once and
+                # hand the first answer to all of them. It is deliberately a
+                # substring rather than a prefix so a rule can name the one line
+                # that distinguishes two `sh -c` invocations of the same command.
+                needle = rule.get("match_contains")
+                if needle is not None and not any(needle in token for token in argv):
+                    continue
                 # A rule may carry a sequence of answers, so a case can say
                 # "the first listing shows it, the second does not" -- which is
                 # what a sweep that actually removed something looks like.

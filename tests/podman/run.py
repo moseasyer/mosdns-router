@@ -109,6 +109,7 @@ def build_scenarios() -> dict[str, str]:
     """
     return {
         "dhcp": "dhcp_test:build_scenario",
+        "install": "install_test:build_scenario",
         "watchdog": "watchdog_test:build_scenario",
     }
 
@@ -117,14 +118,24 @@ def build_scenarios() -> dict[str, str]:
 # rather than discovered by inspecting the builders.
 #
 # `dhcp` needs no package: it drives NetworkManager and the mock router, both of
-# which the target image has. `watchdog` needs the `.deb`, because the mechanism
-# it observes is four files inside it -- the unit, the timer, the setting and the
-# verb -- and a scenario that hand-copied those four would be testing a
-# constructed approximation of the package rather than the package. So the
-# harness copies the real artifact in, and the set of scenarios that need it is
-# declared here where a case can read it. A builder that gained a `package`
-# parameter would not be found by this: the registration is the fact.
-PACKAGE_SCENARIOS = ("watchdog",)
+# which the target image has. `install` and `watchdog` need the `.deb`, because
+# the mechanisms they observe are inside it -- the install transaction, postinst's
+# provisioning and the pinned range document for one; the unit, the timer, the
+# setting and the verb for the other -- and a scenario that hand-copied those
+# files would be testing a constructed approximation of the package rather than
+# the package. So the harness copies the real artifact in, and the set of
+# scenarios that need it is declared here where a case can read it. A builder that
+# gained a `package` parameter would not be found by this: the registration is the
+# fact.
+#
+# `install` is first in the ORDER the matrix runs them in as well as in this set,
+# and that order is load-bearing rather than alphabetical. It installs the package
+# and `watchdog` then observes units this package installed, so a cell that ran
+# them the other way round would have `watchdog` documenting a package that was
+# not there. The registry is sorted for the `--scenario` help and the refusal's
+# list of valid names; `PACKAGE_SCENARIOS` is what the matrix iterates, and it is
+# written in the order the scenarios must run.
+PACKAGE_SCENARIOS = ("install", "watchdog")
 
 
 def _resolve_builder(name: str):
@@ -567,7 +578,13 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
     tag would be a matrix that tested a different Ubuntu than the one it was
     pinned to, on the one run nobody re-reads the lock.
     """
+    # The order scenarios RUN in is the registry's, and not the order they were
+    # typed in: `install` has to run before `watchdog`, which observes units this
+    # package installed, and a cell asked for `watchdog,install` would otherwise
+    # document a package that was not there. Sorting by the registry rather than
+    # by the request keeps that true for every request and needs no second list.
     requested = tuple(args.scenario or ()) or SCENARIO_NAMES
+    requested = tuple(name for name in SCENARIO_NAMES if name in requested)
     clock = scenario_clock()
     cells = []
     for version in versions:
