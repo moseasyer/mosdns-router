@@ -836,6 +836,23 @@ def toml_listen_addresses(text):
     return re.findall(r"'([^']+)'", match.group(1))
 
 
+def toml_scalar(text, key):
+    """One scalar from a dnscrypt-proxy document, as an int where it reads as one.
+
+    `None` when the key is absent, which is the answer the caller needs: a
+    document that does not set a key at all is a document running the program's
+    own default for it, and a test that read a default as a value would compare
+    two numbers that were never written down.
+    """
+    match = re.search(rf"^{key}\s*=\s*(\S+)\s*$", text, flags=re.MULTILINE)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return match.group(1).strip("'\"")
+
+
 class UnitTextTests(unittest.TestCase):
     """The unit text itself: what is shipped, and what every directive says."""
 

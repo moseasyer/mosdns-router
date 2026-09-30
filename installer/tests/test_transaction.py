@@ -53,8 +53,10 @@ from typing import NamedTuple
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "installer"))
+sys.path.insert(0, str(REPO))
 
 import mosdns_installer as installer  # noqa: E402
+from installer.tests.test_units import toml_scalar  # noqa: E402
 
 MODULE = REPO / "installer" / "mosdns_installer.py"
 SOURCE = MODULE.read_text(encoding="utf-8")
@@ -1885,6 +1887,62 @@ class PrefixListTests(TransactionFixture):
         )
         for word in ("--ranges-url", "--ranges-cache", "http://", "https://"):
             self.assertNotIn(word, " ".join(published), f"{word!r} in the command would make the publish reach the network on its own terms")
+
+    def test_the_resolver_binds_inside_the_budget_the_transaction_waits_in(self):
+        """The one number that had to change before any install could complete.
+
+        MEASURED, in a container cell, on the first install that ever got this far:
+        ``dnscrypt-proxy`` logged
+
+            Network not available yet -- waiting...
+            Timeout while waiting for network connectivity
+            Now listening to 127.0.0.1:15353 [UDP]
+
+        sixty seconds after it was started, and the transaction gave up at the
+        same second -- because the resolver's own reachability probe is configured
+        for 60 seconds and ``WAIT_DEADLINE_SECONDS`` is 60 seconds. On a machine
+        with a route both are satisfied instantly; on a machine with NO route the
+        probe has to run out before the listener exists, so the two budgets
+        collided exactly and the install refused at this step, on every machine
+        this step exists to make installable.
+
+        The probe is kept, because a blackholed network should still be reported,
+        and the budget is what has to exceed it. Disabling the probe outright would
+        take the report with it; raising the wait would make every offline install
+        spend a minute discovering there is no internet.
+
+        So the invariant is the relationship, and both sides of it are read from
+        the files that carry them: a number here could be changed in step with the
+        number there and leave this test as the only thing that notices.
+        """
+        text = (REPO / "configs" / "dnscrypt-proxy.toml").read_text(encoding="utf-8")
+        rendered = toml_scalar(text, "netprobe_timeout")
+        self.assertIsNotNone(
+            rendered,
+            "the shipped resolver document sets no netprobe_timeout, so the resolver uses "
+            "dnscrypt-proxy's own default of 60 seconds and the transaction waits exactly as long",
+        )
+        self.assertGreater(
+            rendered, 0,
+            "netprobe_timeout is 0, which switches the probe off; a blackholed network would then "
+            "be reported by nothing at all",
+        )
+        self.assertLess(
+            rendered, installer.WAIT_DEADLINE_SECONDS,
+            f"the resolver's own start-up budget is {rendered}s and the transaction waits "
+            f"{installer.WAIT_DEADLINE_SECONDS}s, so on a machine that cannot reach the probe "
+            "address the listener appears at the moment the transaction has given up waiting "
+            "for it",
+        )
+        # And the wait itself is bounded, because a test that only said "the probe
+        # is shorter" would pass with a probe of a microsecond and no deadline at
+        # all, which is the opposite of what the collision was.
+        self.assertGreater(
+            installer.WAIT_DEADLINE_SECONDS, rendered,
+            "the transaction's own wait was lowered to fit under the resolver's probe rather than "
+            "the probe being bounded -- a resolver that cannot start at all would then be waited "
+            "for less than the time a healthy one needs",
+        )
 
     def test_no_undo_is_registered_for_the_publication(self):
         # Republishing an already-published list is idempotent, and a rollback
