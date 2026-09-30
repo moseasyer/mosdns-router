@@ -462,6 +462,61 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
             "not keep the run off a pass",
         )
 
+    def test_each_vantage_point_asks_the_address_that_vantage_point_can_reach(self):
+        """**The in-target queries were addressed to the target's BRIDGE address,
+        so from inside the target they asked a socket nothing is bound to.**
+
+        MEASURED, and it is a defect the refusal was hiding: the first
+        three-release run of this round's code produced four answers of the shape
+
+            (not readable: 'podman exec …-target-24.04 sh -c dig +short @10.89.0.10
+             -p 53 probe.0033.cn' exited 9)
+
+        on all three releases, and the cell then reported "the mock router's query
+        log … does not carry a query within 60s". `dig` exits 9 for "no reply from
+        server", and the reason there was no reply is that the router binds
+        `127.0.0.1:53` — which is the same fact §1b has been reading the target's
+        listener table to establish, and the same fact the loopback-only property
+        is. The `ask` helper asked one address for both vantage points, so the
+        half of the step this round exists to measure was asking a socket that
+        does not exist.
+
+        The two addresses are different *addresses of the same router*: the
+        client's has to be the bridge address, or the client cannot reach it, and
+        the target's has to be the loopback address, or nothing answers. So the
+        address is a property of the vantage point, and the record carries which
+        one each vantage used.
+        """
+        _fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        record = self.record(result)
+        self.assertEqual(
+            record["vantage_point_addresses"],
+            {"target": routing.TARGET_LOCAL_ADDRESS, "client": TARGET_ADDRESS},
+        )
+        self.assertEqual(routing.TARGET_LOCAL_ADDRESS, "127.0.0.1")
+        # And the invocations, because a record field nobody asserted is a
+        # sentence (ruling 190).
+        fake, _result = self.run_scenario()
+        for container, address in (
+            (TARGET, routing.TARGET_LOCAL_ADDRESS),
+            (CLIENT, TARGET_ADDRESS),
+        ):
+            asked = [line for line in self.asked_in(fake, container) if "dig" in line]
+            self.assertEqual(len(asked), 4, f"{container} was asked {asked}")
+            for line in asked:
+                self.assertIn(
+                    f"@{address} -p 53", line,
+                    f"{container} was asked {line!r}, which does not name the address that "
+                    f"vantage point can reach",
+                )
+                self.assertNotIn(
+                    f"@{routing.TARGET_LOCAL_ADDRESS} -p 53"
+                    if address == TARGET_ADDRESS else f"@{TARGET_ADDRESS} -p 53",
+                    line,
+                    f"{container} was asked an address it cannot reach: {line!r}",
+                )
+
     def test_a_router_also_bound_to_the_bridge_address_is_not_refused_for_that(self):
         # The control: the refusal is about the BINDING, not about the client. A
         # cell whose router does listen on the bridge address -- which is a

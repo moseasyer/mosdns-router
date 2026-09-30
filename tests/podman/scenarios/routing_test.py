@@ -84,6 +84,22 @@ TARGET_ADDRESS = "10.89.0.10"
 MOCK_FOREIGN_ADDRESS = "10.89.0.40"
 CLIENT_ADDRESS = "10.89.0.30"
 
+# **The router's own loopback address, which is where the TARGET asks it and NOT
+# where the client does.** MEASURED, and it is a defect the refusal in section 1b
+# was hiding: `ask` used one address for both vantage points, so the queries asked
+# from inside the target went to `10.89.0.10` -- the bridge address, which the
+# router does not bind -- and all four came back `exited 9` ("no reply from
+# server") on all three releases, after which the cell reported that the mock
+# router's query log did not carry a query. The half of the step this round exists
+# to measure was asking a socket that does not exist.
+#
+# The two are the same router at two addresses, and which one a vantage point can
+# reach is the whole difference: the client has no `127.0.0.1` that is the
+# target's, and the target has nothing bound to its own bridge address. So the
+# address is a property of the vantage point, and the evidence document carries
+# which one each used.
+TARGET_LOCAL_ADDRESS = "127.0.0.1"
+
 # The published China list, inside the target. Read for the China-set test name
 # and to prove the foreign one is outside it.
 PUBLISHED_CN_LIST = "/var/lib/mosdns/lists/cn-domains.txt"
@@ -419,16 +435,26 @@ def build_scenario(
             json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
-    def ask(container, name, transport) -> str:
-        """One query, from one container, over one transport, and its output.
+    def ask(container, name, transport, address) -> str:
+        """One query, from one container, to one address, over one transport.
 
         `+tcp` is the whole of the transport choice: `dig`'s `+tcp` forces TCP and
         its absence is UDP, and both are asked rather than one being derived from
         the other. `+short` so the output is the address and nothing else, which
         is what makes "the answer was the one belonging to the branch that was
         supposed to answer it" a comparison rather than a reading.
+
+        **The address is an argument, and it is the vantage point's own.** The
+        router binds `127.0.0.1:53` and nothing else, so a query asked from inside
+        the target has to go to the loopback and a query asked from the client has
+        to go to the bridge address -- there is no address both can use, and the
+        first version of this asked the bridge one from both. See
+        `TARGET_LOCAL_ADDRESS` for the measurement.
         """
-        command = f"{QUERY_TOOL} +short {'+tcp ' if transport == 'tcp' else ''}@{TARGET_ADDRESS} -p {RESOLVER_PORT} {name}"
+        command = (
+            f"{QUERY_TOOL} +short {'+tcp ' if transport == 'tcp' else ''}"
+            f"@{address} -p {RESOLVER_PORT} {name}"
+        )
         return try_read(container, "sh", "-c", command)
 
     def run_scenario() -> ScenarioResult:
@@ -582,6 +608,15 @@ def build_scenario(
             vantage_points = ("target", "client") if client_reachable else ("target",)
             document["vantage_points_measured"] = list(vantage_points)
             containers = {"target": target, "client": client}
+            # **The address each vantage point can actually reach**, and the
+            # client's is the bridge address precisely because its `127.0.0.1` is
+            # its own. Recorded, because "asked from inside the target" does not
+            # say where the target was asked, and a reader of the evidence
+            # document should not have to guess.
+            addresses = {"target": TARGET_LOCAL_ADDRESS, "client": TARGET_ADDRESS}
+            document["vantage_point_addresses"] = {
+                vantage: addresses[vantage] for vantage in vantage_points
+            }
 
             # -- 2. the two names, and which branch each must reach ---------
             # The China name is read out of the *published* list, so it is a name
@@ -646,7 +681,9 @@ def build_scenario(
                                        ("foreign", document["foreign_name"])):
                     for transport in TRANSPORTS:
                         key = f"{vantage}/{name_key}/{transport}"
-                        answers[key] = ask(containers[vantage], name, transport)
+                        answers[key] = ask(
+                            containers[vantage], name, transport, addresses[vantage]
+                        )
                         document.setdefault("answers", {})[key] = answers[key]
             _require(
                 all(value.strip() for value in answers.values()),
@@ -864,6 +901,7 @@ __all__ = [
     "RoutingScenarioError",
     "SCENARIO_NAME",
     "TARGET_ADDRESS",
+    "TARGET_LOCAL_ADDRESS",
     "TRANSPORTS",
     "build_scenario",
     "foreign_counters",
