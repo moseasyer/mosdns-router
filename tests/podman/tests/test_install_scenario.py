@@ -26,9 +26,13 @@ found, so one cell's failed case cannot be the next cell's starting state.
 """
 
 import ast
+import errno
 import importlib.util
+import io
 import json
+import os
 import re
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -122,11 +126,88 @@ postinst: in it. Refusing to install a selector over a range list this project c
 postinst: name. Nothing has been changed on this machine's DNS.
 """.format(shipped=SHIPPED_PIN_SHA)
 
-# A cell that cannot reach the origin. The wording is the kernel's own, because
-# the scenario reads the kernel's answer rather than testing a name: a cell whose
-# DNS merely SERVFAILs and one with no route at all are different machines, and
-# the message names which.
-NO_ROUTE = "Traceback (most recent call last):\nOSError: [Errno 101] Network is unreachable"
+# The no-route probe, and what a cell that cannot route answers it.
+#
+# **The answer is DERIVED BY RUNNING THE SCENARIO'S OWN PROGRAM, and that is the
+# whole point of this block.** The first version of this file held the literal
+# text `OSError: [Errno 101] Network is unreachable` -- the exact substring
+# `install_test.py` was looking for -- so the fake asserted the value the code
+# wanted rather than what the real command produces, and twenty cases in this
+# file could not see that the real command produced a `socket.gaierror` instead.
+# A fake that hardcodes the answer is this project's most repeated defect, and it
+# had reached a podman fixture.
+#
+# So the number goes in and the sentence comes out, by executing the program's
+# own `except` clause with a real `OSError` in place of the real `connect`:
+#
+#   * the fake cannot be made to agree with a wrong assertion, because it does
+#     not contain an assertion to agree with -- change the scenario to require
+#     `EHOSTUNREACH` and this answer still says `ENETUNREACH`;
+#   * and if the program stops printing an errno at all, the helper raises here
+#     and every case in this file says so, rather than the fake quietly
+#     answering "" and a case reading that as a routeless cell.
+def probe_failed(number: int = errno.ENETUNREACH) -> str:
+    """What the in-cell probe prints when its `connect` fails with `number`.
+
+    Run here, in this process, with the real `socket` module and only
+    `socket.socket` replaced -- so `AF_INET`, `SOCK_DGRAM`, `settimeout` and the
+    program's own `except` clause are the production ones, and the address and
+    port the cell would have received are the arguments that are checked.
+    """
+    program = install.PROBE_PROGRAM
+    saved_socket, saved_argv, saved_out = socket.socket, sys.argv, sys.stdout
+    captured = io.StringIO()
+
+    class _Refusing:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def settimeout(self, _seconds):
+            return None
+
+        def connect(self, _address):
+            raise OSError(number, os.strerror(number))
+
+    socket.socket = _Refusing
+    sys.argv = ["mosdns-probe", install.NO_ROUTE_ADDRESS, str(install.NO_ROUTE_PORT)]
+    sys.stdout = captured
+    try:
+        exec(compile(program, "<mosdns-probe>", "exec"), {"__name__": "__main__"})  # noqa: S102
+    except OSError as error:
+        raise AssertionError(
+            f"install_test.py's route probe lets an OSError escape instead of reporting its "
+            f"errno, so a cell that cannot route is reported as a command failure rather than as "
+            f"a measurement, and this fixture cannot derive an answer for it. The program is:\n"
+            f"{program}\nand it raised {error!r}"
+        ) from error
+    finally:
+        socket.socket, sys.argv, sys.stdout = saved_socket, saved_argv, saved_out
+    return captured.getvalue().strip()
+
+
+# A probe that resolved a NAME and found nothing. `socket.EAI_NONAME` is what a
+# real `socket.gaierror` carries when the only resolver in the cell -- the mock
+# router, `no-resolv` with no upstream -- cannot answer, and it is MEASURED: a
+# 24.04 cell answering the old name-based probe printed
+# `socket.gaierror: [Errno -2] Name or service not known`.
+#
+# The number is reproduced faithfully and the sentence is not, deliberately:
+# glibc's `gai_strerror` gave the cell "Name or service not known" where
+# `os.strerror(-2)` gives "Unknown error -2", and nothing here asserts on a
+# sentence. That gap is the argument for asserting on the number -- and for a
+# fixture that produces the sentence rather than copying one run's copy of it.
+NAME_UNRESOLVED = probe_failed(socket.EAI_NONAME)
+
+# The probe succeeded, which is the cell this scenario refuses to measure. Named
+# from the scenario's own constant so it cannot drift from what is looked for.
+PROBE_CONNECTED = install.CLAIM_PROBE_CONNECTED
+
+# The needle the probe's rule matches on: the LITERAL address and port, as they
+# appear in the `sh -c` script. A scenario that went back to probing a hostname
+# would be a command no rule in this table matches, so the cell would come back
+# with no probe output at all and be refused -- which is the failure the first
+# version could not have produced, because its rule matched whatever probe ran.
+PROBE_NEEDLE = f"{install.NO_ROUTE_ADDRESS} {install.NO_ROUTE_PORT}"
 
 # What `update-lists --refresh-ranges` prints on a machine with no route and no
 # published document, and what it prints when the check has measured the pin.
@@ -175,10 +256,10 @@ def install_rules(**overrides):
     than a re-run.
     """
     answers = {
-        # The route table of a cell on a private bridge, and the origin connect
-        # that fails. The precondition of the whole scenario.
+        # The route table of a cell on a private bridge, and the route probe that
+        # fails. The precondition of the whole scenario.
         "route": "10.89.0.0/24 dev eth0 proto kernel scope link src 10.89.0.190 metric 100",
-        "reachable": NO_ROUTE,
+        "reachable": probe_failed(),
         # The package, installed once.
         "stat": "16205254",
         "install": COMPLETED_OUTPUT,
@@ -205,7 +286,12 @@ def install_rules(**overrides):
          "answers": [{"stdout": "eth0\n"}, {"stdout": "eth0-managed\n"}]},
         {"match": ["nmcli", "-g", "IP4.DNS", "device", "show", "eth0"], "stdout": "10.89.0.2\n"},
         {"match": ["ip", "route", "show"], "stdout": answers["route"] + "\n"},
-        {"match": ["sh", "-c"], "match_contains": "socket.SOCK_DGRAM", "stdout": answers["reachable"] + "\n"},
+        # The rule that answers the route probe matches on the LITERAL address, so
+        # it is the shape of the command that is asserted here rather than a
+        # substring of the program: a rule that matched on `SOCK_DGRAM` would
+        # answer whatever probe ran, and a rule that matched on a hostname would
+        # answer exactly the command that made this fix necessary.
+        {"match": ["sh", "-c"], "match_contains": PROBE_NEEDLE, "stdout": answers["reachable"] + "\n"},
         {"match": ["stat", "-c", "%s", "/tmp/mosdns-router.deb"], "stdout": answers["stat"] + "\n"},
         {"match": ["sh", "-c", DPKG_INSTALL], "returncode": 0, "stdout": answers["install"] + "DPKG_EXIT=0\n"},
         {"match": ["sh", "-c", DPKG_STATUS_QUERY], "stdout": answers["status"] + "\n"},
@@ -351,12 +437,36 @@ class ScenarioPassesTest(InstallScenarioHarness):
     def test_the_record_says_the_cell_had_no_route_and_why_that_matters(self):
         # The precondition is recorded rather than assumed, so a reader of the
         # evidence can tell that the install was possible BECAUSE the snapshot
-        # exists rather than in spite of a reachable origin.
+        # exists rather than in spite of a reachable origin. The errno is the
+        # fact, and it is recorded as the number the kernel gave.
         _fake, result = self.run_scenario()
         record = self.record(result)
         self.assertTrue(record["no_route_established"])
         self.assertIn("10.89.0.0/24", record["route_table"])
-        self.assertIn("Network is unreachable", record["origin_reachable"])
+        self.assertEqual(record["origin_probe_errno"], errno.ENETUNREACH)
+        self.assertIn(f"errno={errno.ENETUNREACH}", record["origin_reachable"])
+        self.assertIn("mosdns-probe: failed", record["origin_reachable"])
+
+    def test_a_blackholed_route_is_accepted_because_the_probe_timed_out(self):
+        # A machine with a default route and no answer for the address is a
+        # machine with no route to the internet as far as this claim is
+        # concerned, and it answers `ETIMEDOUT` rather than `ENETUNREACH`. It is
+        # a different kernel message for the same fact, which is the reason the
+        # assertion is on the number.
+        _fake, result = self.run_scenario(reachable=probe_failed(errno.ETIMEDOUT) + "\n")
+        self.assertEqual(result.status, "passed", result.detail)
+        self.assertEqual(self.record(result)["origin_probe_errno"], errno.ETIMEDOUT)
+
+    def test_a_probe_that_produced_no_errno_at_all_is_refused(self):
+        # Empty output is what the fake answers a command no rule matches, and it
+        # is what a `python3` that is not installed answers. Either way the probe
+        # did not measure the route table, and a scenario that read an absent
+        # measurement as "no route" would be reporting the precondition it was
+        # checking.
+        _fake, result = self.run_scenario(reachable="\n")
+        self.assertEqual(result.status, "failed")
+        self.assertIn("reported no errno at all", result.detail)
+        self.assertIn("it is a probe that did not run", result.detail)
 
     def test_the_record_carries_the_reports_an_operator_would_read(self):
         _fake, result = self.run_scenario()
@@ -401,10 +511,59 @@ class TheRefusalsTest(InstallScenarioHarness):
         # would let the install succeed for an entirely different reason, the
         # published document would be the origin's, and every other observation
         # would read the same -- so the cell would pass while measuring nothing.
-        _fake, result = self.run_scenario(reachable="reachable\n")
+        _fake, result = self.run_scenario(reachable=PROBE_CONNECTED + "\n")
         self.assertEqual(result.status, "failed")
-        self.assertIn("the range origin is reachable", result.detail)
-        self.assertIn("would publish from the origin", result.detail)
+        self.assertIn("SUCCEEDED", result.detail)
+        self.assertIn("would then be true for a different reason", result.detail)
+
+    def test_the_no_route_probe_asks_a_literal_address_and_not_a_name(self):
+        # **The defect this pair of cases exists for.** A UDP `connect()` to a
+        # NAME resolves the name first, through the cell's own resolver -- which
+        # here is the mock router, `no-resolv` with no upstream, answering exactly
+        # one name -- so the probe read a resolution error and never read the
+        # route table at all. MEASURED in a 24.04 cell: the old probe printed
+        # `socket.gaierror: [Errno -2] Name or service not known`.
+        #
+        # So the command is read out of the fake's own log rather than trusted,
+        # because a source-level check cannot tell a name from an address and a
+        # substring check on the scenario would be the same kind of assertion the
+        # first version made.
+        fake, result = self.run_scenario()
+        probes = [line for line in self.asked(fake) if "mosdns-probe" in line or "SOCK_DGRAM" in line]
+        self.assertEqual(len(probes), 1, f"the route probe ran {len(probes)} times: {probes}")
+        self.assertIn(f"{install.NO_ROUTE_ADDRESS} {install.NO_ROUTE_PORT}", probes[0])
+        for name in ("api.cloudflare.com", "cloudflare.com"):
+            self.assertNotIn(
+                name, probes[0],
+                f"the no-route probe resolves {name} through this cell's own resolver, so it "
+                f"measures the mock router rather than the route table: {probes[0]!r}",
+            )
+        self.assertEqual(result.status, "passed", result.detail)
+
+    def test_a_probe_that_only_failed_to_resolve_a_name_is_refused_and_says_so(self):
+        # The fake cannot get this wrong by accident: `NAME_UNRESOLVED` is
+        # derived from `EAI_NONAME` and `os.strerror`, and `EAI_NONAME` is not in
+        # the scenario's accepted set. Before the fix the scenario looked for a
+        # message substring, and the message the real cell produced contained
+        # neither the kernel's nor a timeout -- so it refused a routeless cell
+        # while saying the origin was REACHABLE, the exact inverse of the truth.
+        _fake, result = self.run_scenario(reachable=NAME_UNRESOLVED + "\n")
+        self.assertEqual(result.status, "failed")
+        self.assertIn(
+            "is not one of the", result.detail,
+            "the scenario refused a name that did not resolve, which is right, and said so "
+            "by the number rather than by a sentence",
+        )
+        self.assertIn(
+            "has measured nothing", result.detail,
+            "the refusal does not say that a name-resolving probe measured the cell's resolver "
+            "instead of its route table, which is the defect that produced it",
+        )
+        self.assertNotIn(
+            "is reachable from", result.detail,
+            "the refusal claims the origin is reachable, which is the inverse of what a cell with "
+            "no route is: this is the message the first version produced on the real cell",
+        )
 
     def test_a_published_document_that_is_not_the_shipped_one_is_refused(self):
         # The digest equality is the measurement, so a cell holding the ORIGIN's
@@ -540,9 +699,44 @@ class ScenarioShapeTest(unittest.TestCase):
         }
         for name in (
             "CLAIM_PIN_PUBLISHED", "CLAIM_PIN_VERIFIED", "CLAIM_PIN_DRIFT_NONE",
-            "CLAIM_NO_ROUTE", "CLAIM_TRANSACTION_TOOK_OVER", "CLAIM_MARKER_WRITTEN",
+            "CLAIM_TRANSACTION_TOOK_OVER", "CLAIM_MARKER_WRITTEN",
         ):
             self.assertIn(name, constants, f"{name} is asserted but not named at module scope")
+
+    def test_the_no_route_assertion_is_a_number_and_not_a_sentence(self):
+        # The first version named `CLAIM_NO_ROUTE = "Network is unreachable"` and
+        # required that sentence, so the fake had to produce that sentence and
+        # the twenty cases here could not tell a real reading from a written
+        # one. The accepted set is now built from the `errno` module and the
+        # probe program classifies its own failure, so both the claim and the
+        # fake's answer are derived from a number.
+        source = self.source()
+        self.assertNotIn(
+            "CLAIM_NO_ROUTE", source,
+            "the scenario still asserts a message substring for its no-route precondition",
+        )
+        self.assertIn("import errno", source)
+        self.assertIn("NO_ROUTE_ERRNOS", source)
+        self.assertIn(
+            "errno.ENETUNREACH", source,
+            "the accepted set of 'no route' errors is written out rather than derived from the "
+            "`errno` module, so a platform that renumbers one would silently stop matching",
+        )
+        self.assertEqual(
+            install.NO_ROUTE_ERRNOS,
+            (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ETIMEDOUT),
+            "the accepted set changed; a case that depends on the exact set has to say so",
+        )
+        for number in (socket.EAI_NONAME, socket.EAI_AGAIN):
+            self.assertNotIn(
+                number, install.NO_ROUTE_ERRNOS,
+                f"{number} is a name that did not resolve, not a route that does not lead anywhere",
+            )
+        self.assertEqual(
+            install.NAME_ERRNOS, (socket.EAI_NONAME, socket.EAI_AGAIN),
+            "the scenario's named set of 'the name did not resolve' errors changed, and the refusal "
+            "message above is written against it",
+        )
 
     def test_the_scenario_waits_rather_than_sleeps_for_the_handoff(self):
         # `nmcli connection up` returns before the device has an address, so a

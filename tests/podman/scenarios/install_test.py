@@ -42,8 +42,11 @@ asserting a property the cell cannot have.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
+import socket
 import time
 from pathlib import Path
 from typing import Callable
@@ -93,6 +96,67 @@ LOCAL_DNS = "127.0.0.1"
 DNS_PORT = 53
 RESOLVER_PORT = 15353
 
+# **The address the no-route probe asks about, and why it is a literal and not a
+# name.** The first version of this probe connected to
+# `RANGE_ORIGIN.split('/')[2]` -- `api.cloudflare.com` -- and a UDP `connect()`
+# to a NAME resolves it first, through whatever resolver the cell is configured
+# with. In this matrix that resolver is the mock router, which is `no-resolv`
+# with no upstream and answers exactly one name, so the probe read a
+# `socket.gaierror` (`[Errno -2] Name or service not known`) and the assertion --
+# which looked for the kernel's `Network is unreachable` or a timeout -- refused
+# a cell that had no route, with a message saying the opposite: that the origin
+# was reachable and every claim below was true for the wrong reason. MEASURED in
+# a 24.04 cell; see the task-4-step1 report.
+#
+# A literal address measures the route table and nothing else, which is the whole
+# claim, and it makes the fake answerable: the rule that answers this command
+# matches on `9.9.9.9 443`, so a probe that went back to a name would be a
+# command no rule matches and the cell would be refused rather than measured.
+# 9.9.9.9 is Quad9's, chosen because it is a well-known public resolver address
+# and because the probe is a UDP `connect()`, which sends no packet: it asks the
+# routing table and stops.
+NO_ROUTE_ADDRESS = "9.9.9.9"
+NO_ROUTE_PORT = 443
+PROBE_TIMEOUT_SECONDS = 4.0
+
+# The `OSError` numbers that mean "there is no route to that address", and the
+# only three this scenario accepts. `ENETUNREACH` is what a container with one
+# link-scope route answers; `EHOSTUNREACH` is what a machine with a default
+# route and no answer for that host answers; `ETIMEDOUT` is what a blackholed
+# route answers once the probe's own timeout runs out. A NAME that does not
+# resolve is `EAI_NONAME` (-2) or `EAI_AGAIN` (-3) and is on no list here,
+# deliberately: a probe that measured the cell's resolver instead of its route
+# table has measured nothing, and accepting its answer is what made the first
+# version of this scenario report a routeless cell as a reachable one.
+NO_ROUTE_ERRNOS = (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ETIMEDOUT)
+
+# The two numbers that mean "the NAME did not resolve", named so the refusal can
+# say which kind of failure it read rather than only that the number was not in
+# the set above. They live in `socket` rather than `errno` because a name is not
+# a system call: getaddrinfo reports them itself.
+NAME_ERRNOS = (socket.EAI_NONAME, socket.EAI_AGAIN)
+
+# The probe program, run in the cell through `python3 -c`. It classifies the
+# failure ITSELF and prints the number, because the number is the fact and a
+# message is a sentence somebody can spell differently on a different kernel. The
+# traceback the first version relied on is gone with the name.
+PROBE_PROGRAM = "\n".join(
+    (
+        "import errno, socket, sys",
+        "address, port = sys.argv[1], int(sys.argv[2])",
+        "sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
+        f"sock.settimeout({PROBE_TIMEOUT_SECONDS:g})",
+        "try:",
+        "    sock.connect((address, port))",
+        "except OSError as error:",
+        "    print('mosdns-probe: failed errno=%d text=%s' % (error.errno, error.strerror))",
+        "else:",
+        "    print('mosdns-probe: connected')",
+    )
+)
+CLAIM_PROBE_CONNECTED = "mosdns-probe: connected"
+CLAIM_PROBE_FAILED = re.compile(r"mosdns-probe: failed errno=(-?\d+)")
+
 # How long to wait for the machine to reach a state after a command that should
 # cause it. Every one of these is a poll of a real fact, not a sleep.
 DEFAULT_WAIT_SECONDS = 120.0
@@ -111,7 +175,6 @@ CONFIGURED_STATES = ("installed", "install ok installed")
 CLAIM_PIN_PUBLISHED = "ranges-source: pinned-snapshot"
 CLAIM_PIN_VERIFIED = "ranges-pin-verified: true"
 CLAIM_PIN_DRIFT_NONE = "ranges-pin-drift: none"
-CLAIM_NO_ROUTE = "Network is unreachable"
 CLAIM_TRANSACTION_TOOK_OVER = "now uses the loopback address 127.0.0.1"
 CLAIM_MARKER_WRITTEN = "the ownership marker at"
 
@@ -267,18 +330,47 @@ def build_scenario(
             # nothing. So the cell's lack of a route is the precondition of this
             # scenario, and a cell that has one is reported rather than passed.
             document["route_table"] = try_read("ip", "route", "show")
+            document["probe_address"] = f"{NO_ROUTE_ADDRESS}:{NO_ROUTE_PORT}"
             document["origin_reachable"] = try_read(
                 "sh", "-c",
-                f"python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
-                f"s.settimeout(4);s.connect(('{RANGE_ORIGIN.split('/')[2].split(':')[0]}',443));"
-                "print('reachable')\" 2>&1 || true",
+                f'python3 -c "{PROBE_PROGRAM}" {NO_ROUTE_ADDRESS} {NO_ROUTE_PORT} 2>&1 || true',
             ).strip()
+            failure = CLAIM_PROBE_FAILED.search(document["origin_reachable"] or "")
+            document["origin_probe_errno"] = int(failure.group(1)) if failure else None
             _require(
-                CLAIM_NO_ROUTE in document["origin_reachable"] or "timed out" in document["origin_reachable"],
-                f"the range origin is reachable from {target} ({document['origin_reachable']!r}), so this "
-                "cell would publish from the origin rather than from the snapshot the package ships, "
-                "and every claim below would be true for the wrong reason. The cell's route table is:\n"
-                f"{document['route_table']}",
+                CLAIM_PROBE_CONNECTED not in document["origin_reachable"],
+                f"a UDP connect to {document['probe_address']} SUCCEEDED in {target}, so this cell has a "
+                f"route off its own bridge and the origin would be reachable from it. Every claim below "
+                f"would then be true for a different reason -- the snapshot the package ships would never "
+                f"be consulted. The probe said:\n{document['origin_reachable']}\n"
+                f"and the cell's route table is:\n{document['route_table']}",
+            )
+            _require(
+                document["origin_probe_errno"] is not None,
+                f"the probe to {document['probe_address']} reported no errno at all:\n"
+                f"{document['origin_reachable']!r}\n"
+                f"The probe asks a LITERAL address, so this is not a resolution failure -- it is a probe "
+                f"that did not run, or one whose output this scenario cannot read. A cell that answered a "
+                f"NAME here instead would be measuring this cell's resolver rather than its route table, "
+                f"and the route table is the claim:\n{document['route_table']}",
+            )
+            _require(
+                document["origin_probe_errno"] in NO_ROUTE_ERRNOS,
+                f"the probe to {document['probe_address']} failed with errno "
+                f"{document['origin_probe_errno']}, which is not one of the {NO_ROUTE_ERRNOS} this "
+                f"scenario accepts as 'no route to that address':\n"
+                f"{document['origin_reachable']}\n"
+                + (
+                    f"That is a NAME that did not resolve ({NAME_ERRNOS} are "
+                    f"'{os.strerror(socket.EAI_NONAME)}' and '{os.strerror(socket.EAI_AGAIN)}'), and a "
+                    f"probe that measured this cell's resolver instead of its route table has measured "
+                    f"nothing. The probe asks {NO_ROUTE_ADDRESS} -- a literal -- so this is the shape "
+                    f"of the probe, not a property of this cell.\n"
+                    if document["origin_probe_errno"] in NAME_ERRNOS
+                    else "The probe asks a literal address, so this is a failure of the route to it "
+                         "that this scenario does not recognise, and it is not treated as 'no route'.\n"
+                )
+                + f"The cell's route table is:\n{document['route_table']}",
             )
             document["no_route_established"] = True
 
