@@ -35,9 +35,9 @@ Start with `preflight`. It reports the Podman client version, the store
 driver, the source tree it would mount, and the NetworkManager fact below.
 It changes nothing.
 
-**`matrix` runs the scenarios and exits 0 or 1.** The first scenario to exist
-is `dhcp`: a cell creates the private network, starts a mock DHCP/DNS router and
-a target on it, and proves NetworkManager obtained an address **by DHCP**,
+**`matrix` runs the scenarios and exits 0, 1, 2 or 3.** The first scenario to
+exist is `dhcp`: a cell creates the private network, starts a mock DHCP/DNS router
+and a target on it, and proves NetworkManager obtained an address **by DHCP**,
 published the router's DNS, and then received a **new** DNS address after the
 router was reconfigured. Naming no scenario runs every registered one, which is
 what the plan's own acceptance command does. Exit codes are the interface:
@@ -46,8 +46,19 @@ what the plan's own acceptance command does. Exit codes are the interface:
 - `1` — a test failed
 - `2` — a harness or configuration error (including asking for a scenario that
   is not registered, which is refused with its name rather than ignored)
-- `3` — an incomplete matrix (a target that could not be brought up, or a
-  required architecture was skipped)
+- `3` — an incomplete matrix: a target that could not be brought up, a required
+  architecture that was skipped, **or a scenario that recorded a required skip**
+  (a requirement it could not close, in that requirement's own words)
+
+**A flag-free `matrix` is expected to exit 3 today.** The registry's default set
+includes `install`, and `install` proves what it can and then records the one
+requirement it cannot close — that the transaction reaches `install ok configured`
+with no route to the internet — as a required skip. A version holding a required
+skip is `incomplete`, never `passed`, however green its scenarios are, so the
+default run's exit is 3 rather than 0 or 1. Naming `--scenario` is how a run gets
+a different number: `--scenario dhcp` can exit 0. Task 4 Step 5 is what closes
+that requirement; until then 3 is the honest number for the default set and a
+reader who is not told so would be looking for a failure that is not there.
 
 A scenario that fails is a `failed` row in the report with the reason beside
 it; a scenario the registry does not hold is exit 2. They are different claims:
@@ -393,11 +404,15 @@ REQUEST and ACK are ordinary unicast.
 
 `python3 tests/podman/run.py matrix --arch amd64 --versions 24.04 --scenario watchdog`
 
-This is the only scenario that **installs the package**, because the mechanism it
-observes is four files inside the `.deb` — the unit, the timer, the setting and
-the verb — and a scenario that hand-copied those would be testing a constructed
-approximation of the package. It needs `make package` to have run; a missing
-`.deb` is a harness error (exit 2) naming the command, not a failed cell.
+This is one of the **two scenarios that install the package** — `install` and
+`watchdog` are the set `PACKAGE_SCENARIOS` names, and a flag-free `matrix` runs
+both of them, so a run with no `--scenario` installs the package twice. For
+`watchdog` the reason is that the mechanism it observes is four files inside the
+`.deb` — the unit, the timer, the setting and the verb — and a scenario that
+hand-copied those would be testing a constructed approximation of the package;
+`install` is in the set because it runs the transaction the package's own
+`postinst` performs. Both need `make package` to have run; a missing `.deb` is a
+harness error (exit 2) naming the command, not a failed cell.
 
 It is also the only scenario that can be described as a *product* test rather
 than a claim about files, because the watchdog is the first thing this project
@@ -427,13 +442,29 @@ evidence of something a unit test cannot reach:
 **The install transaction is refused in a container**, measured on 24.04:
 
 ```text
-install: publishing the Cloudflare prefix list, which the router refuses to start
-without failed: ... update-lists: https://api.cloudflare.com/client/v4/ips: dial
-tcp: lookup api.cloudflare.com on 127.0.0.53:53: server misbehaving
+install: dnscrypt-proxy.service was started but nothing answered a DNS query at
+127.0.0.1:15353 within 60s, so the machine has no local resolver to point
+NetworkManager at; nothing has been pointed at anything and the transaction is
+being undone
 ```
 
-A container on this bridge has no route off it, so the publish cannot happen. The
-refusal happens *after* the record is written and read back and *before* any DNS
+**The barrier is the resolver's own start-up wait, and not the range origin.** A
+container on this bridge has no route off it, so `dnscrypt-proxy` binds its
+loopback listener once its own reachability probe runs out and then answers
+nothing — the DNSCrypt server it needs is on the internet. The transaction waits
+60 seconds for an answer that cannot come and rolls itself back. It gets *past*
+the range step: the transaction publishes the pin from the snapshot the package
+ships, which needs no network at all, and `update-lists --refresh-ranges` reports
+`ranges-source: pinned-snapshot` at exit 0.
+
+This paragraph is where a reader used to be sent after the range origin and
+failing to reach it — a claim that was true before the pinned snapshot shipped and
+is false now, and that pointed at a network problem the cell does not have. The
+`install` scenario is what holds the difference: it measures which barrier
+refused, and requires the two range refusals to be **absent** from dpkg's output
+rather than merely unreported.
+
+The refusal happens *after* the record is written and read back and *before* any DNS
 setting is changed, which is why the scenario has a record to restore — and it
 rolls itself back cleanly, so the machine is exactly the one the watchdog is for.
 The evidence document says all of this, and says explicitly that the router was
@@ -726,8 +757,16 @@ A scenario module gets:
   directory, returning a **zero-argument** callable the runner invokes. Bound
   rather than global, because a cell has its own containers and a global name
   would measure whichever container happened to be running.
-- a `ScenarioResult` with `status="passed"` or `status="failed"`, and a `log`
-  path **relative** to the run's own result directory.
+- a `ScenarioResult` with `status="passed"` or `status="failed"`, a `log`
+  path **relative** to the run's own result directory, and — when the scenario
+  proved what it could and hit a requirement it could not close — `skips=`, a
+  tuple of `Skip(requirement=…, reason=…)` in the requirement's own words.
+  `skips` defaults to empty and is not an error to carry: a `passed` scenario
+  that also recorded a required skip is the honest shape, and the runner hoists
+  the skips onto the version, where `status` refuses to read `passed` while one
+  is under it. A requirement that was not closed belongs here rather than in
+  `detail`, because a reader should not have to read prose to find an open
+  requirement.
 - its own exception type for a failed assertion. `PodmanError` means a harness
   fault (exit 2); a scenario that raises it for "the DNS did not change" is
   reporting a broken matrix as a broken harness.

@@ -1192,6 +1192,173 @@ class ScenarioSkipTest(EntryPoint):
         self.assertEqual(built.status, "failed")
 
 
+class ContributorPageAgreesWithTheRun(unittest.TestCase):
+    """`docs/testing.md` is tracked, and it is the page a contributor reads.
+
+    Four sentences on it described a harness this tree no longer has, and all four
+    failed the same way: a reader who believed one of them went looking for a
+    thing that is not there. That is the defect the project's own convention
+    already holds this file for once -- `test_images.py` requires the page to
+    carry a specific claim about the NM declaration -- so this is the same shape,
+    for the four sentences that were stale.
+
+    * **The watchdog section gave a stale reason as a measurement.** It printed
+      dpkg's output refusing at the Cloudflare prefix list and concluded "a
+      container on this bridge has no route off it, so the publish cannot happen".
+      Task 4 Step 1 ended that: the transaction publishes the package's pinned
+      snapshot with no network at all (`ranges-source: pinned-snapshot`, exit 0),
+      and what refuses in a cell with no route is the **resolver's own start-up
+      barrier**. A reader sent to the range origin goes hunting for a network
+      fault this cell does not have.
+    * **The same section called `watchdog` the only scenario that installs the
+      package.** `install` installs it too, and `install` is in the *default* set,
+      so a flag-free `matrix` runs two package-installing scenarios.
+    * **The harness section said `matrix` "exits 0 or 1"** -- contradicted by the
+      four-code list two lines under it -- and gave exit 3 exactly two causes,
+      neither of which is a scenario's required skip. A contributor who runs the
+      documented default command, gets 3, and finds no listed cause is in exactly
+      the position to file a required requirement as a nicety.
+    * **The "Adding a scenario" contract listed `status` and `log`** and not
+      `skips`, which is the instrument the third of those is made of: a scenario
+      that proves what it can and cannot prove the rest reports the open
+      requirement as a skip, and a scenario author reading this page would have
+      put it in `detail` -- a skip reported as prose.
+
+    **Checked against the code, not against a paraphrase of the page.** The
+    package set, the default set and `ScenarioResult`'s fields are read here, so
+    the case fails if either side moves: a page that is right about a registry
+    that has changed is still a page that is wrong, and a code change that
+    invalidates the page's claim has to be a failing case rather than a sentence
+    nobody re-reads. Deferring prose is defensible; a tracked page held by a test
+    is what this project has already decided on.
+    """
+
+    PAGE = REPO / "docs/testing.md"
+    HARNESS = "## The system-level harness"
+    WATCHDOG = "## The resolver watchdog scenario"
+    REFUSAL = "### What the cell does not prove"
+    ADDING = "## Adding a scenario"
+
+    def setUp(self):
+        self.page = self.PAGE.read_text(encoding="utf-8")
+
+    def section(self, heading: str) -> str:
+        """The one section of the page a claim is about, cut at the next heading.
+
+        A substring of the whole page would let a sentence in a *different*
+        section satisfy a claim about this one, which is the same defect as a
+        refusal that names a sequence the code does not run.
+        """
+        self.assertIn(heading, self.page, f"the page has no {heading!r} section to check")
+        body = self.page[self.page.index(heading) + len(heading):]
+        ends = [body.index(line) for line in ("\n## ", "\n### ") if line in body]
+        return body[: min(ends)] if ends else body
+
+    def test_the_page_names_the_barrier_that_refused_and_not_the_range_origin(self):
+        # -- the refusal's reason, which was a stale measurement ---------------
+        refusal = self.section(self.REFUSAL)
+        self.assertIn(
+            "nothing answered a DNS query at", refusal,
+            "the page does not give the barrier the transaction actually refused at. The cell's "
+            "own words are 'dnscrypt-proxy.service was started but nothing answered a DNS query "
+            "at 127.0.0.1:15353 within 60s', and that is the measurement",
+        )
+        self.assertIn(
+            "127.0.0.1:15353", refusal,
+            "the resolver's own port is not named, so a reader cannot tell the resolver's "
+            "start-up barrier from any other refusal",
+        )
+        # **And the range origin is not the reason it gives.** This is the
+        # assertion that makes the sentence load-bearing: the pinned snapshot
+        # publishes with no route, so a page that names the origin sends the
+        # reader to a fault the cell does not have.
+        self.assertNotIn(
+            "api.cloudflare.com", refusal,
+            "the page still states, as the measured reason a cell's transaction refuses, that "
+            "the Cloudflare prefix list cannot be published. Task 4 Step 1 ended that: the "
+            "transaction publishes the package's pinned snapshot with no route at all",
+        )
+        self.assertIn(
+            "ranges-source: pinned-snapshot", refusal,
+            "the page does not say the cell publishes the pin from the shipped snapshot, which "
+            "is the half of the claim that makes the resolver the barrier",
+        )
+
+        # -- the set of scenarios that install the package ---------------------
+        self.assertIn(
+            "install", run.SCENARIO_NAMES,
+            "the `install` scenario is no longer registered, so the watchdog section's account "
+            "of the package set has to be written again",
+        )
+        self.assertIn(
+            "install", run.PACKAGE_SCENARIOS,
+            "`install` installs the package, so it belongs in the set the page names; without "
+            "it a flag-free `matrix` would run exactly one package-installing scenario",
+        )
+        # The falsifiable consequence: the default set really does install the
+        # package, so "the only scenario that installs the package" cannot be
+        # true of a run with no `--scenario`.
+        self.assertTrue(
+            set(run.SCENARIO_NAMES) & set(run.PACKAGE_SCENARIOS),
+            f"the default set is {run.SCENARIO_NAMES} and the package set is "
+            f"{run.PACKAGE_SCENARIOS}; a flag-free run installs the package only while the two "
+            "overlap, and the page claims a flag-free run installs it twice",
+        )
+        watchdog = self.section(self.WATCHDOG)
+        self.assertNotIn(
+            "the only scenario that **installs the package**", watchdog,
+            "the watchdog section still calls itself the only scenario that installs the "
+            f"package, while {sorted(set(run.SCENARIO_NAMES) & set(run.PACKAGE_SCENARIOS))} are "
+            "in the default set and in the package set",
+        )
+        for name in run.PACKAGE_SCENARIOS:
+            self.assertIn(
+                f"`{name}`", watchdog,
+                f"the watchdog section does not name `{name}`, which is one of the scenarios that "
+                "install the package, so a contributor reading it cannot see the whole set",
+            )
+
+        # -- exit 3's causes, and the number a flag-free run returns -----------
+        harness = self.section(self.HARNESS)
+        self.assertNotIn(
+            "exits 0 or 1", harness,
+            "the page still says `matrix` exits 0 or 1, which its own four-code list two lines "
+            "under it contradicts",
+        )
+        third = re.search(r"^- `3` — (.+?)(?=\n- `|\n\n)", harness, re.M | re.S)
+        self.assertIsNotNone(third, "the page does not list what exit 3 means")
+        self.assertIn(
+            "required skip", third.group(1),
+            "exit 3's causes do not include a scenario's required skip, which is the cause the "
+            "default set produces on every cell: `install` proves the property and records the "
+            "one requirement it cannot close",
+        )
+        self.assertIn(
+            "flag-free `matrix`", harness,
+            "the page does not say what a run with no `--scenario` returns, and 3 is what it "
+            "returns -- a reader who is not told so looks for a failure that is not there",
+        )
+        self.assertIn(
+            "Task 4 Step 5", harness,
+            "the page does not say which step makes 3 go away, so the number reads as permanent",
+        )
+
+        # -- the contract a scenario module is handed -------------------------
+        adding = self.section(self.ADDING)
+        self.assertIn(
+            "skips=", adding,
+            "the contract for a returned `ScenarioResult` names `status` and `log` and not "
+            "`skips`, so a scenario author has no way to learn that an unclosed requirement "
+            "belongs on the result rather than in `detail`",
+        )
+        # And the field is really there, and really optional.
+        self.assertEqual(
+            ScenarioResult("install", "passed").skips, (),
+            "`ScenarioResult` no longer defaults `skips` to empty, so the page's contract is not "
+            "just incomplete -- a scenario that returns none of it cannot be constructed",
+        )
+
+
 class NamespaceAndGateTest(unittest.TestCase):
     """Two things that are not this task's to add, and are held anyway.
 
