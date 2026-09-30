@@ -588,9 +588,17 @@ def target_rules(*, dns_answers=None, connection=None, route=None, state_file=No
     and the failure would then be about a different run than the one it names.
     """
     return [
+        # **The fifth and sixth answers are the restore.** Step 7 publishes the
+        # mock CDN's address and step 10 puts the router's own back, and the
+        # scenario waits for `IP4.DNS` to read it again. Without those two, the
+        # fake's sequence helper repeats the LAST answer for ever, the restore's
+        # wait runs out, and every case here fails for a reason that has nothing
+        # to do with DHCP -- which is the shape of this file's own lesson about
+        # fakes that cannot fail the way the real thing fails.
         {"match": ["nmcli", "-g", "IP4.DNS", "device", "show", "eth0"],
          "answers": [{"stdout": f"{value}\n"} for value in (
-             dns_answers or [MOCK_ROUTER_ADDRESS] * 3 + [MOCK_CDN_ADDRESS])]},
+             dns_answers or [MOCK_ROUTER_ADDRESS] * 3 + [MOCK_CDN_ADDRESS] * 2
+             + [MOCK_ROUTER_ADDRESS] * 2)]},
         {"match": ["nmcli", "-g", "IP4.ADDRESS", "device", "show", "eth0"],
          "stdout": f"{LEASE_ADDRESS}/24\n"},
         {"match": ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", "eth0"],
@@ -601,6 +609,7 @@ def target_rules(*, dns_answers=None, connection=None, route=None, state_file=No
          "answers": [
              {"stdout": f"dhcp_server_identifier = {MOCK_ROUTER_ADDRESS} | domain_name_servers = {MOCK_ROUTER_ADDRESS} | ip_address = {LEASE_ADDRESS} | routers = {MOCK_ROUTER_ADDRESS}\n"},
              {"stdout": f"dhcp_server_identifier = {MOCK_ROUTER_ADDRESS} | domain_name_servers = {MOCK_CDN_ADDRESS} | ip_address = {LEASE_ADDRESS} | routers = {MOCK_ROUTER_ADDRESS}\n"},
+             {"stdout": f"dhcp_server_identifier = {MOCK_ROUTER_ADDRESS} | domain_name_servers = {MOCK_ROUTER_ADDRESS} | ip_address = {LEASE_ADDRESS} | routers = {MOCK_ROUTER_ADDRESS}\n"},
          ]},
         {"match": ["nmcli", "-g", "ipv4.never-default", "connection", "show", PROFILE],
          "stdout": "yes\n"},
@@ -608,6 +617,7 @@ def target_rules(*, dns_answers=None, connection=None, route=None, state_file=No
          "answers": [
              {"stdout": f"Link 2 (eth0): {MOCK_ROUTER_ADDRESS}\n"},
              {"stdout": f"Link 2 (eth0): {MOCK_CDN_ADDRESS}\n"},
+             {"stdout": f"Link 2 (eth0): {MOCK_ROUTER_ADDRESS}\n"},
          ]},
         {"match": ["ip", "route"],
          "stdout": route or f"10.89.0.0/24 dev eth0 proto kernel scope link src {LEASE_ADDRESS}\n"},
@@ -735,6 +745,75 @@ class ScenarioRunsThePlanTest(ScenarioHarness):
         # of "the DNS came from DHCP": the device field could have been written
         # by something other than the lease.
         self.assertIn(f"domain_name_servers = {MOCK_CDN_ADDRESS}", record["lease_dns_after"])
+
+    def test_it_puts_the_routers_published_dns_back_before_it_finishes(self):
+        """**The scenario must leave the cell the way it found it.**
+
+        Step 7 is the plan's control command and it changes the mock router's
+        published resolver from `10.89.0.2` to `10.89.0.20` -- the mock CDN's
+        address, which Task 5 builds and which nothing is serving in this task.
+        Left there, every LATER scenario in the same cell inherits it, and the
+        first one to need a resolver to answer anything fails for a reason that
+        has nothing to do with itself.
+
+        MEASURED: with the leak, `run.py matrix` on 24.04 failed the `watchdog`
+        scenario with `emergency-rollback` exiting 6 -- "a query for
+        install-probe.example through 127.0.0.53 did not resolve" -- because
+        the machine's own resolver was an address with nothing behind it. Run
+        with `--scenario install --scenario watchdog`, i.e. without this
+        scenario, `watchdog` passes. So the restore is the fix, and this case is
+        what holds it.
+        """
+        fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        record = self.record(result)
+        self.assertEqual(record["dns_restored_to"], MOCK_ROUTER_ADDRESS)
+        self.assertTrue(record["dns_restored"])
+        # The option file is written twice -- once to change it, once to change it
+        # back -- and the second write carries the router's own address.
+        writes = [
+            line for line in self.scripts(fake, ROUTER) if DNS_OPTION_FILE in line
+        ]
+        self.assertEqual(len(writes), 2, f"the option file was written {len(writes)} times: {writes}")
+        self.assertIn(dhcp.dns_option_line(MOCK_CDN_ADDRESS), writes[0])
+        self.assertIn(dhcp.dns_option_line(MOCK_ROUTER_ADDRESS), writes[1])
+        # And the target is re-asked, because a lease is not renegotiated on a
+        # timer the scenario controls -- the same reason step 7 gave.
+        self.assertGreaterEqual(
+            sum(1 for line in self.scripts(fake) if f"nmcli connection up {PROFILE}" in line), 2,
+            "the target was not re-activated after the router published the restored address, so the "
+            "restore is in the router and not in the machine",
+        )
+
+    def test_a_restore_that_did_not_take_is_a_failure_and_not_a_pass(self):
+        # The cell proved what it was written to prove and then left the next
+        # scenario a machine it did not build. That is a failure, not a pass: a
+        # pass here is a claim about a cell whose later half is untrustworthy.
+        #
+        # The sequence is the router's own address **once** and then nothing but
+        # the mock CDN's, for as long as the scenario reads: the fake repeats its
+        # LAST answer, so a list that still began with the router's address
+        # would let the restore's first poll read `10.89.0.2` and pass.
+        _fake, result = self.run_scenario(
+            dns_answers=[MOCK_ROUTER_ADDRESS] + [MOCK_CDN_ADDRESS] * 20,
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("the mock router is still publishing", result.detail)
+        self.assertEqual(self.record(result)["dns_restored"], False)
+
+    def test_a_restore_that_failed_after_a_pass_is_still_reported(self):
+        # The restore runs whatever happened before it, so a scenario that failed
+        # at step 5 and then could not put the address back says so on its own
+        # row rather than leaving the next scenario to find out. A `failed`
+        # ScenarioResult does not stop the scenarios after it, which is the
+        # whole reason the restore is in a `finally`.
+        _fake, result = self.run_scenario(
+            dns_answers=[MOCK_ROUTER_ADDRESS] + [MOCK_CDN_ADDRESS] * 20,
+            route="default via 10.89.0.2 dev eth0\n",
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("has a default route through the mock router", result.detail)
+        self.assertEqual(self.record(result)["dns_restored"], False)
 
     def test_it_records_the_bridges_dhcp_state_file_as_absent_rather_than_empty(self):
         """`/run/mosdns/dhcp-upstreams.json` is the *package's* file, and the package is not installed.

@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Callable
 
 from podman import PodmanError
-from report import ScenarioResult
+from report import STATUS_PASSED, ScenarioResult
 
 # -- the plan's private network ------------------------------------------------
 #
@@ -621,14 +621,118 @@ def build_scenario(
             )
         except DhcpScenarioError as error:
             document["failure"] = str(error)
-            write_evidence(document)
-            return ScenarioResult(
+            outcome = ScenarioResult(
                 name=SCENARIO_NAME, status="failed", detail=str(error), log=log_name
             )
-        write_evidence(document)
-        return ScenarioResult(name=SCENARIO_NAME, status="passed", log=log_name)
+        else:
+            outcome = ScenarioResult(name=SCENARIO_NAME, status="passed", log=log_name)
+        finally:
+            # -- 10. put the router back, whatever happened -------------------
+            # **A scenario has to leave the cell the way it found it**, and step
+            # 7 changed the mock router's published resolver to `10.89.0.20` --
+            # the mock CDN's address, which Task 5 builds and which nothing is
+            # serving in this task. Left there, every later scenario in the same
+            # cell inherits it.
+            #
+            # MEASURED, and the cost was another scenario's failure: with the
+            # leak, `run.py matrix` on 24.04 failed `watchdog` with
+            # `emergency-rollback` exiting 6 -- "a query for
+            # install-probe.example through 127.0.0.53 did not resolve, so this
+            # machine still cannot resolve" -- because the machine's own resolver
+            # was an address with nothing behind it. Run with `--scenario install
+            # --scenario watchdog`, i.e. without this scenario, `watchdog`
+            # passes. So the fix is here and not in the scenario that noticed.
+            #
+            # In a `finally`, because the leak matters most exactly when this
+            # scenario does NOT pass: a `failed` ScenarioResult does not stop the
+            # scenarios after it, so a cell that failed at step 9 would hand the
+            # next one the same machine.
+            document.update(
+                restore_published_dns(
+                    podman,
+                    router=router,
+                    target=target,
+                    read_field=read_field,
+                    wait_seconds=wait_seconds,
+                    interval=interval,
+                    now=now,
+                    sleep=sleep,
+                )
+            )
+            if not document.get("dns_restored") and outcome.status == STATUS_PASSED:
+                outcome = ScenarioResult(
+                    name=SCENARIO_NAME,
+                    status="failed",
+                    detail=document.get("dns_restore_failure", ""),
+                    log=log_name,
+                )
+            write_evidence(document)
+        return outcome
 
     return run
+
+
+def restore_published_dns(
+    podman,
+    *,
+    router,
+    target,
+    read_field,
+    wait_seconds: float,
+    interval: float,
+    now,
+    sleep,
+) -> dict:
+    """Put the mock router's published resolver back, and say whether it took.
+
+    The same three steps step 7 took, in the other direction: write the option
+    file, SIGHUP so dnsmasq re-reads it, and re-activate the target's profile
+    because a lease is not renegotiated on a timer a scenario controls.
+
+    **It returns a document fragment rather than raising**, because it runs in a
+    `finally` and a restore that raised would replace the cell's own outcome with
+    its own error -- a scenario that failed for a real reason would be reported
+    as having failed to clean up, which is the one thing the cell's own evidence
+    would no longer describe.
+    """
+    document: dict = {"dns_restored_to": MOCK_ROUTER_ADDRESS, "dns_restored": False}
+    try:
+        podman.exec_script(
+            router,
+            "set -eu\n"
+            + f"printf '%s\\n' '{dns_option_line(MOCK_ROUTER_ADDRESS)}' > {DNS_OPTION_FILE}\n",
+        )
+        podman.signal_container(router, "HUP")
+        podman.exec_script(
+            target, "set -eu\n" f"nmcli connection up {CONNECTION_PROFILE}\n",
+        )
+        restored = wait_for(
+            read_field(target, "nmcli", "-g", "IP4.DNS", "device", "show", DEVICE),
+            MOCK_ROUTER_ADDRESS,
+            what=f"IP4.DNS on {DEVICE} in {target} after the mock router's published resolver "
+                 f"was put back",
+            timeout=wait_seconds,
+            interval=interval,
+            now=now,
+            sleep=sleep,
+        )
+        document["dns_restored"] = True
+        document["dns_after_restore"] = restored
+        document["dns_restore_note"] = (
+            f"The mock router is publishing {MOCK_ROUTER_ADDRESS} again, which is the resolver this "
+            f"cell started with. Step 7 published {MOCK_CDN_ADDRESS} to demonstrate the control "
+            f"command, and nothing in this task serves that address -- Task 5's mock CDN does -- so "
+            f"leaving it published would hand every later scenario in this cell a machine whose own "
+            f"resolver answers nothing."
+        )
+    except (PodmanError, DhcpScenarioError) as error:
+        document["dns_restore_failure"] = (
+            f"the mock router is still publishing {MOCK_CDN_ADDRESS} after this scenario finished, "
+            f"so every later scenario in this cell starts from a machine whose own resolver answers "
+            f"nothing -- and the failures that causes are about the resolver, not about those "
+            f"scenarios. The restore failed with: {error}"
+        )
+    return document
 
 
 def _option_file_reads(router_log: str) -> int:
