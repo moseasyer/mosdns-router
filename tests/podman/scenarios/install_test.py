@@ -1140,6 +1140,28 @@ def build_scenario(
                 document[f"state:{unit}"] = try_read(
                     "sh", "-c", f"systemctl show --property=ActiveState --value {unit}"
                 ).strip()
+                # **Required, and the requirement is what this scenario's
+                # upgrade rests on.** The four barrier assertions this scenario
+                # used to require said the resolver's own start-up wait had
+                # refused the transaction; what replaced them is the configured
+                # state, and a configured package whose units are not running is
+                # a machine whose DNS is about to stop resolving. So the word is
+                # read AND required, rather than recorded as evidence nobody
+                # looked at -- a `try_read` whose value is never compared is a
+                # sentence in the evidence document that a reader can check
+                # themselves, which is not the same as a gate.
+                #
+                # `active` rather than "not failed": the two units are the
+                # project's own and there is nothing else they can usefully be,
+                # and `is-active` is the question the plan's Task 4 Step 3 asks.
+                _require(
+                    document[f"state:{unit}"] == "active",
+                    f"{unit} is {document[f'state:{unit}']!r} in {target} and the transaction is "
+                    f"supposed to have left it running: the package is {document['package_status_phrase'] or document['package_state']}, "
+                    f"and a configured package whose resolver is not active is a machine whose "
+                    f"resolution is about to stop, which is the failure the four assertions this "
+                    f"scenario replaced used to catch",
+                )
             document["loopback_listeners"] = try_read(
                 "sh", "-c", f"ss -lntup 2>/dev/null | grep -E '127\\.0\\.0\\.1:({DNS_PORT}|{RESOLVER_PORT})\\b' || true"
             )

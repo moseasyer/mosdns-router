@@ -892,14 +892,29 @@ def install_rules(**overrides):
          "returncode": answers["corrupt_present"]},
         {"match": ["test", "-e", "/var/lib/mosdns/lists/cloudflare-prefixes.txt"],
          "returncode": answers["corrupt_present"]},
-        # Recorded rather than asserted -- the scenario's claims about the two
-        # units are the loopback hand-over and the enabled timers, and those are
-        # things the transaction said about itself; a unit's `ActiveState` read
-        # afterwards is evidence about the system rather than about the package.
-        {"match": ["systemctl", "show", "--property=ActiveState", "--value",
-                   "dnscrypt-proxy.service"], "stdout": answers["active"] + "\n"},
-        {"match": ["systemctl", "show", "--property=ActiveState", "--value",
-                   "mosdns-router.service"], "stdout": answers["active"] + "\n"},
+        # The two daemons the transaction owns, both active because it committed.
+        # **Now ASSERTED, not just recorded** -- a `try_read` whose value nothing
+        # compares is a sentence in an evidence document rather than a gate, and
+        # the four barrier assertions this scenario's upgrade replaced used to
+        # catch exactly this: a package at `install ok installed` with a resolver
+        # that is not running. The scenario's claims about the two units are the
+        # loopback hand-over and the enabled timers, which are things the
+        # transaction said about itself; `ActiveState` read afterwards is a
+        # reading of the machine, and a reading of the machine is what the
+        # barrier used to be.
+        #
+        # **The two rules are matched on `sh -c` plus a substring, and that is not
+        # a style choice.** The scenario asks `try_read("sh", "-c", "systemctl
+        # show --property=ActiveState --value <unit>")`, so the whole command
+        # arrives as ONE argv token and a rule matching the token SEQUENCE
+        # `["systemctl", "show", …]` never matches -- the first version of these
+        # two rules was written that way and matched nothing, which is why
+        # nothing noticed that the value was never compared. A rule that matches
+        # nothing is indistinguishable from a gate that passes.
+        {"match": ["sh", "-c"], "match_contains": f"ActiveState --value {install.RESOLVER_UNIT}",
+         "stdout": answers["active"] + "\n"},
+        {"match": ["sh", "-c"], "match_contains": f"ActiveState --value {install.ROUTER_UNIT}",
+         "stdout": answers["active"] + "\n"},
         # And the loopback listeners, which the transaction's own hand-over is
         # about. Recorded, not asserted: the scenario's claim is that the
         # transaction said it served them, and `ss` output is a reading of the
@@ -1251,6 +1266,50 @@ class ScenarioPassesTest(InstallScenarioHarness):
         self.assertEqual(result.status, "failed")
         self.assertIn(install.ROUTER_CONFIG, result.detail)
         self.assertIn("could not be", result.detail)
+
+    def test_both_units_are_required_to_be_active_and_not_merely_recorded(self):
+        """**A `try_read` whose value is never compared is a sentence, not a gate.**
+
+        The scenario read each unit's `ActiveState` and put it in the evidence
+        document; nothing required it to be `active`. The four barrier assertions
+        this scenario's upgrade replaced said the resolver's own start-up wait had
+        refused the transaction, and what replaced them is the configured state --
+        so a package that reached `install ok installed` with a dead resolver is
+        the failure the old assertions would have caught and the new ones, as
+        written, did not. **Four states, and the interesting ones are the ones no
+        one writes down**: `failed` is the obvious one, and `activating` is what a
+        `try-restart` leaves behind on a loaded machine -- the exact shape the
+        harness's own readiness wait exists to distinguish from `active`.
+        """
+        for state, what in (
+            ("failed", "a unit that failed"),
+            ("activating", "a unit still starting"),
+            ("inactive", "a unit that stopped"),
+            ("", "a read that returned nothing"),
+        ):
+            for unit in (install.RESOLVER_UNIT, install.ROUTER_UNIT):
+                with self.subTest(unit=unit, state=what):
+                    # **One unit at a time.** The scenario requires the resolver
+                    # first and refuses there, so a rule table that made both
+                    # units wrong at once would only ever exercise the first --
+                    # and a case that claimed to cover the router would be
+                    # covering the resolver twice.
+                    _fake, result = self.run_scenario(
+                        rules=[
+                            rule for rule in install_rules()
+                            if rule.get("match_contains")
+                            != f"ActiveState --value {unit}"
+                        ] + [{"match": ["sh", "-c"],
+                              "match_contains": f"ActiveState --value {unit}",
+                              "stdout": f"{state}\n"}],
+                    )
+                    self.assertEqual(
+                        result.status, "failed",
+                        f"{unit} was {state!r} and the cell passed: the transaction is supposed "
+                        f"to have left both units running",
+                    )
+                    self.assertIn(unit, result.detail)
+                    self.assertIn("is not active", result.detail)
 
     def test_a_digest_that_is_not_a_digest_is_not_read_as_one(self):
         """**`sha256sum` prints `<digest>  <path>`, and a line that is only a path
