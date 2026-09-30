@@ -412,7 +412,31 @@ CONTROL_DEPENDS = (
     "python3",
     "systemd",
     "network-manager",
-    "systemd-resolved",
+    # **`libnss-resolve`, and NOT `systemd-resolved`** -- MEASURED, and the reason
+    # is a package that does not exist. `systemd-resolved` is a binary package on
+    # 24.04 and 26.04 and **there is no such package on 22.04**, where the daemon
+    # is part of `systemd` -- so a `Depends: systemd-resolved` is a package dpkg
+    # refuses to configure on the oldest release this project supports, with
+    #
+    #     dpkg: dependency problems prevent configuration of mosdns-router:
+    #      mosdns-router depends on systemd-resolved; however:
+    #       Package systemd-resolved is not installed.
+    #
+    # MEASURED on 22.04 in the Podman matrix (Task 4 Step 7), and the failure
+    # looks like an install failure rather than like a dependency that cannot be
+    # satisfied on this release.
+    #
+    # `libnss-resolve` exists on all three and brings the daemon with it where the
+    # daemon is a package of its own (24.04: `Depends: … systemd-resolved
+    # (= 255.4-…)`, measured) and is the NSS module everywhere. It is the same
+    # reasoning `tests/podman/images/target.Containerfile` already applies to the
+    # image, for the same reason, and the two spellings are the same fact.
+    #
+    # The preflight still requires `systemd-resolved.service` to be *running*
+    # (`check_managers` in `mosdns_installer.py`), which is the property this
+    # package actually needs; a package name that exists on every release is how
+    # a dependency says it.
+    "libnss-resolve",
     "libc6",
 )
 
@@ -2756,6 +2780,54 @@ class MaintainerScriptTests(_Staged):
         fields = control_fields(self.read(DEBIAN + "/control"))
         self.assertIn("acl", dependency_names(fields))
         self.assertIn("setfacl", POSTINST.read_text())
+
+    def test_the_depends_field_names_the_resolved_daemon_by_a_name_every_release_has(self):
+        """**`libnss-resolve`, not `systemd-resolved`, and that is measured.**
+
+        `systemd-resolved` is a binary package on 24.04 and 26.04 and does not
+        exist at all on 22.04, where the daemon is part of `systemd` -- so
+        `Depends: systemd-resolved` is a package dpkg refuses to configure on the
+        oldest release this project supports, and it refuses it in the words of a
+        broken install:
+
+            dpkg: dependency problems prevent configuration of mosdns-router:
+             mosdns-router depends on systemd-resolved; however:
+              Package systemd-resolved is not installed.
+
+        MEASURED on 22.04 in the Podman matrix (Task 4 Step 7), where a cell that
+        would otherwise have installed reported a dependency problem instead.
+
+        `libnss-resolve` exists on all three, brings the daemon with it where the
+        daemon is a package of its own, and is the NSS module that makes a lookup
+        on this machine go to the resolved stub. **The preflight still requires
+        the daemon to be RUNNING** (`check_managers`), so nothing about the
+        property the package needs is relaxed by naming it differently.
+
+        **The reasoning is here rather than in `packaging/debian/control`**, because
+        a `#` line inside a control stanza is a field continuation to `dpkg-deb` and
+        not a comment. MEASURED, `dpkg-deb --build` refuses the file with `error:
+        parsing file '.../DEBIAN/control' near line 6 package 'mosdns-router'`. So
+        this case is where a reader who asks "why not `systemd-resolved`?" is sent.
+        """
+        fields = control_fields(self.read(DEBIAN + "/control"))
+        depends = dependency_names(fields)
+        self.assertIn("libnss-resolve", depends)
+        self.assertNotIn(
+            "systemd-resolved", depends,
+            "`systemd-resolved` does not exist as a package on 22.04, so depending on it is a "
+            "package that cannot be configured on one of the three releases this project supports",
+        )
+        # And the property itself is still required, by name, at run time.
+        self.assertIn(
+            "systemd-resolved.service", (REPO / "installer" / "mosdns_installer.py").read_text(),
+            "the preflight has to require the resolved DAEMON to be running, whatever the "
+            "dependency calls the package that carries it",
+        )
+        # **And the image makes the same substitution**, for the same reason. Two
+        # files spelling one fact is how they drift, and this is the third time
+        # that has been the defect in this project.
+        containerfile = (REPO / "tests" / "podman" / "images" / "target.Containerfile").read_text()
+        self.assertIn("libnss-resolve", containerfile)
 
     def test_every_maintainer_script_handles_every_call_dpkg_can_make(self):
         """Debian Policy 6.5, compared in both directions and against a table

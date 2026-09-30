@@ -4,7 +4,7 @@ Section: net
 Priority: optional
 Architecture: amd64 arm64
 Maintainer: mosdns-router maintainers <mosdns-router@localhost>
-Depends: python3 (>= 3.10), systemd, network-manager, systemd-resolved, libc6, acl
+Depends: python3 (>= 3.10), systemd, network-manager, libnss-resolve, libc6, acl
 Description: DNS router on loopback, with a DNSCrypt foreign resolver
  This package installs a DNS router, a DNSCrypt resolver and the control tool
  that measures and publishes the CDN address the router puts in service, and
