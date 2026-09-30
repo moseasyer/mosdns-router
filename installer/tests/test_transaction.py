@@ -1927,12 +1927,40 @@ class PrefixListTests(TransactionFixture):
             "netprobe_timeout is 0, which switches the probe off; a blackholed network would then "
             "be reported by nothing at all",
         )
+        # **The relation that matters is `probe + answer < wait`, not
+        # `probe < wait`.** The resolver does not bind the moment its probe runs
+        # out: it binds, and then the transaction's own query has to come back,
+        # and that query is bounded by the installer's `PROBE_TIMEOUT_SECONDS`.
+        # So the last moment at which a healthy-but-slow resolver can still
+        # answer is `WAIT_DEADLINE_SECONDS - PROBE_TIMEOUT_SECONDS`, and the
+        # probe has to be under THAT. `probe < wait` is satisfied by a probe of
+        # 59 seconds, which is the collision this case exists to prevent --
+        # MEASURED, by setting `netprobe_timeout` to 59: the old assertion was
+        # green and the machine would have been refused.
+        #
+        # The number itself is chosen, not derived, and the choice is written
+        # down where the number is (`internal/dnscrypt/config.go`): the probe is
+        # kept, because 0 switches off the report of a blackholed network, and
+        # 60 makes every offline install spend a minute discovering there is no
+        # internet. What is derived here is the BOUND, and that is the part that
+        # has to hold on 22.04 and 26.04 as well -- the relationship is read from
+        # the two files that carry its sides, so a release that differs in
+        # timing cannot break it by differing.
+        #
+        # **What is NOT measured: the actual bind time on 22.04 and 26.04.**
+        # `netprobe_timeout` is one number for all three releases and this case
+        # holds the relationship it has to satisfy; how long dnscrypt-proxy
+        # actually takes to bind once its probe has run out is a per-release
+        # measurement, and it is the plan's later task's job. It is a residual,
+        # not a claim.
         self.assertLess(
-            rendered, installer.WAIT_DEADLINE_SECONDS,
-            f"the resolver's own start-up budget is {rendered}s and the transaction waits "
-            f"{installer.WAIT_DEADLINE_SECONDS}s, so on a machine that cannot reach the probe "
-            "address the listener appears at the moment the transaction has given up waiting "
-            "for it",
+            rendered + installer.PROBE_TIMEOUT_SECONDS,
+            installer.WAIT_DEADLINE_SECONDS,
+            f"the resolver's own start-up budget is {rendered}s and the transaction's own query "
+            f"takes up to {installer.PROBE_TIMEOUT_SECONDS:g}s more, so the last moment a healthy "
+            f"resolver on a machine that cannot reach the probe address can answer is "
+            f"{rendered + installer.PROBE_TIMEOUT_SECONDS:g}s and the transaction gives up at "
+            f"{installer.WAIT_DEADLINE_SECONDS:g}s",
         )
         # And the wait itself is bounded, because a test that only said "the probe
         # is shorter" would pass with a probe of a microsecond and no deadline at
