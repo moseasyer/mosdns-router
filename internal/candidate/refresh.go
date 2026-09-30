@@ -123,7 +123,18 @@ func (s *HTTPCloudflareSource) read(ctx context.Context) (cloudflareRanges, fetc
 // standInFor answers the one question `read` cannot answer for itself: the origin
 // could not be read, so which document stands in for it.
 //
-// Three answers, in this order, and the order is the design:
+// **The order is the origin, then this machine's own published document, then
+// the package's snapshot.** It is worth saying in that sentence, because this
+// function is only the LAST step of it: `fetchDocument` has already asked the
+// origin and already fallen back to the cache, and what is left is whether the
+// package's snapshot replaces the absence. So this doc comment used to lead
+// with the machine's own document and got the order wrong -- the manual said the
+// same wrong thing, which is worse, because an operator reading it is told a
+// machine never re-pins its ranges when what actually happens online is the
+// opposite: the origin's document replaces the published one, and the report
+// says `ranges-source: origin`.
+//
+// What this function decides, and why:
 //
 //  1. **Nothing this source was pointed at** -- a source built without a pinned
 //     snapshot returns the cause unchanged, exactly as it did before the snapshot
@@ -142,6 +153,10 @@ func (s *HTTPCloudflareSource) read(ctx context.Context) (cloudflareRanges, fetc
 //     the snapshot the package carries usable. A message that mentioned only the
 //     first would leave a machine that ships a snapshot looking like a machine
 //     that has nothing.
+//
+// `precedence_test.go` is what holds that sentence to the code, by making each
+// of the three cells happen and requiring this file, `pinned.go` and the manual
+// to state the same order.
 //
 // A document this build accepted is never substituted for one it did not: the
 // snapshot goes through the same reader a cache does, and a pin whose recorded

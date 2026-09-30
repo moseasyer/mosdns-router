@@ -1450,6 +1450,44 @@ class ActionTests(WatchdogFixture):
         self.assertIn("effectiveUID", source)
 
 
+def shipped_prose(path: Path) -> str:
+    """A shipped document's words, with troff and YAML structure removed.
+
+    **Necessary, and the failure it fixes is the case being false for the
+    wrong reason.** `mosdns-router(8)` writes the correction as
+
+        it does
+        .B not
+        fire in this package's own unit
+
+    so a regex over the raw source sees `.B` between `not` and `fire` and
+    reports a man page that says the right thing as one that does not. A gate
+    that cannot read the sentence it is checking is a gate whose failures
+    send a reader to the wrong file.
+
+    **Only the macro NAME is removed, never its argument** -- `.BR
+    ProcSubset=pid ,` must keep `ProcSubset=pid`, and a whole-line strip
+    would take it. The first version of this helper dropped every line
+    beginning with `.` and failed all three documents for exactly that
+    reason: a gate that cannot see the word it is looking for.
+
+    **Module-level, and shared with `test_package.py`**, for the reason this
+    project's fakes are shared rather than copied: a second implementation of
+    "what words does this roff file say" is a second thing that can be wrong
+    about the same file, and the two would disagree about the documents they
+    both read.
+    """
+    lines = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("."):
+            line = re.sub(r"^\.[A-Za-z]+\*?\s?", " ", line)
+        lines.append(line.replace("\\-", "-").replace("\\&", ""))
+    # Emphasis markers go too, for the same reason: `mosdns-cdnctl(1)` writes
+    # `it does **not** fire`, and an assertion about the WORDS must not care
+    # how they are marked up.
+    return re.sub(r"\s+", " ", " ".join(lines)).replace("*", "").lower()
+
+
 class RecordOwnershipTests(WatchdogFixture):
     """Nothing that is not the root watchdog may be able to reach the record.
 
@@ -1581,37 +1619,6 @@ class RecordOwnershipTests(WatchdogFixture):
             "above noticed",
         )
 
-    @staticmethod
-    def _prose(path: Path) -> str:
-        """A shipped document's words, with troff and YAML structure removed.
-
-        **Necessary, and the failure it fixes is the case being false for the
-        wrong reason.** `mosdns-router(8)` writes the correction as
-
-            it does
-            .B not
-            fire in this package's own unit
-
-        so a regex over the raw source sees `.B` between `not` and `fire` and
-        reports a man page that says the right thing as one that does not. A gate
-        that cannot read the sentence it is checking is a gate whose failures
-        send a reader to the wrong file.
-
-        **Only the macro NAME is removed, never its argument** -- `.BR
-        ProcSubset=pid ,` must keep `ProcSubset=pid`, and a whole-line strip
-        would take it. The first version of this helper dropped every line
-        beginning with `.` and failed all three documents for exactly that
-        reason: a gate that cannot see the word it is looking for.
-        """
-        lines = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("."):
-                line = re.sub(r"^\.[A-Za-z]+\*?\s?", " ", line)
-            lines.append(line.replace("\\-", "-").replace("\\&", ""))
-        # Emphasis markers go too, for the same reason: `mosdns-cdnctl(1)` writes
-        # `it does **not** fire`, and an assertion about the WORDS must not care
-        # how they are marked up.
-        return re.sub(r"\s+", " ", " ".join(lines)).replace("*", "").lower()
 
     def test_no_shipped_text_promises_a_boot_guard_that_does_not_fire(self):
         # **The diff carried the overstatement and the correction only lived in a
@@ -1629,7 +1636,7 @@ class RecordOwnershipTests(WatchdogFixture):
         # shipped unit. Asserted as text because the failure is a sentence, and a
         # sentence can only be held as one.
         for path in self.SECONDARY_GUARD_TEXTS:
-            prose = self._prose(path)
+            prose = shipped_prose(path)
             with self.subTest(path=path.name):
                 self.assertIn(
                     "procsubset=pid",
@@ -1652,12 +1659,12 @@ class RecordOwnershipTests(WatchdogFixture):
             with self.subTest(path=path.name):
                 self.assertIn(
                     "tmpfs",
-                    self._prose(path),
+                    shipped_prose(path),
                     f"{path.name} does not say what the guard in force actually is",
                 )
                 self.assertIn(
                     "guard in force",
-                    self._prose(path),
+                    shipped_prose(path),
                     f"{path.name} does not name the guard that is in force, so a reader cannot "
                     "tell which of the two answers protects this machine",
                 )

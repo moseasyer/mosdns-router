@@ -17,6 +17,30 @@
 # It is the one file under /etc this package installs that is not a document, it
 # has no content an operator can edit, and the installer removes it on uninstall
 # rather than leaving it behind for dpkg to prompt about a binary.
+#
+# The two Cloudflare range files under /usr/share are also NOT conffiles, and
+# that is the same decision with the same consequence, so it is written here
+# where the next reader looks rather than only in the manual:
+#
+#     /usr/share/mosdns-router/cloudflare-ranges.json
+#     /usr/share/mosdns-router/cloudflare-ranges.lock.json
+#
+# They are the ranges a selector classifies every query against, and the install
+# verifies the snapshot's digest against the lock before it runs any
+# transaction. A conffile pair would let two files nobody edited differ from the
+# package -- and an upgrade replaces the LOCK too, so a half-re-pinned pair is
+# refused rather than installed, which is the correct answer and is not one an
+# operator who edited the files in place would understand.
+#
+# THE CONSEQUENCE, so nobody has to discover it: dpkg replaces both files with
+# the new package's on every upgrade WITHOUT ASKING. A hand-re-pinned snapshot
+# survives exactly until the next upgrade, and the machine is then back on the
+# ranges that package was built with, with nothing having said so. The way to
+# re-pin is to reinstall from wherever you install it -- which is the only route
+# that produces a pair this project can account for.
+#
+# `mosdns-cdnctl(1)` says the same thing in its FILES section, which is where an
+# operator who has just edited the pair will actually look.
 /etc/mosdns/mosdns.yaml
 /etc/mosdns/dnscrypt-proxy.toml
 /etc/mosdns/policy.yaml

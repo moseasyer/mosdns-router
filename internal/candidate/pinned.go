@@ -263,13 +263,21 @@ func readPinnedLock(path string) (pinnedLock, error) {
 // package ships when, and only when, the origin cannot be read and there is no
 // published document of this machine's own to stand in for it.
 //
-// The order is the whole of the design, and it is the China list's order because
-// that is the only precedent this project has for a reviewed pin: what the
-// machine published of its own wins, then a request to the origin, and the
-// package's snapshot last. An offline upgrade therefore keeps the document the
-// machine already classified against, and a machine that has published nothing at
-// all -- which is every fresh installation with no route to the internet -- gets
-// the ranges the package was built against instead of a refusal.
+// **The order is the origin, then this machine's own published document, then
+// the package's snapshot**, and it is the China list's order because that is the
+// only precedent this project has for a reviewed pin. It is also the order the
+// code does, which was not what this comment said: it used to lead with the
+// machine's own document, and so did `packaging/man/mosdns-cdnctl.1` -- the
+// manual being the worse of the two, because an operator reading it is told a
+// machine never re-pins its ranges when what happens on a machine that CAN reach
+// the origin is the reverse. `precedence_test.go` holds this sentence, the
+// manual's and the implementation to the same measured order.
+//
+// So: a machine that can reach the origin publishes today's ranges and says
+// `ranges-source: origin`; a machine that cannot keeps the document it already
+// classified against; and a machine that has published nothing at all -- which
+// is every fresh installation with no route to the internet -- gets the ranges
+// the package was built against instead of a refusal.
 func NewCloudflareSourceWithPin(client *http.Client, baseURL, cachePath string, paths PinnedSnapshotPaths) (*HTTPCloudflareSource, error) {
 	source, err := NewCloudflareSource(client, baseURL, cachePath)
 	if err != nil {

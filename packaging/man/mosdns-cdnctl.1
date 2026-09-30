@@ -103,10 +103,14 @@ against that lock. A snapshot whose bytes the lock does not record, a lock that
 records no date or no digest of the prefix list, and a snapshot taken from a
 different endpoint are all refusals, and nothing is published: a selector over
 ranges this project cannot name is worse than an installation that does not
-happen. The order is this machine's own published document, then the origin, then
-the package's snapshot, so an upgrade on a machine that cannot reach the origin
-keeps the ranges its selector was built against and never re\-pins them. The
-report says which of the three answered, and how old the snapshot is.
+happen. The order is the origin, then this machine's own published document, then
+the package's snapshot. A machine that can reach the origin publishes today's
+ranges and says
+.B "ranges-source: origin" ;
+a machine that cannot keeps the ranges its selector was built against and never
+re\-pins them; and a machine that has published nothing at all gets the snapshot
+the package was built against. The report says which of the three answered, and
+how old the snapshot is.
 .TP
 .B \-\-pinned\-ranges\ \fIPATH\fR
 .TQ
@@ -259,6 +263,19 @@ without touching the machine's DNS if it does not match. It is never re\-pinned:
 the published artifacts above are written only by
 .BR \-\-refresh\-ranges ,
 which reads them first.
+.PP
+Neither of the two is a conffile, so
+.BR dpkg (1)
+replaces both with the new package's on every upgrade
+.BR without asking .
+That is deliberate -- they are the ranges a selector classifies every query
+against, and two files nobody edited that differ from the package are two files
+this package can no longer account for, since the install verifies the snapshot
+against a lock the same upgrade replaced. The cost is the one an operator
+re\-pinning by hand has to know: such a pin survives exactly until the next
+upgrade, and the machine is then back on the ranges that package was built with,
+with nothing having said so. Reinstall from wherever you install it, rather than
+editing the pair in place.
 .SH EXIT STATUS
 .TP
 .B 0

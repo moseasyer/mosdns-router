@@ -45,6 +45,12 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+# The one implementation of "what words does this roff file say", shared with
+# `test_watchdog.py` rather than copied: a second one is a second thing that can
+# be wrong about the same file, and the two would disagree about the documents
+# they both read.
+from test_watchdog import shipped_prose  # noqa: E402
+
 BUILD_SCRIPT = REPO / "scripts" / "build-deb.sh"
 PACKAGING = REPO / "packaging"
 MANIFEST = PACKAGING / "mosdns-router.install"
@@ -2237,6 +2243,58 @@ class PinnedRangeSnapshotTests(_Staged):
         # the archive they were given.
         text = self.read(BUILD_MANIFEST)
         self.assertIn(hashlib.sha256(self.read_bytes(RANGES_SNAPSHOT)).hexdigest(), text)
+
+    def test_the_pair_is_not_a_conffile_and_what_that_costs_is_written_down(self):
+        """A hand-re-pinned pair is reverted by the next upgrade, silently.
+
+        The pair is under `/usr/share`, beside the China list, and it is
+        **deliberately not a conffile** -- the same position postinst's own
+        message takes ("It is read here and never written") and the same one the
+        China pair takes. The consequence is that `dpkg` replaces both files with
+        the new package's on every upgrade, without asking: a hand-re-pinned
+        snapshot survives exactly until the next upgrade and then the machine is
+        back on the ranges the new package was built with, with nothing having
+        said so.
+
+        That is the right behaviour -- a conffile here would mean two files
+        nobody edited differ from the package, and `postinst` verifies the pair
+        against a lock `dpkg` also replaced, so a half-re-pinned pair would be
+        refused rather than installed. But an operator who re-pins by hand has to
+        be told, and the two places they would look are the manual and the
+        `conffiles` file itself. Asserted as text because the failure is a
+        sentence, and a sentence can only be held as one.
+        """
+        listed = [
+            line.strip()
+            for line in (REPO / "packaging" / "debian" / "conffiles").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        for path in (RANGES_SNAPSHOT, RANGES_SNAPSHOT_LOCK):
+            self.assertNotIn(
+                path, listed,
+                f"{path} is a conffile, so an upgrade would ask before replacing it and a hand-made "
+                f"pin would survive -- and a pair that survives an upgrade is a pair the package can "
+                f"no longer account for, because postinst verifies it against a lock dpkg replaced",
+            )
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-cdnctl.1")
+        self.assertIn(
+            "without asking", manual,
+            "mosdns-cdnctl(1) does not say that a hand-re-pinned pair is reverted by the next "
+            "upgrade, and the manual is where an operator who re-pinned would look",
+        )
+        self.assertIn("conffile", manual)
+        conffiles = (REPO / "packaging" / "debian" / "conffiles").read_text(encoding="utf-8")
+        self.assertIn(
+            "cloudflare-ranges", conffiles,
+            "packaging/debian/conffiles does not mention the range pair at all, so the next reader "
+            "sees seven conffiles, no range pair, and no reason -- and adds it",
+        )
+        # Lower-cased for the prose assertion, because this is a comment in a
+        # Debian control file rather than roff: it shouts the consequence, and
+        # the words are the words.
+        self.assertIn("without asking", conffiles.lower())
 
 
 # --- the payload -------------------------------------------------------------
