@@ -240,6 +240,12 @@ type PublishedRanges struct {
 	// reads and the envelope is a cache beside it.
 	Prefixes int
 	SHA256   string
+	// DocumentSHA256 is the digest of the envelope's own stored document, which
+	// is the thing a report compares against the document a package's shipped
+	// snapshot holds. SHA256 above is the digest of the *rendering*, and two
+	// documents that render to the same list are the same space reached two ways
+	// -- so the drift question is answered on the document, not on the list.
+	DocumentSHA256 string
 	// CachePath and PrefixPath are the two files this report is about.
 	CachePath  string
 	PrefixPath string
@@ -278,6 +284,7 @@ func ReadPublished(cachePath string) (PublishedRanges, error) {
 	published.URL = cached.URL
 	published.ETag = cached.ETag
 	published.SHA256 = digestOf(list)
+	published.DocumentSHA256 = digestOf(cached.Body)
 	published.Prefixes = countPrefixLines(list)
 	// A body this build cannot parse leaves the consistency question open rather
 	// than answered either way: the envelope is a cache, and a cache holding a

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -205,6 +207,14 @@ type updateListOptions struct {
 	controlLock   string
 	rangesURL     string
 	rangesCache   string
+	// pinnedRanges and pinnedRangesLock are the snapshot a package ships and the
+	// lock beside it. They are paths of this project's own installation for the
+	// reason the other range paths are, and they are the two that make an
+	// installation with no route to the internet possible: the origin cannot be
+	// read there, nothing is published on a fresh machine, and without a pair to
+	// stand in the install refuses and the router never starts.
+	pinnedRanges     string
+	pinnedRangesLock string
 }
 
 // parseUpdateListOptions parses and validates the command line. Exactly one of
@@ -242,6 +252,8 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	controlLock := flags.String("control-lock", defaultControlLockPath, "path to the shared control lock")
 	rangesURL := flags.String("ranges-url", candidate.DefaultCloudflareBaseURL, "the published Cloudflare range document")
 	rangesCache := flags.String("ranges-cache", candidate.DefaultCloudflareCachePath, "where the published range document is cached; its prefix list is written beside it")
+	pinnedRanges := flags.String("pinned-ranges", candidate.DefaultPinnedSnapshotPath, "the range document snapshot this package ships, published when the origin cannot be read and this machine has published none of its own; a snapshot that does not verify is a refusal")
+	pinnedRangesLock := flags.String("pinned-ranges-lock", candidate.DefaultPinnedSnapshotLockPath, "the lock that accounts for the pinned snapshot: its endpoint, its revision, when it was taken, and the two digests of it")
 	if err := flags.Parse(args); err != nil {
 		return updateListOptions{}, err
 	}
@@ -268,20 +280,24 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 		{"--control-lock", *controlLock},
 		{"--ranges-url", *rangesURL},
 		{"--ranges-cache", *rangesCache},
+		{"--pinned-ranges", *pinnedRanges},
+		{"--pinned-ranges-lock", *pinnedRangesLock},
 	} {
 		if strings.TrimSpace(path.value) == "" {
 			return updateListOptions{}, fmt.Errorf("%s must not be empty", path.name)
 		}
 	}
 	return updateListOptions{
-		check:         *check,
-		pinRemote:     *pinRemote,
-		refreshRanges: *refreshRanges,
-		sourceLock:    *sourceLock,
-		listFile:      *listFile,
-		controlLock:   *controlLock,
-		rangesURL:     *rangesURL,
-		rangesCache:   *rangesCache,
+		check:            *check,
+		pinRemote:        *pinRemote,
+		refreshRanges:    *refreshRanges,
+		sourceLock:       *sourceLock,
+		listFile:         *listFile,
+		controlLock:      *controlLock,
+		rangesURL:        *rangesURL,
+		rangesCache:      *rangesCache,
+		pinnedRanges:     *pinnedRanges,
+		pinnedRangesLock: *pinnedRangesLock,
 	}, nil
 }
 
@@ -333,18 +349,12 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	}
 
 	client := services.newHTTPClient()
-	remote, err := rules.ResolveCommit(ctx, client, rules.Repository)
-	if err != nil {
-		writeCLIError(stderr, "update-lists: %v", err)
-		return exitStateUnavailable
-	}
 	var report bytes.Buffer
 	writeReportLine(&report, "repository: %s\n", published.Repository)
 	writeReportLine(&report, "entry: %s\n", published.Entry)
 	writeReportLine(&report, "locked-commit: %s\n", published.Commit)
 	writeReportLine(&report, "locked-archive-sha256: %s\n", published.SHA256)
 	writeReportLine(&report, "locked-list-sha256: %s\n", published.ListSHA256)
-	writeReportLine(&report, "remote-commit: %s\n", remote.Commit)
 
 	// The Cloudflare ranges are reported here, in the same report, and they cost
 	// no request: ReadPublished reads the two artifacts off the disk and says
@@ -353,7 +363,28 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	// to say "the file is there" would be a request whose only effect is to be
 	// able to fail -- and a daily timer acting on this report would then fail on
 	// an API outage while the files it is reporting about are perfectly fine.
-	reportRanges(&report, options)
+	reportRanges(&report, options, services.now())
+
+	remote, err := rules.ResolveCommit(ctx, client, rules.Repository)
+	if err != nil {
+		// The half of this report that was read off the disk goes out on the
+		// failure path, and this is why. It needed no request, and the machine
+		// this project makes installable without a route to the internet is
+		// precisely the machine on which the request above cannot be made: a daily
+		// timer acting on this report would otherwise say only "the China source
+		// could not be read" there, forever, and the one snapshot the package
+		// ships would never be measured at all.
+		//
+		// It goes to STDERR and stdout stays empty, because the property this
+		// command already holds -- stdout carries a complete answer or nothing --
+		// is what stops a reader treating half a report as a verdict. The status is
+		// the one it always was: the check could not do its job.
+		_, _ = stderr.Write([]byte("update-lists: " + err.Error() + "\n" +
+			"update-lists: what was read from the disk, which did not depend on that request:\n"))
+		_, _ = stderr.Write(report.Bytes())
+		return exitStateUnavailable
+	}
+	writeReportLine(&report, "remote-commit: %s\n", remote.Commit)
 
 	if remote.Commit == published.Commit {
 		// The remote still publishes the commit the list was converted from, so
@@ -386,16 +417,25 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 // way for a daily timer to fail.
 //
 // The absence of a prefix list is reported rather than treated as a failure. It is
-// a fact about the installation, not about the check's ability to do its job, and
-// the check still exits 0 on drift per ruling 50; a reader that wants a refusal
+// a fact about the installation, not about the check's ability to do its job, and the
+// check still exits 0 on drift per ruling 50; a reader that wants a refusal
 // asks for one with `update-lists --refresh-ranges`, which is the only command
 // here that writes.
-func reportRanges(report *bytes.Buffer, options updateListOptions) {
+//
+// The pin the package ships is reported in the same breath, and it is the second
+// half of what this report exists for. The published artifacts answer "is the
+// file the rewriter refuses to start without actually there"; the pin answers
+// "how old is the artefact this package was built with, and is what is published
+// still the same document", which is a question with a silent wrong answer -- a
+// machine that has been reinstalled from the same package for a year looks
+// exactly like a healthy one.
+func reportRanges(report *bytes.Buffer, options updateListOptions, now time.Time) {
 	published, err := candidate.ReadPublished(options.rangesCache)
 	if err != nil {
 		// A path that cannot be read at all is a question this report cannot
 		// answer, and it is stated as one rather than as an absence.
 		writeReportLine(report, "ranges-unreadable: %v\n", err)
+		reportPinDrift(report, options, now, candidate.PublishedRanges{})
 		return
 	}
 	writeReportLine(report, "ranges-cache: %s\n", published.CachePath)
@@ -403,11 +443,71 @@ func reportRanges(report *bytes.Buffer, options updateListOptions) {
 	writeReportLine(report, "ranges-published: %t\n", published.Present)
 	if !published.Present {
 		writeReportLine(report, "ranges-missing: %s\n", published.Missing)
+		reportPinDrift(report, options, now, published)
 		return
 	}
 	writeReportLine(report, "ranges-consistent: %t\n", published.Consistent)
 	writeReportLine(report, "ranges-prefixes: %d\n", published.Prefixes)
 	writeReportLine(report, "ranges-prefix-list-sha256: %s\n", published.SHA256)
+	writeReportLine(report, "ranges-published-document-sha256: %s\n", published.DocumentSHA256)
+	reportPinDrift(report, options, now, published)
+}
+
+// reportPinDrift states what the package's shipped snapshot holds, how old it is,
+// and whether the document this machine published is the same one.
+//
+// The comparison is between the two documents' own digests rather than between
+// the published prefix list and a rendered copy of the pin, because the published
+// list is a rendering of the envelope beside it and the question is which
+// document that envelope holds. A machine that refreshed its ranges online reports
+// drift from the package's pin, and that is the healthy case: it has today's
+// ranges and the package carries an older snapshot. Reporting it as the same
+// would be the false claim that a re-pin had happened.
+//
+// An unusable pin gets no drift line at all rather than a `false` one. There is
+// nothing to compare against, and a report that said "no drift" about a snapshot
+// it could not read would be the one report an operator would act on by mistake.
+func reportPinDrift(report *bytes.Buffer, options updateListOptions, now time.Time, published candidate.PublishedRanges) {
+	paths := candidate.PinnedSnapshotPaths{Snapshot: options.pinnedRanges, Lock: options.pinnedRangesLock}
+	writeReportLine(report, "ranges-pin: %s\n", paths.Snapshot)
+	writeReportLine(report, "ranges-pin-lock: %s\n", paths.Lock)
+	pin, err := candidate.ReadPinnedSnapshot(paths)
+	if err != nil {
+		writeReportLine(report, "ranges-pin-verified: false\n")
+		writeReportLine(report, "ranges-pin-unusable: %v\n", err)
+		return
+	}
+	writeReportLine(report, "ranges-pin-verified: true\n")
+	writeReportLine(report, "ranges-pin-source: %s\n", pin.Source)
+	writeReportLine(report, "ranges-pin-sha256: %s\n", pin.SHA256)
+	writeReportLine(report, "ranges-pin-revision: %s\n", pin.Revision)
+	writeReportLine(report, "ranges-pin-pinned-at: %s\n", pin.FetchedAt.UTC().Format(time.RFC3339))
+	writeReportLine(report, "ranges-pin-age: %s\n", pinAge(now, pin.FetchedAt))
+	writeReportLine(report, "ranges-pin-prefixes: %d\n", pin.Prefixes)
+	writeReportLine(report, "ranges-pin-prefix-list-sha256: %s\n", pin.PrefixListSHA256)
+	writeReportLine(report, "ranges-pin-document-sha256: %s\n", digestOfDocument(pin.Body))
+	if !published.Present {
+		// Nothing is published, so there is no drift to measure and no document
+		// to drift from. The pin is still reported, because its age is the fact an
+		// operator has to be able to see.
+		return
+	}
+	if published.DocumentSHA256 == digestOfDocument(pin.Body) {
+		writeReportLine(report, "ranges-pin-drift: none\n")
+		return
+	}
+	writeReportLine(report, "ranges-pin-drift: published-differs\n")
+}
+
+// digestOfDocument is the digest of a range document's own bytes, which is what
+// two documents are compared by. The two sides of a drift comparison have to be
+// digested the same way or the comparison is a coin toss, and one of them is
+// digested inside internal/candidate, so the function is named here rather than
+// reached for: the alternative is a report comparing a body against a re-encoding
+// of itself and calling the result no drift.
+func digestOfDocument(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
 }
 
 // runPinRemote accepts the current reviewed default-branch commit and publishes
@@ -481,8 +581,20 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 // while an origin is slow. It also touches nothing the China list owns: a
 // separate mode rather than a flag is what keeps an install from re-pinning that
 // list, which ruling 59 forbids.
+//
+// The snapshot the package ships is the fourth thing this mode consults, and it
+// is the last: the origin, then the document this machine published before, then
+// the pair `/usr/share/mosdns-router` carries. That order is the China list's, and
+// it is why a `dpkg` upgrade on an offline machine keeps the ranges its selector
+// was built against while a fresh one gets a working install instead of a
+// refusal. A snapshot that does not verify is not published and is not warned
+// about: it is a refusal, because the only alternative is a selector over ranges
+// this project cannot account for.
 func runRefreshRanges(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
-	source, err := candidate.NewCloudflareSource(services.newHTTPClient(), options.rangesURL, options.rangesCache)
+	source, err := candidate.NewCloudflareSourceWithPin(
+		services.newHTTPClient(), options.rangesURL, options.rangesCache,
+		candidate.PinnedSnapshotPaths{Snapshot: options.pinnedRanges, Lock: options.pinnedRangesLock},
+	)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitInvalidCLI
@@ -503,9 +615,61 @@ func runRefreshRanges(ctx context.Context, options updateListOptions, stdout, st
 	// router that starts on a stale list is a router classifying against
 	// yesterday's space.
 	writeReportLine(stdout, "ranges-stale: %t\n", refreshed.Stale)
+	// Which of the three documents answered, because "stale" alone cannot tell a
+	// machine three days old from a machine that has been installing from the same
+	// package copy for a year. The two are different states with different
+	// remedies: one is a timer that has not run, the other is a package whose pin
+	// nobody has refreshed.
+	writeReportLine(stdout, "ranges-source: %s\n", documentSource(refreshed))
+	if refreshed.Pinned {
+		reportPin(stdout, refreshed.Pin, services.now())
+	}
 	writeReportLine(stdout, "published-ranges-cache: %s\n", refreshed.CachePath)
 	writeReportLine(stdout, "published-prefix-list: %s\n", refreshed.PrefixPath)
 	return exitSuccess
+}
+
+// documentSource names which of the three places a published document came from.
+func documentSource(refreshed candidate.RangeRefresh) string {
+	switch {
+	case refreshed.Pinned:
+		return "pinned-snapshot"
+	case refreshed.Stale:
+		return "cache"
+	default:
+		return "origin"
+	}
+}
+
+// reportPin states what a package's shipped snapshot holds and how old it is.
+//
+// The age is the whole reason this function exists. A three-month-old pin is a
+// perfectly good input for a selector, and a pin nobody measures the age of is
+// not: it is the difference between a stale artefact an operator can decide
+// about and a stale artefact that is simply how the machine has always been. It
+// is computed from the command's own clock rather than a wall clock read here, so
+// every timestamp in one report is one reading.
+func reportPin(output io.Writer, pin candidate.PinnedSnapshot, now time.Time) {
+	writeReportLine(output, "ranges-pinned-snapshot: %s\n", pin.SnapshotPath)
+	writeReportLine(output, "ranges-pinned-lock: %s\n", pin.LockPath)
+	writeReportLine(output, "ranges-pinned-sha256: %s\n", pin.SHA256)
+	writeReportLine(output, "ranges-pinned-revision: %s\n", pin.Revision)
+	writeReportLine(output, "ranges-pinned-at: %s\n", pin.FetchedAt.UTC().Format(time.RFC3339))
+	writeReportLine(output, "ranges-pinned-age: %s\n", pinAge(now, pin.FetchedAt))
+	writeReportLine(output, "ranges-pinned-prefixes: %d\n", pin.Prefixes)
+	writeReportLine(output, "ranges-pinned-prefix-list-sha256: %s\n", pin.PrefixListSHA256)
+}
+
+// pinAge is how long ago a pin was taken, and never negative: a pin whose
+// recorded time is in the future is a lock with a wrong date in it, and reporting
+// a negative age would be a way of saying so that reads like a measurement. The
+// zero is the whole answer instead, and the date beside it is what an operator
+// has to look at.
+func pinAge(now, taken time.Time) time.Duration {
+	if age := now.Sub(taken); age > 0 {
+		return age
+	}
+	return 0
 }
 
 // countListRules counts the expressions of a published list, which is the number

@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/filelock"
@@ -143,18 +144,29 @@ type rangePaths struct {
 	sourceLock string
 	listFile   string
 	control    string
+	// pinSnapshot and pinLock are the pair a package ships, named here rather
+	// than defaulted. They sit in the fixture's own directory -- flat, like every
+	// other file here -- and no fixture writes them unless it is about them, so
+	// every test in this file runs with a snapshot configured and none there. That
+	// is the state which must behave exactly as it did before the snapshot
+	// existed, and which must not depend on whether the machine running the suite
+	// happens to have this package installed.
+	pinSnapshot string
+	pinLock     string
 }
 
 func newRangePaths(t *testing.T) rangePaths {
 	t.Helper()
 	dir := t.TempDir()
 	return rangePaths{
-		dir:        dir,
-		cache:      filepath.Join(dir, "cloudflare-ips.json"),
-		prefixList: filepath.Join(dir, candidate.DefaultCloudflarePrefixFileName),
-		sourceLock: filepath.Join(dir, "source-lock.json"),
-		listFile:   filepath.Join(dir, "cn-domains.txt"),
-		control:    filepath.Join(dir, "control.lock"),
+		dir:         dir,
+		cache:       filepath.Join(dir, "cloudflare-ips.json"),
+		prefixList:  filepath.Join(dir, candidate.DefaultCloudflarePrefixFileName),
+		sourceLock:  filepath.Join(dir, "source-lock.json"),
+		listFile:    filepath.Join(dir, "cn-domains.txt"),
+		control:     filepath.Join(dir, "control.lock"),
+		pinSnapshot: filepath.Join(dir, "cloudflare-ranges.json"),
+		pinLock:     filepath.Join(dir, "cloudflare-ranges.lock.json"),
 	}
 }
 
@@ -192,6 +204,12 @@ func (o *rangeOrigin) services(github *http.Client) services {
 		},
 		documents:   productionDocumentPaths(),
 		documentOps: defaultDocumentOps(),
+		// The clock is here rather than left nil because `--check` now states how
+		// old a package's shipped snapshot is, and a report about an age is a
+		// report about a moment. `clockedServices` replaces it wherever the age
+		// itself is the thing under test; a fixture that needs neither should not
+		// have to think about it.
+		now: time.Now,
 		// The two boundaries the emergency-rollback verb uses are the real ones
 		// here, because this fixture replaces the network and the filesystem and
 		// says nothing about who the caller is or what running the installer
@@ -225,6 +243,8 @@ func refreshArgs(paths rangePaths) []string {
 	return []string{
 		"--ranges-cache", paths.cache,
 		"--ranges-url", candidate.DefaultCloudflareBaseURL,
+		"--pinned-ranges", paths.pinSnapshot,
+		"--pinned-ranges-lock", paths.pinLock,
 		"--source-lock", paths.sourceLock,
 		"--list-file", paths.listFile,
 		"--control-lock", paths.control,
@@ -591,6 +611,8 @@ func TestUpdateListsTheThreeModesAreMutuallyExclusiveAndOneIsRequired(t *testing
 		{name: "pin and refresh", args: []string{"--pin-remote", "HEAD", "--refresh-ranges"}},
 		{name: "refresh with an empty cache path", args: []string{"--refresh-ranges", "--ranges-cache", ""}},
 		{name: "refresh with an empty url", args: []string{"--refresh-ranges", "--ranges-url", ""}},
+		{name: "refresh with an empty pinned snapshot path", args: []string{"--refresh-ranges", "--pinned-ranges", ""}},
+		{name: "refresh with an empty pinned snapshot lock path", args: []string{"--refresh-ranges", "--pinned-ranges-lock", ""}},
 		{name: "check with an empty cache path", args: []string{"--check", "--ranges-cache", ""}},
 		{name: "a positional argument", args: []string{"--refresh-ranges", "extra"}},
 	}
@@ -619,10 +641,15 @@ func TestUpdateListsTheThreeModesAreMutuallyExclusiveAndOneIsRequired(t *testing
 	}
 }
 
+// containsRangeFlag answers whether a case has already supplied one of the range
+// paths itself, which is what stops the fixture's real paths from overwriting a
+// value the case chose on purpose -- an empty one, in every case here. It lists
+// every range path flag for that reason: a flag missing from it is a flag whose
+// empty-value case is silently defeated and passes for the wrong reason.
 func containsRangeFlag(args []string) bool {
 	for _, arg := range args {
 		switch arg {
-		case "--ranges-cache", "--ranges-url":
+		case "--ranges-cache", "--ranges-url", "--pinned-ranges", "--pinned-ranges-lock":
 			return true
 		}
 	}
@@ -642,6 +669,16 @@ func TestUpdateListsRefreshRangesDefaultsAreTheInstalledPaths(t *testing.T) {
 	}
 	if options.rangesURL != candidate.DefaultCloudflareBaseURL {
 		t.Errorf("the default ranges url is %q, want the published Cloudflare API", options.rangesURL)
+	}
+	// The snapshot pair, for the same reason and with the same force: the
+	// installer runs this command with no paths at all, so a default that named
+	// anything other than the file the package installs is a command that
+	// publishes nothing on a machine with no route to the internet.
+	if options.pinnedRanges != candidate.DefaultPinnedSnapshotPath {
+		t.Errorf("the default pinned snapshot is %q, want the file this package installs", options.pinnedRanges)
+	}
+	if options.pinnedRangesLock != candidate.DefaultPinnedSnapshotLockPath {
+		t.Errorf("the default pinned snapshot lock is %q, want the file this package installs", options.pinnedRangesLock)
 	}
 	if !options.refreshRanges {
 		t.Error("parsing --refresh-ranges did not select the mode")
