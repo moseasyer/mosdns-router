@@ -97,7 +97,42 @@ DISPATCHER_DNS_VARIABLES = ("DHCP4_DOMAIN_NAME_SERVERS", "DHCP6_DOMAIN_NAME_SERV
 # empty once ``ignore-auto-dns`` hides the lease. Both families are read one
 # field at a time because a colon separates nmcli fields and appears inside
 # every IPv6 address.
-RAW_DHCP_FIELDS = ("DHCP4.OPTION_DOMAIN_NAME_SERVERS", "DHCP6.OPTION_DOMAIN_NAME_SERVERS")
+#
+# **`DHCP4.OPTION` and `DHCP6.OPTION` are the field names nmcli HAS, and the first
+# version of this asked for `DHCP4.OPTION_DOMAIN_NAME_SERVERS`, which is not one.**
+# MEASURED, in a 24.04 target container after a successful install:
+#
+#     $ nmcli -g DHCP4.OPTION_DOMAIN_NAME_SERVERS device show eth0
+#     Error: 'device show': invalid field 'DHCP4.OPTION_DOMAIN_NAME_SERVERS';
+#     allowed fields: DHCP4.OPTION
+#     rc=2
+#
+#     $ nmcli -g DHCP4.OPTION device show eth0
+#     broadcast_address = 10.89.0.255 | dhcp_client_identifier = 01\:4e\:... |
+#     domain_name_servers = 10.89.0.2 | ... | routers = 10.89.0.2 | ...
+#     rc=0
+#
+# So the resolvers are a KEY inside a `key = value | key = value` list, not a
+# field of their own, and the whole list is read and the key picked out of it --
+# see `option_domain_name_servers`.
+#
+# **What the wrong name cost, and it was not a fallback.** An unknown field is
+# exit 2 with no output, which this module reads as "this source could not be
+# read", so the highest-priority source was skipped on every release and the
+# bridge fell through to the *effective* device DNS. That is harmless until the
+# install points NetworkManager at the loopback -- at which point the effective
+# DNS IS the loopback, a local address filtered out here, and the published state
+# becomes `{"upstreams": [], "last_good": false, "source": "nm-effective"}`
+# (MEASURED, same cell, generation 2). The router's `dhcp_forward` plugin then
+# has no upstream and every China-set name SERVFAILs **after a successful
+# install** -- the condition this project exists to fix, produced by the install
+# that fixes the foreign side.
+RAW_DHCP_FIELDS = ("DHCP4.OPTION", "DHCP6.OPTION")
+
+# The key the lease's resolvers are recorded under inside that list, and nmcli's
+# separator between the entries of it.
+OPTION_DNS_KEY = "domain_name_servers"
+OPTION_SEPARATOR = "|"
 EFFECTIVE_DNS_FIELDS = ("IP4.DNS", "IP6.DNS")
 
 # The token each source is recorded under. A lease that named its resolvers in
@@ -205,6 +240,30 @@ def _event_variables(env: Mapping[str, str]) -> _Outcome:
     )
 
 
+def option_domain_name_servers(text: Optional[str]) -> str:
+    """The `domain_name_servers` value inside one `nmcli -g DHCPn.OPTION` answer.
+
+    The field nmcli prints is a `key = value | key = value` list, so the
+    resolvers are a key inside it rather than the whole answer -- and every
+    sibling key has to be skipped, most of which (`broadcast_address`,
+    `routers`, `subnet_mask`, and a dozen `requested_*` flags) are not addresses.
+    A colon inside a value is written escaped by nmcli (`01\:4e\:b1`) because a
+    colon is nmcli's own field separator, so the escaping is undone here: an
+    address with backslashes in it is not an address.
+
+    Returns the empty string for a field that named no resolvers, which is a
+    source that was read and had nothing to say -- not a failure.
+    """
+    if not isinstance(text, str):
+        return ""
+    found = []
+    for entry in text.split(OPTION_SEPARATOR):
+        key, separator, value = entry.partition("=")
+        if separator and key.strip() == OPTION_DNS_KEY and value.strip():
+            found.append(value.strip().replace("\\:", ":"))
+    return " ".join(found)
+
+
 def _raw_dhcp_fields(interface: str, run: CommandRunner) -> _Outcome:
     """Read each raw DHCP field with its own argument array and name its family.
 
@@ -213,15 +272,20 @@ def _raw_dhcp_fields(interface: str, run: CommandRunner) -> _Outcome:
     with nothing is still a source that was read. The recorded source names the
     family that carried the addresses, so a v4-only lease is not recorded as a
     v6 one and a lease that named both is recorded as the single answer it is.
+
+    **The answer is a key inside the field, not the field.** See
+    `option_domain_name_servers` and `RAW_DHCP_FIELDS` -- the second of which
+    records what asking for a field nmcli does not have cost.
     """
     answers = [
         (source, _read(run, ["nmcli", "-g", field, "device", "show", interface]))
         for source, field in RAW_DHCP_SOURCES
     ]
-    answering = [source for source, output in answers if _normalized([output])]
+    resolvers = {source: option_domain_name_servers(output) for source, output in answers}
+    answering = [source for source, value in resolvers.items() if _normalized([value])]
     recorded = answering[0] if len(answering) == 1 else SOURCE_NM_DHCP
     return _Outcome(
-        _normalized(output for _, output in answers),
+        _normalized(resolvers[source] for source, _output in answers),
         any(output is not None for _, output in answers),
         recorded,
     )

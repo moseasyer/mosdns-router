@@ -40,6 +40,26 @@ from mosdns_dhcp_bridge.publish import (
 )
 
 INTERFACE = "enp3s0"
+
+
+def option_line(resolvers, **extra):
+    """A `DHCPn.OPTION` answer in the shape nmcli really prints it.
+
+    **A bare address is not the shape, and passing one is how 36 green cases
+    agreed with a field nmcli does not have.** nmcli prints the whole lease as
+    `key = value | key = value` and the resolvers are the `domain_name_servers`
+    key inside it -- MEASURED in a configured 24.04 target, where
+    `nmcli -g DHCP4.OPTION_DOMAIN_NAME_SERVERS` answers `invalid field;
+    allowed fields: DHCP4.OPTION` with exit 2. `extra` adds sibling keys a real
+    lease carries, because the parser has to skip them and a fixture with no
+    siblings cannot show that it does.
+    """
+    keys = [f"{key} = {value}" for key, value in extra.items()]
+    keys.append(f"domain_name_servers = {resolvers}")
+    keys.append("subnet_mask = 255.255.255.0")
+    return " | ".join(keys) + "\n"
+
+
 UUID = "11111111-1111-1111-1111-111111111111"
 NOW = datetime.datetime(2026, 9, 25, 0, 0, tzinfo=datetime.timezone.utc)
 LATER = NOW + datetime.timedelta(hours=1)
@@ -1019,7 +1039,7 @@ class DispatcherCommandLineTests(unittest.TestCase):
         """
         runner = RecordingRunner(
             {
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "192.168.1.53",
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE): option_line("192.168.1.53"),
             }
         )
         code, _, _ = self.call(
@@ -1038,8 +1058,8 @@ class DispatcherCommandLineTests(unittest.TestCase):
     def test_both_raw_nm_dhcp_families_are_recorded_as_one_source(self):
         runner = RecordingRunner(
             {
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "192.168.1.53",
-                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "fd00::53",
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE): option_line("192.168.1.53"),
+                ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE): option_line("fd00::53"),
             }
         )
         code, _, _ = self.call(
@@ -1070,8 +1090,8 @@ class DispatcherCommandLineTests(unittest.TestCase):
             failures={
                 command: OSError("nmcli")
                 for command in [
-                    ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
-                    ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                    ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE),
+                    ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE),
                     ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE),
                     ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE),
                 ]
@@ -1094,7 +1114,7 @@ class DispatcherCommandLineTests(unittest.TestCase):
         """
         runner = RecordingRunner(
             {
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): "192.168.1.1",
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE): option_line("192.168.1.1"),
             }
         )
         for action in ["up", "dhcp4-change", "dns-change"]:
@@ -1460,8 +1480,8 @@ class DispatcherCommandLineTests(unittest.TestCase):
         self.assertEqual(
             runner.calls,
             [
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
-                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE),
+                ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE),
                 ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE),
                 ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE),
                 ("resolvectl", "dns", INTERFACE),
@@ -1513,8 +1533,8 @@ class DispatcherCommandLineTests(unittest.TestCase):
         self.assertEqual(
             runner.calls,
             [
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
-                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE),
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE),
+                ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE),
             ],
         )
 
@@ -1534,10 +1554,10 @@ class DispatcherCommandLineTests(unittest.TestCase):
     def test_a_failure_before_a_readable_empty_source_still_publishes_a_disabled_generation(self):
         runner = RecordingRunner(
             failures={
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): OSError(
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE): OSError(
                     "nmcli"
                 ),
-                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE): OSError(
+                ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE): OSError(
                     "nmcli"
                 ),
             }
@@ -1583,8 +1603,8 @@ class DispatcherCommandLineTests(unittest.TestCase):
         self.assertEqual(
             runner.calls,
             [
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", "br-lan"),
-                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", "br-lan"),
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", "br-lan"),
+                ("nmcli", "-g", "DHCP6.OPTION", "device", "show", "br-lan"),
                 ("nmcli", "-g", "IP4.DNS", "device", "show", "br-lan"),
                 ("nmcli", "-g", "IP6.DNS", "device", "show", "br-lan"),
                 ("resolvectl", "dns", "br-lan"),

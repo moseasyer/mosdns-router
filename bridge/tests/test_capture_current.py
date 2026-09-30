@@ -43,13 +43,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from mosdns_dhcp_bridge import cli
 
 INTERFACE = "enp3s0"
+
+
+def option_line(resolvers, **extra):
+    """A `DHCPn.OPTION` answer in the shape nmcli really prints it.
+
+    **A bare address is not the shape, and passing one is how 36 green cases
+    agreed with a field nmcli does not have.** nmcli prints the whole lease as
+    `key = value | key = value` and the resolvers are the `domain_name_servers`
+    key inside it -- MEASURED in a configured 24.04 target, where
+    `nmcli -g DHCP4.OPTION_DOMAIN_NAME_SERVERS` answers `invalid field;
+    allowed fields: DHCP4.OPTION` with exit 2. `extra` adds sibling keys a real
+    lease carries, because the parser has to skip them and a fixture with no
+    siblings cannot show that it does.
+    """
+    keys = [f"{key} = {value}" for key, value in extra.items()]
+    keys.append(f"domain_name_servers = {resolvers}")
+    keys.append("subnet_mask = 255.255.255.0")
+    return " | ".join(keys) + "\n"
+
+
 UUID = "11111111-1111-1111-1111-111111111111"
 
 # The exact argument arrays a capture may build for one interface. DHCP4 and DHCP6
 # are read separately because a colon is both nmcli's field separator and part of
 # every IPv6 address.
-RAW_DHCP4 = ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE)
-RAW_DHCP6 = ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE)
+RAW_DHCP4 = ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE)
+RAW_DHCP6 = ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE)
 EFFECTIVE_IP4 = ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE)
 EFFECTIVE_IP6 = ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE)
 RESOLVECTL = ("resolvectl", "dns", INTERFACE)
@@ -198,7 +218,7 @@ class CaptureModeTests(CaptureCase):
 
     def test_a_capture_publishes_the_lease_the_raw_dhcp_field_carries(self):
         code, _, _ = self.capture(
-            {RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"}
+            {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"}
         )
         self.assertEqual(code, 0)
         self.assertEqual(
@@ -257,14 +277,15 @@ class CaptureModeTests(CaptureCase):
         self.assertEqual((data["source"], data["upstreams"]), ("dispatcher-env", ["192.168.1.1"]))
 
     def test_the_dhcp6_field_alone_is_recorded_as_nm_dhcp6(self):
-        code, _, _ = self.capture({RAW_DHCP6: "fd00::1", CONNECTION: UUID + "\n"})
+        code, _, _ = self.capture({RAW_DHCP6: option_line("fd00::1"), CONNECTION: UUID + "\n"})
         self.assertEqual(code, 0)
         data = self.published()
         self.assertEqual((data["source"], data["upstreams"]), ("nm-dhcp6", ["fd00::1"]))
 
     def test_both_raw_dhcp_families_are_recorded_as_one_source(self):
         code, _, _ = self.capture(
-            {RAW_DHCP4: "192.168.1.1", RAW_DHCP6: "fd00::1", CONNECTION: UUID + "\n"}
+            {RAW_DHCP4: option_line("192.168.1.1"), RAW_DHCP6: option_line("fd00::1"),
+             CONNECTION: UUID + "\n"}
         )
         self.assertEqual(code, 0)
         data = self.published()
@@ -279,9 +300,10 @@ class CaptureModeTests(CaptureCase):
         vocabulary does not carry would be a document nothing proved usable.
         """
         answers = [
-            {RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"},
-            {RAW_DHCP6: "fd00::1", CONNECTION: UUID + "\n"},
-            {RAW_DHCP4: "192.168.1.1", RAW_DHCP6: "fd00::1", CONNECTION: UUID + "\n"},
+            {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"},
+            {RAW_DHCP6: option_line("fd00::1"), CONNECTION: UUID + "\n"},
+            {RAW_DHCP4: option_line("192.168.1.1"), RAW_DHCP6: option_line("fd00::1"),
+             CONNECTION: UUID + "\n"},
             {CONNECTION: UUID + "\n"},
             {EFFECTIVE_IP4: "192.168.1.9", CONNECTION: UUID + "\n"},
             {RESOLVECTL: f"Link 2 ({INTERFACE}): 192.168.1.1", CONNECTION: UUID + "\n"},
@@ -301,7 +323,7 @@ class CaptureModeTests(CaptureCase):
 
     def test_the_connection_the_caller_exports_is_used_without_asking_networkmanager(self):
         code, _, runner = self.capture(
-            {RAW_DHCP4: "192.168.1.1", CONNECTION: "22222222-2222-2222-2222-222222222222\n"},
+            {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: "22222222-2222-2222-2222-222222222222\n"},
             env={"CONNECTION_UUID": UUID},
         )
         self.assertEqual(code, 0)
@@ -521,8 +543,8 @@ class CaptureInterfaceTests(CaptureCase):
         )
         self.assertEqual(code, 0)
         for field in [
-            "DHCP4.OPTION_DOMAIN_NAME_SERVERS",
-            "DHCP6.OPTION_DOMAIN_NAME_SERVERS",
+            "DHCP4.OPTION",
+            "DHCP6.OPTION",
             "IP4.DNS",
             "IP6.DNS",
             "GENERAL.CON-UUID",
@@ -568,7 +590,7 @@ class CaptureConnectionTests(CaptureCase):
 
     def test_a_connection_that_could_not_be_read_publishes_nothing(self):
         self.assertEqual(
-            self.capture({RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"})[0], 0
+            self.capture({RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"})[0], 0
         )
         original = self.bytes_on_disk()
         before = self.state_path.stat()
@@ -588,13 +610,13 @@ class CaptureConnectionTests(CaptureCase):
                 self.assertNotIn(secret, stderr)
 
     def test_a_lookup_that_answers_something_other_than_a_string_is_not_an_answer(self):
-        code, _, _ = self.capture({RAW_DHCP4: "192.168.1.1", CONNECTION: None})
+        code, _, _ = self.capture({RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: None})
         self.assertEqual(code, 4)
         self.assertFalse(self.state_path.exists())
         self.assertFalse(self.lock_path.exists())
 
     def test_an_empty_connection_beside_resolvers_is_invalid_input(self):
-        code, stderr, runner = self.capture({RAW_DHCP4: "192.168.1.1", CONNECTION: ""})
+        code, stderr, runner = self.capture({RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: ""})
         self.assertEqual(code, 2)
         self.assertIn("connection_uuid", stderr)
         self.assertEqual(runner.calls[-1], CONNECTION)
@@ -603,7 +625,7 @@ class CaptureConnectionTests(CaptureCase):
     def test_a_connection_that_is_not_a_uuid_is_invalid_input(self):
         """A connection name is what GENERAL.CONNECTION holds, and it is not a UUID."""
         code, stderr, _ = self.capture(
-            {RAW_DHCP4: "192.168.1.1", CONNECTION: "Wired connection 1\n"}
+            {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: "Wired connection 1\n"}
         )
         self.assertEqual(code, 2)
         self.assertIn("connection_uuid", stderr)
@@ -645,7 +667,7 @@ class CaptureGenerationTests(CaptureCase):
     """
 
     def test_the_capture_and_the_first_up_event_after_it_record_one_state(self):
-        answers = {RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"}
+        answers = {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"}
         self.assertEqual(self.capture(answers)[0], 0)
         original = self.bytes_on_disk()
         before = self.state_path.stat()
@@ -664,7 +686,7 @@ class CaptureGenerationTests(CaptureCase):
         )
 
     def test_two_captures_of_the_same_lease_record_one_state(self):
-        answers = {RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"}
+        answers = {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"}
         self.assertEqual(self.capture(answers)[0], 0)
         original = self.bytes_on_disk()
         before = self.state_path.stat()
@@ -675,7 +697,7 @@ class CaptureGenerationTests(CaptureCase):
 
     def test_a_capture_of_a_lease_the_router_already_knows_does_not_advance_it(self):
         """The install may run on a machine the dispatcher has been watching."""
-        answers = {RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"}
+        answers = {RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"}
         self.assertEqual(
             self.dispatch(
                 self.event(
@@ -695,10 +717,10 @@ class CaptureGenerationTests(CaptureCase):
 
     def test_a_capture_of_a_changed_lease_advances_the_generation(self):
         self.assertEqual(
-            self.capture({RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"})[0], 0
+            self.capture({RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"})[0], 0
         )
         self.assertEqual(
-            self.capture({RAW_DHCP4: "192.168.1.53", CONNECTION: UUID + "\n"})[0], 0
+            self.capture({RAW_DHCP4: option_line("192.168.1.53"), CONNECTION: UUID + "\n"})[0], 0
         )
         data = self.published()
         self.assertEqual((data["generation"], data["upstreams"]), (2, ["192.168.1.53"]))
@@ -722,7 +744,7 @@ class CaptureFailureTests(CaptureCase):
 
     def test_a_total_source_failure_preserves_the_published_state(self):
         self.assertEqual(
-            self.capture({RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"})[0], 0
+            self.capture({RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"})[0], 0
         )
         original = self.bytes_on_disk()
         before = self.state_path.stat()
@@ -751,12 +773,12 @@ class CaptureFailureTests(CaptureCase):
 
     def test_a_held_lock_exits_three_and_keeps_the_state(self):
         self.assertEqual(
-            self.capture({RAW_DHCP4: "192.168.1.1", CONNECTION: UUID + "\n"})[0], 0
+            self.capture({RAW_DHCP4: option_line("192.168.1.1"), CONNECTION: UUID + "\n"})[0], 0
         )
         original = self.bytes_on_disk()
         with self.held_lock():
             code, stderr, _ = self.capture(
-                {RAW_DHCP4: "192.168.1.53", CONNECTION: UUID + "\n"}
+                {RAW_DHCP4: option_line("192.168.1.53"), CONNECTION: UUID + "\n"}
             )
         self.assertEqual(code, 3)
         self.assertIn("lock", stderr)

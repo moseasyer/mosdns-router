@@ -27,12 +27,43 @@ INTERFACE = "enp3s0"
 # The exact argument arrays the collector may build for one interface. DHCP4 and
 # DHCP6 are read separately because a colon is both nmcli's field separator and
 # part of every IPv6 address.
-RAW_DHCP4 = ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE)
-RAW_DHCP6 = ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", INTERFACE)
+# **The fields are `DHCP4.OPTION` and `DHCP6.OPTION`, and that is MEASURED, not
+# chosen.** nmcli 1.42.4 inside a configured 24.04 target answers
+#
+#     $ nmcli -g DHCP4.OPTION_DOMAIN_NAME_SERVERS device show eth0
+#     Error: 'device show': invalid field 'DHCP4.OPTION_DOMAIN_NAME_SERVERS';
+#     allowed fields: DHCP4.OPTION
+#
+# with exit 2 and no output -- and the whole lease is in the `key = value |`
+# list the allowed field prints. These two names were the wrong ones, so the
+# collector's highest-priority source was unreadable on every release, and the
+# fixture in this file asked the same wrong question, which is why 36 green
+# cases agreed with the code and neither agreed with nmcli. See
+# `NmcliFieldNameTests`, which holds the command.
+RAW_DHCP4 = ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE)
+RAW_DHCP6 = ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE)
 EFFECTIVE_IP4 = ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE)
 EFFECTIVE_IP6 = ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE)
 RESOLVECTL = ("resolvectl", "dns", INTERFACE)
 ALL_COMMANDS = (RAW_DHCP4, RAW_DHCP6, EFFECTIVE_IP4, EFFECTIVE_IP6, RESOLVECTL)
+
+
+def option_line(resolvers, **extra):
+    """A `DHCPn.OPTION` answer in the shape nmcli really prints it.
+
+    **The first version of this fixture handed the collector a bare address**,
+    which is what the code asked for while it asked for a field nmcli does not
+    have -- so the fixture and the code agreed with each other and neither agreed
+    with the program. nmcli prints the whole lease as `key = value | key = value`
+    and the resolvers are the `domain_name_servers` key inside it, so that is what
+    a case supplies now. `extra` adds sibling keys a real lease carries, because
+    the parser has to skip them and a fixture with no siblings cannot show that it
+    does.
+    """
+    keys = [f"{key} = {value}" for key, value in extra.items()]
+    keys.append(f"domain_name_servers = {resolvers}")
+    keys.append("subnet_mask = 255.255.255.0")
+    return " | ".join(keys) + "\n"
 
 
 def quiet_outputs(answers):
@@ -75,7 +106,7 @@ class SourcePriorityTests(unittest.TestCase):
         runner = FakeRunner(
             quiet_outputs(
                 {
-                    RAW_DHCP4: "192.168.1.1",
+                    RAW_DHCP4: option_line("192.168.1.1"),
                     EFFECTIVE_IP4: "127.0.0.53",
                     EFFECTIVE_IP6: "127.0.0.53",
                     RESOLVECTL: "127.0.0.53",
@@ -97,7 +128,7 @@ class SourcePriorityTests(unittest.TestCase):
         runner = FakeRunner(
             quiet_outputs(
                 {
-                    RAW_DHCP6: "fd00::53",
+                    RAW_DHCP6: option_line("fd00::53"),
                     EFFECTIVE_IP4: "192.168.1.9",
                     RESOLVECTL: "192.168.1.8",
                 }
@@ -178,7 +209,7 @@ class SourcePriorityTests(unittest.TestCase):
         runner = FakeRunner(
             quiet_outputs(
                 {
-                    RAW_DHCP4: "192.168.1.1,192.168.1.2",
+                    RAW_DHCP4: option_line("192.168.1.1,192.168.1.2"),
                     EFFECTIVE_IP4: "203.0.113.9",
                     RESOLVECTL: "203.0.113.8",
                 }
@@ -199,20 +230,20 @@ class SourceTokenTests(unittest.TestCase):
     """
 
     def test_the_raw_dhcp4_field_alone_is_named_nm_dhcp4(self):
-        runner = FakeRunner(quiet_outputs({RAW_DHCP4: "192.168.1.1"}))
+        runner = FakeRunner(quiet_outputs({RAW_DHCP4: option_line("192.168.1.1")}))
         result = collect_dns_with_source({}, INTERFACE, runner)
         self.assertEqual(result.source, "nm-dhcp4")
         self.assertEqual(result.addresses, ["192.168.1.1"])
 
     def test_the_raw_dhcp6_field_alone_is_named_nm_dhcp6(self):
-        runner = FakeRunner(quiet_outputs({RAW_DHCP6: "fd00::1"}))
+        runner = FakeRunner(quiet_outputs({RAW_DHCP6: option_line("fd00::1")}))
         result = collect_dns_with_source({}, INTERFACE, runner)
         self.assertEqual(result.source, "nm-dhcp6")
         self.assertEqual(result.addresses, ["fd00::1"])
 
     def test_both_raw_dhcp_families_are_named_nm_dhcp(self):
         runner = FakeRunner(
-            quiet_outputs({RAW_DHCP4: "192.168.1.1", RAW_DHCP6: "fd00::1"})
+            quiet_outputs({RAW_DHCP4: option_line("192.168.1.1"), RAW_DHCP6: option_line("fd00::1")})
         )
         result = collect_dns_with_source({}, INTERFACE, runner)
         self.assertEqual(result.source, "nm-dhcp")
@@ -221,7 +252,7 @@ class SourceTokenTests(unittest.TestCase):
     def test_the_family_that_answered_is_named_when_its_sibling_could_not_be_read(self):
         """One readable field still carries the lease's resolvers."""
         runner = FakeRunner(
-            quiet_outputs({RAW_DHCP6: "fd00::1"}), failures={RAW_DHCP4: OSError("nmcli")}
+            quiet_outputs({RAW_DHCP6: option_line("fd00::1")}), failures={RAW_DHCP4: OSError("nmcli")}
         )
         result = collect_dns_with_source({}, INTERFACE, runner)
         self.assertEqual(result.source, "nm-dhcp6")
@@ -268,7 +299,7 @@ class SourceTokenTests(unittest.TestCase):
             collect_dns_with_source({}, INTERFACE, broken())
 
     def test_the_list_wrapper_still_returns_the_addresses_only(self):
-        got = collect_dns({}, INTERFACE, FakeRunner(quiet_outputs({RAW_DHCP4: "192.168.1.1"})))
+        got = collect_dns({}, INTERFACE, FakeRunner(quiet_outputs({RAW_DHCP4: option_line("192.168.1.1")})))
         self.assertIs(type(got), list)
         self.assertEqual(got, ["192.168.1.1"])
 
@@ -437,8 +468,8 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(
             runner.calls,
             [
-                ("nmcli", "-g", "DHCP4.OPTION_DOMAIN_NAME_SERVERS", "device", "show", "br-lan.2"),
-                ("nmcli", "-g", "DHCP6.OPTION_DOMAIN_NAME_SERVERS", "device", "show", "br-lan.2"),
+                ("nmcli", "-g", "DHCP4.OPTION", "device", "show", "br-lan.2"),
+                ("nmcli", "-g", "DHCP6.OPTION", "device", "show", "br-lan.2"),
                 ("nmcli", "-g", "IP4.DNS", "device", "show", "br-lan.2"),
                 ("nmcli", "-g", "IP6.DNS", "device", "show", "br-lan.2"),
                 ("resolvectl", "dns", "br-lan.2"),
@@ -484,6 +515,158 @@ class InterfaceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     collect_dns({}, interface, runner)
                 self.assertEqual(runner.calls, [])
+
+class NmcliFieldNameTests(unittest.TestCase):
+    """**The field name the collector asked for is not a field nmcli has.**
+
+    MEASURED, in a 24.04 target container after a **successful** install, on
+    `mosdns-router` 0.1.0:
+
+        $ nmcli -g DHCP4.OPTION_DOMAIN_NAME_SERVERS device show eth0
+        Error: 'device show': invalid field 'DHCP4.OPTION_DOMAIN_NAME_SERVERS';
+        allowed fields: DHCP4.OPTION
+        rc=2
+
+        $ nmcli -g DHCP4.OPTION device show eth0
+        broadcast_address = 10.89.0.255 | dhcp_client_identifier = 01\\:4e\\:b1\\:...
+        | domain_name_servers = 10.89.0.2 | ... | routers = 10.89.0.2 | ...
+        rc=0
+
+    The lease's resolvers are in the output, under a KEY inside a `key = value |
+    key = value` list, and the field that carries the list is `DHCP4.OPTION`. The
+    collector's highest-priority source -- the one its own docstring says "is the
+    only source that still names the lease's resolvers once `ignore-auto-dns`
+    keeps NetworkManager from passing them to resolved" -- has therefore been
+    **unreadable on every release**, and the bridge falls through to the
+    effective device DNS.
+
+    Which is harmless until the install points NetworkManager at the loopback.
+    Then the effective DNS *is* `127.0.0.1`, a local address the collector
+    filters out, and the published state becomes:
+
+        { "upstreams": [], "last_good": false, "source": "nm-effective",
+          "generation": 2, "interface": "eth0" }
+
+    MEASURED, same cell, same moment. The router's `dhcp_forward` plugin then has
+    no upstream, so **every China-set name SERVFAILs after a successful install**
+    -- which is the exact condition this project exists to fix, produced by the
+    install that fixes the foreign side. The plan's Task 4 Step 4 asks for "the
+    bridge state retains the original mock DNS", and it did not.
+
+    **The fixture is why 36 green cases never saw it.** `RAW_DHCP4` in this file
+    is the same wrong field name, so the fake runner answered a question nmcli
+    cannot be asked and the test agreed with the code. That is the same defect
+    class as `install_test.py`'s `ActiveState` rule that matched nothing: a
+    fixture and an assertion that agree with each other and neither agrees with
+    the program under test.
+    """
+
+    # The output `nmcli -g DHCP4.OPTION device show eth0` really prints. Trimmed,
+    # and with the escaped colons left exactly as nmcli writes them, because the
+    # unescaping is part of what has to work.
+    REAL_DHCP4_OPTION = (
+        "broadcast_address = 10.89.0.255 | "
+        "dhcp_client_identifier = 01\\:4e\\:b1\\:5f\\:bf\\:79\\:e2 | "
+        "domain_name_servers = 10.89.0.2 | "
+        "routers = 10.89.0.2 | "
+        "subnet_mask = 255.255.255.0\n"
+    )
+    # A CANONICAL v6 address, and that is a constraint rather than a preference:
+    # Python 3.14's `ipaddress` rejects a short form like `2001:db8:1:53` outright
+    # ("does not appear to be an IPv4 or IPv6 address"), so a fixture using one
+    # would be testing nothing. The escaped colons are nmcli's, not the
+    # address's, and unescaping them is part of what has to work.
+    REAL_DHCP6_OPTION = "domain_name_servers = 2001\\:db8\\:\\:53\n"
+
+    def test_the_lease_resolvers_are_read_out_of_the_option_field_nmcli_has(self):
+        result = collect_dns_with_source(
+            {},
+            INTERFACE,
+            FakeRunner({RAW_DHCP4: self.REAL_DHCP4_OPTION}),
+        )
+        self.assertEqual(result.addresses, ["10.89.0.2"])
+        self.assertEqual(result.source, "nm-dhcp4")
+
+    def test_a_v6_lease_is_read_the_same_way_and_keeps_its_escaped_colons(self):
+        result = collect_dns_with_source(
+            {},
+            INTERFACE,
+            FakeRunner({RAW_DHCP6: self.REAL_DHCP6_OPTION}),
+        )
+        # The escaped colons are nmcli's, not the address's, and an address with
+        # backslashes in it is not an address.
+        self.assertEqual(result.addresses, ["2001:db8::53"])
+        self.assertEqual(result.source, "nm-dhcp6")
+
+    def test_both_families_in_one_lease_are_one_answer(self):
+        result = collect_dns_with_source(
+            {},
+            INTERFACE,
+            FakeRunner({
+                RAW_DHCP4: self.REAL_DHCP4_OPTION,
+                RAW_DHCP6: self.REAL_DHCP6_OPTION,
+            }),
+        )
+        self.assertEqual(result.addresses, ["10.89.0.2", "2001:db8::53"])
+        self.assertEqual(result.source, "nm-dhcp")
+
+    def test_the_loopback_the_install_configures_never_comes_from_this_source(self):
+        """**And the case that is the whole point: a lease whose raw option names
+        the router's real upstream, on a machine whose effective DNS is the
+        loopback.**
+
+        This is the state a configured target is in, and it is the state the
+        install leaves the bridge in. With the field name fixed, the raw lease
+        answers and the empty effective list is never consulted; with it wrong,
+        the loopback is the only thing left and the published state is empty.
+        """
+        result = collect_dns_with_source(
+            {},
+            INTERFACE,
+            FakeRunner({
+                RAW_DHCP4: self.REAL_DHCP4_OPTION,
+                EFFECTIVE_IP4: "127.0.0.1",
+            }),
+        )
+        self.assertEqual(result.addresses, ["10.89.0.2"])
+        self.assertEqual(result.source, "nm-dhcp4")
+
+    def test_an_option_line_with_no_resolvers_is_an_empty_answer_not_a_failure(self):
+        # A v4-only lease's DHCP6 field prints nothing at all, and a field that
+        # answered with nothing is a source that was read -- which is what keeps
+        # `SourcesUnavailable` for a NetworkManager that cannot be queried.
+        result = collect_dns_with_source(
+            {},
+            INTERFACE,
+            FakeRunner({
+                RAW_DHCP4: "routers = 10.89.0.2 | subnet_mask = 255.255.255.0\n",
+                EFFECTIVE_IP4: "",
+            }),
+        )
+        self.assertEqual(result.addresses, [])
+
+    def test_the_argument_arrays_name_fields_nmcli_actually_has(self):
+        """**The command is asserted, because the command was the defect.**
+
+        A field name is not a formatting choice: nmcli refuses an unknown one with
+        exit 2 and no output, which the collector reads as "this source could not
+        be read" and skips. So the argument arrays are held to `DHCP4.OPTION` and
+        `DHCP6.OPTION` -- the two fields nmcli lists as allowed -- and a case that
+        renames them fails here rather than silently making the source unreadable
+        on every release.
+        """
+        runner = FakeRunner()
+        collect_dns_with_source({}, INTERFACE, runner)
+        for expected in (
+            ("nmcli", "-g", "DHCP4.OPTION", "device", "show", INTERFACE),
+            ("nmcli", "-g", "DHCP6.OPTION", "device", "show", INTERFACE),
+        ):
+            self.assertIn(expected, runner.calls, f"the collector did not run {expected!r}")
+        self.assertNotIn(
+            "OPTION_DOMAIN_NAME_SERVERS", " ".join(" ".join(call) for call in runner.calls),
+            "a field name nmcli does not have was asked for again: exit 2 and no output, which "
+            "this collector reads as a source it could not read and skips",
+        )
 
 
 if __name__ == "__main__":
