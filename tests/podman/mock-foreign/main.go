@@ -47,7 +47,12 @@ import (
 
 func main() {
 	listen := flag.String("listen", "0.0.0.0:443",
-		"the address to serve DNSCrypt on, over UDP and TCP, and the address the stamp names")
+		"the address to serve DNSCrypt on, over UDP and TCP")
+	advertised := flag.String("address", "",
+		"the address the stamp and the counters publish, which is the address a "+
+			"CLIENT dials and is NOT the address this program binds: the container is "+
+			"reached on the private network's address while it binds 0.0.0.0. Empty "+
+			"means the bind address, and an unspecified one is refused")
 	countersPath := flag.String("counters", "/run/mosdns-mock-foreign/counters.json",
 		"where the counters and the stamp are written; the harness polls this path")
 	answer := flag.String("answer", "198.51.100.7",
@@ -55,10 +60,67 @@ func main() {
 			"so nothing but this harness can reach whatever this mock says")
 	flag.Parse()
 
-	if err := run(*listen, *countersPath, *answer); err != nil {
+	if err := run(*listen, *advertised, *countersPath, *answer); err != nil {
 		fmt.Fprintf(os.Stderr, "mosdns-mock-foreign: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// assertedAddress is the address the stamp and the counters publish, and it is
+// checked rather than assumed.
+//
+// **A stamp names the address a client dials, and a client is in another
+// container.** This program binds `0.0.0.0:443` so it answers on whatever address
+// the private network gave it, and a stamp built from that bind address names
+// `0.0.0.0:443` -- which the client resolves to *itself*. MEASURED, on all three
+// releases, with the first version of this image: the target dialed its own port
+// 443, got nothing, and the install transaction refused at its own barrier with
+//
+//	dnscrypt-proxy.service was started but nothing answered a DNS query at
+//	127.0.0.1:15353 within 60s
+//
+// which says nothing about an address nobody could have dialed. So the address is
+// named separately, and an unspecified one is refused here rather than by a cell
+// that would report it as an unreachable resolver.
+//
+// The two other refusals are the same class. A **name** in a stamp is resolved by
+// the client through its own bootstrap resolvers -- Quad9's, on a machine with no
+// route -- so a stamp naming a name is a stamp nothing can use. And a **port** is
+// what makes the override a change of address rather than of address and port
+// together, which is the distinction the plan's Step 5 turns on.
+func assertedAddress(listen, advertised string) (string, error) {
+	if advertised == "" {
+		advertised = listen
+	}
+	host, port, err := net.SplitHostPort(advertised)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%q is not a host:port address, and a DNSCrypt stamp carries both: %w", advertised, err,
+		)
+	}
+	if port == "" || port == "0" {
+		return "", fmt.Errorf(
+			"%q carries no port, and a stamp with no port is a resolver this program is not "+
+				"serving: it serves %s", advertised, listen,
+		)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", fmt.Errorf(
+			"%q names a host rather than an address, and a DNSCrypt client resolves a name in "+
+				"a stamp with its own bootstrap resolvers -- which in this cell are on the "+
+				"internet this cell cannot reach", advertised,
+		)
+	}
+	if ip.IsUnspecified() {
+		return "", fmt.Errorf(
+			"%q is an unspecified address, so it names no host at all: a client dialling it "+
+				"reaches ITSELF, which is what the first version of this image did on every "+
+				"release. Pass --address with the address the client dials -- the private "+
+				"network's %s -- and keep --listen at %s", advertised, "network address", listen,
+		)
+	}
+	return advertised, nil
 }
 
 // resolver is the whole program: an identity, a place to record what it was
@@ -71,18 +133,25 @@ type resolver struct {
 	answer   string
 }
 
-func run(listen, countersPath, answer string) error {
+func run(listen, advertised, countersPath, answer string) error {
+	// The address the stamp names, checked before anything is bound: a mock that
+	// cannot be dialled is a cell that reports the transaction's foreign-resolver
+	// barrier, and this is the only place that knows the difference.
+	reachable, err := assertedAddress(listen, advertised)
+	if err != nil {
+		return err
+	}
 	keys, err := newProvider()
 	if err != nil {
 		return err
 	}
-	stamp, err := keys.stamp(listen)
+	stamp, err := keys.stamp(reachable)
 	if err != nil {
 		return err
 	}
 	counters := newCounters()
 	counters.setStamp(stamp)
-	counters.setAddress(listen)
+	counters.setAddress(reachable)
 	// Written before the sockets are bound. The harness polls this path for the
 	// stamp, and a file that only appeared once something had been asked for
 	// would be a file the install might start without.
@@ -93,7 +162,8 @@ func run(listen, countersPath, answer string) error {
 
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
-	log.Printf("mosdns-mock-foreign: listening on %s, provider %s, stamp %s", listen, providerName, stamp)
+	log.Printf("mosdns-mock-foreign: listening on %s, reachable at %s, provider %s, stamp %s",
+		listen, reachable, providerName, stamp)
 	// One line per answer, on the container's log. The counters file is what the
 	// harness asserts on and this is what a person reads when a count does not
 	// move: it names the name and the transport, which is the pair a routing

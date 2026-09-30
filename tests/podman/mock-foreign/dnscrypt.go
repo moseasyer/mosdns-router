@@ -152,6 +152,13 @@ const (
 type provider struct {
 	signing  ed25519.PrivateKey
 	exchange [32]byte
+	// **The validity window, read once.** It is inside the certificate and the
+	// certificate is signed over the window, so a window read per request is a
+	// different document per request -- not merely a different pair of timestamps
+	// but a different signature over the whole tail. `TestTheCertificateThisStart
+	// PublishesDoesNotMoveWithTheClock` is the case, and the failure it replaced
+	// was 9 runs in 20 of a TXT-escaping case that was about the clock.
+	from, until uint32
 }
 
 // publicExchange is the public half of `exchange`, and it is what goes into the
@@ -183,7 +190,17 @@ func newProvider() (*provider, error) {
 	exchange[0] &= 248
 	exchange[31] &= 127
 	exchange[31] |= 64
-	return &provider{signing: signing, exchange: exchange}, nil
+	// **The clock is read here and nowhere else.** A mock's certificate is "the
+	// one this start publishes", and a window that moved per request would make
+	// that a different document every time a client asked -- which no cell can
+	// see and a test cannot stop tripping over.
+	now := uint32(time.Now().Unix())
+	return &provider{
+		signing:  signing,
+		exchange: exchange,
+		from:     now - uint32(certificateBackdate/time.Second),
+		until:    now + uint32(certificateLifetime/time.Second),
+	}, nil
 }
 
 // certificate is the signed document dnscrypt-proxy fetches before it will send
@@ -220,11 +237,11 @@ func (p *provider) certificate(serial, from, until uint32) []byte {
 	return certificate
 }
 
-// validCertificate is the certificate this start of this resolver publishes,
-// with a window around now so dnscrypt-proxy's own timestamp check passes.
+// validCertificate is the certificate this start of this resolver publishes, with
+// a window around now -- read at the start, so it is the same document every time
+// it is asked for.
 func (p *provider) validCertificate() []byte {
-	now := uint32(time.Now().Unix())
-	return p.certificate(1, now-uint32(certificateBackdate/time.Second), now+uint32(certificateLifetime/time.Second))
+	return p.certificate(1, p.from, p.until)
 }
 
 // stamp is the one line of the override document: a DNSCrypt stamp naming this

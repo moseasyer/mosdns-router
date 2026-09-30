@@ -48,6 +48,8 @@ import re
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -1105,14 +1107,8 @@ class MockCdnContainerfileTest(unittest.TestCase):
         build = stage_named(stages, "build")
         self.assertIsNotNone(build, [name for name, _ in stages])
         self.assertTrue(
-            any("golang" in line for line in build),
-            "the build stage does not install a Go toolchain, so nothing here is compiled",
-        )
-        self.assertTrue(
-            any(
-                "go build" in line and "tests/podman/mock-foreign" in line
-                for line in build
-            ),
+            any("go build" in line and "tests/podman/mock-foreign" in line
+                for line in build),
             f"the foreign resolver is not built from this module: {build}",
         )
         serving = stages[-1][1]
@@ -1140,6 +1136,134 @@ class MockCdnContainerfileTest(unittest.TestCase):
                 line.strip().upper().startswith("EXPOSE"),
                 f"the foreign resolver image publishes a port: {line.strip()!r}",
             )
+
+    def test_the_build_toolchain_is_pinned_and_not_the_distributions(self):
+        """**The Go toolchain is a pinned artifact, and that is measured.**
+
+        The first version of this image installed `golang-go` from the release's
+        own archive, which makes the toolchain a function of the release. It is
+        1.18 on 22.04, and 1.18 cannot read this module's `go.mod`:
+
+        ```
+        go: errors parsing go.mod:
+        /src/go.mod:3: invalid go version '1.25.8': must match format 1.23
+        Error: building at STEP "RUN go mod download": ... exit status 1
+        ```
+
+        and the run reported `harness error: could not build the mock-foreign
+        image for 22.04` -- a matrix that could not start on one of the three
+        releases it exists to compare. 24.04 and 26.04 happen to be new enough,
+        and that is the dangerous half: a cell that passed there was compiled by
+        a different toolchain than the cell that failed, for a reason that has
+        nothing to do with what the mock is.
+
+        So the build unpacks a **digest-verified** release tarball, and three
+        things are held: the distribution's Go is gone, the download is checked
+        against a digest written in the file, and the version downloaded is the
+        one this module's own `go` directive names -- so a bump of `go.mod` that
+        nobody carried into the image fails the build rather than compiling
+        against whatever the file happens to say.
+        """
+        build = stage_named(containerfile_stages(read(MOCK_FOREIGN_CONTAINERFILE)), "build")
+        self.assertIsNotNone(build)
+        for line in build:
+            self.assertNotRegex(
+                line, r"apt-get install[^\n]*\bgolang-go\b",
+                f"the build stage installs the release's own Go, so the toolchain is a "
+                f"function of the release rather than a pin: {line!r}",
+            )
+        self.assertTrue(
+            any("sha256sum" in line and "-c" in line for line in build),
+            f"the toolchain is downloaded and never checked: {build}",
+        )
+        # **The version is the module's own.** Read out of go.mod rather than
+        # written here, so the two cannot be two different facts.
+        wanted = re.search(
+            r"^go\s+(\S+)\s*$", (REPO / "go.mod").read_text(encoding="utf-8"), re.MULTILINE
+        )
+        self.assertIsNotNone(wanted, "go.mod carries no `go` directive")
+        version = wanted.group(1)
+        self.assertIn(
+            f"GO_VERSION={version}", "\n".join(build),
+            f"the image builds with a Go other than the {version} this module declares, so "
+            f"the mock the resolver talks to was not compiled by the release it is measured on",
+        )
+        # And every digest in the file is a digest: 64 hex, in a `sha256sum -c`
+        # line, one per architecture the plan's arms name. A `case` that fell
+        # through to a shell default would compile with an unverified toolchain,
+        # so the control is an architecture with no entry.
+        text = read(MOCK_FOREIGN_CONTAINERFILE)
+        digests = re.findall(r"\b([0-9a-f]{64})\b", text)
+        self.assertEqual(
+            sorted(set(digests)), sorted(digests),
+            "a digest is written twice in the file, and a digest written in the prose as well "
+            "as where the build reads it is a digest that can be updated in one place and not "
+            "the other",
+        )
+        self.assertEqual(
+            len(digests), 2,
+            f"the file carries {len(digests)} digests and the plan's two amd64/arm64 arms need "
+            f"one each: {digests}",
+        )
+        self.assertTrue(
+            any("no pinned Go" in line for line in build),
+            "an architecture with no digest in the case falls through to something rather than "
+            "refusing, so a third arm would build with an unverified toolchain",
+        )
+        for arm in ("amd64", "arm64"):
+            self.assertIn(f"{arm})", "\n".join(build), f"no digest is pinned for {arm}")
+
+    def test_the_pinned_digests_are_the_official_ones(self):
+        """The digests, asked of the registry that publishes them.
+
+        A digest written in a file is a pin only if somebody looked it up. This
+        asks `https://go.dev/dl/?mode=json&include=all` -- the list the Go project
+        publishes the release digests in -- and requires the two the file carries
+        to be there for the version `go.mod` names. **It is the only case in this
+        file that reaches the network for something other than a base image**, and
+        that is the point: the alternative is a digest that is right today and
+        unfalsifiable, which is the property `images.lock.json` was written to
+        stop having.
+        """
+        version = re.search(
+            r"^go\s+(\S+)\s*$", (REPO / "go.mod").read_text(encoding="utf-8"), re.MULTILINE
+        ).group(1)
+        pinned = dict(
+            re.findall(
+                r"(\w+)\)\s+GO_SHA256=([0-9a-f]{64})", read(MOCK_FOREIGN_CONTAINERFILE)
+            )
+        )
+        self.assertEqual(sorted(pinned), ["amd64", "arm64"])
+        try:
+            response = urllib.request.urlopen(
+                "https://go.dev/dl/?mode=json&include=all", timeout=30
+            )
+            releases = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise unittest.SkipTest(
+                f"the published release list could not be read, so the digests this file pins "
+                f"are unverified rather than confirmed: {error}"
+            )
+        official = {
+            entry["filename"]: entry["sha256"]
+            for release in releases
+            # go.mod's directive is `1.25.8` and the published list's version
+            # field is `go1.25.8`. Reading one for the other is a case that
+            # passes vacuously -- an empty `official` and `assertTrue` on it --
+            # so the prefix is here rather than left to a reader.
+            if release["version"] == f"go{version}"
+            for entry in release["files"]
+        }
+        self.assertTrue(official, f"the published list carries no release {version}")
+        for arm, digest in pinned.items():
+            name = f"go{version}.linux-{arm}.tar.gz"
+            with self.subTest(architecture=arm):
+                self.assertEqual(
+                    official.get(name), digest,
+                    f"{name} is published with a different digest, so the image builds with a "
+                    f"toolchain the Go project does not publish for this release -- or the file's "
+                    f"digest is a transcription nobody re-checked",
+                )
 
     def test_the_cdn_rule_can_fail(self):
         """The control: a Containerfile that installs caddy is reported.
