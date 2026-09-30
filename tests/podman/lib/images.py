@@ -227,7 +227,15 @@ CONTAINERFILE_SUFFIX = ".Containerfile"
 
 # The roles a cell builds, in the order it needs them: the router owns the
 # address the target will be given, so it is started first.
-IMAGE_ROLES = ("mock-router", "target")
+#
+# `mock-foreign` is third, and its position is not alphabetical: it is the mock
+# foreign *listener*, reached by the packaged resolver's own unit, so it is only
+# started by the scenarios that measure the branch split (`run.MOCK_SCENARIOS`)
+# and a cell running `dhcp` alone never pays for its build. It is in this tuple
+# rather than discovered from the directory because the tuple is the set a cell
+# BUILDS for every version, and a build that skipped it would leave the routing
+# scenario with no image to start a container from.
+IMAGE_ROLES = ("mock-router", "target", "mock-foreign")
 
 # How much of the content hash goes in the tag. Twelve hex characters is 48 bits:
 # enough that two different Containerfiles do not collide by accident, and short

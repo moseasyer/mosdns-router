@@ -395,9 +395,12 @@ ALLOWED_CAPABILITIES = ("SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW")
 # need what the others do, and then it is wrong in a way nothing reports, because
 # a capability granted and not needed is not an error podman or the kernel will
 # ever mention.
+#
+# | `mock-foreign` | **none** | A Go program that opens one UDP socket and one TCP listener, reads a counter, writes a JSON file and answers. It runs no init and is not traced, so it needs nothing the router needs, and unlike the router it does not need `NET_ADMIN` or `NET_RAW` because it neither sends nor receives at the link layer. Its port is 443, which looks privileged, and the same measurement as the router's row answers it: podman's default rootless bounding set already carries `NET_BIND_SERVICE` (bit 10, `CapEff: 00000000800405fb` on this host). |
 CONTAINER_CAPABILITIES = {
     "target": ALLOWED_CAPABILITIES,
     "mock-router": ("NET_ADMIN", "NET_RAW"),
+    "mock-foreign": (),
 }
 
 
@@ -1456,6 +1459,23 @@ class Podman:
 
     def copy_to(self, container: str, host_path: str, container_path: str) -> CommandResult:
         return self.run(["cp", str(host_path), f"{container}:{container_path}"])
+
+    def logs(self, container: str) -> str:
+        """A container's own output, which for a mock is the evidence it produced.
+
+        `dnsmasq` is started with `log-facility=-`, so its log goes to stderr
+        because a container has no syslog to write to -- which makes `podman logs`
+        the only place the mock router's query log exists, and there is no file
+        inside that container to read instead. So this is a *data* read, not a
+        diagnostic one, and it sits with the other reads a scenario makes rather
+        than with the log-reading helpers.
+
+        A container's logs are readable while it is running, so this is asked of a
+        live container and there is no `--follow` and no wait: a scenario that
+        wanted the tail would have to ask for it, and the harness's own waits poll
+        facts rather than sleeping, so a scenario polls this.
+        """
+        return self.run(["logs", str(container)]).output
 
     def stop(self, container: str) -> CommandResult:
         return self.run(["stop", "--time", str(STOP_TIME_SECONDS), container])

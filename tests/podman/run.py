@@ -54,7 +54,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 
 import dhcp_test  # noqa: E402
+import foreign_override  # noqa: E402
 import images  # noqa: E402
+import routing_test  # noqa: E402
 import snapshot  # noqa: E402
 import watchdog_test  # noqa: E402
 from podman import (  # noqa: E402
@@ -110,9 +112,24 @@ def build_scenarios() -> dict[str, str]:
     return {
         "dhcp": "dhcp_test:build_scenario",
         "install": "install_test:build_scenario",
+        "routing": "routing_test:build_scenario",
         "watchdog": "watchdog_test:build_scenario",
     }
 
+
+# **The scenarios that need a mock the cell does not otherwise start.** `routing`
+# needs two more containers than `dhcp` and `install` do, and the reason is the
+# property it measures: a China-set name and a foreign name have to reach *two
+# different listeners* for the cell to have shown a split, and a listener is a
+# container on this run's private network. A routing scenario that pointed both
+# branches at the mock router would resolve everything and prove nothing, so the
+# foreign mock is a container of its own at its own fixed address, and the fact
+# that it is listed here is what makes a cell start it.
+#
+# `dhcp` and `install` do not need either: the first drives NetworkManager and the
+# mock router, and the second installs the package and asks the packaged resolvers
+# what they do. Neither claims a branch split, so neither needs a second listener.
+MOCK_SCENARIOS = ("routing",)
 
 # The scenarios that need the built package, and why the two sets are named here
 # rather than discovered by inspecting the builders.
@@ -194,6 +211,9 @@ def run_target(
     image: str,
     scenarios,
     router_image: str | None = None,
+    foreign_image: str | None = None,
+    client_image: str | None = None,
+    need_foreign_mock: bool = False,
     network_name: str = "testnet",
     subnet: str = DEFAULT_NETWORK_SUBNET,
     device: str = "eth0",
@@ -215,10 +235,17 @@ def run_target(
        that booted unmanaged is reported as itself rather than as an installer
        bug -- and waited for, not asked, because `podman run -d` returns before
        the target has booted; and
-    4. the **scenarios** run inside a session whose teardown happens whatever
+    4. the **mock foreign listener** and the **client** are started next, and only
+       when a scenario asked for them (`need_foreign_mock`). A cell that runs
+       `dhcp` and `install` alone does not pay for two more containers, and a cell
+       that runs `routing` cannot be a routing cell without them: the property is
+       that two names reach *two different listeners*, so the two listeners have to
+       be two containers at two fixed addresses, and the client has to be a
+       container that was not the thing under test;
+    5. the **scenarios** run inside a session whose teardown happens whatever
        they do.
 
-    Both containers are tracked, so `cleanup` removes them. A container named by
+    Every container is tracked, so `cleanup` removes them. A container named by
     hand is one nothing finds.
     """
     network = RunResources(podman, run_id).network_name(network_name)
@@ -246,6 +273,49 @@ def run_target(
                 network=network,
                 extra_args=["--ip", dhcp_test.TARGET_ADDRESS],
             )
+            foreign = client = None
+            if need_foreign_mock:
+                # The foreign listener, at the plan's own fixed address. Started
+                # after the target and before the client because the client is
+                # pointed at the target and a client pointed at a target that is
+                # not up yet would read a connection refused and record it.
+                foreign = run.track_container(run.container_name("mock-foreign", version))
+                podman.run_container(
+                    image=foreign_image or image,
+                    name=foreign,
+                    network=network,
+                    extra_args=["--ip", routing_test.MOCK_FOREIGN_ADDRESS],
+                    capabilities=CONTAINER_CAPABILITIES["mock-foreign"],
+                )
+                # The client, which is a SECOND target image rather than a fourth
+                # kind of container: it needs systemd and `dig` and nothing else,
+                # and giving it its own image would be a second thing that could
+                # differ from the target's for no reason. It is named `client`
+                # rather than `target-2` because that is the role it has.
+                client = run.track_container(run.container_name("client", version))
+                podman.run_container(
+                    image=client_image or image,
+                    name=client,
+                    network=network,
+                    extra_args=["--ip", routing_test.CLIENT_ADDRESS],
+                )
+                # **The client is pointed at the target before any scenario runs**,
+                # and this is the seam the routing scenario's whole claim rests on.
+                # A client on this private network can reach the mock router
+                # directly, so "the client got an answer" is not evidence about the
+                # target's routing unless the target is the only resolver it was
+                # asked. The target's DHCP lease is what publishes the address, so
+                # the target has to be on its own profile first -- which the
+                # scenarios do, and which is why this is a note here and not an
+                # `nmcli` call: a client pointed at an address nothing has a lease
+                # for would resolve nothing, and the failure would read as a
+                # routing defect.
+                podman.exec_script(
+                    client,
+                    "set -eu\n"
+                    f"mkdir -p /etc\n"
+                    f"printf 'nameserver {routing_test.TARGET_ADDRESS}\n' > /etc/resolv.conf\n",
+                )
             # Two gates, in this order, and the order is the fix.
             #
             # **First: the target's own setup unit.** `GENERAL.NM-MANAGED` is
@@ -611,15 +681,28 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
         # command that builds it -- and it is a harness error (exit 2), because
         # nothing was proved about the release either way.
         package = _package_path(args.arch) if set(requested) & set(PACKAGE_SCENARIOS) else None
+        resources = RunResources(podman, args.run_id)
+        # The container names, composed here and handed to every builder, so a
+        # scenario and the cell that starts the container cannot spell a name
+        # differently -- and so a scenario is given a name rather than reaching
+        # for one, which is what makes "a scenario that reached for a global
+        # container name would be measuring whichever container happened to be
+        # running" a comment rather than a defect waiting to happen.
+        names = {
+            role: resources.container_name(role, version)
+            for role in ("mock-router", "target", "mock-foreign", "client")
+        }
         scenarios = [
             (name, builder(
                 podman=podman,
                 version=version,
                 arch=args.arch,
                 run_id=args.run_id,
-                router=RunResources(podman, args.run_id).container_name("mock-router", version),
-                target=RunResources(podman, args.run_id).container_name("target", version),
-                network=RunResources(podman, args.run_id).network_name("testnet"),
+                router=names["mock-router"],
+                target=names["target"],
+                foreign=names["mock-foreign"],
+                client=names["client"],
+                network=resources.network_name("testnet"),
                 results_dir=Path(args.results_dir),
                 now=clock["now"],
                 sleep=clock["sleep"],
@@ -635,6 +718,9 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
                 version=version,
                 image=cell_images[version]["target"],
                 router_image=cell_images[version]["mock-router"],
+                foreign_image=cell_images[version].get("mock-foreign"),
+                client_image=cell_images[version]["target"],
+                need_foreign_mock=bool(set(requested) & set(MOCK_SCENARIOS)),
                 scenarios=scenarios,
                 results_dir=Path(args.results_dir),
             )
