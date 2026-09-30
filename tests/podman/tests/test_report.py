@@ -76,7 +76,7 @@ MINIMAL_GOLDEN = """\
     }
   ],
   "run_id": "20260928T101010Z",
-  "schema": "mosdns-podman-report/1",
+  "schema": "mosdns-podman-report/2",
   "started_utc": "2026-09-28T10:10:10Z",
   "status": "passed"
 }
@@ -94,8 +94,8 @@ def version(name, recorded=None, scenarios=(), skips=(), detail=None, arch="amd6
     )
 
 
-def scenario(name, status, detail=None, log=None):
-    return ScenarioResult(name=name, status=status, detail=detail, log=log)
+def scenario(name, status, detail=None, log=None, skips=()):
+    return ScenarioResult(name=name, status=status, detail=detail, log=log, skips=tuple(skips))
 
 
 def report(results, **kwargs):
@@ -353,6 +353,62 @@ class LogAttachmentTest(unittest.TestCase):
         self.assertEqual(names, ["install", "routing", "failure"])
 
 
+class ScenarioSkipTest(unittest.TestCase):
+    """A scenario that cannot close a requirement records it, rather than passing.
+
+    The `install` scenario is the case this exists for. It proves the property
+    this project's Task 4 Step 1 delivered -- with no route to the internet the
+    transaction gets past the range publication and refuses at the *foreign*
+    barrier -- and it cannot prove the requirement the plan wrote for the step,
+    that the transaction reaches `install ok configured`, because the foreign
+    chain is a DNSCrypt server on the internet. Reported as `failed`, that cell
+    is a red run for a reason that is not a defect, which is worse than no
+    scenario at all; reported as `passed` with no record, it is a skip reported
+    as a pass, which the plan forbids twice.
+
+    So the skip travels on the scenario, where the evidence for it is, and
+    `run.py` hoists it onto the version -- where `status` already refuses to
+    call a version `passed` while a required skip sits under it.
+    """
+
+    def test_a_scenario_carries_the_requirements_it_did_not_close(self):
+        built = scenario("install", "passed", skips=[
+            Skip(requirement="the transaction reaches install ok configured", reason="the foreign chain is on the internet"),
+        ])
+        self.assertEqual(len(built.skips), 1)
+        self.assertEqual(built.to_dict()["skips"], [{
+            "reason": "the foreign chain is on the internet",
+            "required": True,
+            "requirement": "the transaction reaches install ok configured",
+        }])
+
+    def test_a_scenario_with_no_skip_carries_an_empty_list(self):
+        # An empty list rather than an absent key: the document has a fixed key
+        # set, and a key that appears only when a skip exists is a key a diff
+        # cannot be read against.
+        self.assertEqual(scenario("dhcp", "passed").to_dict()["skips"], [])
+
+    def test_a_scenario_refuses_a_skip_that_is_not_a_skip(self):
+        with self.assertRaises(TypeError):
+            scenario("install", "passed", skips=[{"requirement": "x", "reason": "y"}])
+
+    def test_a_passing_scenario_with_a_required_skip_leaves_the_version_incomplete(self):
+        # The whole reason the field is on the scenario rather than in a string:
+        # reading only the scenario list says `passed`, which is the failure the
+        # plan names.
+        built = version("24.04", scenarios=[
+            scenario("install", "passed", skips=[Skip(requirement="r", reason="why")]),
+        ])
+        self.assertEqual(built.status, "incomplete")
+        self.assertEqual(report([built]).exit_code, EXIT_INCOMPLETE)
+
+    def test_a_passing_scenario_with_an_optional_skip_still_passes_the_version(self):
+        built = version("24.04", scenarios=[
+            scenario("install", "passed", skips=[Skip(requirement="r", reason="why", required=False)]),
+        ])
+        self.assertEqual(built.status, "passed")
+
+
 class DocumentStabilityTest(unittest.TestCase):
     """The serialised document is a stable artifact, not a debug dump."""
 
@@ -360,9 +416,15 @@ class DocumentStabilityTest(unittest.TestCase):
         self.assertEqual(MINIMAL.to_json(), MINIMAL_GOLDEN)
 
     def test_the_schema_identifier_is_in_the_document(self):
-        """A report compared against an older one has to say which it is."""
+        """A report compared against an older one has to say which it is.
+
+        `/2` is the shape change that came with `ScenarioResult.skips`: a
+        scenario can now record a requirement it did not close, and a report
+        compared against a `/1` document has to be able to say the two are not
+        the same shape rather than discover a missing key in a diff.
+        """
         self.assertEqual(json.loads(MINIMAL.to_json())["schema"], SCHEMA)
-        self.assertEqual(SCHEMA, "mosdns-podman-report/1")
+        self.assertEqual(SCHEMA, "mosdns-podman-report/2")
 
     def test_two_builds_of_the_same_run_produce_the_same_bytes(self):
         first = report([version("22.04", scenarios=[scenario("dhcp", "passed")]),
@@ -406,12 +468,16 @@ class DocumentStabilityTest(unittest.TestCase):
         )
 
     def test_the_document_has_exactly_these_keys_per_scenario(self):
+        # `skips` is in the list because a scenario may record a requirement it
+        # could not close. It is a fixed key rather than one that appears only
+        # when a skip exists: a key that comes and goes is a key a diff cannot
+        # be read against.
         built = report([version("24.04", scenarios=[
             scenario("dhcp", "passed", detail="eth0 was managed and DHCP supplied 10.89.0.2", log="logs/dhcp.log")
         ])])
         self.assertEqual(
             sorted(built.to_dict()["results"][0]["scenarios"][0]),
-            ["detail", "log", "name", "status"],
+            ["detail", "log", "name", "skips", "status"],
         )
 
     def test_the_document_has_exactly_these_keys_for_podman(self):

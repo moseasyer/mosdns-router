@@ -10,7 +10,10 @@ are what they are.
   exit 3. So a version's status is *derived* from what happened inside it, a
   version with no scenarios is `incomplete` rather than `passed`, and a version
   that recorded a required skip cannot be `passed` however green its scenarios
-  are.
+  are. A **scenario** may carry a skip of its own and the version inherits it:
+  a scenario is where the evidence for an unclosed requirement is, and a skip
+  that had to be written into a `detail` sentence is a skip a reader has to read
+  prose to find.
 * **The document is stable.** A fixed key set, sorted results, and a schema
   identifier, so two runs of the same thing are byte-comparable and a field that
   appears is a visible change rather than a silent one.
@@ -32,7 +35,7 @@ from typing import Any
 
 # The identifier that says which shape this document is. A report compared
 # against an older one has to be able to say it is not the same shape.
-SCHEMA = "mosdns-podman-report/1"
+SCHEMA = "mosdns-podman-report/2"
 
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
@@ -147,23 +150,39 @@ class Skip:
 
 @dataclass(frozen=True)
 class ScenarioResult:
-    """One scenario's outcome, and the log that explains it."""
+    """One scenario's outcome, the log that explains it, and what it could not close.
+
+    `skips` is here rather than only on `VersionResult` because a scenario is
+    where the evidence for an unclosed requirement is, and a scenario that had
+    to put one in a sentence in `detail` is a scenario a reader has to read
+    prose to find an open requirement in. The `install` scenario is the case
+    this was added for: it proves the property Task 4 Step 1 delivered and cannot
+    prove the one the plan first wrote, because the foreign chain is a DNSCrypt
+    server on the internet. A skip the runner then hoists onto the version, where
+    `status` already refuses to say `passed` while a required skip sits under it.
+    """
 
     name: str
     status: str
     detail: str | None = None
     log: str | None = None
+    skips: tuple[Skip, ...] = ()
 
     def __post_init__(self):
         _check_status(self.status, "scenario")
         if self.log is not None:
             _check_relative_log(self.log)
+        for skip in self.skips:
+            if not isinstance(skip, Skip):
+                raise TypeError(f"a scenario's skip must be a Skip, not {skip!r}")
+        object.__setattr__(self, "skips", tuple(self.skips))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "detail": redact(self.detail) if self.detail is not None else None,
             "log": self.log,
             "name": self.name,
+            "skips": [skip.to_dict() for skip in self.skips],
             "status": self.status,
         }
 
@@ -201,14 +220,36 @@ class VersionResult:
         object.__setattr__(self, "skips", tuple(self.skips))
 
     @property
+    def all_skips(self) -> tuple[Skip, ...]:
+        """The version's own skips, and every skip its scenarios recorded.
+
+        A duplicate is kept rather than removed: a version whose runner hoisted a
+        scenario's skip onto it holds the same `Skip` twice, and the document
+        already shows it twice -- once on the version and once on the scenario it
+        came from. Collapsing the two would make the document say something the
+        two objects do not.
+        """
+        return self.skips + tuple(skip for scenario in self.scenarios for skip in scenario.skips)
+
+    @property
     def status(self) -> str:
+        """Always derived, and never `passed` with a required skip under it.
+
+        **A scenario's own skips count here as well as the version's.** The
+        invariant belongs to the type and not to one runner: a caller that built
+        a `VersionResult` from scenario results and forgot to hoist a required
+        skip would otherwise produce a `passed` version with one sitting under
+        it, which is the failure the plan's constraint names. `run.py` hoists
+        them anyway, because a skip that is only in the status and not in
+        `skips` is a skip nobody reads.
+        """
         if self.recorded is not None:
             return self.recorded
         if any(s.status == STATUS_FAILED for s in self.scenarios):
             return STATUS_FAILED
         if any(s.status != STATUS_PASSED for s in self.scenarios):
             return STATUS_INCOMPLETE
-        if self.scenarios and not any(skip.required for skip in self.skips):
+        if self.scenarios and not any(skip.required for skip in self.all_skips):
             return STATUS_PASSED
         return STATUS_INCOMPLETE
 

@@ -340,7 +340,21 @@ def run_target(
                 detail = f"stopped after {name}: the remaining scenarios did not run"
                 break
             results.append(outcome if outcome is not None else ScenarioResult(name=name, status="passed"))
-    return VersionResult(version=version, arch=arch, scenarios=tuple(results), detail=detail)
+    # **A scenario's skips become the version's**, and that is the whole of why
+    # they are allowed on a scenario. A requirement a cell could not close is
+    # known where the evidence for it is -- inside the scenario that found it --
+    # and the version's `status` is where "a skip is never a pass" is enforced.
+    # Hoisted rather than left on the scenario alone because nothing above this
+    # line reads a scenario's skips: without the hoist the cell would read
+    # `passed` with a required skip underneath it, which is the failure the
+    # plan's constraint names twice.
+    return VersionResult(
+        version=version,
+        arch=arch,
+        scenarios=tuple(results),
+        skips=tuple(skip for result in results for skip in result.skips),
+        detail=detail,
+    )
 
 
 def _podman_from(args) -> Podman:

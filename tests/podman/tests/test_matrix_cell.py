@@ -44,6 +44,7 @@ import test_command  # noqa: E402
 import test_dhcp_scenario  # noqa: E402
 from podman import CONTAINER_CAPABILITIES as CONTAINER_CAPS  # noqa: E402
 from podman import RunResources  # noqa: E402
+from report import Report, ScenarioResult, Skip  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("mosdns_matrix_cell_run", HARNESS / "run.py")
 run = importlib.util.module_from_spec(_spec)
@@ -1082,6 +1083,113 @@ class ImageTagTest(unittest.TestCase):
             with self.subTest(role=role):
                 with self.assertRaises(images.LockError):
                     images.image_tag(role, "24.04", images.reference_for_version("24.04"))
+
+
+class ScenarioSkipTest(EntryPoint):
+    """A scenario that could not close a requirement makes the cell incomplete.
+
+    The `install` scenario is the case this is about, and it is why the field
+    exists. It proves the property Task 4 Step 1 delivered and it cannot prove
+    the one the plan first wrote -- the transaction reaching `install ok
+    configured` -- because the foreign chain is a DNSCrypt server on the
+    internet. Three dispositions were available and two of them are wrong:
+
+    * `failed`, which is a red run for a reason that is not a defect, and it is
+      what the scenario used to do on every cell;
+    * `passed` with the open requirement written into `detail`, which is a skip
+      reported as a pass -- the thing the plan's constraints forbid twice;
+    * `passed` with a **required skip**, which is the honest one: the scenario
+      did what it was written to do, the cell is `incomplete`, and the run is
+      exit 3.
+    """
+
+    SKIP = Skip(
+        requirement="with no route to the internet the transaction reaches `install ok configured`",
+        reason="the foreign chain is a DNSCrypt server on the internet",
+    )
+
+    def cell(self, *, skip=None, status="passed", second=None):
+        """One cell whose `install` scenario records `skip` and passes."""
+        fake = self.passing_fake()
+        outcomes = [("install", lambda: ScenarioResult("install", status, detail="d", skips=(skip,) if skip else ()))]
+        if second is not None:
+            outcomes.append((second[0], lambda: second[1]))
+        built = run.run_target(
+            self.client(fake),
+            RUN_ID,
+            "amd64",
+            "24.04",
+            "localhost/mosdns-target:24.04",
+            outcomes,
+        )
+        return built, [line.splitlines()[0] for line in self.invoke_output(built)]
+
+    def invoke_output(self, built):
+        # The terminal lines `command_matrix` prints, produced here from the
+        # result so the case reads the same shape the operator reads.
+        lines = [f"  amd64/24.04: {built.status}"]
+        for scenario_result in built.scenarios:
+            if scenario_result.status != "passed" and scenario_result.detail:
+                lines.append(f"      {scenario_result.name}: {scenario_result.detail.splitlines()[0]}")
+        for skip in built.skips:
+            lines.append(f"      not closed: {skip.reason}")
+        return lines
+
+    def test_a_scenario_skip_lands_on_the_version(self):
+        built, _lines = self.cell(skip=self.SKIP)
+        self.assertEqual([s.requirement for s in built.skips], [self.SKIP.requirement])
+        self.assertTrue(built.skips[0].required, "an optional skip is a nicety, and this is not one")
+
+    def test_a_scenario_skip_leaves_the_cell_incomplete_and_the_run_at_three(self):
+        built, _lines = self.cell(skip=self.SKIP)
+        self.assertEqual(built.status, "incomplete")
+        self.assertEqual(
+            Report(
+                run_id=RUN_ID,
+                arch="amd64",
+                started_utc="2026-09-30T00:00:00Z",
+                finished_utc="2026-09-30T00:01:00Z",
+                podman_version="5.7.0",
+                store_driver="overlay",
+                results=(built,),
+            ).exit_code,
+            3,
+        )
+
+    def test_a_scenario_skip_is_printed_as_not_closed(self):
+        _built, lines = self.cell(skip=self.SKIP)
+        self.assertIn(f"      not closed: {self.SKIP.reason}", lines)
+
+    def test_a_scenario_with_no_skip_passes_the_cell(self):
+        built, lines = self.cell()
+        self.assertEqual(built.status, "passed")
+        self.assertEqual(built.skips, ())
+        self.assertNotIn("not closed:", "\n".join(lines))
+
+    def test_a_skip_from_a_failed_scenario_is_hoisted_too(self):
+        # The evidence is still evidence: a scenario that recorded a requirement
+        # it could not close and then failed on a later assertion has not closed
+        # it, and dropping the record on the strength of the failure would make
+        # the failure hide the skip.
+        built, _lines = self.cell(skip=self.SKIP, status="failed")
+        self.assertEqual([s.requirement for s in built.skips], [self.SKIP.requirement])
+        self.assertEqual(built.status, "failed")
+
+    def test_a_scenario_that_raises_records_no_skip(self):
+        # The exception path builds its own ScenarioResult, and a cell whose
+        # first scenario crashed is `failed` on that alone -- there is nothing
+        # from that scenario to hoist.
+        fake = self.passing_fake()
+
+        def boom():
+            raise RuntimeError("the scenario crashed")
+
+        built = run.run_target(
+            self.client(fake), RUN_ID, "amd64", "24.04",
+            "localhost/mosdns-target:24.04", [("install", boom)],
+        )
+        self.assertEqual(built.skips, ())
+        self.assertEqual(built.status, "failed")
 
 
 class NamespaceAndGateTest(unittest.TestCase):
