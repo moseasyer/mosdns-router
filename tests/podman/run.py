@@ -117,19 +117,63 @@ def build_scenarios() -> dict[str, str]:
     }
 
 
-# **The scenarios that need a mock the cell does not otherwise start.** `routing`
-# needs two more containers than `dhcp` and `install` do, and the reason is the
-# property it measures: a China-set name and a foreign name have to reach *two
-# different listeners* for the cell to have shown a split, and a listener is a
-# container on this run's private network. A routing scenario that pointed both
-# branches at the mock router would resolve everything and prove nothing, so the
-# foreign mock is a container of its own at its own fixed address, and the fact
-# that it is listed here is what makes a cell start it.
+# **The scenarios that need a mock the cell does not otherwise start, and which
+# mock each of them needs.** `routing` needs two more containers than `dhcp` does,
+# and the reason is the property it measures: a China-set name and a foreign name
+# have to reach *two different listeners* for the cell to have shown a split, and
+# a listener is a container on this run's private network. A routing scenario that
+# pointed both branches at the mock router would resolve everything and prove
+# nothing, so the foreign mock is a container of its own at its own fixed address.
 #
-# `dhcp` and `install` do not need either: the first drives NetworkManager and the
-# mock router, and the second installs the package and asks the packaged resolvers
-# what they do. Neither claims a branch split, so neither needs a second listener.
-MOCK_SCENARIOS = ("routing",)
+# `dhcp` needs neither: it drives NetworkManager and the mock router. `install`
+# needs the foreign mock but not the client, and the reason is what its
+# transaction's own barrier is: `postinst` starts `dnscrypt-proxy` and then waits
+# up to 60s for 127.0.0.1:15353 to answer, so on a cell with no route to the
+# internet the transaction refuses unless a foreign answer is reachable -- and the
+# test-only override that makes one reachable points at a mock on this run's
+# private network. So the cell has to start that mock, and nothing about a client
+# container.
+#
+# This map is the ONE declaration, and it answers two questions from one answer:
+# which keyword arguments a builder is handed, and which containers the cell
+# starts. A cell that started a mock no scenario asked for would pay for a
+# container nobody uses, and a cell that started no mock a scenario asked for
+# would hand a builder the name of a container that does not exist -- which is
+# exit 2, "the matrix is broken", for a cell that never ran. That is what the
+# first version of this did: one set, and every builder in it handed every
+# argument, so `install` was given a `client` and `routing` an `override_path`,
+# neither of which it accepts.
+#
+# The three names are declared per scenario, for the reason `PACKAGE_SCENARIOS`
+# is declared at all: the registration is the fact, and a builder that gained a
+# parameter without being listed here would be handed nothing and would say so.
+# `test_the_declared_extra_arguments_are_the_builders_own_parameters` in
+# `tests/podman/tests/test_matrix_cell.py` is the case that holds the two to each
+# other.
+MOCK_SCENARIO_EXTRA = {
+    # The install needs the mock's name to read its counters, and somewhere to
+    # build the override it copies in -- both test-only, both outside the target.
+    "install": ("foreign", "override_path"),
+    # The routing needs the foreign listener's name, and a client on the same
+    # bridge to ask from. It needs no override: the install's own transaction is
+    # what wrote `/etc/mosdns/dnscrypt-proxy.toml`, and routing reads the
+    # resolvers that transaction left running.
+    "routing": ("foreign", "client"),
+}
+
+# **Which ROLE each extra parameter names, and why it is not the parameter's own
+# name.** The cell's roles are the containers' parts in it, and the mock foreign
+# resolver's role is `mock-foreign`; a builder's parameter is `foreign`. Spelling
+# that mapping here rather than in a comprehension at the call site is the
+# difference between one declaration a case can read and a rule hidden in a
+# subscript, and the map above is declared for the same reason. Every key here is
+# a parameter `MOCK_SCENARIO_EXTRA` names, and every value is a role the cell
+# builds a name for. `override_path` is deliberately absent: it is a path the
+# harness chooses, not a container.
+EXTRA_PARAMETER_ROLES = {
+    "foreign": "mock-foreign",
+    "client": "client",
+}
 
 # The scenarios that need the built package, and why the two sets are named here
 # rather than discovered by inspecting the builders.
@@ -214,6 +258,7 @@ def run_target(
     foreign_image: str | None = None,
     client_image: str | None = None,
     need_foreign_mock: bool = False,
+    need_client: bool = False,
     network_name: str = "testnet",
     subnet: str = DEFAULT_NETWORK_SUBNET,
     device: str = "eth0",
@@ -235,13 +280,18 @@ def run_target(
        that booted unmanaged is reported as itself rather than as an installer
        bug -- and waited for, not asked, because `podman run -d` returns before
        the target has booted; and
-    4. the **mock foreign listener** and the **client** are started next, and only
-       when a scenario asked for them (`need_foreign_mock`). A cell that runs
-       `dhcp` and `install` alone does not pay for two more containers, and a cell
-       that runs `routing` cannot be a routing cell without them: the property is
-       that two names reach *two different listeners*, so the two listeners have to
-       be two containers at two fixed addresses, and the client has to be a
-       container that was not the thing under test;
+    4. the **mock foreign listener** and the **client** are started next, and each
+       only when a scenario asked for it (`need_foreign_mock`, `need_client`). A
+       cell that runs `dhcp` and `install` alone does not pay for two more
+       containers, and a cell that runs `routing` cannot be a routing cell without
+       them: the property is that two names reach *two different listeners*, so the
+       two listeners have to be two containers at two fixed addresses, and the
+       client has to be a container that was not the thing under test.
+       **Two flags and not one, because the two scenarios that need a mock need
+       different halves of it.** `install` needs the foreign listener and no
+       client; `routing` needs both. One flag would have made every `install` cell
+       start a client it never asks anything, and a container nobody asks is a
+       container that can only cost the run time;
     5. the **scenarios** run inside a session whose teardown happens whatever
        they do.
 
@@ -287,11 +337,17 @@ def run_target(
                     extra_args=["--ip", routing_test.MOCK_FOREIGN_ADDRESS],
                     capabilities=CONTAINER_CAPABILITIES["mock-foreign"],
                 )
+            if need_client:
                 # The client, which is a SECOND target image rather than a fourth
                 # kind of container: it needs systemd and `dig` and nothing else,
                 # and giving it its own image would be a second thing that could
                 # differ from the target's for no reason. It is named `client`
                 # rather than `target-2` because that is the role it has.
+                #
+                # Its own `if`, not a nested one, because it is a flag of its own:
+                # `install` asks for the foreign listener and not this, and a
+                # client nobody asks anything from is a container that can only
+                # cost the run its time.
                 client = run.track_container(run.container_name("client", version))
                 podman.run_container(
                     image=client_image or image,
@@ -746,6 +802,7 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
         # nothing was proved about the release either way.
         package = _package_path(args.arch) if set(requested) & set(PACKAGE_SCENARIOS) else None
         resources = RunResources(podman, args.run_id)
+        run_id = args.run_id
         # The container names, composed here and handed to every builder, so a
         # scenario and the cell that starts the container cannot spell a name
         # differently -- and so a scenario is given a name rather than reaching
@@ -764,18 +821,30 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
                 run_id=args.run_id,
                 router=names["mock-router"],
                 target=names["target"],
-                # The two extra containers, and ONLY to the scenarios that use
-                # them. A builder that took them unconditionally would break every
-                # scenario that has no use for a client, and passing them
-                # conditionally on this set is the same kind of declaration as
+                # The extra containers, and ONLY to the scenarios that use them,
+                # each one named explicitly rather than by set membership. A
+                # builder that took them unconditionally would break every
+                # scenario that has no use for a client, and passing a name a
+                # builder does not accept is a `TypeError` at cell construction --
+                # exit 2 with a report that says nothing was proved. Declaring the
+                # names per scenario is the same kind of declaration as
                 # `PACKAGE_SCENARIOS`: the registration is the fact, and a builder
-                # that gained the parameters without joining the set would be
-                # handed no names and would say so.
-                **(
-                    {"foreign": names["mock-foreign"], "client": names["client"]}
-                    if name in MOCK_SCENARIOS
-                    else {}
-                ),
+                # that gained a parameter without being listed in
+                # `MOCK_SCENARIO_EXTRA` would be handed nothing and would say so.
+                #
+                # `foreign` is spelled `mock-foreign` in the ROLE names, because
+                # the role is the container's part in the cell and `foreign` is the
+                # builder's parameter name; the mapping between them is the second
+                # half of the same declaration and is not something to be spelled
+                # out per call site.
+                **{
+                    parameter: (
+                        Path(args.results_dir) / run_id / f"{name}-foreign-override.toml"
+                        if parameter == "override_path"
+                        else names[EXTRA_PARAMETER_ROLES[parameter]]
+                    )
+                    for parameter in MOCK_SCENARIO_EXTRA.get(name, ())
+                },
                 network=resources.network_name("testnet"),
                 results_dir=Path(args.results_dir),
                 now=clock["now"],
@@ -784,6 +853,13 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
             ))
             for name, builder in builders
         ]
+        # Which extra containers this cell starts, read out of the SAME
+        # declaration the builders' keyword arguments come from. Deriving both
+        # from one map is the point: a cell that started a mock no scenario asked
+        # for would pay for a container nobody uses, and a cell that started no
+        # mock a scenario asked for would hand a builder a name of a container
+        # that does not exist, which is exit 2 rather than a failed cell.
+        asked = set(requested)
         cells.append(
             run_target(
                 podman,
@@ -794,7 +870,12 @@ def _run_cells(args, podman: Podman, versions, base_images: dict, cell_images: d
                 router_image=cell_images[version]["mock-router"],
                 foreign_image=cell_images[version].get("mock-foreign"),
                 client_image=cell_images[version]["target"],
-                need_foreign_mock=bool(set(requested) & set(MOCK_SCENARIOS)),
+                need_foreign_mock=any(
+                    "foreign" in MOCK_SCENARIO_EXTRA.get(name, ()) for name in asked
+                ),
+                need_client=any(
+                    "client" in MOCK_SCENARIO_EXTRA.get(name, ()) for name in asked
+                ),
                 scenarios=scenarios,
                 results_dir=Path(args.results_dir),
             )

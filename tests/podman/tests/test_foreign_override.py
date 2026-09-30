@@ -25,6 +25,7 @@ describe.
 import base64
 import re
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -142,7 +143,7 @@ class TheOverrideIsASubstitutionTest(unittest.TestCase):
         override = self.override()
         self.assertEqual(
             foreign_override.static_names(override),
-            [foreign_override.STATIC_NAME] * 3,
+            [foreign_override.static_name(n) for n in (1, 2, 3)],
             "the override did not rename every static table to the mock's",
         )
         # The selection has to move with the tables, and that is the half a
@@ -151,7 +152,7 @@ class TheOverrideIsASubstitutionTest(unittest.TestCase):
         # it would still answer nothing -- because the names it selects are Quad9's.
         self.assertEqual(
             foreign_override.selected_names(override),
-            [foreign_override.STATIC_NAME] * 3,
+            [foreign_override.static_name(n) for n in (1, 2, 3)],
             "the override's server_names still selects a resolver it does not define",
         )
         # Read on the *lines* rather than the whole text, because the shipped
@@ -349,7 +350,92 @@ class TheOverrideIsASubstitutionTest(unittest.TestCase):
         self.assertIn("this project did not ship", str(raised.exception))
 
 
-class TheOverrideIsCompleteOrRefusedTest(unittest.TestCase):
+class TheOverrideLoadsTest(unittest.TestCase):
+    """**The override is a document the resolver's own parser can read.**
+
+    MEASURED, 24.04, and it cost a full matrix run on all three releases. The
+    substitution renamed every `[static.*]` table to the mock's ONE name, and
+    TOML does not allow a table to be defined twice:
+
+        [FATAL] toml: line 77 (last key "static"): Key
+        'static.mosdns-mock-foreign' has already been defined.
+
+    So `dnscrypt-proxy` exited 255, systemd restarted it eleven times in sixty
+    seconds, nothing ever answered `127.0.0.1:15353`, and the cell reported the
+    install transaction's foreign-resolver barrier -- a sentence about a
+    symptom, about a resolver that never got as far as dialling anybody.
+
+    The bug was invisible to every other case, and the reason is worth stating:
+    `assert_only_stamps_changed` compared the definitions and the selection as
+    **sets**, and `["mosdns-mock-foreign"] * 3` and `["mosdns-mock-foreign"] * 3`
+    are the same set. A check about agreement was read as a check about
+    well-formedness, and a document three definitions deep in the same table is
+    agreed upon and unloadable.
+
+    So the check is a **parse**, with the standard library's own TOML reader --
+    the same grammar the resolver's parser implements, rather than a second
+    opinion this file wrote.
+    """
+
+    def test_the_shipped_document_and_the_override_both_load(self):
+        for name, document in (
+            ("shipped", SHIPPED),
+            ("override", foreign_override.build_override(SHIPPED, STAMP, ADDRESS)),
+        ):
+            with self.subTest(document=name):
+                try:
+                    parsed = tomllib.loads(document)
+                except tomllib.TOMLDecodeError as error:
+                    self.fail(f"the {name} document does not load: {error}")
+                self.assertIn("static", parsed, f"the {name} document has no tables")
+
+    def test_every_table_has_a_name_of_its_own(self):
+        override = foreign_override.build_override(SHIPPED, STAMP, ADDRESS)
+        names = foreign_override.static_names(override)
+        self.assertEqual(
+            len(set(names)), len(names),
+            f"the override defines {names} -- TOML refuses a table defined twice, so "
+            f"dnscrypt-proxy exits on the document rather than on anything a cell measures",
+        )
+        self.assertEqual(
+            sorted(names), sorted(foreign_override.selected_names(override)),
+            "the definitions and the selection disagree",
+        )
+        for name in names:
+            self.assertTrue(
+                name.startswith(foreign_override.STATIC_NAME),
+                f"{name!r} does not carry the mock's name, so a reader of the document cannot "
+                f"tell which table is the test-only one",
+            )
+
+    def test_a_document_with_one_table_defined_three_times_is_refused(self):
+        # The control, and the case that could not have failed before: the
+        # property is a PARSE, so it is shown to fail on a document that is
+        # otherwise perfectly well formed -- three tables, one name, a selection
+        # that agrees with them, and every non-stamp line byte-identical to the
+        # shipped document's.
+        #
+        # Built by collapsing the override's own three headers rather than by
+        # asking `build_override` for it, because the builder is what refuses to
+        # produce it: a control that goes through the code under test is a control
+        # that cannot fail for the reason it exists.
+        collapsed = foreign_override.build_override(SHIPPED, STAMP, ADDRESS)
+        for n in (1, 2, 3):
+            collapsed = collapsed.replace(
+                f"[static.{foreign_override.static_name(n)}]",
+                f"[static.{foreign_override.STATIC_NAME}]",
+            )
+        with self.assertRaises(tomllib.TOMLDecodeError):
+            tomllib.loads(collapsed)
+        # **And the module refuses it too, without needing tomllib.** 22.04's
+        # container has Python 3.10 and no `tomllib`, so the native check is the
+        # one that has to hold everywhere.
+        with self.assertRaises(foreign_override.OverrideError) as caught:
+            foreign_override.assert_only_stamps_changed(SHIPPED, collapsed)
+        self.assertIn("already", str(caught.exception))
+
+
+class TheOverrideIsACompleteOrRefusedTest(unittest.TestCase):
     """The inputs it refuses, because each is a cell that would fail for a reason
     the evidence document would not describe."""
 

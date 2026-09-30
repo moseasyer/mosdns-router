@@ -27,6 +27,7 @@ of the three is a way for a run to report something it did not do.
 """
 
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -169,6 +170,98 @@ class ScenarioRegistryTest(EntryPoint):
             "naming no scenario must not run a package-backed one a fake podman cannot satisfy; "
             f"the scenarios a flag-free run covers are {run.SCENARIO_NAMES} and the one it skipped "
             f"is {sorted(set(run.PACKAGE_SCENARIOS))}",
+        )
+
+    def test_the_declared_extra_arguments_are_the_builders_own_parameters(self):
+        """**The map and the signatures, held to each other.**
+
+        `run.py` hands every builder the keyword arguments `MOCK_SCENARIO_EXTRA`
+        names for it, and every one of them is keyword-only, so a name the
+        builder does not accept is a `TypeError` at cell construction: exit 2, a
+        report that says nothing was proved about any release, and a reader sent
+        to look for a broken harness rather than a cell that never ran. That is
+        exactly what the first version of this did -- one set, every argument to
+        every member of it, so `install` was handed a `client` and `routing` an
+        `override_path`, neither of which either of them accepts.
+
+        So this is checked from both directions, by `inspect.signature` on the
+        builders themselves rather than by reading the map's comments: a name in
+        the map that no builder takes, and a builder that takes a name the map
+        does not give it. The second is the one a comment cannot catch.
+        """
+        declared = run.MOCK_SCENARIO_EXTRA
+        self.assertEqual(
+            set(declared) - set(run.SCENARIO_NAMES),
+            set(),
+            "a scenario is listed as needing an extra container and is not registered, so the "
+            "harness would start a container for a scenario that never runs",
+        )
+        for name in run.SCENARIO_NAMES:
+            with self.subTest(scenario=name):
+                parameters = inspect.signature(
+                    run._resolve_builder(name)
+                ).parameters
+                wanted = set(declared.get(name, ()))
+                missing = wanted - set(parameters)
+                self.assertEqual(
+                    missing, set(),
+                    f"the harness hands {name} {sorted(missing)} and its builder does not take "
+                    f"it, so the cell dies with a TypeError before a scenario runs",
+                )
+                # `deb` is the other conditional, and it is held by the same rule
+                # from the other end: a builder that takes it and is not in
+                # `PACKAGE_SCENARIOS` is handed nothing, and one in the set that
+                # does not take it is a `TypeError`. The case above already covers
+                # the set, so here it is only subtracted.
+                passed = set(declared.get(name, ()))
+                if name in run.PACKAGE_SCENARIOS:
+                    passed.add("deb")
+                # The parameters every builder takes, so what is left is a
+                # parameter the cell's own composition forgot -- a builder that grew
+                # one the declarations do not name would be handed nothing for it
+                # and would say so, which is the property being held here.
+                common = {
+                    "podman", "version", "arch", "run_id", "router", "target",
+                    "network", "results_dir", "wait_seconds", "interval", "now", "sleep",
+                }
+                undeclared = set(parameters) - common - passed
+                self.assertEqual(
+                    undeclared, set(),
+                    f"{name}'s builder takes {sorted(undeclared)}, which the harness does not "
+                    f"pass it, so it can only ever see the default",
+                )
+
+    def test_every_extra_parameter_names_a_role_the_cell_builds_a_name_for(self):
+        # `EXTRA_PARAMETER_ROLES` is what turns a builder's parameter name into the
+        # container role the name comes from, and `foreign` -> `mock-foreign` is a
+        # mapping somebody has to have written down. A role the cell does not build
+        # a name for is a `KeyError` at cell construction, and a parameter with no
+        # entry at all is one too -- so both are refusals here.
+        built = {
+            "mock-router", "target", "mock-foreign", "client",
+        }
+        self.assertEqual(
+            set(run.EXTRA_PARAMETER_ROLES.values()) - built, set(),
+            "an extra parameter names a role the cell does not build a container name for",
+        )
+        for scenario, parameters in run.MOCK_SCENARIO_EXTRA.items():
+            for parameter in parameters:
+                if parameter == "override_path":
+                    continue
+                self.assertIn(
+                    parameter, run.EXTRA_PARAMETER_ROLES,
+                    f"{scenario} is handed {parameter!r} and the role map has no entry for it, "
+                    f"so the cell looks the name up under a key that is not there",
+                )
+        # And the two flags the cell starts containers from are the same map, so a
+        # scenario that needs the client cannot be served a cell without one.
+        self.assertEqual(
+            {name for name, extra in run.MOCK_SCENARIO_EXTRA.items() if "client" in extra},
+            {"routing"},
+        )
+        self.assertEqual(
+            {name for name, extra in run.MOCK_SCENARIO_EXTRA.items() if "foreign" in extra},
+            {"install", "routing"},
         )
 
     def test_the_package_backed_scenarios_are_the_ones_that_need_the_package(self):

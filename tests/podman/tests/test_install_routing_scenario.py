@@ -75,6 +75,11 @@ routing = _load_scenario("routing_test")
 DOMESTIC_LISTENER = routing.MOCK_ROUTER_ADDRESS
 FOREIGN_LISTENER = routing.MOCK_FOREIGN_ADDRESS
 CLIENT_ADDRESS = routing.CLIENT_ADDRESS
+# The target's own address on the private network, and the address a client
+# container would have to ask to reach the target's resolver. Read out of the
+# scenario rather than typed, so the listener table this file's fixture writes
+# cannot be about a different address than the one the scenario asks for.
+TARGET_ADDRESS = routing.TARGET_ADDRESS
 
 
 def counters_document(**counts):
@@ -175,6 +180,20 @@ def routing_rules(**overrides):
     answers["domestic_queries"] = overrides.pop("domestic_queries", 2)
     answers.update(overrides)
     return [
+        # -- the target's own listener table ---------------------------------
+        # Read before the queries, and the refusal that hangs on it is in
+        # `TheClientCannotReachALoopbackOnlyRouterTest`. **The default answer has
+        # the target's bridge address bound**, so the table does not turn every
+        # case in this file into that one: a case that wants the loopback-only
+        # shape says so, and the rest of this suite is about the counters.
+        {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+         "stdout": (
+             "tcp   LISTEN 0      128       127.0.0.1:53        0.0.0.0:*\n"
+             "tcp   LISTEN 0      128       127.0.0.1:15353     0.0.0.0:*\n"
+             "udp   UNCONN 0      0         127.0.0.1:53        0.0.0.0:*\n"
+             "udp   UNCONN 0      0         127.0.0.1:15353     0.0.0.0:*\n"
+             f"tcp   LISTEN 0      128       {TARGET_ADDRESS}:53       0.0.0.0:*\n"
+         )},
         # -- the client's resolver, which is the whole of "the answer came
         # through the target" for a client on the same bridge --------------
         {"match": ["exec", CLIENT, "cat", "/etc/resolv.conf"],
@@ -242,6 +261,85 @@ class RoutingScenarioHarness(PodmanTestCase):
             for argv in fake.invocations()
             if argv[:2] == ["exec", container]
         ]
+
+
+class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
+    """**The plan's client half cannot be measured, and the reason is the
+    package's own headline property.**
+
+    Task 4 Step 6 says "from a separate client container **and** from inside the
+    target, query China-set and foreign test names". The second vantage point
+    works: a query asked inside the target of 127.0.0.1:53 goes down the domestic
+    branch to the mock router and down the foreign branch to the mock foreign
+    resolver, and both listeners' counters move.
+
+    The first cannot. `configs/mosdns.yaml` listens on `127.0.0.1:53` and nothing
+    else, and the package's own Description says it: "The router binds 127.0.0.1:53
+    and the resolver 127.0.0.1:15353, on UDP and TCP, **and nothing else; no
+    listener in this package is reachable from another host**". A client container
+    on the bridge cannot `dig @10.89.0.10 -p 53` anything, because nothing is
+    bound to 10.89.0.10.
+
+    MEASURED, 24.04 and 26.04, Task 4 Step 7:
+
+        answers: {"client/domestic/tcp": "(not readable: 'podman exec
+                  mosdns-…-client-24.04 sh -c dig +short +tcp @10.89.0.10 -p 53
+                  probe.0033.cn' exited 9)", …}
+
+    `exited 9` is `dig`'s "no reply from server", on all four client queries.
+
+    So the scenario does not wait out its whole budget to report a symptom. It
+    reads the target's own listener table first and, when nothing is bound to the
+    bridge address, refuses **naming this**: the finding is that Step 6's client
+    half and the package's loopback-only property cannot both hold, and a reader
+    needs that sentence rather than a 60-second timeout followed by "the mock
+    router's query log does not carry a query", which is what the first version
+    produced.
+    """
+
+    LISTENERS_LOOPBACK_ONLY = (
+        "tcp   LISTEN 0      128       127.0.0.1:53        0.0.0.0:*\n"
+        "tcp   LISTEN 0      128       127.0.0.1:15353     0.0.0.0:*\n"
+        "udp   UNCONN 0      0         127.0.0.1:53        0.0.0.0:*\n"
+        "udp   UNCONN 0      0         127.0.0.1:15353     0.0.0.0:*\n"
+    )
+    LISTENERS_ON_THE_BRIDGE = LISTENERS_LOOPBACK_ONLY + (
+        "tcp   LISTEN 0      128       10.89.0.10:53       0.0.0.0:*\n"
+    )
+
+    def test_a_router_bound_to_loopback_only_is_refused_and_says_why(self):
+        _fake, result = self.run_scenario(
+            rules=[
+                {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+                 "stdout": self.LISTENERS_LOOPBACK_ONLY},
+            ] + routing_rules(),
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("reachable from another host", result.detail)
+        self.assertIn("cannot be measured", result.detail)
+        self.assertIn(TARGET_ADDRESS, result.detail)
+        self.assertIn(f"nothing is bound to {TARGET_ADDRESS}:53", result.detail)
+        # And the listener table is in the evidence, because a reader who doubts
+        # the refusal needs the reading the refusal is based on.
+        record = self.record(result)
+        self.assertIn("127.0.0.1:53", record["target_listeners"])
+        self.assertNotIn(TARGET_ADDRESS, record["target_listeners"])
+
+    def test_a_router_also_bound_to_the_bridge_address_is_not_refused_for_that(self):
+        # The control: the refusal is about the BINDING, not about the client. A
+        # cell whose router does listen on the bridge address -- which is a
+        # configuration this project does not ship, and which the plan's Task 4
+        # Step 3 forbids -- must get past this check and on to the counters, or
+        # the case is a statement about the container rather than about the
+        # binding.
+        _fake, result = self.run_scenario(
+            rules=[
+                {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+                 "stdout": self.LISTENERS_ON_THE_BRIDGE},
+            ] + routing_rules(),
+        )
+        self.assertEqual(result.status, "passed", result.detail)
+        self.assertIn(TARGET_ADDRESS, self.record(result)["target_listeners"])
 
 
 class RoutingScenarioTest(RoutingScenarioHarness):
@@ -487,6 +585,40 @@ class RoutingScenarioShapeTest(unittest.TestCase):
     def test_the_scenario_is_registered_under_this_name(self):
         registry = (HARNESS / "run.py").read_text(encoding="utf-8")
         self.assertIn('"routing": "routing_test:build_scenario"', registry)
+
+    def test_the_image_publishes_the_address_this_scenario_dials(self):
+        """**The address the foreign mock's stamp names is the one the client dials.**
+
+        MEASURED, and it cost a matrix run on all three releases. The mock binds
+        `0.0.0.0:443` so it answers on whatever address the private network gave
+        it, and its first version built the DNSCrypt stamp from that bind address.
+        The stamp therefore named `0.0.0.0:443`, which the client resolves to
+        *itself*: `dnscrypt-proxy` in the target dialled the target's own port 443,
+        got nothing, and the install transaction refused at its own barrier with
+
+            dnscrypt-proxy.service was started but nothing answered a DNS query at
+            127.0.0.1:15353 within 60s
+
+        -- a sentence about a resolver that says nothing about an address nobody
+        could have dialled.
+
+        So the image names the address separately (`--address`), and this case holds
+        that name equal to the address the scenario dials: two spellings of one fact
+        in two files, which is exactly the shape that produced the failure.
+        """
+        text = (SCENARIOS / ".." / "images" / "mock-foreign.Containerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'"--address={FOREIGN_LISTENER}:443"', text,
+            f"the foreign mock's image does not name {FOREIGN_LISTENER}:443 as the address its "
+            f"stamp carries, so the stamp names whatever the container binds",
+        )
+        self.assertIn(
+            '"--listen=0.0.0.0:443"', text,
+            "and the bind address is the unspecified one on purpose: it is the address the "
+            "container listens on, not the one a client dials",
+        )
 
     def test_the_two_listeners_are_different_addresses(self):
         """The premise, held here so a later edit moving them onto one address is

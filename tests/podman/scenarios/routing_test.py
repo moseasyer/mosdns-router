@@ -423,6 +423,46 @@ def build_scenario(
                 "measured a different configuration",
             )
 
+            # -- 1b. whether a client container can ask the target at all ----
+            # **This project ships a router that binds `127.0.0.1:53` and nothing
+            # else, and its own package Description says so: "no listener in this
+            # package is reachable from another host".** So a client container on
+            # this bridge cannot ask the target anything -- `dig @10.89.0.10 -p 53`
+            # is `exited 9`, "no reply from server", because nothing is bound to
+            # that address. MEASURED on 24.04 and 26.04.
+            #
+            # The plan's Task 4 Step 6 asks for the client vantage point as well as
+            # the target's, and the two cannot both hold against a loopback-only
+            # router. That is a finding, not something to work around by binding a
+            # port this project refuses to expose -- and it is read from the
+            # target's own listener table rather than inferred from a timeout, so
+            # the cell is refused with the sentence a reader needs rather than
+            # with "the mock router's query log does not carry a query" sixty
+            # seconds later.
+            document["target_listeners"] = try_read(
+                "sh", "-c", "ss -lntup 2>/dev/null || true"
+            )[:4000]
+            _require(
+                f"{TARGET_ADDRESS}:53" in document["target_listeners"],
+                f"nothing is bound to {TARGET_ADDRESS}:53 in {target}, so a client container on "
+                f"this run's private network cannot ask the target's resolver anything -- and "
+                f"this project's own router does not bind it. `configs/mosdns.yaml` listens on "
+                f"127.0.0.1:53 and nothing else, and the package's Description says 'no listener "
+                f"in this package is reachable from another host'.\n"
+                f"So the CLIENT vantage point of the plan's Task 4 Step 6 -- 'from a separate "
+                f"client container AND from inside the target' -- cannot be measured against the "
+                f"configuration this project ships: `dig @{TARGET_ADDRESS} -p 53` is `exited 9` "
+                f"('no reply from server') on every query, MEASURED on 24.04 and 26.04.\n"
+                f"The queries asked from INSIDE the target do exercise both branches and do move "
+                f"both listeners' counters, so the split is measurable from one vantage point "
+                f"rather than two. Measuring the second would mean binding a listener this "
+                f"project's own packaging refuses to expose, and the plan's Task 4 Step 3 asks "
+                f"for loopback listeners only -- so the two requirements contradict each other "
+                f"and the resolution belongs to the plan, not to this scenario.\n"
+                f"The target's own listener table, which is what this refusal is based on:\n"
+                f"{document['target_listeners']}",
+            )
+
             # -- 2. the two names, and which branch each must reach ---------
             # The China name is read out of the *published* list, so it is a name
             # this project's own configuration routes domestically. A literal here
