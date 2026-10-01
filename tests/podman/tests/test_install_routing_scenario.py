@@ -138,6 +138,22 @@ _PUBLISHED_ENTRIES = frozenset(
 )
 
 
+
+def dnsmasq_query_line(name, client=None, query_type="A"):
+    """One `log-queries` line in the shape dnsmasq 2.91 really prints.
+
+    **The first version of this fixture was a syslog line** --
+    `Sep 30 20:00:00 mosdns-mock-router 10.89.0.2 probe.example.cn is 192.168.123.53`
+    -- which is the shape `router_queries` used to parse and the shape this dnsmasq
+    never prints: a container has no syslog, which is the only reason
+    `log-facility=-` is set, so there is no timestamp and no hostname. So the
+    fixture and the parser agreed with each other and neither agreed with dnsmasq,
+    and the cell counted the word `error` on a live run. MEASURED, run
+    `20261001T003319Z`; this helper's output is copied from it.
+    """
+    return f"dnsmasq[1]: query[{query_type}] {name} from {client or DOMESTIC_LISTENER}"
+
+
 def routing_rules(**overrides):
     """Every answer a cell whose two branches are distinguishable needs.
 
@@ -169,10 +185,21 @@ def routing_rules(**overrides):
         # a startup line cannot satisfy the domestic count -- and the first version
         # of `router_queries` read the fields positionally, counted nothing, and the
         # only symptom was a cell that waited out its whole budget.
-        "router_log": (
-            f"Sep 30 20:00:00 mosdns-mock-router {DOMESTIC_LISTENER} {CHINA_NAME} is "
-            f"{routing.DOMESTIC_ANSWER}\n"
-        ),
+        # **Two lines, one per transport, in the shape dnsmasq prints.** The
+        # answer dnsmasq gives this name is REFUSED (it has no upstream), and it
+        # prints that on a SEPARATE line that carries no name -- which is why the
+        # old parser read the word `error` and why this parser recognises the
+        # `query[...]` line instead.
+        "router_log": "\n".join(
+            [
+                "dnsmasq[1]: started, version 2.91 cachesize 150",
+                "dnsmasq[1]: warning: no upstream servers configured",
+                dnsmasq_query_line(CHINA_NAME),
+                "dnsmasq[1]: config error is REFUSED (EDE: not ready)",
+                dnsmasq_query_line(CHINA_NAME),
+                "dnsmasq[1]: config error is REFUSED (EDE: not ready)",
+            ]
+        ) + "\n",
         "answer": "198.51.100.7",
     }
     # The domestic mock is the DHCP/DNS router, whose evidence is its own log
@@ -881,8 +908,8 @@ class TheCountersAreTheMeasurementTest(RoutingScenarioHarness):
     def test_a_foreign_name_that_reached_the_domestic_listener_is_refused(self):
         _fake, result = self.run_scenario(
             router_log=(
-                f"Sep 30 20:00:00 mosdns-mock-router {DOMESTIC_LISTENER} {FOREIGN_NAME} is "
-                f"{routing.DOMESTIC_ANSWER}\n"
+                dnsmasq_query_line(FOREIGN_NAME)
+                + "\ndnsmasq[1]: config error is REFUSED (EDE: not ready)\n"
             )
         )
         self.assertEqual(result.status, "failed")
@@ -928,8 +955,8 @@ class TheCountersAreTheMeasurementTest(RoutingScenarioHarness):
                 **{f"{FOREIGN_NAME}/udp": 1, f"{FOREIGN_NAME}/tcp": 1, f"{CHINA_NAME}/tcp": 1},
             ),
             router_log=(
-                f"Sep 30 20:00:00 mosdns-mock-router {DOMESTIC_LISTENER} {FOREIGN_NAME} is "
-                f"{routing.DOMESTIC_ANSWER}\n"
+                dnsmasq_query_line(FOREIGN_NAME)
+                + "\ndnsmasq[1]: config error is REFUSED (EDE: not ready)\n"
             ),
         )
         self.assertEqual(result.status, "failed")
@@ -986,6 +1013,221 @@ def _dig_invocations(tree: ast.AST) -> list[tuple[str, str]]:
             found.append((f"line {node.lineno}", rendered))
     return found
 
+
+class TheDomesticCounterIsCountedFromTheLinesDnsmasqWritesTest(unittest.TestCase):
+    """**`router_queries` counted the word `error`, six times, and called it a
+    routing result.**
+
+    MEASURED, run `20261001T003319Z`, 24.04, with the two defects of this round's
+    first half already fixed (`log-queries` set, and the log read through the
+    reader that sees stderr). The mock router's log is now readable, and it says:
+
+    ```text
+    dnsmasq[1]: query[A] probe.0033.cn from 10.89.0.168
+    dnsmasq[1]: config error is REFUSED (EDE: not ready)
+    dnsmasq[1]: query[A] probe.0033.cn from 10.89.0.168
+    dnsmasq[1]: config error is REFUSED (EDE: not ready)
+    ```
+
+    **The China-set name reached the mock router, twice — one per transport.** The
+    domestic branch works. And the cell reported
+
+    ```text
+    routing: the mock router's log carries no query for the China-set name
+    'probe.0033.cn', so the domestic branch was not exercised. Its counted names
+    are: ['error']
+    ```
+
+    because `router_queries` recognises a query by a `reply to` marker and reads
+    the name as the field before it, and dnsmasq 2.91's `log-queries` **writes the
+    answer on a separate line that carries no name at all**:
+
+    ```text
+    query[A] probe.0033.cn from 10.89.0.168     <- the query: name and client
+    config error is REFUSED (EDE: not ready)    <- the answer: no name, no client
+    ```
+
+    So the marker `is REFUSED` matched on the *answer* line and the field before
+    it was the word `error`. Six such lines across the cell — four
+    `api.cloudflare.com` and two `probe.0033.cn` — and the count came out
+    `{"error": 6}`.
+
+    The docstring documents the *wrong* shape, quoting a syslog-with-facility line
+    (`Sep 30 20:00:00 hostname 10.89.0.10 probe.example.cn is 10.89.0.2`) that this
+    dnsmasq, in a container with `log-facility=-`, never prints. So the parser was
+    written against a line a fixture invented -- the same class as the bridge's
+    bare-address fixtures and the `ActiveState` rule that matched nothing, and the
+    third time in this project that **the harness's own evidence has been a
+    fixture agreeing with a parser and neither agreeing with the program**.
+
+    And the failure is the worst kind: it is a **routing result**. The refusal says
+    "the domestic branch was not exercised", names the name it looked for, and
+    calls what it found "counted names". A reader has no way to know that the
+    split was measured correctly two lines above.
+    """
+
+    # The lines, verbatim from run 20261001T003319Z's 24.04 cell. Trimmed of the
+    # DHCP exchange and dnsmasq's banner, and left otherwise untouched -- the
+    # whole defect is in these exact characters.
+    REAL_LOG = "\n".join(
+        [
+            "dnsmasq[1]: started, version 2.91 cachesize 150",
+            "dnsmasq[1]: warning: no upstream servers configured",
+            "dnsmasq-dhcp[1]: DHCP, IP range 10.89.0.100 -- 10.89.0.199, lease time 5m",
+            "dnsmasq-dhcp[1]: 2249392984 DHCPDISCOVER(eth0) b6:68:81:b7:90:a0 ",
+            "dnsmasq-dhcp[1]: 2249392984 DHCPACK(eth0) 10.89.0.168 b6:68:81:b7:90:a0 dd64d35d826a",
+            "dnsmasq-dhcp[1]: 2249392984 sent size:  4 option:  6 dns-server  10.89.0.2",
+            "dnsmasq-dhcp[1]: 2249392984 DHCPACK(eth0) 10.89.0.168 b6:68:81:b7:90:a0 dd64d35d826a",
+            "dnsmasq[1]: query[AAAA] api.cloudflare.com from 10.89.0.168",
+            "dnsmasq[1]: config error is REFUSED (EDE: not ready)",
+            "dnsmasq[1]: query[A] api.cloudflare.com from 10.89.0.168",
+            "dnsmasq[1]: config error is REFUSED (EDE: not ready)",
+            "dnsmasq[1]: query[A] probe.0033.cn from 10.89.0.168",
+            "dnsmasq[1]: config error is REFUSED (EDE: not ready)",
+            "dnsmasq[1]: query[A] probe.0033.cn from 10.89.0.168",
+            "dnsmasq[1]: config error is REFUSED (EDE: not ready)",
+        ]
+    )
+
+    def counts(self, log=None):
+        return routing.router_queries(self.REAL_LOG if log is None else log)
+
+    def test_the_china_name_is_counted_twice_from_the_lines_dnsmasq_really_writes(self):
+        """The whole of it, on the log the cell actually produced.
+
+        Two lines for one name is the shape the plan's "Repeat over UDP and TCP"
+        produces at this listener, so the count of two is not a detail: it is the
+        evidence that both transports reached the domestic upstream. At this
+        listener that evidence is the *count* and not a per-transport split --
+        dnsmasq's `log-queries` records the query type and not the transport --
+        and `test_the_domestic_counter_says_it_cannot_see_a_transport` holds that
+        the record says so rather than implying a split it does not have.
+        """
+        self.assertEqual(
+            self.counts().get("probe.0033.cn"), 2,
+            "the China-set name reached the mock router twice in the cell's own log and the "
+            "counter does not see it. The measured log is in this case's docstring; the parser "
+            "recognises a query by an answer-side marker that this dnsmasq writes on a separate "
+            "line carrying no name, so it reads the word before `is REFUSED` as the name",
+        )
+
+    def test_a_name_nobody_asked_about_is_absent(self):
+        """The other half, and it is the half that makes the count worth having.
+
+        `api.cloudflare.com` is in the log because the install's list refresh asked
+        the mock router directly. A parser that counted everything would put it in
+        the same document as the routing measurement, and the cell's assertion that
+        the **foreign** name is absent from the domestic listener would then be
+        asserting against a document that mixes the install's own questions in.
+        """
+        counts = self.counts()
+        self.assertEqual(counts.get("api.cloudflare.com"), 2)
+        self.assertNotIn(
+            "foreign-routing.test", counts,
+            "a name the foreign branch asked for is in the domestic listener's log, so the split "
+            "is broken and this parser is counting something other than what reached it",
+        )
+
+    def test_no_dhcp_line_and_no_banner_line_is_counted_as_a_query(self):
+        """A DHCP exchange is not a DNS query, and the banner is not anything.
+
+        The old parser's `marker < 1` guard was doing this job by accident, on a
+        shape that never occurred. On the real shape the recognition is `query[`,
+        which cannot match `DHCPDISCOVER(eth0)` or `DHCPACK(eth0)` or
+        `sent size: 4 option: 6 dns-server 10.89.0.2` -- and the last of those is
+        the dangerous one, because it is a line about a **DNS server address** and
+        a positional parser would read `dns-server` as a name.
+        """
+        counts = self.counts()
+        for name in ("dhcpdiscover(eth0)", "dhcpack(eth0)", "dhcp,", "dns-server", "started,", "warning:"):
+            with self.subTest(name=name):
+                self.assertNotIn(
+                    name, counts,
+                    "a line that is not a DNS query was counted as one. dnsmasq's `log-dhcp` "
+                    "prints `sent size: 4 option: 6 dns-server 10.89.0.2`, which is a line about "
+                    "a DNS server ADDRESS and the closest thing in this log to a query line",
+                )
+        self.assertEqual(sum(counts.values()), 4, "the four DNS query lines are the whole of it")
+
+    def test_the_parser_documents_the_shape_this_dnsmasq_prints(self):
+        """**The docstring is what the next reader implements from.**
+
+        The old one quoted
+        `Sep 30 20:00:00 hostname 10.89.0.10 probe.example.cn is 10.89.0.2` -- a
+        syslog line with a hostname and a client address in front of the name --
+        and dnsmasq in a container with `log-facility=-` prints neither. So the
+        documented shape and the real shape disagreed, and the parser followed the
+        documentation because the documentation was the only shape anyone had
+        written down.
+        """
+        doc = routing.router_queries.__doc__ or ""
+        self.assertIn(
+            "query[", doc,
+            "the parser's docstring does not name the `query[` line this dnsmasq prints, so the "
+            "shape it documents is not the shape the mock writes",
+        )
+        # **The check is on the CLAIM, not on the string**, and for the reason the
+        # plan's `dhcp-option` case uses: the correction is allowed to quote the
+        # line it is correcting, because a reader who remembers
+        # `Sep 30 20:00:00 hostname 10.89.0.10 …` and finds nothing saying it is
+        # wrong learns nothing from the absence. What has to be there is the
+        # sentence saying a container prints no such line -- and what must NOT be
+        # there is a parser that still recognises an answer-side marker, which is
+        # the mechanical half of the same claim.
+        self.assertIn(
+            "never prints",
+            doc,
+            "the parser's docstring quotes the syslog line it used to be written against but does "
+            "not say that a container with `log-facility=-` never prints one, so a reader cannot "
+            "tell which of the two quoted shapes this parser implements",
+        )
+
+
+    def test_a_queried_name_is_normalised_so_the_set_can_be_compared_with_it(self):
+        """Case and the trailing dot, because the China set is compared with this count.
+
+        `matches_china_set` lowercases and strips a trailing dot from the name it
+        is asked about, and the published list carries `domain:0033.cn`. So a
+        counter that returned `probe.0033.cn.` would compare unequal to a set
+        entry built the other way, and the cell would refuse a split it had
+        measured. dnsmasq echoes the name as it arrived, which for a query with a
+        trailing dot has one, and for a randomised-case query is mixed.
+        """
+        for asked in ("probe.0033.cn", "probe.0033.cn.", "PROBE.0033.CN", "Probe.0033.Cn."):
+            with self.subTest(asked=asked):
+                counts = routing.router_queries(f"dnsmasq[1]: query[A] {asked} from 10.89.0.168")
+                self.assertEqual(
+                    list(counts), ["probe.0033.cn"],
+                    f"the name {asked!r} was counted as something that cannot be compared with "
+                    f"the published China set",
+                )
+
+    def test_the_count_says_it_cannot_see_a_transport(self):
+        """**And the record has to admit the domestic counter is not per-transport.**
+
+        The plan asks for per-name counters at both listeners and for the repeat
+        over UDP and TCP. At the foreign listener the mock publishes
+        `{name: {udp: n, tcp: m}}` and both are there. At the domestic one
+        dnsmasq records `query[<TYPE>] <name> from <client>` and **no transport at
+        all** -- the plan's "Repeat over UDP and TCP" is visible here only as a
+        count of two. So the record says that, rather than carrying a number that
+        reads as a per-transport split it is not, and the foreign side is left as
+        the one that has it.
+        """
+        source = (SCENARIOS / "routing_test.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "domestic_counters_transport",
+            source,
+            "the record never says that the domestic counter cannot distinguish UDP from TCP, so a "
+            "reader comparing the two listeners' documents would compare a per-name count against "
+            "a per-transport one and conclude the domestic side is missing half the measurement",
+        )
+        self.assertIn(
+            "no transport",
+            source,
+            "the record does not say in words why the domestic side has no per-transport split, so "
+            "the field is a name and not an explanation",
+        )
 
 class ThePlanAgreesWithTheRoutingCellTest(unittest.TestCase):
     """**The plan is the file a reader of the diff alone sees, so the amendment
