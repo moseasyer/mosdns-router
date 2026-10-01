@@ -181,6 +181,15 @@ CHINA_TEST_NAME = "(read from the published China list)"
 # It is kept as a name rather than deleted because a reader of the evidence document
 # needs to know what the domestic side was NOT allowed to answer, and because the
 # dnsmasq log line a query produces carries an address column.
+# **The only transport the foreign listener can ever see from this cell**, because
+# the foreign branch's forward is configured as `tcp://127.0.0.1:15353` in
+# `configs/mosdns.yaml`. MEASURED on 24.04 and on the plan's own document: a
+# client query over UDP and one over TCP both arrive at mosdns on their own
+# transport and both leave it over TCP. So this is not a default -- it is the
+# transport the shipped configuration sends, and a scenario that required a UDP
+# count here would be requiring something the router cannot do.
+FOREIGN_TRANSPORT = "tcp"
+
 FOREIGN_ANSWER = "198.51.100.7"
 DOMESTIC_ANSWER = "192.168.123.53"
 
@@ -836,6 +845,17 @@ def build_scenario(
             # other's pair would read as though the domestic half were missing,
             # and a reader has to be able to see the difference from the document
             # rather than infer it.
+            document["foreign_counters_transport"] = (
+                "NOT what the router was asked: the foreign branch is configured to forward "
+                "over TCP only (`foreign_upstream: tcp://127.0.0.1:15353` in "
+                "configs/mosdns.yaml), so a client query over UDP and one over TCP both leave "
+                "this router over TCP and the foreign listener can only ever see TCP from "
+                "this cell. The split it publishes is therefore a measure of how many times "
+                "dnscrypt-proxy's own cache missed -- and dnscrypt-proxy caches, so a second "
+                "identical question is answered without arriving at all. MEASURED, run "
+                "20261001T003952Z on 24.04: `foreign-routing.test` counted tcp=1 with BOTH "
+                "transports asked and both answers carrying the foreign branch's address."
+            )
             document["domestic_counters_transport"] = (
                 "not observable: dnsmasq's log-queries records query[<TYPE>] <name> "
                 "from <client> and carries no transport, so the repeat over UDP and TCP is "
@@ -881,18 +901,58 @@ def build_scenario(
                 "machine still resolves either way, which is why the counters and not the "
                 "answers are what this scenario asserts",
             )
+            # **The foreign listener is required to have been ASKED, and the
+            # requirement is deliberately NOT per transport.** MEASURED, run
+            # `20261001T003952Z` on 24.04 with everything else in this round
+            # working:
+            #
+            #     answers        = {"target/foreign/udp": "198.51.100.7",
+            #                       "target/foreign/tcp": "198.51.100.7"}
+            #     foreign_counters = {"foreign-routing.test": {"tcp": 1}, ...}
+            #
+            # Both foreign-branch answers carried the foreign branch's address and
+            # the mock counted one arrival, over TCP. Two measured facts, and
+            # neither is about a transport:
+            #
+            #   * **the router forwards the foreign branch over TCP** --
+            #     `configs/mosdns.yaml` says `foreign_upstream:
+            #     tcp://127.0.0.1:15353` and `addr: tcp://127.0.0.1:15353`, so a
+            #     `dig` over UDP and a `dig +tcp` from a client both arrive at
+            #     mosdns on their own transport and both leave it over TCP, and
+            #     the foreign listener can only ever see TCP from here;
+            #   * **dnscrypt-proxy caches**, so the second query was answered
+            #     without arriving.
+            #
+            # So requiring a UDP count here was requiring a **cache miss**: it
+            # would pass or fail with the resolver's cache state and with nothing
+            # about this project's routing, and the sentence it produced named the
+            # transport -- so a reader who believed it would go looking for a
+            # router that ignored UDP. What is required instead is that the
+            # foreign listener was asked about the foreign name at all, and the
+            # per-transport split at the DOMESTIC listener is the one that
+            # corresponds to what the router was asked: a count of two for one
+            # name, one question per transport.
             _require(
-                document["foreign_counters"].get(foreign_name, {}).get("udp", 0) >= 1,
-                f"the mock foreign resolver counted no UDP query for {foreign_name!r}, so the "
-                "foreign branch was not exercised over UDP. It counted "
-                f"{sorted(document['foreign_counters'])}",
+                sum(document["foreign_counters"].get(foreign_name, {}).values()) >= 1,
+                f"the mock foreign resolver never reached the foreign listener for "
+                f"{foreign_name!r}, so the foreign branch never reached it and nothing here was "
+                f"measured about that branch. It counted {sorted(document['foreign_counters'])} "
+                f"and the foreign answers were "
+                f"{ {key: value for key, value in answers.items() if '/foreign/' in key} }",
             )
+            # **And the arrivals must be TCP, because the configured forward is
+            # TCP.** This is the control the relaxed requirement needs: the point
+            # is not "any count will do", it is "the count that corresponds to
+            # what this router is configured to send". A UDP arrival here means
+            # something other than `tcp://127.0.0.1:15353` reached the listener.
             _require(
-                document["foreign_counters"].get(foreign_name, {}).get("tcp", 0) >= 1,
-                f"the mock foreign resolver counted no TCP query for {foreign_name!r}. The "
-                "plan's Step 6 asks for the repeat over UDP and TCP, and a cell that asked "
-                "only UDP would resolve every name it asked -- so a name that arrived over "
-                f"UDP alone fails here. It counted {document['foreign_counters']}",
+                document["foreign_counters"].get(foreign_name, {}).get("udp", 0) == 0,
+                f"the mock foreign resolver counted {document['foreign_counters'][foreign_name]} "
+                f"for {foreign_name!r}, so it saw a UDP query from this cell. The foreign "
+                "branch's forward is configured as `tcp://127.0.0.1:15353` in "
+                "`configs/mosdns.yaml`, so every arrival this router causes is TCP and a UDP "
+                "arrival came from something else -- a different listener, a different path, or "
+                "a resolver that is not the one the router is configured to use",
             )
             _require(
                 foreign_name not in document["domestic_counters"],
@@ -1052,6 +1112,7 @@ __all__ = [
     "DOMESTIC_ANSWER",
     "FOREIGN_ANSWER",
     "FOREIGN_TEST_NAME",
+    "FOREIGN_TRANSPORT",
     "MOCK_FOREIGN_ADDRESS",
     "MOCK_ROUTER_ADDRESS",
     "CLIENT_VANTAGE_POINT_REASON",

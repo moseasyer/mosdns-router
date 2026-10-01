@@ -176,13 +176,22 @@ def routing_rules(**overrides):
         # split: the China name at the domestic listener only, the foreign name
         # at the foreign one only.
         "domestic": counters_document(),
+        # **TCP ONLY, and that is what the cell measures.** The foreign branch's
+        # forward is `tcp://127.0.0.1:15353`, so every arrival the foreign
+        # listener sees from this router is TCP -- and this fixture used to claim
+        # a UDP count as well, which the scenario then *required*, so the fixture
+        # and the assertion agreed with each other and neither agreed with the
+        # configuration. MEASURED, run `20261001T003952Z`: `foreign-routing.test`
+        # counted `tcp: 1` with both transports asked of the router and both
+        # answers carrying the foreign branch's address.
         "foreign": counters_document(
-            **{f"{FOREIGN_NAME}/udp": 1, f"{FOREIGN_NAME}/tcp": 1},
+            **{f"{FOREIGN_NAME}/tcp": 1},
         ),
-        # A dnsmasq `log-queries` line, in the shape dnsmasq(1) documents:
-        # `<timestamp> <hostname> <client> <name> is <answer>`. The marker between
-        # the name and the answer is what makes the line a query, so a DHCP line or
-        # a startup line cannot satisfy the domestic count -- and the first version
+        # A dnsmasq `log-queries` line, in the shape dnsmasq 2.91 prints with
+        # `log-facility=-`: `dnsmasq[1]: query[A] <name> from <client>`, with the
+        # answer on a SEPARATE line that carries no name. The bracketed token in
+        # the second field is what makes the line a query, so a DHCP line or a
+        # startup line cannot satisfy the domestic count -- and the first version
         # of `router_queries` read the fields positionally, counted nothing, and the
         # only symptom was a cell that waited out its whole budget.
         # **Two lines, one per transport, in the shape dnsmasq prints.** The
@@ -408,10 +417,20 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
             record["domestic_counters"].get(CHINA_NAME, 0), 1,
             f"the domestic listener never saw the China name: {record['domestic_counters']}",
         )
+        # The foreign branch's forward is TCP, so the arrival is TCP and both
+        # transports are checked by their ANSWERS instead -- both of which carry
+        # the foreign branch's address. See
+        # `test_both_transports_reached_the_foreign_branch_and_arrivals_were_tcp`.
+        self.assertEqual(
+            record["foreign_counters"].get(FOREIGN_NAME), {routing.FOREIGN_TRANSPORT: 1},
+            f"the foreign listener did not count the one TCP arrival a working foreign branch "
+            f"produces: {record['foreign_counters']}",
+        )
         for transport in ("udp", "tcp"):
-            self.assertGreaterEqual(
-                record["foreign_counters"].get(FOREIGN_NAME, {}).get(transport, 0), 1,
-                f"the foreign listener was not asked over {transport}: {record['foreign_counters']}",
+            self.assertEqual(
+                record["answers"][f"target/foreign/{transport}"], routing.FOREIGN_ANSWER,
+                f"the {transport} foreign query did not come back with the foreign branch's own "
+                f"address, so that transport did not exercise the branch",
             )
         self.assertNotIn(CHINA_NAME, record["foreign_counters"])
         self.assertNotIn(FOREIGN_NAME, record["domestic_counters"])
@@ -766,24 +785,50 @@ class RoutingScenarioTest(RoutingScenarioHarness):
         self.assertEqual(record["domestic_listener"], DOMESTIC_LISTENER)
         self.assertEqual(record["foreign_listener"], FOREIGN_LISTENER)
 
-    def test_both_transports_reached_the_foreign_listener(self):
-        """UDP and TCP, which is half of what Step 6 asks for.
+    def test_both_transports_reached_the_foreign_branch_and_arrivals_were_tcp(self):
+        """**What the plan's "Repeat over UDP and TCP" is at each listener, measured.**
 
-        Read from the mock's own counters and not from a summary the scenario
-        wrote, so a scenario that recorded "tcp: yes" without the counter having
-        moved would fail here.
+        This case used to assert a UDP count **and** a TCP count at the foreign
+        mock, on the reasoning that "TCP is not a formality in Step 6". The
+        measurement says that reasoning was inverted: the shipped configuration
+        forwards the foreign branch over `tcp://127.0.0.1:15353`, so every arrival
+        at the foreign listener is TCP and a UDP count there would mean something
+        other than the configured forward got there.
+
+        So the two transports are checked where they *are* observable:
+
+        * at the **domestic** listener, the China-set name is counted **twice** --
+          one question per transport, because nothing caches a REFUSED answer in
+          front of dnsmasq; and
+        * at the **foreign** listener, the arrival is **TCP**, and both foreign
+          answers carry the foreign branch's address.
+
+        And the per-transport evidence is required in both directions, because
+        the second one is what makes the first meaningful: a count of one would
+        pass a cell that asked one transport.
         """
         _fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
         record = self.record(result)
+        counted = record["domestic_counters"].get(CHINA_NAME, 0)
+        self.assertGreaterEqual(
+            counted, 2,
+            f"the China-set name was counted {counted} time(s) at the domestic listener. The cell "
+            f"asks it over UDP and over TCP, and nothing in front of dnsmasq caches a REFUSED "
+            f"answer, so both questions arrive and a count below two means one transport was not "
+            f"exercised end to end",
+        )
+        self.assertEqual(
+            record["foreign_counters"].get(FOREIGN_NAME), {routing.FOREIGN_TRANSPORT: 1},
+            "the foreign listener did not count exactly one TCP arrival for the foreign name. The "
+            "configured forward is TCP, so that is the shape a working foreign branch produces",
+        )
         for transport in ("udp", "tcp"):
             with self.subTest(transport=transport):
-                # Read per name and then per transport, in that order, because the
-                # document is nested that way and a flat lookup would report a
-                # missing name as a missing transport.
-                self.assertGreaterEqual(
-                    record["foreign_counters"].get(FOREIGN_NAME, {}).get(transport, 0), 1,
-                    f"the foreign listener was not asked for {FOREIGN_NAME} over {transport}; "
-                    f"it counted {record['foreign_counters']}",
+                self.assertEqual(
+                    record["answers"][f"target/foreign/{transport}"], routing.FOREIGN_ANSWER,
+                    f"the {transport} query did not come back with the foreign branch's address, so "
+                    f"that transport did not exercise the foreign branch end to end",
                 )
 
     def test_the_china_name_never_reached_the_foreign_listener(self):
@@ -915,14 +960,30 @@ class TheCountersAreTheMeasurementTest(RoutingScenarioHarness):
         self.assertEqual(result.status, "failed")
         self.assertIn(FOREIGN_NAME, result.detail)
 
-    def test_a_foreign_name_answered_only_over_udp_is_refused(self):
-        """TCP is not a formality in Step 6, and a scenario that dropped it would
-        still resolve every name it asked."""
+    def test_a_foreign_name_the_foreign_listener_saw_only_over_udp_is_refused(self):
+        """**Same assertion, restated from the measurement, and it is about the
+        configured forward rather than about a transport.**
+
+        This case used to hold "a foreign name answered only over UDP is refused",
+        with the reasoning "TCP is not a formality in Step 6". That reasoning was
+        backwards: the shipped config forwards the foreign branch over
+        `tcp://127.0.0.1:15353`, so **every** arrival at the foreign listener from
+        this router is TCP, and a UDP arrival means something other than the
+        configured forward got there. Refusing it is right; refusing it *as a
+        missing TCP count* was not, because the count that mattered is a TCP count
+        and a UDP count is a different anomaly with a different cause.
+        """
         _fake, result = self.run_scenario(
             foreign=counters_document(**{f"{FOREIGN_NAME}/udp": 2}),
         )
         self.assertEqual(result.status, "failed")
         self.assertIn("tcp", result.detail.lower())
+        self.assertIn(
+            "forward",
+            result.detail.lower(),
+            "the refusal does not say that the arrival did not come from the configured forward, "
+            "which is what a UDP arrival at this listener means",
+        )
 
     def test_a_foreign_listener_that_answered_nothing_is_refused(self):
         # The refusal comes from the WAIT, not from the count assertion: a mock
@@ -1013,6 +1074,142 @@ def _dig_invocations(tree: ast.AST) -> list[tuple[str, str]]:
             found.append((f"line {node.lineno}", rendered))
     return found
 
+
+class TheForeignCounterIsNotATransportOfTheRouterTest(RoutingScenarioHarness):
+    """**The cell required a dnscrypt-proxy cache miss and called it "the repeat
+    over UDP and TCP".**
+
+    MEASURED, run `20261001T003952Z`, 24.04, everything else in this round
+    working — the domestic counter read `{"api.cloudflare.com": 4,
+    "probe.0033.cn": 2}`, so the China-set name reached the mock router **twice**,
+    one question per transport — and the cell refused:
+
+    ```text
+    routing: the mock foreign resolver counted no UDP query for
+    'foreign-routing.test', so the foreign branch was not exercised over UDP.
+    It counted ['api.cloudflare.com', 'api.github.com', 'foreign-routing.test',
+    'install-probe.example']
+    ```
+
+    And the counters say:
+
+    ```json
+    "foreign-routing.test": { "tcp": 1 },
+    "install-probe.example": { "tcp": 2, "udp": 2 }
+    ```
+
+    **The foreign name reached the foreign listener, once, and both of the
+    foreign-branch answers carried the foreign mock's address** --
+    `answers` records `target/foreign/udp = 198.51.100.7` and
+    `target/foreign/tcp = 198.51.100.7`. So the branch worked over both
+    transports and the counter still said one of them was never asked. Two
+    measured facts explain it, and neither is about a transport:
+
+    * **The router forwards the foreign branch over TCP.** `configs/mosdns.yaml`
+      says `foreign_upstream: tcp://127.0.0.1:15353` and
+      `addr: tcp://127.0.0.1:15353`. A `dig +short` over UDP and a `dig +short
+      +tcp` from a client both arrive at mosdns on their own transport and both
+      leave it over **TCP**, so the mock foreign resolver can only ever see TCP
+      from this cell's vantage point.
+    * **dnscrypt-proxy caches.** It answered the second query itself, so the
+      second never arrived. That is what a resolver in front of a mock does, and
+      the foreign mock's per-transport counter is a measure of **how many times
+      that cache missed** -- which is why `install-probe.example`, asked by the
+      installer through the same path, shows both `tcp: 2` and `udp: 2`: something
+      in that exchange re-queried, and the cell has no account of what.
+
+    So the assertion `foreign_counters[name]["udp"] >= 1` is asserting a cache
+    miss. It would pass or fail with the resolver's cache state and with nothing
+    about this project's routing, and the message it produces names the transport
+    -- which is the most misleading sentence in this scenario, because a reader
+    who believes it would go looking for a router that ignored UDP.
+
+    **What is true and is asserted instead**, all three of it measured above:
+    the foreign name reached the foreign listener; both foreign-branch answers
+    carried the foreign branch's address; and the China-set name never reached the
+    foreign listener at all. The per-transport split at the *domestic* listener is
+    the one that does correspond to what the router was asked, and it is a count
+    of two rather than a pair.
+    """
+
+    def run_with_foreign_counted(self, counted):
+        _fake, result = self.run_scenario(
+            rules=[
+                {"match": ["sh", "-c"], "match_contains": "ss -lntup",
+                 "stdout": TheClientCannotReachALoopbackOnlyRouterTest.LISTENERS_LOOPBACK_ONLY},
+            ] + routing_rules(foreign=counters_document(**counted)),
+        )
+        return result
+
+    def test_a_foreign_name_counted_once_over_tcp_is_the_split_being_measured(self):
+        """The real cell's shape, verbatim: one TCP arrival, both transports asked."""
+        result = self.run_with_foreign_counted({f"{FOREIGN_NAME}/tcp": 1})
+        self.assertEqual(
+            result.status, "passed",
+            "the foreign branch reached the foreign listener and answered both queries with the "
+            "foreign address, and the cell refused it for a UDP arrival the router cannot make: "
+            f"{result.detail}",
+        )
+        record = self.record(result)
+        self.assertTrue(record["branches_distinguished"])
+        self.assertEqual(record["answers"]["target/foreign/udp"], routing.FOREIGN_ANSWER)
+        self.assertEqual(record["answers"]["target/foreign/tcp"], routing.FOREIGN_ANSWER)
+        # And the domestic listener saw the China name once per transport asked,
+        # which is the per-transport evidence this configuration can give.
+        self.assertGreaterEqual(record["domestic_counters"].get(CHINA_NAME, 0), 2)
+
+    def test_a_foreign_name_the_foreign_listener_never_saw_is_still_a_failure(self):
+        """The control, and it is the one that keeps the loosened requirement honest.
+
+        Requiring an arrival rather than an arrival *per transport* must not
+        become requiring nothing: a foreign branch that never reached the foreign
+        listener is the defect this counter exists to catch, and it is still
+        refused.
+        """
+        # The document carries a DIFFERENT name, so the read succeeds and the
+        # split assertion is what refuses -- rather than the wait for a
+        # counters document to carry anything at all, which is a harness refusal
+        # about the same fact and would let this case pass for the wrong reason.
+        result = self.run_with_foreign_counted({"api.github.com/tcp": 1})
+        self.assertEqual(result.status, "failed")
+        self.assertIn(FOREIGN_NAME, result.detail)
+        self.assertIn(
+            "never reached",
+            result.detail,
+            "the refusal does not say the foreign listener was never reached for that name, which "
+            "is the finding",
+        )
+
+    def test_the_record_says_the_foreign_split_measures_the_resolvers_cache(self):
+        """**And it says so in the record, not only in this file.**
+
+        A reader of the evidence document holds two numbers: the foreign mock's
+        `{name: {udp: n, tcp: m}}` and the domestic listener's plain count. The
+        first looks like a per-transport split of what the router was asked and is
+        not; the second looks like a total and is the per-transport evidence. Both
+        readings are wrong unless the document says which is which, and a reader
+        has no way to work it out from the numbers.
+        """
+        _fake, result = self.run_scenario()
+        self.assertEqual(result.status, "passed", result.detail)
+        record = self.record(result)
+        for field in ("domestic_counters_transport", "foreign_counters_transport"):
+            with self.subTest(field=field):
+                self.assertIn(
+                    field, record,
+                    "the record does not say how each listener's numbers were produced, so the two "
+                    "counters in it cannot be compared by a reader",
+                )
+        self.assertIn(
+            "cache", record["foreign_counters_transport"],
+            "the record does not say that the foreign mock's transport split measures dnscrypt-"
+            "proxy's cache misses rather than what the router was asked",
+        )
+        self.assertIn(
+            "tcp://127.0.0.1:15353", record["foreign_counters_transport"],
+            "the record does not name the configured forward, which is why only one transport "
+            "can ever appear at the foreign listener",
+        )
 
 class TheDomesticCounterIsCountedFromTheLinesDnsmasqWritesTest(unittest.TestCase):
     """**`router_queries` counted the word `error`, six times, and called it a
