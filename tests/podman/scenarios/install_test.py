@@ -419,12 +419,20 @@ def build_scenario(
         stderr to podman's stderr -- the same split `docker logs` makes -- and
         dnsmasq with `log-facility=-` logs to stderr, which is the only facility a
         container has. A reader that looked at stdout alone would report a
-        perfectly healthy mock as a silent one. (`Podman.logs` reads both and
-        joins them; this is the one place a scenario asks for a container that is
-        not the target, so it is wrapped rather than reached for.)
+        perfectly healthy mock as a silent one.
+
+        **MEASURED, 2026-10-01, and this docstring used to assert the opposite.**
+        It once said "`Podman.logs` reads both and joins them", and it did not:
+        `Podman.logs` returned `.output`, which is stdout only, so the mock
+        foreign resolver's log in this document was empty on every cell and on
+        every release -- and nothing compared it, so nothing failed.
+        `Podman.container_logs` is the reader that joins both streams, and this
+        now calls it by name rather than describing a method that did not do what
+        the description said. `Podman.logs` delegates to the same one, so the two
+        spellings cannot answer differently again.
         """
         try:
-            return podman.logs(container)
+            return podman.container_logs(container)
         except PodmanError as error:
             return f"(log not readable: {str(error).splitlines()[-1]})"
 

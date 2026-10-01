@@ -55,6 +55,8 @@ from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
+LIB = REPO / "tests" / "podman" / "lib"
+SCENARIOS = REPO / "tests" / "podman" / "scenarios"
 # The harness is used from a source checkout, so its library directory is the
 # import root. There is no installed distribution of it.
 sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
@@ -409,6 +411,169 @@ class FakePodmanBinary:
             raise AssertionError(f"expected exactly one invocation, got {invocations!r}")
         return invocations[0]
 
+
+class TheMockRouterLogIsReadableTest(unittest.TestCase):
+    """**Two readers for one thing, and the routing cell picked the one that reads
+    a stream dnsmasq never writes to.**
+
+    MEASURED, on this host, against the harness's own mock-router image and the
+    harness's own `run_container` flags:
+
+    ```text
+    $ podman logs <mock-router>            # stdout only
+    (nothing)
+    $ podman logs <mock-router> 2>&1 1>/dev/null
+    dnsmasq[1]: started, version 2.91 cachesize 150
+    dnsmasq[1]: warning: no upstream servers configured
+    dnsmasq-dhcp[1]: DHCP, IP range 10.89.0.100 -- 10.89.0.199, lease time 5m
+    ```
+
+    podman puts a container's stdout on its own stdout and its **stderr** on its
+    own stderr -- the split `docker logs` makes -- and dnsmasq with
+    `log-facility=-` logs to stderr, which is the only facility a container has.
+    So `Podman.logs()` returning `.output` is a **stdout-only** read, and it
+    returned `''` for a mock router that had in fact logged a DHCP range, a
+    version banner and three more lines.
+
+    **And `Podman.container_logs()` already gets this right, and its docstring
+    already records this exact trap**, measured on the first live 22.04 cell:
+    "`podman logs` gives a container's stdout to podman's stdout and the
+    container's stderr to podman's stderr … so a reader that found nothing here
+    would report a DORA exchange that plainly happened as a missing one." The
+    DHCP scenario calls `container_logs` and works. The routing scenario called
+    `logs` and saw an empty log on all three releases, in every cell, for the whole
+    of the task — and reported it as "the mock router's query log does not carry
+    a query".
+
+    This file's subject is therefore not `log-queries` (a harness case holds that
+    in `test_images.py`) but the **two readers**: two methods with the same name
+    for the same question, one of which is wrong, and two call sites plus three
+    docstrings that all assert the wrong one is right.
+    """
+
+    def setUp(self):
+        self.podman_source = (LIB / "podman.py").read_text(encoding="utf-8")
+        self.routing = (SCENARIOS / "routing_test.py").read_text(encoding="utf-8")
+        self.install = (SCENARIOS / "install_test.py").read_text(encoding="utf-8")
+
+    def test_there_is_one_log_reader_and_it_reads_both_streams(self):
+        """The fix is a deletion, not an addition.
+
+        Two methods called `logs` and `container_logs` answering the same
+        question differently is the defect: a caller cannot be expected to know
+        which one is right, and nothing in either name says. So `logs` delegates,
+        there is one implementation, and a caller that reaches for either spelling
+        gets the whole log.
+        """
+        self.assertIn(
+            "def logs(self, container: str) -> str:",
+            self.podman_source,
+            "the wrapper no longer has a `logs` reader, so a caller asking for one gets an "
+            "AttributeError rather than an empty string — which is at least loud. If this was "
+            "intentional, this case and the two docstrings that describe `logs` must both be "
+            "updated, and the two callers changed",
+        )
+        code = self.body_of("logs")
+        self.assertIn(
+            "container_logs(container)",
+            code,
+            "`Podman.logs` does not delegate to `container_logs`, so the two readers can still "
+            "answer the same question differently and a caller can still pick the wrong one",
+        )
+        self.assertNotIn(
+            "self.run([\"logs\", container]).output",
+            code,
+            "`Podman.logs` still reads `.output`, which is stdout only — the read that returned "
+            "an empty log for a mock router that had logged its DHCP range on stderr",
+        )
+
+    def body_of(self, method: str) -> str:
+        """One method's CODE, with its docstring removed.
+
+        **Because the docstring quotes the line the case is checking for.** The
+        note that explains this defect names the wrong read verbatim, so a check
+        over the raw source would fail on the explanation of the fix -- which is
+        the same shape as the plan's `dhcp-option` correction and the same reason
+        the check there is on the claim rather than on the string. A case that
+        could not be satisfied by a correct fix is a case against the fix.
+
+        Cut by the first pair of triple quotes after the signature and the next
+        one, which is this module's one documented convention for every method
+        this case looks at. Anything else -- an `ast` walk, a regex over
+        non-docstring lines -- would be more machinery than the thing is worth,
+        and a case whose own parser can be wrong is a second thing to trust.
+        """
+        after = self.podman_source.split(f"    def {method}(self", 1)[1]
+        after = after.split("\n    def ", 1)[0]
+        opening = after.index('"""')
+        closing = after.index('"""', opening + 3)
+        return after[closing + 3:]
+
+    def test_no_scenario_calls_the_reader_directly(self):
+        """Every caller goes through the one reader, so the wrong one cannot be reached.
+
+        Both call sites already documented that they wanted both streams —
+        `install_test.py` says "`Podman.logs` reads both and joins them" and
+        `routing_test.py` says "`podman logs` gives a container's stdout … which
+        makes the container's own output the only place that log exists". **Both
+        were describing a method that reads stdout.** A caller is allowed to call
+        `container_logs` by name; what it is not allowed to do is call `logs` and
+        be told it is reading everything.
+        """
+        for name, source in (("routing_test.py", self.routing), ("install_test.py", self.install)):
+            with self.subTest(scenario=name):
+                self.assertNotIn(
+                    "podman.logs(",
+                    source,
+                    f"{name} calls `podman.logs(...)`, the stdout-only reader. It has to ask for "
+                    f"`container_logs`, which joins both streams",
+                )
+                self.assertIn(
+                    "container_logs(",
+                    source,
+                    f"{name} does not read the container's log at all any more, so its evidence "
+                    f"has lost the document that carries it",
+                )
+
+    def test_no_docstring_in_the_harness_claims_a_reader_reads_only_stdout(self):
+        """A docstring that asserts the wrong thing about a method is worse than none.
+
+        `Podman.logs`' own docstring said "`podman logs` gives a container's stdout
+        to podman's stdout and the container's stderr to podman's stderr, the same
+        split `docker logs` makes" and then returned `.output` — describing a
+        method that did not exist. A reader who trusted it would conclude the log
+        was empty, which is exactly the conclusion the routing cell drew.
+        """
+        # The one honest statement about the split has to name the consequence,
+        # because that is what a caller needs to know and what was missing.
+        self.assertIn(
+            "container_logs",
+            self.podman_source.split("def logs(self, container: str) -> str:", 1)[1][:2000],
+            "the `logs` reader does not say which reader it delegates to, so a reader comparing "
+            "the two methods has nothing to compare",
+        )
+
+    def test_the_domestic_counter_is_read_through_the_reader_that_works(self):
+        """The specific claim the routing scenario makes about its evidence.
+
+        `router_queries` counts names out of the mock router's log. If the log is
+        read from the wrong stream the count is empty, and the cell reports the
+        domestic branch as unreachable — which is a routing result, produced by a
+        harness read. So the two are held together: the parser is a dnsmasq
+        `log-queries` parser, and the reader is the one that sees stderr.
+        """
+        router_log = self.routing.split("def router_log(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn(
+            "container_logs(",
+            router_log,
+            "`router_log` reads the wrong stream: dnsmasq logs to stderr and the reader it calls "
+            "reads stdout, so the domestic counter is empty on every cell",
+        )
+        self.assertNotIn(
+            "podman.logs(",
+            router_log,
+            "`router_log` still calls the stdout-only reader",
+        )
 
 class PodmanTestCase(unittest.TestCase):
     """A temp directory, a fake podman, and a wrapper pointed at both."""

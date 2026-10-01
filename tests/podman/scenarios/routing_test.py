@@ -123,7 +123,12 @@ COUNTERS_PATH = "/run/mosdns-mock-foreign/counters.json"
 # markers are a set, and the name is the field immediately before whichever one
 # appeared -- see `router_queries`.
 ROUTER_LOG_QUERY = "log-queries"
-QUERY_LOG_MARKERS = ("is", "reply", "NXDOMAIN", "cached", "NODATA", "SERVFAIL", "REFUSED")
+# The field dnsmasq's `log-queries` opens a query line with, and the word that
+# ends the question on that line. Both are required together, because the log also
+# carries `sent size: 4 option: 6 dns-server 10.89.0.2` -- a line about a DNS server
+# ADDRESS -- and `log-dhcp`'s `DHCPDISCOVER(eth0)` / `DHCPACK(eth0)`.
+QUERY_RECORDING = "query["
+QUERY_CLIENT_MARKER = "from"
 
 # The transports Step 6 asks the repeat over, in the order it asks it. Both, and
 # not "UDP and then TCP if there is time": a scenario that asked one would satisfy
@@ -314,40 +319,93 @@ def router_queries(log: str) -> dict[str, int]:
     evidence is comparable without either of them being something this project
     wrote.
 
-    **A query is recognised by its `reply to` marker, not by the position of a
-    field.** dnsmasq(1)'s `log-queries` prints, per query:
+    **A query is the `query[<TYPE>] <name> from <client>` line, and that is what
+    this function recognises.** MEASURED, dnsmasq 2.91 in this harness's own
+    mock-router image with `log-facility=-`, from run `20261001T003319Z`:
+
+    ```text
+    dnsmasq[1]: query[AAAA] api.cloudflare.com from 10.89.0.168
+    dnsmasq[1]: config error is REFUSED (EDE: not ready)
+    dnsmasq[1]: query[A] probe.0033.cn from 10.89.0.168
+    dnsmasq[1]: config error is REFUSED (EDE: not ready)
+    ```
+
+    **The query line carries the name; the answer line does not.** That is the
+    whole reason the previous version of this function counted `{"error": 6}` and
+    the cell called it a routing result: it recognised a query by an answer-side
+    marker (`reply to`, `is <addr>`, `NXDOMAIN`) and read the name as the field
+    before it, and on this dnsmasq the only line carrying `is REFUSED` is
+    `config error is REFUSED (EDE: not ready)`, whose field before the marker is
+    the word `error`.
+
+    Its docstring made that inevitable, because it documented a different shape
+    entirely -- a syslog line with a timestamp and a hostname in front of the name:
 
     ```text
     Sep 30 20:00:00 hostname 10.89.0.10 probe.example.cn is 10.89.0.2
-    Sep 30 20:00:00 hostname 10.89.0.10 probe.example.cn is 1.2.3.4 NXDOMAIN
     ```
 
-    and the two words between the timestamp and the name vary with the log level:
-    a query with no answer carries `reply to`, an answered one carries `is <addr>`,
-    a refused one carries `NXDOMAIN` or `cached ... NODATA-Other`. So a parser that
-    read fields positionally would read the client's address as the name, and the
-    first version of this function did exactly that -- it counted nothing at all
-    on a real log, and the only symptom was a cell that waited out its whole
-    budget and reported a routing failure.
+    A container has no syslog, which is the only reason `log-facility=-` is set,
+    so a container running this project's mock router **never prints** a line
+    with a timestamp or a hostname in front of the name. The parser followed the
+    documentation because the documentation was the only shape anyone had written
+    down. **That is the third time in this project that the harness's own
+    evidence has been a fixture agreeing with a parser and neither agreeing with
+    the program** -- after the bridge's bare-address fixtures and
+    `install_test.py`'s `ActiveState` rule that matched nothing.
 
-    The marker is therefore the *recognition* and the name is the field before it.
-    Everything before the marker is a timestamp, a hostname and a client address,
-    none of which is this scenario's business, and a line with no marker is not a
-    query -- which is also what keeps a `DHCPDISCOVER` line out of the count.
+    **Why `query[` is a safe recognition and not a substring.** `log-dhcp` prints
+    `DHCPDISCOVER(eth0)`, `DHCPACK(eth0)` and
+    `sent size: 4 option: 6 dns-server 10.89.0.2`, and that last one is the
+    dangerous neighbour: it is a line about a DNS server **address**, and a parser
+    reading fields positionally would count `dns-server` as a name. The bracket
+    and the ` from ` that follows the name are what no other line in this log
+    carries, so both are required rather than one.
+
+    **Names are normalised** -- lowercased, trailing dot stripped -- because
+    `matches_china_set` normalises the name it is asked about and the published
+    list carries `domain:0033.cn`. A counter that returned `probe.0033.cn.` would
+    compare unequal to the set and the cell would refuse a split it had measured,
+    and dnsmasq echoes the name exactly as it arrived.
+
+    **And it cannot see a transport, which the record says.** dnsmasq records the
+    query *type* and not the transport, so the plan's "Repeat over UDP and TCP" is
+    visible here only as a count of two for one name. The foreign mock, which is
+    this project's own code, publishes `{name: {udp: n, tcp: m}}` and both are
+    there -- so the two listeners' documents are comparable per NAME, and only
+    one of them per transport. See `domestic_counters_transport`, which records
+    that rather than letting a reader infer a split this log does not carry.
     """
     counts: dict[str, int] = {}
     for line in log.splitlines():
         fields = line.split()
-        marker = next(
-            (index for index, field in enumerate(fields) if field in QUERY_LOG_MARKERS), None
-        )
-        if marker is None or marker < 1:
+        # `query[A]` is ONE field, so the recognition is on a field that both
+        # opens with `query[` and closes with `]`, and it has to be the second
+        # field: dnsmasq prefixes every line with `dnsmasq[1]:` or
+        # `dnsmasq-dhcp[1]:` and nothing else puts a bracketed token there.
+        if len(fields) < 5 or not fields[1].startswith(QUERY_RECORDING):
             continue
-        name = fields[marker - 1].strip(".").lower()
+        if not fields[1].endswith("]"):
+            continue
+        # The name is the one field before the literal `from`, which is the only
+        # place in a dnsmasq log line where those two meet: `from` appears in
+        # `query[TYPE] name from client` and in nothing else this daemon prints.
+        # Requiring it at that position rather than merely somewhere on the line
+        # is what keeps `sent size: 4 option: 6 dns-server 10.89.0.2` out, which
+        # is a line about a DNS server ADDRESS and the nearest neighbour a
+        # positional parser has to get wrong.
+        if fields[-2] != QUERY_CLIENT_MARKER:
+            continue
+        name = fields[-3].strip(".").lower()
         if not name:
             continue
         counts[name] = counts.get(name, 0) + 1
     return counts
+
+
+def china_name_key(document: dict) -> str:
+    """The China-set name this cell asked about, normalised the way the log counts it."""
+    return str(document.get("domestic_name", "")).strip(".").lower()
 
 
 def foreign_counters(document: str) -> dict[str, dict[str, int]]:
@@ -768,6 +826,23 @@ def build_scenario(
             document["domestic_counters_source"] = (
                 f"the mock router's own query log in {router}, counted by name"
             )
+            # **And the record says the domestic side has NO per-transport split,
+            # because that is what it has.** dnsmasq's `log-queries` records
+            # `query[<TYPE>] <name> from <client>` and the transport is not in it,
+            # so the plan's "Repeat over UDP and TCP" is visible at this listener
+            # only as a count of two for one name -- one question per transport,
+            # which is the evidence, and it is weaker than the foreign mock's
+            # `{name: {udp: n, tcp: m}}`. A record carrying one count and the
+            # other's pair would read as though the domestic half were missing,
+            # and a reader has to be able to see the difference from the document
+            # rather than infer it.
+            document["domestic_counters_transport"] = (
+                "not observable: dnsmasq's log-queries records query[<TYPE>] <name> "
+                "from <client> and carries no transport, so the repeat over UDP and TCP is "
+                f"visible here as a count of {document['domestic_counters'].get(china_name_key(document), 0)} "
+                "for the China-set name rather than as one number per transport. The foreign "
+                "mock publishes both."
+            )
             document["foreign_counters_source"] = (
                 f"the mock foreign resolver's counters document at {COUNTERS_PATH} in {foreign}"
             )
@@ -939,13 +1014,33 @@ def router_log(podman, container) -> str:
     publishes a document, and the router is a package on the locked release and
     logs to stderr.
 
+    **`container_logs` and not `logs`, and that is the whole of this round's
+    fourth defect.** MEASURED, on this host, against this harness's own image:
+
+        $ podman logs <mock-router> | head              # stdout only -- nothing
+        $ podman logs <mock-router> 2>&1 1>/dev/null   # stderr
+        dnsmasq[1]: started, version 2.91 cachesize 150
+        dnsmasq-dhcp[1]: DHCP, IP range 10.89.0.100 -- 10.89.0.199, lease time 5m
+
+    podman puts a container's stdout on podman's stdout and its **stderr** on
+    podman's stderr, and dnsmasq logs to stderr. `Podman.logs` returned `.output`,
+    which is stdout only, so **every cell of this scenario on every release read an
+    empty log** and then waited out its 60-second budget reporting
+    `the mock router's query log … to carry a query within 60s; last read: ''` --
+    which is a sentence about the DOMESTIC BRANCH produced by a read of the wrong
+    stream. `Podman.container_logs` joins both, its docstring records this trap and
+    the measurement that found it on the first live 22.04 cell, and the DHCP
+    scenario has always called it. So the trap was found once and re-entered by
+    the second caller of the same question. `Podman.logs` now delegates to it, and
+    the two cannot disagree again.
+
     A log read that *raised* would fail the cell as a harness fault, and a
     container whose log cannot be read is not a routing result. So the failure is
     carried as text and the counter check downstream refuses the cell, with a
     message about the routing rather than about podman.
     """
     try:
-        return podman.logs(container)
+        return podman.container_logs(container)
     except PodmanError as error:
         return f"(the mock router's log is not readable: {str(error).splitlines()[-1]})"
 
@@ -969,6 +1064,7 @@ __all__ = [
     "TARGET_LOCAL_ADDRESS",
     "TRANSPORTS",
     "build_scenario",
+    "china_name_key",
     "foreign_counters",
     "matches_china_set",
     "published_cn_domains",

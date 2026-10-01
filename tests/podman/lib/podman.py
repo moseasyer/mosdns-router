@@ -1463,19 +1463,46 @@ class Podman:
     def logs(self, container: str) -> str:
         """A container's own output, which for a mock is the evidence it produced.
 
-        `dnsmasq` is started with `log-facility=-`, so its log goes to stderr
-        because a container has no syslog to write to -- which makes `podman logs`
-        the only place the mock router's query log exists, and there is no file
-        inside that container to read instead. So this is a *data* read, not a
-        diagnostic one, and it sits with the other reads a scenario makes rather
-        than with the log-reading helpers.
+        **It delegates, and that is the fix rather than an alias.**
+
+        This method used to `return self.run(["logs", container]).output` -- and
+        `.output` is **stdout only**. MEASURED, against this harness's own
+        mock-router image and its own `run_container` flags:
+
+        ```text
+        $ podman logs mosdns-...-mock-router-24.04 | head          # stdout only
+        (nothing)
+        $ podman logs mosdns-...-mock-router-24.04 2>&1 1>/dev/null
+        dnsmasq[1]: started, version 2.91 cachesize 150
+        dnsmasq[1]: warning: no upstream servers configured
+        dnsmasq-dhcp[1]: DHCP, IP range 10.89.0.100 -- 10.89.0.199, lease time 5m
+        ```
+
+        podman puts a container's stdout on podman's stdout and its **stderr** on
+        podman's stderr, the split `docker logs` makes, and dnsmasq with
+        `log-facility=-` logs to stderr -- the only facility a container has. So
+        this reader returned `''` for a mock router that had in fact logged a DHCP
+        range, a version banner and more.
+
+        **And `container_logs` already got this right**, with a docstring that
+        records this exact trap and the measurement that found it on the first live
+        22.04 cell. So the class carried two readers for one question, one of them
+        wrong, with nothing in either name saying which -- and
+        `tests/podman/scenarios/routing_test.py` called the wrong one, on every
+        cell, on every release, for the whole of Task 4, and reported
+        "the mock router's query log does not carry a query" sixty seconds later
+        as though the domestic branch had never forwarded anything. The DHCP
+        scenario called `container_logs` and worked, which is why the trap was
+        found once and then re-entered.
+
+        One implementation, one behaviour, and both spellings reach it.
 
         A container's logs are readable while it is running, so this is asked of a
         live container and there is no `--follow` and no wait: a scenario that
         wanted the tail would have to ask for it, and the harness's own waits poll
         facts rather than sleeping, so a scenario polls this.
         """
-        return self.run(["logs", str(container)]).output
+        return self.container_logs(container)
 
     def stop(self, container: str) -> CommandResult:
         return self.run(["stop", "--time", str(STOP_TIME_SECONDS), container])
