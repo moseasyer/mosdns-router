@@ -53,6 +53,7 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
+SCENARIOS = REPO / "tests" / "podman" / "scenarios"
 sys.path.insert(0, str(REPO / "tests" / "podman" / "lib"))
 
 import images  # noqa: E402
@@ -2258,6 +2259,140 @@ class HarnessRefusalNamesTheDeclarationTest(unittest.TestCase):
         message = self.podman.NM_UNMANAGED_EXPLANATION
         self.assertIn("1.44", message)
         self.assertIn("1.36.6", message)
+class TheMockRouterLogsTheQueriesTest(unittest.TestCase):
+    """**The mock router never logs a DNS query, and the routing scenario's whole
+    domestic counter is that log.**
+
+    MEASURED on a live 24.04 cell, three releases, every run: the routing cell's
+    domestic evidence read ``the mock router's query log … to carry a query within
+    60s; last read: ''``. The log was empty. And it is not a plumbing failure —
+    `tests/podman/mock-router/dnsmasq.conf` sets `log-dhcp`, which records
+    DISCOVER, OFFER, REQUEST, ACK and the options the server sent, and **does not
+    set `log-queries`**, which is the one that records a DNS query. The image's
+    `CMD` is `dnsmasq --keep-in-foreground --conf-file=/etc/dnsmasq.conf` and adds
+    nothing.
+
+    So the domestic branch's evidence is a document that is never written. A cell
+    cannot distinguish "the domestic branch forwarded nothing" from "the domestic
+    branch forwarded and the record of it does not exist", and it cannot read a
+    per-name counter at the domestic listener at all — which is half of what the
+    plan's Step 6 asks for.
+
+    **And the scenario asserted that the image sets it.**
+    `tests/podman/scenarios/routing_test.py` says, in its own words:
+
+        # The mock-router image sets `log-queries`, so the log carries a line per query
+
+    and `router_queries` documents the exact dnsmasq(1) line shape it parses. The
+    scenario was written against a property the harness's own image did not have,
+    and 688 cases did not see it, because no case read the mock router's config.
+    That is the same class as `install_test.py`'s `ActiveState` rule that matched
+    nothing and the bridge's `DHCP4.OPTION_DOMAIN_NAME_SERVERS` that nmcli rejects:
+    **a fixture and an assertion that agree with each other and neither agrees
+    with the program under test.** Twice the offender was a *document the harness
+    claims about itself*.
+    """
+
+    CONFIG = REPO / "tests" / "podman" / "mock-router" / "dnsmasq.conf"
+    CMD = REPO / "tests" / "podman" / "images" / "mock-router.Containerfile"
+
+    def setUp(self):
+        self.config = self.CONFIG.read_text(encoding="utf-8")
+        self.containerfile = self.CMD.read_text(encoding="utf-8")
+
+    def directives(self):
+        """The directives the file actually sets, keyed by name; comment lines dropped.
+
+        **Parsed rather than searched**, because the file is 150 lines of prose
+        explaining each decision — so a case that searched the raw text would one
+        day be satisfied by a comment mentioning the key in order to say it is
+        absent, which is exactly the shape the plan's `dhcp-option` correction
+        took and the reason this case checks the *directive* instead.
+
+        **A bare key is a directive**, which is the detail a first version of this
+        got wrong and it is the reason the parse cannot look for `=`: dnsmasq(5)
+        writes `log-queries`, `log-dhcp`, `no-resolv` and `no-hosts` as bare keys
+        and only `interface=eth0`, `port=53` and `log-facility=-` with a value.
+        A parser that required `=` would report `log-dhcp` as unset — and the file
+        it is checking sets it — which is a green case that is wrong about the
+        thing it exists to check.
+        """
+        found = {}
+        for line in self.config.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            key, _, value = stripped.partition("=")
+            key = key.strip()
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", key):
+                continue
+            found[key.lower()] = value.strip()
+        return found
+
+    def test_the_mock_router_logs_every_dns_query_it_answers(self):
+        self.assertIn(
+            "log-queries", self.directives(),
+            "the mock router's config does not set `log-queries`, so it records no DNS query at "
+            "all and the routing scenario's domestic counter — a per-name count read out of that "
+            "log — can never be anything but empty. Measured: `the mock router's query log … to "
+            "carry a query within 60s; last read: ''` on all three releases",
+        )
+
+    def test_the_log_goes_to_stderr_where_the_harness_reads_it(self):
+        """`log-queries` is worthless without a facility, and the harness reads one stream.
+
+        With the default facility dnsmasq writes to syslog, a container has no
+        syslog, and `podman logs` — the only thing `podman.py` reads — is empty.
+        The DHCP scenario's `log-dhcp` records to `-` for exactly this reason and
+        says so; a `log-queries` line added without thinking about the facility
+        would produce the same empty log through a different key.
+        """
+        self.assertEqual(
+            self.directives().get("log-facility"), "-",
+            "the mock router's log is not on stderr, so `podman logs` is empty and neither the "
+            "DHCP scenario's `log-dhcp` evidence nor the routing scenario's `log-queries` "
+            "evidence can be read",
+        )
+
+    def test_the_scenarios_claim_about_the_image_is_backed_by_the_image(self):
+        """The sentence a reader is sent to the image with, held against the image.
+
+        The scenario's comment is a claim about a *different file in this
+        repository*, and a claim about a harness artifact is the kind that rots
+        quietly: the comment is prose, so nothing fails when the image stops
+        matching it, and the comment is what a future maintainer would trust
+        before checking.
+        """
+        routing = (SCENARIOS / "routing_test.py").read_text(encoding="utf-8")
+        for sentence in ("sets `log-queries`", "log-queries"):
+            with self.subTest(sentence=sentence):
+                self.assertIn(
+                    sentence, routing,
+                    "the routing scenario no longer mentions log-queries, so whatever the image "
+                    "does is no longer documented where the parser is",
+                )
+        # And the parser's own documented line shape is the shape this dnsmasq
+        # prints, which is asserted against dnsmasq(1)'s format rather than
+        # against a log line copied out of a run: `log-queries` prints one line
+        # per query as `<timestamp> <host> <client> <name> is <answer>`, and a
+        # query with no answer carries `reply to` instead.
+        parser = (SCENARIOS / "routing_test.py").read_text(encoding="utf-8")
+        for marker in ("reply to", "is 1.2.3.4"):
+            with self.subTest(marker=marker):
+                self.assertIn(
+                    marker, parser,
+                    "the parser's documented dnsmasq line shape has changed; `log-queries` output "
+                    "is what it recognises a query by, and a shape this file no longer names is a "
+                    "shape it cannot be reading",
+                )
+        # The key without a value is what enables the option, so a case that
+        # accepted `log-queries=0` would pass on a config that logs nothing.
+        self.assertNotIn(
+            "log-queries=0", self.config,
+            "log-queries is explicitly disabled, so enabling it in the config would be the only "
+            "thing this case could be about and it is not",
+        )
+
 class PlanAgreesWithTheImageTest(unittest.TestCase):
     """The plan is the record the next implementer works from, so it is held here.
 
