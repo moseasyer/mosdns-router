@@ -25,9 +25,11 @@ package mosdnsconfig
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -176,6 +178,256 @@ func TestAChinaSetNameReachesTheUpstreamTheBridgePublished(t *testing.T) {
 		t.Errorf("the foreign resolver received %d queries in total, want none", got)
 	}
 	_ = instance
+}
+
+// publishGeneration writes one published state document the way the bridge
+// writes it: a temporary file in the state file's own directory, then a rename
+// over the target.
+//
+// **The rename is the load-bearing part and not an incidental detail of the
+// fixture.** `publish_if_changed` commits through `os.replace`
+// (`bridge/mosdns_dhcp_bridge/publish.py:458`), so a new generation is a *new
+// file* rather than a rewrite of the old one, which is why the plugin's own
+// reload criterion can include file identity and still see every generation. A
+// case that published in place would be testing a writer this project does not
+// ship, and would pass for a reason that says nothing about the cell.
+func publishGeneration(t *testing.T, path string, generation uint64, upstream string, observedAt time.Time) {
+	t.Helper()
+	temporary := path + ".next"
+	if err := os.WriteFile(temporary, stateDocument(t, generation, upstream, observedAt), 0o600); err != nil {
+		t.Fatalf("write the temporary state document: %v", err)
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		t.Fatalf("rename the temporary state document over %s: %v", path, err)
+	}
+}
+
+// stateFileFacts describes a published state file the way the plugin's reload
+// criterion looks at it, so a failure can name what did and did not change. It
+// is a reporting helper, not the rule: the rule is `fileSignature.sameAs`, and it
+// is held by `TestStateFileSignatureTracksFileIdentity` in the plugin's own
+// package, where the unexported type is reachable.
+func stateFileFacts(t *testing.T, path string) string {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat the state file %s: %v", path, err)
+	}
+	return fmt.Sprintf("%d bytes, mtime %s, dev %d ino %d",
+		info.Size(), info.ModTime().UTC().Format(time.RFC3339Nano), info.Sys().(*syscall.Stat_t).Dev, info.Sys().(*syscall.Stat_t).Ino)
+}
+
+// TestASecondGenerationIsAdoptedOverOneThatNamedNoUpstream is the sequence a
+// live cell runs and no test ran: a generation that names **no** upstream, and
+// then a generation that names a real one, published over it while mosdns keeps
+// running.
+//
+// **Why the first generation has no upstream.** That is what the install's own
+// hand-over produces. `postinst` captures the current state through the same
+// publisher the bridge uses, and the installer then points NetworkManager at the
+// loopback — so a capture taken after the hand-over reads `127.0.0.1` as the
+// effective DNS, the collector filters local addresses out, and what is
+// published is a valid document that disables the branch. The bridge's own DHCP
+// event then publishes the lease's real resolver as a later generation. So
+// "disabled, then enabled, without a restart" is not a hypothetical ordering; it
+// is the ordinary install ordering, and this is the only test that walks it
+// through the real plugin and the shipped document.
+//
+// **What it decides.** Two candidate causes were on the record for a live cell
+// that would not forward a China-set name: `reloadGeneration` keeping the
+// current generation when `published.Generation <= current.generation`, and the
+// `signature.sameAs(r.observed)` short-circuit skipping the read. Neither can
+// survive this case, and the case says so by reaching a state the disabled
+// generation cannot serve.
+func TestASecondGenerationIsAdoptedOverOneThatNamedNoUpstream(t *testing.T) {
+	address := routableAddress(t)
+	port := freeRoutablePort(t, address)
+
+	domestic, err := testdns.StartOn(net.JoinHostPort(address, port), func(_ context.Context, request *dns.Msg) *dns.Msg {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = append(response.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.IPv4(198, 51, 100, 7).To4(),
+		})
+		return response
+	})
+	if err != nil {
+		t.Fatalf("start the domestic upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = domestic.Close() })
+
+	foreign := startForeignMock(t)
+	observed := time.Unix(1750000000, 0).UTC()
+	paths, listenAddress := publishedStatePaths(t, "tcp://"+foreign.Address(), stateDocument(t, 1, "", observed))
+	paths.DHCPUpstreamPort = mustPort(t, port)
+	instance := loadMosdns(t, decodeMosdnsConfig(t, mustRender(t, paths)))
+
+	// The disabled generation must fail the branch closed. Two things are
+	// asserted, and the second is the one a "REFUSED" reading mistakes: the name
+	// is a China-set name, so anything the foreign resolver answered would mean
+	// the domestic branch's failure leaked a query into the network the user is
+	// leaving.
+	disabled := ask(t, listenAddress, chinaDomain)
+	if disabled.Rcode == dns.RcodeSuccess || len(disabled.Answer) > 0 {
+		t.Fatalf("a China-set name came back as %v (rcode %s) from the generation that named no "+
+			"upstream: an empty upstream list is the documented way to disable the branch, and it "+
+			"must fail closed rather than answer", addressesIn(t, disabled), dns.RcodeToString[disabled.Rcode])
+	}
+	// errDisabled is returned as an error, and mosdns's entry handler answers an
+	// entry error with SERVFAIL. So the code this case observes is a measurement
+	// of which mechanism refused, and it is not REFUSED: `resp == nil` with no
+	// error is the only path to REFUSED, and `exchange` cannot take it — every
+	// branch of `runtime.race` returns either a message or an error.
+	if disabled.Rcode != dns.RcodeServerFailure {
+		t.Errorf("the disabled generation answered rcode %s, want SERVFAIL: dhcp_forward returns "+
+			"errDisabled as an error, and an entry error is SERVFAIL. A different code names a "+
+			"different mechanism, and this case exists to name it",
+			dns.RcodeToString[disabled.Rcode])
+	}
+	if got := foreign.Count("", ""); got != 0 {
+		t.Errorf("the foreign resolver received %d queries, want none: the domestic branch's "+
+			"disabled state must not leak a China-set name into the network the user is leaving", got)
+	}
+	if got := domestic.Count("", chinaDomain); got != 0 {
+		t.Errorf("the domestic upstream received %d queries for %s, want none: the generation named "+
+			"no upstream, so nothing may be dialled", got, chinaDomain)
+	}
+	disabledFacts := stateFileFacts(t, paths.DHCPState)
+
+	// Generation 2, published over generation 1 by the mechanism the bridge uses.
+	publishGeneration(t, paths.DHCPState, 2, address, observed.Add(time.Minute))
+	enabledFacts := stateFileFacts(t, paths.DHCPState)
+
+	answered := ask(t, listenAddress, chinaDomain)
+	if got := addressesIn(t, answered); !equalStrings(got, []string{"198.51.100.7"}) {
+		t.Fatalf("after generation 2 was published a China-set name came back as %v (rcode %s), "+
+			"want the domestic upstream's own address 198.51.100.7: generation 1 named no upstream and "+
+			"generation 2 named %s on port %d, so the plugin must have adopted it. Generation 1 was %s; "+
+			"generation 2 is %s",
+			got, dns.RcodeToString[answered.Rcode], address, paths.DHCPUpstreamPort, disabledFacts, enabledFacts)
+	}
+	if got := domestic.Count("", chinaDomain); got != 1 {
+		t.Errorf("the domestic upstream received %d queries for %s, want 1: only the second generation "+
+			"can forward, so exactly one query can have been forwarded", got, chinaDomain)
+	}
+	if got := foreign.Count("", ""); got != 0 {
+		t.Errorf("the foreign resolver received %d queries in total, want none", got)
+	}
+	_ = instance
+}
+
+// TestASameLengthSecondGenerationIsStillAdopted covers the exact shape the
+// `signature.sameAs` candidate needed: a document that is **the same length** as
+// the one it replaces, published over it by rename with the modification time
+// forced to the value the file it replaces carries.
+//
+// Only the generation digit differs, so the size is identical, and
+// `os.Chtimes` makes the modification time identical too. What is left to tell
+// the two apart is file identity, which is why the rename is what the assertion
+// rests on. It is asserted on the length and the time as controls: a fixture
+// that failed to produce equal lengths would make this case pass without
+// testing the thing it names, which is the defect this project has now paid for
+// four times.
+//
+// **The evidence is a COUNT and not the answer, and that is the whole design of
+// this case.** Two generations naming the same upstream produce the same address
+// from the same mock, so an answer cannot tell generation 1 from generation 2 —
+// and a case whose evidence cannot tell the two states apart is a green gate that
+// walks through the defect it is named for, which is what this project has now
+// paid for four times over. The count can: a replaced generation takes its cache
+// with it, so a query answered by generation 2 is a query that was forwarded
+// again, while a query answered by generation 1 is a cache hit and costs the
+// upstream nothing. The middle query is what makes that difference attributable:
+// it shows an unchanged file does not re-forward, so the count moving afterwards
+// is the reload and not the passage of time.
+func TestASameLengthSecondGenerationIsStillAdopted(t *testing.T) {
+	address := routableAddress(t)
+	port := freeRoutablePort(t, address)
+
+	domestic, err := testdns.StartOn(net.JoinHostPort(address, port), func(_ context.Context, request *dns.Msg) *dns.Msg {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = append(response.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.IPv4(198, 51, 100, 8).To4(),
+		})
+		return response
+	})
+	if err != nil {
+		t.Fatalf("start the domestic upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = domestic.Close() })
+
+	foreign := startForeignMock(t)
+	observed := time.Unix(1750000000, 0).UTC()
+	first := stateDocument(t, 1, address, observed)
+	paths, listenAddress := publishedStatePaths(t, "tcp://"+foreign.Address(), first)
+	paths.DHCPUpstreamPort = mustPort(t, port)
+	loadMosdns(t, decodeMosdnsConfig(t, mustRender(t, paths)))
+
+	if got := domestic.Count("", chinaDomain); got != 0 {
+		t.Fatalf("the domestic upstream received %d queries before any was asked, want 0", got)
+	}
+	first1 := addressesIn(t, ask(t, listenAddress, chinaDomain))
+	first2 := addressesIn(t, ask(t, listenAddress, chinaDomain))
+	if !equalStrings(first1, []string{"198.51.100.8"}) || !equalStrings(first2, []string{"198.51.100.8"}) {
+		t.Fatalf("the first generation answered %v then %v, want 198.51.100.8 from both", first1, first2)
+	}
+	if got := domestic.Count("", chinaDomain); got != 1 {
+		t.Fatalf("the domestic upstream received %d queries for two identical questions, want 1: the "+
+			"second must have been a cache hit, or the count below cannot tell a reload from a re-forward",
+			got)
+	}
+
+	before, err := os.Stat(paths.DHCPState)
+	if err != nil {
+		t.Fatalf("stat the published state file: %v", err)
+	}
+	second := stateDocument(t, 2, address, observed.Add(time.Minute))
+	if len(second) != len(first) {
+		t.Fatalf("the two generations are %d and %d bytes, want them equal: this case is named for the "+
+			"same-length rewrite, and a longer document would be adopted by the size alone", len(first), len(second))
+	}
+	temporary := paths.DHCPState + ".next"
+	if err := os.WriteFile(temporary, second, 0o600); err != nil {
+		t.Fatalf("write the temporary state document: %v", err)
+	}
+	if err := os.Chtimes(temporary, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatalf("set the replacement times: %v", err)
+	}
+	if err := os.Rename(temporary, paths.DHCPState); err != nil {
+		t.Fatalf("rename the temporary state document: %v", err)
+	}
+	after, err := os.Stat(paths.DHCPState)
+	if err != nil {
+		t.Fatalf("stat the renamed state file: %v", err)
+	}
+	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("the setup did not reproduce the shape it names: %d bytes and mtime %s became %d "+
+			"bytes and mtime %s, want the same length and the same modification time",
+			before.Size(), before.ModTime().UTC().Format(time.RFC3339Nano),
+			after.Size(), after.ModTime().UTC().Format(time.RFC3339Nano))
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the setup renamed nothing: the replacement kept the replaced file's identity, so this " +
+			"case would pass without the rename it is about")
+	}
+
+	third := addressesIn(t, ask(t, listenAddress, chinaDomain))
+	if !equalStrings(third, []string{"198.51.100.8"}) {
+		t.Fatalf("after the same-length replacement a China-set name came back as %v, want 198.51.100.8", third)
+	}
+	if got := domestic.Count("", chinaDomain); got != 2 {
+		t.Fatalf("the domestic upstream received %d queries for %s, want 2: one from generation 1 and one "+
+			"from generation 2. The published document is byte-for-byte the length of the one it replaced and "+
+			"carries its modification time, so only the rename distinguishes them, and a count that stayed at 1 "+
+			"is generation 1's cache answering — the replacement was never read",
+			got, chinaDomain)
+	}
+	if got := foreign.Count("", ""); got != 0 {
+		t.Errorf("the foreign resolver received %d queries in total, want none", got)
+	}
 }
 
 func mustPort(t *testing.T, port string) int {
