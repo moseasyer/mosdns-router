@@ -125,21 +125,57 @@ esac
 #
 # A group this package did not create is a collision, and `addgroup --system` exits
 # zero when the group is already there, so without the check below this install would
-# silently adopt somebody else's ids. That is a real case for the resolver: the
-# upstream `dnscrypt-proxy` package creates a group of the same name, and a machine
-# carrying both would have two packages claiming one identity. It is reported rather
-# than refused because a re-run of THIS package's own postinst also finds the group
-# already there, and refusing that would make a `dpkg --configure` retry impossible.
-# The message says which state it found, so an operator can see which package the
-# group came from and decide.
-for account in "$STATE_GROUP" "$RESOLVER_USER"; do
-	if getent group "$account" >/dev/null 2>&1; then
-		echo "postinst: the $account group already exists ($(getent group "$account"))" >&2
-		echo "postinst: and this install is using it rather than creating it. Nothing in" >&2
-		echo "postinst: this package creates that name, so it belongs to another package," >&2
-		echo "postinst: and the two will share one identity until one of them is removed." >&2
+# silently adopt somebody else's ids. It is reported rather than refused because a
+# re-run of THIS package's own postinst also finds the group already there, and
+# refusing that would make a `dpkg --configure` retry impossible.
+#
+# A GROUP ALONE IS NOT ENOUGH TO CALL IT A COLLISION, and the version of this that
+# tested only the group was wrong on the machine this package is installed on most
+# often: its own. These lines run on every `postinst configure`, so every
+# `dpkg --configure` retry -- which is exactly what dpkg suggests after a refused
+# install and exactly what an operator does next -- printed four lines saying this
+# package's own group belonged to another package. MEASURED on a 24.04 cell: a
+# second install over the first said exactly that, about a group the same run had
+# created four lines earlier:
+#
+#     postinst: the mosdns-router group already exists (mosdns-router:x:102:)
+#     postinst: and this install is using it rather than creating it. Nothing in
+#     postinst: this package creates that name, so it belongs to another package,
+#
+# which is the false sentence in a different direction from the misplaced `fi` above
+# the transaction, and worse here because it is printed on the SUCCESS path too --
+# there is no install this warning would have been a useful aside to.
+#
+# So the test is the PAIR. A group with no service identity behind it is a bare group
+# somebody else made, and this install would be adopting an id it cannot account for.
+# A group AND the identity that goes with it are this package's own accounts from a
+# previous run, and "the two will share one identity" would be false -- there is only
+# one. Nested `if`s rather than an `&&` chain, because this script runs with `set -e`
+# and a chain is a list whose status is its last command's.
+#
+# The upstream `dnscrypt-proxy` package is the case this was written for, and ruling
+# 191(d) renamed the resolver's identity away from that name -- which removes the
+# collision rather than reporting it. These two blocks stay because the names are not
+# a namespace this project owns, and a `postrm purge` is entitled to be told when it
+# is about to remove an account that arrived from somewhere else.
+if getent group "$STATE_GROUP" >/dev/null 2>&1; then
+	if ! getent passwd "$ROUTER_USER" >/dev/null 2>&1; then
+		echo "postinst: the $STATE_GROUP group already exists ($(getent group "$STATE_GROUP"))" >&2
+		echo "postinst: and this install is using it rather than creating it, and there" >&2
+		echo "postinst: is no $ROUTER_USER account behind it, so nothing in this package" >&2
+		echo "postinst: created that name: it belongs to another package, and the two will" >&2
+		echo "postinst: share one identity until one of them is removed." >&2
 	fi
-done
+fi
+if getent group "$RESOLVER_USER" >/dev/null 2>&1; then
+	if ! getent passwd "$RESOLVER_USER" >/dev/null 2>&1; then
+		echo "postinst: the $RESOLVER_USER group already exists ($(getent group "$RESOLVER_USER"))" >&2
+		echo "postinst: and this install is using it rather than creating it, and there is" >&2
+		echo "postinst: no $RESOLVER_USER account behind it, so nothing in this package" >&2
+		echo "postinst: created that name: it belongs to another package, and the two will" >&2
+		echo "postinst: share one identity until one of them is removed." >&2
+	fi
+fi
 addgroup --system "$STATE_GROUP"
 adduser --system --no-create-home --home /nonexistent \
 	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
@@ -159,27 +195,90 @@ adduser --system --no-create-home --home /nonexistent \
 #
 # The unit files are package files, so `User=`/`Group=` became the new names the
 # moment dpkg unpacked them, which is why this runs before anything is started. All
-# that is left is to hand the four state directories to the new group and then drop
-# the old accounts, and the order of those two is the whole of it: a directory still
-# owned by a group that is about to be deleted leaves the units unable to write it,
-# and nothing in the transaction would say why.
+# that is left is to hand the state trees to the new group and then drop the old
+# accounts, and the order of those two is the whole of it: a file still owned by a
+# group that is about to be deleted leaves the units unable to read it, and nothing
+# in the transaction would say why.
+#
+# WHY THE `chgrp` IS RECURSIVE, because the non-recursive version of this line was
+# correct-looking, passed a shape test, and took a machine's DNS down.
+#
+# `chgrp` on a directory moves THE DIRECTORY'S group and nothing else: every file
+# inside it keeps the gid it was created with. So walking the four state directories
+# one at a time moved the directories and left the files behind -- and the next
+# paragraph deletes the group those files were group-owned by, which leaves them
+# owned by a gid that resolves to nothing at all.
+#
+# At 0640, a file whose group does not exist is a file ONLY ROOT CAN READ. That is
+# where this stopped being a rename and became an outage, in two directions:
+#
+#   * `/var/lib/mosdns/lists/cloudflare-ips.json` is what the response rewriter
+#     builds its prefix watcher from, and it does that before anything else. So the
+#     router started, failed to build the watcher, and bound NOTHING on port 53 --
+#     while the transaction had already pointed NetworkManager at 127.0.0.1. The
+#     machine had no resolver, and nothing watching for one: the health timer and
+#     the watchdog are enabled in STEP 5, which is below the transaction this run
+#     had just failed.
+#   * `/var/lib/mosdns/runtime/control.lock` became the same, and preflight reports
+#     it as a lock this package did not write -- so every later `dpkg --configure`
+#     refused forever, with a message about a mode and a group rather than about a
+#     rename.
+#
+# And `/var/lib/mosdns/installer`, which holds the ownership marker and the recorded
+# NetworkManager values, is not one of the four directories at all: the old build
+# created it too, so it kept the old gid outright. Those are the two documents an
+# uninstall reads to decide whether it may put the machine's DNS back, so a machine
+# in that state cannot be uninstalled cleanly either.
+#
+# MEASURED, in a container reproducing a machine the old build had provisioned: after
+# the migration the four directories were on the new group, every file inside them
+# was on a gid nothing resolved, and preflight refused on the control lock by name.
+# Two roots, both named in one command, rather than a list: everything inside these
+# two trees is this package's own state and its own services' output, and
+# enumerating the files is how the first version missed three of them.
+#
+# The `[ -d ]` guard is load-bearing rather than defensive. A machine that has never
+# run this package has neither tree, and the migration runs on every `postinst
+# configure` including the `dpkg --configure` retry dpkg itself recommends -- so a
+# step that treated an absent tree as a failure would fail before the transaction,
+# with a message about a rename rather than about whatever the operator was sent
+# back to fix.
 #
 # The ACL needs re-applying rather than inheriting. `setfacl -d -m g::rwx` records a
 # permission on the OWNING GROUP and does not name it, so the chgrp above is what
 # moves the grant to the new group -- there is no stale named-group entry to clear.
 # The line is run anyway because it is the one that states the grant, and a
 # directory from before the rename is one this script cannot have inspected.
+for tree in /var/lib/mosdns /run/mosdns; do
+	if [ -d "$tree" ]; then
+		chgrp -R "$STATE_GROUP" "$tree"
+	fi
+done
+# And the ACL, on the four directories the package provisions, after the ownership:
+# `setfacl -d -m g::rwx` records a permission on the OWNING GROUP and does not name
+# it, so the chgrp above is what moves the grant to the new group -- there is no
+# stale named-group entry to clear, and this line is re-run anyway because it is the
+# one that states the grant and a directory from before the rename is one this
+# script cannot have inspected. See the STEP 2 header for why a directory carried by
+# a renamed group is the case that needed fixing rather than the ACL.
 for directory in /var/lib/mosdns /var/lib/mosdns/runtime /var/lib/mosdns/lists /run/mosdns; do
 	if [ -d "$directory" ]; then
-		chgrp "$STATE_GROUP" "$directory"
 		setfacl -d -m g::rwx "$directory"
 	fi
 done
+# The watchdog's failure record is root's alone and stays that way. STEP 2 below
+# provisions it as 0700 root:root and would re-assert that, but a recursive chgrp
+# that is not told about this one directory would hand it to a group it has no
+# reason to belong to in between, and the record it holds decides when this machine
+# takes its own DNS back.
+if [ -d /run/mosdns/watchdog ]; then
+	chgrp root /run/mosdns/watchdog
+fi
 # Then the old accounts, and only those this package's own postinst created: the
 # three users, then the two groups. `deluser --system` removes the account and leaves
 # files it owns alone, which is the behaviour wanted here -- a file owned by the old
-# `mosdns` group outside the four directories above is left for an operator, and is
-# named in postrm's purge arm if it is still there at that point.
+# `mosdns` group outside the two trees above is left for an operator, and is named
+# in postrm's purge arm if it is still there at that point.
 #
 # Every removal is `||` a message rather than fatal: an upgrade that cannot drop an
 # old account has still moved the state directories, and refusing to finish leaves a

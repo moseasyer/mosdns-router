@@ -745,9 +745,21 @@ def postinst_step_body(text, number):
     grows does not silently become a different step to the reader. The leading
     header is kept: it carries no logic, and a reader that dropped it would still
     be reading the script.
+
+    **The letter after the number is part of the pattern, and leaving it out cost a
+    case.** `STEP 1b` is a step of its own, but `STEP\\s+\\d+\\b` does not match it:
+    `\\d+` takes the `1` and then `\\b` asks for a boundary between `1` and `b`, which
+    are both word characters, so there is none and the match fails. The consequence
+    was that STEP 1's body ran on to STEP 2 -- carrying STEP 1b with it -- so
+    anything that RAN step 1 also ran the migration, against a real `chgrp` and a
+    group that does not exist on a build machine. `sandboxed_postinst_step` shims
+    `install` for exactly this class of reason and shimmed nothing for `chgrp`, so
+    the step it thought it was running failed on a tool it had never heard of. It
+    went unnoticed because every case in the suite runs STEP 3, whose neighbours are
+    numbered.
     """
     header = re.compile(r"^#\s*-{2,}\s*STEP\s+" + str(number) + r"\b", re.MULTILINE)
-    any_header = re.compile(r"^#\s*-{2,}\s*STEP\s+\d+\b", re.MULTILINE)
+    any_header = re.compile(r"^#\s*-{2,}\s*STEP\s+\d+[a-z]?\b", re.MULTILINE)
     found = list(header.finditer(text))
     if len(found) != 1:
         raise AssertionError(
@@ -1002,6 +1014,311 @@ class purged_sandbox:
 
     def __exit__(self, *exc):
         return False
+
+
+class _Migration:
+    """One `postinst` STEP 1b run: what it printed, and the tree it left."""
+
+    def __init__(self, root, result, names, groups):
+        self.root = root
+        self.result = result
+        self.names = names
+        self.groups = groups
+
+    @property
+    def stderr(self):
+        return self.result.stderr
+
+    def gid_of(self, path):
+        """`path`'s GROUP as a number, or `None` when `path` is not there.
+
+        A number rather than a name, and that is the whole point of this helper. A
+        migration's job is to move ownership from a group it is about to DELETE to
+        the one that is replacing it, so the question a case has to ask is whether
+        the files came off the old gid -- and `os.stat(...).st_gid` is the only
+        reader that can answer it. `getent group <name>` cannot: a gid nothing
+        resolves has no name at all, which is exactly the state the migration is
+        supposed to prevent and the one a name-shaped assertion cannot see.
+        """
+        target = self.root / str(path).lstrip("/")
+        if not target.exists():
+            return None
+        return target.stat().st_gid
+
+
+class migrated_sandbox:
+    """Run the shipped `postinst`'s own migration (STEP 1b) over a throwaway tree
+    that a PREVIOUS build left behind, and hand back the tree it produced.
+
+    **Run rather than read, and the reason is a measured defect rather than a
+    preference.** The first version of this migration walked four directories with
+    `chgrp` and no `-R`. That is correct for the directories and silent about
+    everything inside them: `chgrp` on a directory moves the directory's group and
+    leaves each child's own group alone. The step then went on to `delgroup` the
+    old group, so every published file under `/var/lib/mosdns/lists` was left
+    group-owned by a gid that no longer resolved to anything, at mode 0640 -- a file
+    only root can read. The router reads the Cloudflare ranges there before it binds
+    anything, so it started, failed to build its prefix watcher and bound nothing on
+    port 53 while NetworkManager was already pointing the machine at 127.0.0.1.
+    MEASURED in a container reproducing a machine the old build had provisioned.
+
+    A test that reads the script cannot see that. `test_an_upgrade_moves_the_state_
+    directories_before_it_drops_the_old_group` asserted that a `chgrp` and a
+    `setfacl` appear before a `delgroup`, and every one of those three substrings is
+    still there -- the shape is right and the effect is wrong, which is the whole
+    defect class this project's own gate keeps hitting.
+
+    So the fixture is the machine, and `chgrp` is the real one. What is stubbed is
+    everything that touches the account database, because this is a build machine
+    and the subject is what the migration DOES to files: `addgroup`/`adduser`
+    succeed, `deluser`/`delgroup` record and succeed, `getent` answers from the
+    fixture. `chgrp` needs a name-to-gid shim because neither the old nor the new
+    group name exists on a build machine -- and the shim rewrites the NAME to the
+    fixture's GID and execs the real `chgrp`, so the recursion question the defect
+    turns on is answered by the kernel rather than by this file.
+    """
+
+    def __init__(self, empty=False):
+        # `empty` is a machine that has NEVER run this package: no state tree at
+        # all. It is a fixture rather than a second sandbox because the step under
+        # test has to run in both worlds, and running it in a tree that is merely
+        # empty of FILES would not exercise the `[ -d ]` guard at all.
+        self.empty = empty
+
+    def __enter__(self):
+        text = POSTINST.read_text()
+        variables = shell_assignments(text)
+        for name in ("STATE_GROUP", "LEGACY_STATE_GROUP"):
+            if name not in variables:
+                raise AssertionError(
+                    f"postinst does not assign {name}, so the migration cannot be read out of it"
+                )
+        names = {
+            "new_group": variables["STATE_GROUP"],
+            "legacy_group": variables["LEGACY_STATE_GROUP"],
+        }
+
+        root = Path(scratch_directory("mosdns-postinst-migration.")) / "root"
+        if root.exists():
+            subprocess.run(["rm", "-rf", str(root)], check=True)
+        root.mkdir(parents=True)
+        binroot = root.parent / "bin"
+        binroot.mkdir(exist_ok=True)
+        state = root.parent / "state"
+        state.mkdir(exist_ok=True)
+        removed = state / "removed"
+        removed.write_text("", encoding="utf-8")
+
+        # Two gids this process is actually a MEMBER of, and the reason is that the
+        # question cannot be answered any other way as a normal user. `chgrp` to a
+        # gid you are not in fails with EPERM and `os.chown` to one fails too, so a
+        # fixture that invented 4101 and 4102 could not build the machine it is
+        # describing. Taking two of the caller's own groups makes the fixture
+        # portable -- no group NAME is hard-coded, so it runs on a build machine with
+        # a different membership -- and it keeps the recursion question in the hands
+        # of chgrp(1) rather than of this file.
+        #
+        # Distinct, and checked: a fixture whose two gids were equal would report
+        # every file as correctly migrated whatever the step did, because `chgrp` to
+        # the number a file already has is a no-op that succeeds.
+        available = sorted({os.getgid(), *os.getgroups()})
+        if len(available) < 2:
+            raise unittest.SkipTest(
+                "this process belongs to fewer than two groups, so it cannot build the two "
+                "ownerships a migration has to move a state tree between"
+            )
+        gids = {names["legacy_group"]: available[0], names["new_group"]: available[-1]}
+        (binroot / "chgrp").write_text(
+            "#!/usr/bin/env python3\n"
+            "# Rewrite the group NAME this script uses to a gid the caller is a member\n"
+            "# of, and exec the REAL chgrp -- so whether `chgrp -R` reaches the files\n"
+            "# INSIDE a directory is answered by chgrp(1) and not by this shim.\n"
+            "import os, sys\n"
+            f"GIDS = {gids!r}\n"
+            "args = sys.argv[1:]\n"
+            "for index, word in enumerate(args):\n"
+            "    if word in GIDS:\n"
+            "        args[index] = str(GIDS[word])\n"
+            "        break\n"
+            "else:\n"
+            "    sys.stderr.write('chgrp shim: no fixture group in %r\\n' % (args,))\n"
+            "    sys.exit(97)\n"
+            "os.execv('/usr/bin/chgrp', ['chgrp'] + args)\n",
+            encoding="utf-8",
+        )
+        (binroot / "getent").write_text(
+            "#!/bin/sh\n"
+            "case \"${1:-}:${2:-}\" in\n"
+            # Both groups exist: the step is an UPGRADE off a machine the old build
+            # provisioned, so by the time STEP 1b runs the new one is already there.
+            + "".join(
+                f'group:{name}:) printf "{name}:x:{gid}:\\n"; exit 0;;\n'
+                for name, gid in gids.items()
+            )
+            + f'passwd:{names["legacy_group"]}:*) printf "{names["legacy_group"]}:x:0:'
+            f'{gids[names["legacy_group"]]}::x:/nonexistent:/usr/sbin/nologin\\n"; exit 0;;\n'
+            'esac\nexit 2\n',
+            encoding="utf-8",
+        )
+        for tool in ("addgroup", "adduser", "setfacl"):
+            (binroot / tool).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for tool in ("deluser", "delgroup"):
+            (binroot / tool).write_text(
+                "#!/bin/sh\nname=\n"
+                "while [ $# -gt 0 ]; do case \"$1\" in --system) shift;; *) name=\"$1\"; shift;; esac; done\n"
+                f'printf "%s\\n" "$name" >> "{removed}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+        for stub in binroot.iterdir():
+            stub.chmod(0o755)
+
+        # The tree the OLD build left, unless this case asked for a machine that has
+        # never run this package at all: four directories at 2770 with a default ACL
+        # granting the group rwx, and every file inside them group-owned by the OLD
+        # group at the mode this package publishes at. Plus `/var/lib/mosdns/
+        # installer`, which the old build created too and which is NOT one of the
+        # four -- it holds the ownership marker and the recorded NetworkManager
+        # values, so it is the one directory whose group decides whether a later
+        # uninstall can prove what this package set.
+        #
+        # `os.chown(path, -1, gid)` and not `(os.getuid(), gid)`: asking for the uid
+        # the file already has is a separate, unnecessary privilege, and a fixture
+        # that fails on it would read as a migration failure.
+        if not self.empty:
+            for directory in STATE_DIRECTORIES:
+                target = root / directory.lstrip("/")
+                target.mkdir(parents=True, exist_ok=True)
+                os.chmod(target, 0o2770)
+                os.chown(target, -1, gids[names["legacy_group"]])
+            planted = {
+                "var/lib/mosdns/lists/cn-domains.txt": 0o640,
+                "var/lib/mosdns/lists/source-lock.json": 0o640,
+                "var/lib/mosdns/lists/cloudflare-ips.json": 0o640,
+                "var/lib/mosdns/runtime/control.lock": 0o640,
+            }
+            for relative, mode in planted.items():
+                target = root / relative
+                target.write_bytes(b"planted\n")
+                os.chmod(target, mode)
+                os.chown(target, -1, gids[names["legacy_group"]])
+            installer = root / "var/lib/mosdns/installer"
+            installer.mkdir(parents=True, exist_ok=True)
+            os.chmod(installer, 0o2770)
+            os.chown(installer, -1, gids[names["legacy_group"]])
+            for relative in (
+                "var/lib/mosdns/installer/managed-by",
+                "var/lib/mosdns/installer/network-manager-backup.json",
+            ):
+                target = root / relative
+                target.write_text("{}\n", encoding="utf-8")
+                os.chmod(target, 0o600)
+                os.chown(target, -1, gids[names["legacy_group"]])
+
+        body = postinst_step_body(text, "1b")
+        script = root.parent / "migration.sh"
+        # `_rooted` and not a header of substituted variables: STEP 1b names its
+        # four paths as LITERALS, so a header would have to restate them and the
+        # case would be reading this file's list rather than the script's. Rooting
+        # the shipped text is the same one pass `postrm`'s own sandbox uses, and it
+        # is what keeps the step off this machine's `/var/lib/mosdns`.
+        script.write_text(
+            "set -e\n"
+            f'STATE_GROUP={names["new_group"]}\n'
+            f'LEGACY_STATE_GROUP={names["legacy_group"]}\n'
+            + _rooted(body, str(root))
+            + "\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["sh", str(script)],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PATH": f"{binroot}{os.pathsep}{os.environ['PATH']}"},
+        )
+        return _Migration(root, result, names, gids)
+
+    def __exit__(self, *exc):
+        return False
+
+
+def collision_report(groups=(), users=()):
+    """Run the shipped `postinst`'s own STEP 1 over a fixture account database, and
+    return what it printed.
+
+    **Run rather than read, because the thing under test is a sentence's TRUTH and a
+    sentence's truth is not a substring.** STEP 1 reports a group that already exists
+    and tells the operator it "belongs to another package". Before ruling 191(d)
+    that was worth saying: `dnscrypt-proxy` is the upstream package's own group, and
+    postinst used to admit that the two were sharing one identity. The rename removed
+    anything left to collide with -- and the same lines run against the NEW names,
+    so every `dpkg --configure` retry printed four lines saying this package's own
+    group was somebody else's. MEASURED on a 24.04 cell: a second `dpkg -i` over
+    the first produced
+
+        postinst: the mosdns-router group already exists (mosdns-router:x:102:)
+        postinst: and this install is using it rather than creating it. Nothing in
+        postinst: this package creates that name, so it belongs to another package,
+
+    for a group this package had created four lines earlier.
+
+    So the distinction the report has to make is not "does the group exist" -- on
+    every re-run it does -- but "does the group exist WITHOUT the service identity
+    this package's own `adduser` creates", which is the shape of a real collision.
+    `groups` and `users` are the names the fixture database answers for; a case
+    passes both to describe this package's own accounts and only `groups` to
+    describe a bare group left by somebody else.
+
+    `addgroup` and `adduser` are stubs that succeed, because they are idempotent and
+    the question is what the surrounding reporting decides. Nothing else is stubbed:
+    STEP 1 runs no command that touches this machine.
+    """
+    text = POSTINST.read_text()
+    variables = shell_assignments(text)
+    names = identities_from(text)
+    root = Path(scratch_directory("mosdns-postinst-step1."))
+    if root.exists():
+        subprocess.run(["rm", "-rf", str(root)], check=True)
+    binroot = root / "bin"
+    binroot.mkdir(parents=True)
+    (binroot / "getent").write_text(
+        "#!/bin/sh\n"
+        # The key carries a trailing colon so the patterns can end in one, which is
+        # what keeps `group:mosdns-router` from also answering for a longer account
+        # name that starts with it. `--system` and the like are not arguments this
+        # call makes, but a stub that silently answered for whatever it was given
+        # would report a collision where there is none.
+        'key="${1:-}:${2:-}:"\n'
+        "case \"$key\" in\n"
+        + "".join(f'group:{name}:) printf "{name}:x:1:\\n"; exit 0;;\n' for name in groups)
+        + "".join(
+            f'passwd:{name}:) printf "{name}:x:1:1::x:/nonexistent:/usr/sbin/nologin\\n"; '
+            "exit 0;;\n"
+            for name in users
+        )
+        + "esac\nexit 2\n",
+        encoding="utf-8",
+    )
+    for tool in ("addgroup", "adduser"):
+        (binroot / tool).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    for stub in binroot.iterdir():
+        stub.chmod(0o755)
+    script = root / "step1.sh"
+    script.write_text(
+        "set -e\n"
+        + f'STATE_GROUP={names["group"]}\n'
+        + f'ROUTER_USER={names["router"]}\n'
+        + f'CONTROL_USER={names["control"]}\n'
+        + f'RESOLVER_USER={names["resolver"]}\n'
+        + postinst_step_body(text, 1)
+        + "\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["sh", str(script)],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PATH": f"{binroot}{os.pathsep}{os.environ['PATH']}"},
+    )
+    return completed.stderr
 
 
 def sandboxed_postinst_step(number, published, source_pair, text=None, absent=()):
@@ -3426,7 +3743,20 @@ class MaintainerScriptTests(_Staged):
         come first and the `delgroup` last, in the script's own text.
         """
         run = "\n".join(executed_lines(POSTINST.read_text()))
-        chgrp = run.index('chgrp "$STATE_GROUP"')
+        # A REGEX and not `run.index('chgrp "$STATE_GROUP"')`, because the migration
+        # now runs `chgrp -R` and the literal stopped being in the script -- so the
+        # lookup raised ValueError, and a case that cannot find the command it is
+        # ordering reports a broken script either way. Any option between the verb
+        # and the variable is accepted here on purpose: what this case orders is
+        # the chgrp against the delgroup, and `-R` is an argument to the first rather
+        # than a different command.
+        chgrp_match = re.search(r'chgrp(?:\s+-\S+)*\s+"\$STATE_GROUP"', run)
+        self.assertIsNotNone(
+            chgrp_match,
+            "postinst no longer hands the state trees to the new group at all, so every "
+            "file in them keeps the gid of the group this step is about to delete",
+        )
+        chgrp = chgrp_match.start()
         acl = run.index('setfacl -d -m g::rwx')
         deluser = run.index('deluser --system')
         delgroup = run.index('delgroup --system')
@@ -3452,6 +3782,145 @@ class MaintainerScriptTests(_Staged):
                     r'for directory in [^\n]*' + re.escape(directory),
                     f"{directory} is not in the migration's list at all",
                 )
+
+    def test_an_upgrade_hands_the_files_inside_the_state_tree_to_the_new_group(self):
+        """The defect the four-directory `chgrp` could not see, and the one that
+        takes a machine's DNS down rather than merely refusing an install.
+
+        `chgrp` on a directory moves the DIRECTORY's group and leaves every child's
+        own group alone, so walking the four directories without `-R` moved the
+        directories and nothing else. The step then deleted the old group, and the
+        published files were left group-owned by a gid nothing resolves -- at 0640,
+        which with no group that exists is a file only root can read.
+
+        Two consequences, and both are asserted here rather than described:
+
+          * **the router cannot start.** `/var/lib/mosdns/lists/cloudflare-ips.json`
+            is what the response rewriter builds its prefix watcher from, and it
+            does that before anything else, so the router came up, failed, and bound
+            nothing on port 53 -- while the transaction had already pointed
+            NetworkManager at 127.0.0.1. The machine had no resolver and nothing
+            watching for one, because the watchdog timer is enabled only after the
+            transaction succeeds.
+          * **no later install can succeed either.** `control.lock` is the same
+            story, and preflight reports it as a lock this package did not write --
+            so `dpkg --configure` refused forever with a message about a mode and a
+            group rather than about a rename.
+
+        And `/var/lib/mosdns/installer`, which holds the ownership marker and the
+        recorded NetworkManager values, is not one of the four directories at all,
+        so it kept the old gid outright: the two documents a later uninstall needs
+        to prove what this package set.
+        """
+        with migrated_sandbox() as migration:
+            new_gid = migration.groups[migration.names["new_group"]]
+            legacy_gid = migration.groups[migration.names["legacy_group"]]
+            self.assertEqual(
+                migration.result.returncode, 0,
+                f"the migration failed, so nothing below is about its effect: "
+                f"{migration.stderr}",
+            )
+            # The directories, which the first version got right.
+            for directory in STATE_DIRECTORIES:
+                with self.subTest(directory=directory):
+                    self.assertEqual(
+                        migration.gid_of(directory), new_gid,
+                        f"{directory} was not handed to the new group, so the units "
+                        "cannot write it",
+                    )
+            # The files inside them, which it did not.
+            for relative in (
+                "var/lib/mosdns/lists/cn-domains.txt",
+                "var/lib/mosdns/lists/source-lock.json",
+                "var/lib/mosdns/lists/cloudflare-ips.json",
+                "var/lib/mosdns/runtime/control.lock",
+            ):
+                with self.subTest(path=relative):
+                    self.assertNotEqual(
+                        migration.gid_of(relative), legacy_gid,
+                        f"{relative} is still owned by the group the migration then "
+                        "deletes, so at 0640 with no group that resolves only root can "
+                        "read it and neither service identity can",
+                    )
+                    self.assertEqual(
+                        migration.gid_of(relative), new_gid,
+                        f"{relative} was not handed to the new group, so the router "
+                        "cannot read a document it needs before it binds port 53",
+                    )
+            # And the directory that is not one of the four.
+            for relative in (
+                "var/lib/mosdns/installer",
+                "var/lib/mosdns/installer/managed-by",
+                "var/lib/mosdns/installer/network-manager-backup.json",
+            ):
+                with self.subTest(path=relative):
+                    self.assertEqual(
+                        migration.gid_of(relative), new_gid,
+                        f"{relative} kept the old group's gid, and it is the "
+                        "ownership marker and the recorded NetworkManager values -- "
+                        "the two documents an uninstall reads to decide whether it "
+                        "may put the machine's DNS back",
+                    )
+
+    def test_a_migration_that_finds_no_state_tree_is_not_a_failure(self):
+        """The guard, and it is load-bearing rather than defensive.
+
+        A machine that has never run this package has no state tree, and the
+        migration runs on every `postinst configure` including `dpkg --configure`
+        retries. If the step treated an absent directory as something to fail on,
+        the retry dpkg itself recommends after a refusal would fail at the
+        migration instead -- before the transaction, and with a message about a
+        rename rather than about whatever the operator was sent back to fix.
+        """
+        with migrated_sandbox(empty=True) as migration:
+            self.assertEqual(
+                migration.result.returncode, 0,
+                f"the migration refused a machine with no state tree at all: "
+                f"{migration.stderr}",
+            )
+
+    def test_a_reinstall_is_not_told_its_own_group_belongs_to_another_package(self):
+        """Ruling 191(d) removed the collision; it must not leave the report running.
+
+        Two worlds, and both are this package's own STEP 1:
+
+          * **this package's own accounts, already there.** A group AND the service
+            identity that goes with it, which is what every re-run finds -- and a
+            re-run is exactly what `dpkg` suggests after a refused install and
+            exactly what an operator does next. Reporting that as another package's
+            group sends them looking for a package that does not exist, on the
+            success path as well as the failure one.
+          * **a bare group, with no service identity behind it.** That is what a
+            real collision looks like, and it is the only case the report is for.
+
+        Run both, because the thing under test is which of the two the script calls
+        a collision and a substring of the script cannot tell.
+        """
+        names = identities_from(POSTINST.read_text())
+        claim = "belongs to another package"
+        again = collision_report(groups=(names["group"],), users=(names["router"],))
+        self.assertNotIn(
+            claim, again,
+            "postinst told a re-install that this package's own group belongs to "
+            f"another package, which is the false sentence the rename removed the "
+            f"need for. It printed:\n{again}",
+        )
+        self.assertNotIn(
+            names["group"], again,
+            "postinst reported this package's own group at all on a re-install, so "
+            f"there is nothing in this output to tell a re-run from a collision:\n{again}",
+        )
+        bare = collision_report(groups=(names["group"],), users=())
+        self.assertIn(
+            claim, bare,
+            "postinst no longer reports a bare group as another package's, so a real "
+            f"collision is now silent. It printed:\n{bare}",
+        )
+        self.assertIn(
+            names["group"], bare,
+            "the report did not name the group it is about, so an operator cannot "
+            f"tell which account to look at:\n{bare}",
+        )
 
     def test_a_purge_removes_the_bytecode_cache_dpkg_cannot_see(self):
         """Ruling 191(e). dpkg owns every file this package lists and `__pycache__`
@@ -3546,23 +4015,31 @@ class MaintainerScriptTests(_Staged):
         self.assertEqual(names["resolver"], RESOLVER_USER_NAME)
         # The check covers the shared state group too, which the old script did not:
         # both are names this package could collide with, and only one of them was
-        # asked about.
-        check = 'getent group "$account"'
-        self.assertIn(
-            check, text,
-            "postinst never asks whether a group it is about to create is already "
-            "there, and `addgroup --system` exits 0 when it is, so a collision is "
-            "adopted silently",
-        )
-        self.assertIn(
-            f'for account in "$STATE_GROUP" "$RESOLVER_USER"', text,
-            "postinst checks one group and not the other, so a machine whose state "
-            "group belongs to another package is not told",
-        )
+        # asked about. **Both spellings, in the script's own text**, rather than the
+        # `for account in ...` loop this used to be: the loop was what made the
+        # report fire on this package's own accounts, because a loop can only test
+        # the one thing it iterates over, and the thing that distinguishes a
+        # collision from a re-run is the account BEHIND the group.
+        for group, user in (("STATE_GROUP", "ROUTER_USER"), ("RESOLVER_USER", "RESOLVER_USER")):
+            with self.subTest(group=group):
+                check = f'getent group "${group}"'
+                self.assertIn(
+                    check, text,
+                    f"postinst never asks whether the {group} group it is about to "
+                    "create is already there, and `addgroup --system` exits 0 when it "
+                    "is, so a collision is adopted silently",
+                )
+                self.assertIn(
+                    f'getent passwd "${user}"', text,
+                    f"the {group} collision report does not ask whether this package's "
+                    "own service identity is behind the group, so it fires on every "
+                    "re-run -- which is what dpkg itself suggests after a refusal",
+                )
         # The check has to come BEFORE the addgroup, or it reports a group this
         # script created itself and calls that a collision on every upgrade.
         self.assertLess(
-            text.index(check), text.index('addgroup --system "$STATE_GROUP"'),
+            text.index('getent group "$STATE_GROUP"'),
+            text.index('addgroup --system "$STATE_GROUP"'),
             "a group is created before postinst asks whether it already existed",
         )
         # And the message has to say the group belongs to ANOTHER package, which is
