@@ -368,12 +368,12 @@ func (p *Plugin) logReloadRefusal(err error) {
 
 // Exec answers one query, and is the whole decision this plugin makes.
 //
-// The order is the design. The strict short circuit comes before anything else, so
-// a strict force-ECH name's A and AAAA cost no upstream lookup at all. Every
-// other question is asked downstream exactly once, and only the response that
-// comes back is ever considered for a change: a plugin that answered from its own
-// state would be a second resolver, and the answer it has is a selector, not a
-// record set.
+// The order is the design. Every question is asked downstream exactly once, and
+// only the response that comes back is ever considered for a change: a plugin that
+// answered from its own state would be a second resolver, and the answer it has is a
+// selector, not a record set. There is deliberately no short circuit ahead of that --
+// a listed name's A and AAAA used to be answered from this router's own empty answer
+// without asking anybody, which bought no privacy and cost the client its address.
 func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context, next sequence.ChainWalker) error {
 	if p.closed.Load() {
 		return errClosed
@@ -386,20 +386,22 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context, next seq
 	name := dnsclassify.CanonicalName(question.Name)
 	forced := p.forcesECH(name)
 
-	if forced && p.echPolicy == dnsrewrite.FailClosed {
-		switch question.Qtype {
-		case dns.TypeA, dns.TypeAAAA:
-			// Nothing is asked downstream, and the answer is this router's own: a
-			// NOERROR with no records and no SOA. The SOA is the part that is easy
-			// to get wrong, and it matters: an authority record is a negative
-			// caching claim, and a negative TTL measured against a policy TTL this
-			// router did not choose is a claim about a name that is not true. An
-			// empty answer with nothing in the authority section is recomputed for
-			// free, which is the honest price of refusing to say.
-			qCtx.SetResponse(emptyAnswer(query))
-			return nil
-		}
-	}
+	// There is no short circuit here, and there used to be one: a strict force-ECH
+	// name's A and AAAA queries were answered from this router's own empty answer
+	// without asking anybody. The reasoning was that a name on the list must not have
+	// its address disclosed, and the reasoning does not survive knowing where this
+	// plugin runs. cdn_rewrite is only ever in the foreign path, so the HTTPS query
+	// that named the domain has already gone to the foreign resolver by the time an
+	// A lookup for the same domain arrives -- the disclosure that mattered happened
+	// first, and the lookup that follows discloses nothing that has not been
+	// disclosed. What the suppression bought was the client's address, and a client
+	// with no address has nothing to connect to, so the encrypted ClientHello this
+	// package works to produce was never sent to anything. The feature was worse than
+	// absent, which is the finding ruling 191(a) records.
+	//
+	// So a listed name's address queries are ordinary queries and are answered
+	// exactly as an unlisted name's are. `forced` is now read only by the HTTPS path,
+	// which is the one answer the list is about.
 
 	if err := next.ExecNext(ctx, qCtx); err != nil {
 		return err
@@ -766,18 +768,6 @@ func terminalOf(response *dns.Msg) string {
 		return ""
 	}
 	return owners[len(owners)-1]
-}
-
-// emptyAnswer is the answer a strict force-ECH name's A and AAAA queries get: the
-// question echoed, NOERROR, and no records anywhere. The recursion and
-// checking-disabled bits are the client's own and are copied, so a client that
-// asked not to be checked is not answered as though it had been.
-func emptyAnswer(query *dns.Msg) *dns.Msg {
-	response := new(dns.Msg)
-	response.SetReply(query)
-	response.Answer = nil
-	response.Ns = nil
-	return response
 }
 
 // forcesECH reports whether a name is one the operator asked to force ECH for.

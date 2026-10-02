@@ -64,10 +64,28 @@ import (
 // sequence's.
 const echFetchTimeout = 3 * time.Second
 
-// minimumECHRefresh is the floor under the upstream's TTL. A key fetched more
-// often than this spends a query per client query, on the listener this router
-// forwards every foreign query through.
-const minimumECHRefresh = 60 * time.Second
+// echRotationInterval is the cadence, and it is FIXED rather than derived from what
+// the source published. One request per interval, so with three sources each domain
+// is asked once every fifteen minutes.
+//
+// It was `max(TTL, 60s)` before, and there are two reasons it is not any more. The
+// first is cost, and it is the smaller one: a refresh read EVERY configured source,
+// so a three-source rotation at a 300s TTL spent three queries every five minutes to
+// learn what one of them had already said. The second is that the TTL was never the
+// right thing to schedule on, because the three sources publish the same
+// byte-identical list: there is one key to keep fresh, so there is one question to
+// ask, and rotating WHICH domain is asked spreads it rather than multiplying it.
+//
+// The cost of fixing the cadence, stated because it is a real one: a key is treated
+// as fresh for the whole interval even if a source published a shorter TTL, so a
+// publisher withdrawing its key is noticed up to one interval late. That is bounded
+// and small against what the measurement says: cloudflare-ech.com's HTTPS TTL
+// MEASURED 295-300s, so the interval and the TTL are the same size, and Total-ECH's
+// README says Cloudflare rotates hourly with the config valid for more than three
+// hours. The interval is not derived from those numbers because it is a cost
+// decision, not a validity one, and a cost decision that was re-derived from
+// whatever TTL was measured next would drift back into scheduling on it.
+const echRotationInterval = 5 * time.Minute
 
 // The three states a held key can be in, spelled as the state document spells
 // them, so the file an operator reads and the answer a client gets come out of
@@ -147,6 +165,11 @@ type echProvider struct {
 	have       bool
 	refreshing bool
 	finished   chan struct{}
+	// next is the index into sources of the one the next refresh asks. It advances
+	// only when a fetch stores a key, and it is read and written under mu because a
+	// reader has to see the same position the writer advanced. The zero value is the
+	// first source, which is where every provider starts.
+	next int
 	// published is what the metadata document on disk was last written from, so a
 	// document that would be byte-identical is not written again and an older
 	// snapshot cannot replace a newer one.
@@ -387,53 +410,107 @@ func (e *echProvider) statusLocked() string {
 	}
 }
 
-// fetch reads every configured source and returns the one list they agree on.
+// fetch reads ONE source -- the next in the rotation -- and returns the list it
+// published, if that list agrees with the key already held.
 //
-// Every source is queried, not just the first that answers, because the agreement
-// is the point: a list from one source beside a different public name from another
-// leaves a client unable to say which name it is authenticating, and picking one
-// is a decision no component of this router is placed to make. A source that could
-// not be read fails the refresh as a whole, so the last key is what keeps serving
-// until its grace ends.
+// One source, not all of them. The agreement is still the point, but it is no longer
+// three fetches' worth of evidence gathered at once: the three configured sources are
+// MEASURED (2026-10-02) to publish a byte-identical ECHConfigList, so a rotation
+// between them cannot change the key, and asking all of them on every refresh spent
+// three queries to learn something one of them already said. With one request every
+// echRotationInterval each domain is asked once per round, so a source going quiet
+// costs one third of the key's freshness rather than all of it.
+//
+// The agreement rule survives, relaxed from "every source is reachable at once and
+// they all say the same thing" to "whatever is fetched has to match what is held".
+// Those are not the same claim, and the difference is the whole point of the
+// rotation: the old rule needed all three sources UP simultaneously, so one
+// unreachable or disagreeing source took every force-ECH domain on the router down
+// with it, and the feature was worse than not listing a domain at all. A
+// disagreement now refuses THAT replacement and nothing else -- the held key stays
+// in service, the rotation does not advance, and the next interval lands on a
+// different source.
+//
+// The rotation position advances after EVERY attempt, whether or not a key came
+// back, and that is forced by the arithmetic rather than chosen. One source is asked
+// per interval, so holding the position on a refusal re-asks the same domain five
+// minutes later, and a source that disagrees permanently would then be asked every
+// interval forever while the two healthy domains were never consulted again -- which
+// defeats the rotation, because the rotation is what makes a bad source cost one
+// third of the freshness instead of all of it.
+//
+// Advancing is also what keeps the grace meaningful. The grace is two intervals, so
+// moving on costs at most one interval before the next source is asked, and a
+// disagreement therefore never pushes the next successful refresh past the point
+// where the held key stops serving. Holding the position would make one disagreeing
+// source end the key's life entirely: refuse at t=5, refuse at t=10, and the grace
+// has ended with nothing stored, so a strict force-ECH name fails closed on a fault
+// that two healthy sources could have covered.
+//
+// A source is therefore asked once per round however it answered, and the position
+// is about WHICH DOMAIN TO ASK rather than about whether the last answer was good.
 func (e *echProvider) fetch(ctx context.Context) (echConfig, error) {
-	fetched := echConfig{fetchedAt: e.now()}
-	agreed := true
-	for _, source := range e.sources {
-		list, ttl, err := e.fetchOne(ctx, source)
-		if err != nil {
-			return echConfig{}, err
-		}
-		name := list.Configs[0].PublicName
-		if fetched.source == "" {
-			fetched.source = source
-			fetched.raw = list.Raw
-			fetched.publicName = name
-			fetched.expiresAt = fetched.fetchedAt.Add(refreshAfter(ttl))
-			fetched.staleUntil = fetched.expiresAt.Add(e.grace)
-			digest := sha256.Sum256(list.Raw)
-			fetched.digest = hex.EncodeToString(digest[:])
-			continue
-		}
-		if name != fetched.publicName {
-			agreed = false
-			e.logger.Error("cdn_rewrite: the ECH sources disagree about the public name, so no key is used",
-				zap.String("source", source), zap.String("public_name", name),
-				zap.String("kept_source", fetched.source), zap.String("kept_public_name", fetched.publicName))
-		}
+	e.mu.Lock()
+	source := e.sources[e.next]
+	e.next = (e.next + 1) % len(e.sources)
+	e.mu.Unlock()
+
+	list, _, err := e.fetchOne(ctx, source)
+	if err != nil {
+		return echConfig{}, err
 	}
-	if !agreed {
-		return echConfig{}, fmt.Errorf("%w: the configured sources name different public names", ErrECHUnusable)
+	name := list.Configs[0].PublicName
+
+	e.mu.Lock()
+	held, have := e.current, e.have
+	e.mu.Unlock()
+	// A disagreement is refused only while the key in service is still worth
+	// keeping. Once its grace has ended there is nothing left to protect, and
+	// refusing would be worse than useless: the held key would never be dropped, so
+	// the replacement would never be accepted, and every force-ECH name would fail
+	// closed permanently on a source that is answering perfectly well. That is the
+	// opposite of what the grace is for -- it exists to tell a source that was
+	// briefly unreachable from one that is gone, and "gone" means the held key is no
+	// longer worth preferring to whatever the source publishes now.
+	//
+	// So a legitimate upstream rotation, which moves the public name with the key,
+	// is refused while the old key serves and adopted once it does not. The window
+	// in between is where the held key is both usable and preferred, and preferring
+	// it is the whole point of holding it.
+	if have && name != held.publicName && e.now().Before(held.staleUntil) {
+		e.logger.Error("cdn_rewrite: this ECH source names a different public name than the key in service, so the replacement is refused and the held key stands",
+			zap.String("source", source), zap.String("public_name", name),
+			zap.String("kept_source", held.source), zap.String("kept_public_name", held.publicName),
+			zap.String("kept_until", held.staleUntil.Format(time.RFC3339)))
+		return echConfig{}, fmt.Errorf("%w: %s publishes %q and the key in service names %q, so the replacement is refused and the held key stands",
+			ErrECHUnusable, source, name, held.publicName)
 	}
+
+	fetched := echConfig{
+		fetchedAt:  e.now(),
+		source:     source,
+		raw:        list.Raw,
+		publicName: name,
+		// The cadence, not the TTL, decides how long a key is fresh. See
+		// echRotationInterval for why, and for what it costs a source that publishes
+		// a shorter TTL than the interval.
+		expiresAt: e.now().Add(echRotationInterval),
+	}
+	fetched.staleUntil = fetched.expiresAt.Add(e.grace)
+	digest := sha256.Sum256(list.Raw)
+	fetched.digest = hex.EncodeToString(digest[:])
 
 	e.mu.Lock()
 	fetched.generation = e.current.generation + 1
 	e.bytes += int64(len(fetched.raw))
 	read := e.bytes
+	remaining := len(e.sources) - e.next
 	e.mu.Unlock()
 	e.logger.Info("cdn_rewrite: fetched an ECH key",
 		zap.String("source", fetched.source),
 		zap.String("public_name", fetched.publicName),
-		zap.Int("sources", len(e.sources)),
+		zap.Int("sources_in_rotation", len(e.sources)),
+		zap.Int("until_this_source_is_asked_again", remaining*int(echRotationInterval/time.Second)),
 		zap.Duration("refresh_after", fetched.expiresAt.Sub(fetched.fetchedAt)),
 		zap.Int64("ech-fetch-bytes", read))
 	return fetched, nil
@@ -550,16 +627,6 @@ func consistentPublicName(list *echconfig.List) error {
 		}
 	}
 	return nil
-}
-
-// refreshAfter is how long a fetched key is good for: the TTL the source
-// published, with a floor under it.
-func refreshAfter(ttl uint32) time.Duration {
-	lifetime := time.Duration(ttl) * time.Second
-	if lifetime < minimumECHRefresh {
-		return minimumECHRefresh
-	}
-	return lifetime
 }
 
 // publish writes the metadata document for a key in a known state.

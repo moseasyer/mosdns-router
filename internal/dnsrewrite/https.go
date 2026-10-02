@@ -45,12 +45,18 @@ const (
 //     or has something this router will not forward. They are separate because a
 //     missing config is worth a retry and a corrupt one is not, and because a caller
 //     that cannot tell them apart will keep a record when it should have blocked.
-//   - ErrNoSelectedAddress: there is no address to point the client at -- none at all,
-//     none proved, or one that failed its health check.
 //   - ErrNoCompatibleEndpoint: the name published a service binding and every one of
-//     them is unusable here. Nothing about the ECHConfig or the selected address is at
+//     them is unusable here. Nothing about the ECHConfig or the address is at
 //     fault, so both policies fail: there is no better answer to hand back than the
 //     endpoints that are unusable.
+//
+// There is deliberately no refusal for "there is no address to point the client at".
+// That was one, and it was the wrong one: an address is where the client is sent,
+// not whether the client is told the service exists, so a missing one now takes the
+// upstream's own hint if there is one and is otherwise left out of the record.
+// Refusing there cost every force-ECH name its answer for a field this router does
+// not own, on an install where nothing had ever populated it. The key is the whole
+// of the obligation and it is still refused when it is absent.
 //   - ErrDelegatedName: the name belongs to somebody else. It is either a CNAME at
 //     that owner, or an RRset there that contains an alias. The upstream describes a
 //     service under another name, and a service mode synthesized here would contradict
@@ -70,7 +76,6 @@ const (
 var (
 	ErrNoECHConfig          = errors.New("dnsrewrite: there is no ECHConfig to install")
 	ErrInvalidECHConfig     = errors.New("dnsrewrite: the ECHConfig cannot be forwarded")
-	ErrNoSelectedAddress    = errors.New("dnsrewrite: there is no selected IPv4 address to point the client at")
 	ErrNoCompatibleEndpoint = errors.New("dnsrewrite: no upstream HTTPS endpoint can be used with the selected address")
 	ErrDelegatedName        = errors.New("dnsrewrite: the name is delegated to another name, so no service binding may be synthesized for it")
 	ErrUpstreamDenial       = errors.New("dnsrewrite: the upstream's answer is a statement about the name, not an absence of one")
@@ -90,14 +95,20 @@ type HTTPSInput struct {
 	// under a name the response does not answer is an answer to a question nobody
 	// asked.
 	QName string
-	// Selected is the address to hint, and it must be a routable public IPv4 address
-	// on the same terms as the address rewrite. The hint is the only thing standing
-	// between a client and a network the selector has not proved, so an address that
-	// failed its health check must never become a hint. What happens then depends on
-	// the policy: a strict caller is refused, because a record with no hint sends the
-	// client to resolve the name and this router has emptied that resolution, while a
-	// fallback caller is handed the upstream's own record, which carries the
-	// upstream's own address and no key.
+	// Selected is the address to hint, and it is a routable public IPv4 address on
+	// the same terms as the address rewrite or it is nothing at all. The hint is the
+	// only thing standing between a client and a network the selector has not
+	// proved, so an address that failed its health check must never become a hint --
+	// which is why an unusable one is discarded here rather than repaired.
+	//
+	// It is an input and not an obligation. When it is usable it is the hint, and
+	// the upstream's own hints are replaced, because a selection is the only address
+	// in this design that a component here measured and proved. When it is not, the
+	// record carries the upstream's own hints if every retained endpoint agrees on
+	// them and carries NO hint at all otherwise, and the answer is a service mode
+	// either way. That is the whole of the borrowed-key scheme: the key says the
+	// client should encrypt, the address only says where, and a missing address is
+	// not a reason to tell the client nothing about whether the service exists.
 	Selected netip.Addr
 	// ECH is the ECHConfigList the ECH source published: the SvcParamValue of an
 	// ech parameter including the outer uint16 list length, which is exactly what
@@ -213,9 +224,11 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 	if err != nil {
 		return keepOrRefuse(in, question.Name, err)
 	}
-	if err := checkSelected(in.Selected); err != nil {
-		return keepOrRefuse(in, question.Name, fmt.Errorf("%w: %s", ErrNoSelectedAddress, err))
-	}
+	// The selection is resolved rather than required, and it is resolved HERE so the
+	// key is still the first thing refused. A caller that reads the order as "address
+	// then key" would report a missing key as a missing address, and a client handed
+	// a record with no key in it connects in the clear while believing it did not.
+	selected, selectionErr := selection(in.Selected)
 	if err := bypassable(clone); err != nil {
 		return keepOrRefuse(in, question.Name, err)
 	}
@@ -227,7 +240,7 @@ func HTTPS(in HTTPSInput) (*dns.Msg, error) {
 		return keepOrRefuse(in, question.Name, fmt.Errorf("%w: %q published %d service mode record(s) and none of them is usable: %s",
 			ErrNoCompatibleEndpoint, question.Name, found.bindings, strings.Join(found.refusals, "; ")))
 	}
-	record, dropped := synthesized(question, found, list, in.Selected)
+	record, dropped := synthesized(question, found, list, selected, selectionErr)
 
 	// The answer is positive whatever the upstream said, because the record in it is
 	// this router's and not the upstream's.
@@ -468,8 +481,10 @@ func classify(published []*dns.HTTPS) endpoints {
 // about reachability rather than about the key: an endpoint under an IPv6 address
 // names a network this release does not install, and an endpoint whose only address
 // is an IPv6 hint names the same network by the only route it offers. An endpoint
-// with an IPv4 hint is reachable, and the hint is replaced, so an IPv6 hint beside
-// one is simply left out of the record this router writes.
+// with an IPv4 hint is reachable, and what happens to the hints beside it depends on
+// whether this router has an address of its own: with a selection, the IPv4 hint is
+// replaced by it and the IPv6 one is left out; with no selection, both are the
+// upstream's own claims about where its service lives and both are inherited.
 func unusable(record *dns.HTTPS) string {
 	if ipv6Target(record.Target) {
 		return fmt.Sprintf("its target %q is an IPv6 address", record.Target)
@@ -528,10 +543,36 @@ func countHints(record *dns.HTTPS) (ipv4, ipv6 int) {
 	return ipv4, ipv6
 }
 
+// selection is the address the selector proved, and the reason there is none. The
+// two are separate returns because the caller has to act on the difference: an
+// unusable selection is not a fault in the answer, it is a field this router does
+// not own being empty, and the record it writes is still a usable service mode.
+//
+// The reason is carried rather than logged so that it can end up in the record's
+// own report. An operator whose selector has been down for an hour is looking at a
+// force-ECH record that is working, and nothing about that record says why the
+// address in it is the upstream's rather than the one this router would have
+// chosen.
+func selection(address netip.Addr) (netip.Addr, error) {
+	if err := checkSelected(address); err != nil {
+		return netip.Addr{}, err
+	}
+	return address, nil
+}
+
 // synthesized builds the one record the answer will carry. Every refusal about what
 // the upstream published has already been made by the caller, so this function only
 // builds.
-func synthesized(question dns.Question, found endpoints, list *echconfig.List, address netip.Addr) (*dns.HTTPS, []DroppedParameter) {
+//
+// The address hint is the one parameter whose source is a decision rather than a
+// constant, and there are three outcomes rather than two. A selection puts this
+// router's own address in the record and the upstream's hints are replaced. No
+// selection and an upstream that published one leaves the upstream's hints to be
+// inherited under the ordinary agreement rule. No selection and no upstream hint
+// leaves the parameter ABSENT -- an empty hint would claim the service is reachable
+// at nothing in particular, and a client cannot tell that apart from a hint it
+// should follow, so the honest form of "nowhere in particular" is not writing it.
+func synthesized(question dns.Question, found endpoints, list *echconfig.List, selected netip.Addr, selectionErr error) (*dns.HTTPS, []DroppedParameter) {
 	record := &dns.HTTPS{SVCB: dns.SVCB{
 		Hdr: dns.RR_Header{
 			Name:   question.Name,
@@ -546,9 +587,10 @@ func synthesized(question dns.Question, found endpoints, list *echconfig.List, a
 		Priority: 1,
 		Target:   ".",
 	}}
+	ownHints := selected.IsValid()
 	var dropped []DroppedParameter
 	if len(found.usable) > 0 {
-		inherited, left := inheritedParameters(found.usable)
+		inherited, left := inheritedParameters(found.usable, ownHints)
 		dropped = left
 		record.Value = append(record.Value, inherited...)
 		record.Hdr.Ttl = shortestTTL(found.usable)
@@ -560,19 +602,60 @@ func synthesized(question dns.Question, found endpoints, list *echconfig.List, a
 		// shortestTTL.
 		record.Value = append(record.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}})
 	}
+	if ownHints {
+		dropped = append(dropped, replacedHints(found.usable, selectionErr)...)
+	}
 
-	// The three parameters this router owns. The key is the source's, the hint is
-	// the selection, and the mandatory list is what tells a client that a record
-	// without the key is not an answer to this question. The order they are
-	// appended in is not the order they reach the wire in: the library's packer
-	// sorts SvcParamKeys into the increasing order RFC 9460 Section 2.2 requires,
-	// and this package does not second-guess it.
-	record.Value = append(record.Value,
-		&dns.SVCBECHConfig{ECH: list.Raw},
-		&dns.SVCBIPv4Hint{Hint: []net.IP{net.IP(address.AsSlice())}},
-		&dns.SVCBMandatory{Code: mandatoryList(record.Value, found.usable)},
-	)
+	// The key, then the hint, then the list of what a client must understand to read
+	// this record. The order the three are appended in is not the order they reach
+	// the wire in: the library's packer sorts SvcParamKeys into the increasing order
+	// RFC 9460 Section 2.2 requires, and this package does not second-guess it.
+	//
+	// They are three statements rather than one because the list has to be computed
+	// from a record that already carries the first two. In one statement Go evaluates
+	// the operands first, so mandatoryList would be handed the record as it stood
+	// before the key and the hint existed, and the filter that keeps a mandatory list
+	// from naming a parameter the record does not carry would drop keys the record
+	// ends up carrying -- an endpoint that declared mandatory=ipv4hint would lose it
+	// on the very record that answers with one, and the degradation is invisible
+	// afterwards because the record is usable.
+	record.Value = append(record.Value, &dns.SVCBECHConfig{ECH: list.Raw})
+	if ownHints {
+		record.Value = append(record.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{net.IP(selected.AsSlice())}})
+	}
+	record.Value = append(record.Value, &dns.SVCBMandatory{Code: mandatoryList(record.Value, found.usable)})
 	return record, dropped
+}
+
+// replacedHints reports the address parameters a selection took the place of. It
+// exists because ownedByThisRouter skips them silently, and because this is the one
+// drop in the package that changes where a client connects: every other parameter
+// this router declines to inherit describes something about the service, and this
+// one is an address. An operator reading the record sees an address and has no way
+// to know it is not the one the upstream published.
+func replacedHints(usable []*dns.HTTPS, selectionErr error) []DroppedParameter {
+	claimed := map[dns.SVCBKey]int{}
+	for _, record := range usable {
+		for _, pair := range record.Value {
+			key := pair.Key()
+			if key == dns.SVCB_IPV4HINT || key == dns.SVCB_IPV6HINT {
+				claimed[key]++
+			}
+		}
+	}
+	var dropped []DroppedParameter
+	for _, key := range []dns.SVCBKey{dns.SVCB_IPV4HINT, dns.SVCB_IPV6HINT} {
+		if claimed[key] == 0 {
+			continue
+		}
+		reason := fmt.Sprintf("%d of the %d retained endpoints published it, and the record answers with the address this router's own selector proved instead, which is the only address in this design a component here measured",
+			claimed[key], len(usable))
+		if selectionErr != nil {
+			reason = fmt.Sprintf("%s; the selector had no address either (%v), so the client resolves this name itself", reason, selectionErr)
+		}
+		dropped = append(dropped, DroppedParameter{Key: key, Reason: reason})
+	}
+	return dropped
 }
 
 // inheritedParameters collects what the usable endpoints describe, and reports what
@@ -600,7 +683,7 @@ func synthesized(question dns.Question, found endpoints, list *echconfig.List, a
 // default the endpoints agreed on. But it is a degraded answer, so every drop is
 // reported with the fault that caused it, and a caller that wants to count or log
 // the degradation can.
-func inheritedParameters(usable []*dns.HTTPS) ([]dns.SVCBKeyValue, []DroppedParameter) {
+func inheritedParameters(usable []*dns.HTTPS, ownHints bool) ([]dns.SVCBKeyValue, []DroppedParameter) {
 	order := make([]dns.SVCBKey, 0, len(usable)*2)
 	kept := map[dns.SVCBKey]dns.SVCBKeyValue{}
 	claimed := map[dns.SVCBKey]int{}
@@ -608,7 +691,7 @@ func inheritedParameters(usable []*dns.HTTPS) ([]dns.SVCBKeyValue, []DroppedPara
 	for _, record := range usable {
 		for _, pair := range record.Value {
 			key := pair.Key()
-			if ownedByThisRouter(key) {
+			if ownedByThisRouter(key, ownHints) {
 				continue
 			}
 			if _, seen := claimed[key]; !seen {
@@ -683,23 +766,26 @@ func inheritedParameters(usable []*dns.HTTPS) ([]dns.SVCBKeyValue, []DroppedPara
 // naming itself is forbidden outright. Deduping happens here, before packing,
 // because the library sorts the keys it packs and does not deduplicate them.
 //
-// The set of keys the record carries cannot be read off `record` alone, and the
-// reason is the order the caller builds the record in: it appends the ech parameter
-// and the IPv4 hint and THIS list in one statement, so Go evaluates the operands
-// first and this function is handed the record as it stood before any of the three
-// existed. Filtering on that snapshot alone loses a key the record ends up
-// carrying -- an upstream that declared mandatory=ipv4hint has its key dropped even
-// though the record answers with the selected address in that parameter -- and the
-// degradation is invisible afterwards, because the record is usable and nobody
-// reports a missing key on a usable record. So the two parameters this router
-// installs on every synthesis are named here as well. ipv6hint is not among them,
-// and must not be: no synthesis writes one, so an endpoint that made it mandatory is
-// a key the record does not carry, which is the case the filter above exists for.
+// `record` is the record as built so far, which is the point of the caller
+// appending the key and the hint before calling. The set of keys that ends up in
+// the answer is not knowable from anything else, and guessing at it is how a
+// mandatory list comes to name a parameter the record does not carry. Two ways that
+// used to happen here, both now impossible for the same reason:
+//
+//   - An upstream that declared mandatory=ipv4hint lost the key even on the record
+//     that answers with a hint in it, because the list was computed from a snapshot
+//     taken before the hint existed. The degradation was invisible afterwards: the
+//     record was usable and nothing reports a missing key on a usable record.
+//   - ipv4hint was hardcoded as present, so an endpoint that made it mandatory kept
+//     the key on a record with NO hint in it -- which is now a record this package
+//     writes, whenever there is no selection and the upstream published none. That
+//     is a record a client may reject outright, built out of a filter whose whole
+//     purpose is to prevent exactly that.
+//
+// ipv6hint is never hardcoded for the same reason it never was: whether the record
+// carries one now depends on the upstream, so it is decided by looking.
 func mandatoryList(record []dns.SVCBKeyValue, usable []*dns.HTTPS) []dns.SVCBKey {
-	present := map[dns.SVCBKey]bool{
-		dns.SVCB_ECHCONFIG: true,
-		dns.SVCB_IPV4HINT:  true,
-	}
+	present := map[dns.SVCBKey]bool{}
 	for _, pair := range record {
 		present[pair.Key()] = true
 	}
@@ -750,15 +836,31 @@ func shortestTTL(usable []*dns.HTTPS) uint32 {
 	return shortest
 }
 
-// ownedByThisRouter names the parameters this package decides rather than copies.
-// The ech parameter, the IPv4 hint and the IPv6 hint are the key and the address
-// this router installed, and mandatory is the list that says so. Inheriting any of
-// them would either install an address nobody proved or leave a mandatory list
-// naming parameters that are no longer in the record.
-func ownedByThisRouter(key dns.SVCBKey) bool {
+// ownedByThisRouter names the parameters this synthesis decides rather than copies,
+// and the answer is a function of where the address came from rather than a constant.
+//
+// The ech parameter and the mandatory list are always this router's: the key is the
+// source's and this router validated it, and the list is a statement about the
+// record this function builds. Inheriting either would install a key nobody
+// validated or leave a mandatory list naming parameters that are no longer in the
+// record.
+//
+// The two address hints are the ones that used to be unconditional, and that was
+// the defect: a synthesis with no address to put in them discarded the upstream's
+// and then wrote an empty one, so the record claimed the service was reachable at
+// nothing in particular. They are this router's exactly when it HAS an address of
+// its own to write there. Then the selection is what the record carries, and the
+// upstream's hints describe an edge somebody else measured, so they are replaced.
+// When there is no selection this router has nothing to offer, and the upstream's
+// published hints are the only claim about where the service lives that anybody in
+// this path made -- so they are inherited like any other parameter, under the same
+// agreement rule, and the record ends up with the upstream's hint or with none.
+func ownedByThisRouter(key dns.SVCBKey, ownHints bool) bool {
 	switch key {
-	case dns.SVCB_ECHCONFIG, dns.SVCB_IPV4HINT, dns.SVCB_IPV6HINT, dns.SVCB_MANDATORY:
+	case dns.SVCB_ECHCONFIG, dns.SVCB_MANDATORY:
 		return true
+	case dns.SVCB_IPV4HINT, dns.SVCB_IPV6HINT:
+		return ownHints
 	}
 	return false
 }

@@ -33,9 +33,11 @@ cdn:
 ech:
   enabled: true
   failure_policy: strict
-  stale_grace: 900
+  stale_grace: 600
   sources:
     - cloudflare-ech.com
+    - cdn.discordapp.com
+    - discordapp.com
 dhcp:
   failure_policy: disable-current
 cache:
@@ -71,8 +73,8 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 		ECH: ECHPolicy{
 			Enabled:           true,
 			FailurePolicy:     "strict",
-			StaleGraceSeconds: 900,
-			Sources:           []string{"cloudflare-ech.com"},
+			StaleGraceSeconds: 600,
+			Sources:           []string{"cloudflare-ech.com", "cdn.discordapp.com", "discordapp.com"},
 		},
 		DHCP:  DHCPPolicy{FailurePolicy: "disable-current"},
 		Cache: CachePolicy{PersistentDump: false},

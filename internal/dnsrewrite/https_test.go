@@ -1,6 +1,7 @@
 package dnsrewrite
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"net"
@@ -493,40 +494,260 @@ func TestHTTPSRefusesWithoutAnECHConfigAndSaysWhichKindItWas(t *testing.T) {
 // router never checked unless they arrive as a refusal. The sentinel is distinct
 // from the ECHConfig ones so that a caller does not answer an unhealthy address by
 // keeping a record it would then have to rewrite anyway.
-func TestHTTPSRefusesWithoutASelectedAddress(t *testing.T) {
+// --- where the address hint comes from when the selector has none ---
+//
+// The selector and the upstream are two sources for the same one parameter, and the
+// order between them is the whole of this group. The selector's address wins when
+// it has one, because it is the only address in this design that some component
+// MEASURED and proved inside a window that has not closed. When it has none, the
+// upstream's own published hint is what the record carries, because the upstream
+// measured it too and publishing it is the claim. When it has none either, the
+// parameter is ABSENT -- not present and empty -- and the record is still a service
+// mode carrying the key.
+//
+// The reason the last one matters more than the first two: a record with no hint is
+// a record a client resolves normally and connects to the address the name has. A
+// record with an EMPTY hint claims the service is reachable at nothing in
+// particular, and the difference between those two is the difference between a
+// working fallback and a connection that cannot be made.
+
+// TestHTTPSWithoutASelectionAnswersFromTheUpstreamsOwnHint is the middle case: no
+// selection, and the upstream published a hint. The record carries the upstream's
+// own address and not nothing, because that address is the one claim about where
+// this service lives that anybody in this path actually made.
+func TestHTTPSWithoutASelectionAnswersFromTheUpstreamsOwnHint(t *testing.T) {
 	upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, ".",
 		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+		&dns.SVCBPort{Port: 443},
+		&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.1.1").To4()}},
+		&dns.SVCBIPv6Hint{Hint: []net.IP{net.ParseIP("2606:4700::1111")}},
 	))
-	tests := []struct {
-		name     string
-		selected netip.Addr
-	}{
-		{name: "no address at all", selected: netip.Addr{}},
-		{name: "an IPv6 selection", selected: netip.MustParseAddr("2606:4700::1111")},
-		{name: "a loopback selection", selected: netip.MustParseAddr("127.0.0.1")},
+
+	got, err := HTTPS(HTTPSInput{
+		Response: upstream,
+		QName:    "cdn.example.",
+		Selected: netip.Addr{},
+		ECH:      echFixture(t),
+		Policy:   FailClosed,
+	})
+	if err != nil {
+		t.Fatalf("HTTPS refused a name it had a usable key for and an upstream hint for: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	record := onlyHTTPS(t, got)
+
+	if ech := echOf(t, record); !bytes.Equal(ech, echFixture(t)) {
+		t.Fatal("the answer carries a key other than the one the source published")
+	}
+	if hints := hintOf(t, record); !reflect.DeepEqual(hints, []string{"104.16.1.1"}) {
+		t.Errorf("ipv4hint = %v, want the upstream's own [104.16.1.1]: with no selection this router has no address of its own to give, and the upstream's is a claim somebody made", hints)
+	}
+	// The IPv6 hint is the one this release had always thrown away, because a
+	// synthesis with a selection wrote an IPv4 address and an IPv6 hint beside it
+	// described a network nothing here could select. With no selection the record is
+	// no longer claiming to be reachable over IPv4 at this router's own address, so
+	// the upstream's IPv6 hint is a claim about its own service and is kept. What is
+	// still refused is an endpoint whose ONLY address is an IPv6 hint: that one is
+	// not usable at all, and unusable says so before any of this runs.
+	if !carries(record, dns.SVCB_IPV6HINT) {
+		t.Errorf("the upstream's own ipv6hint was dropped: %s", carried(record))
+	}
+	selfConsistent(t, record)
+}
+
+// TestHTTPSWithoutASelectionAndWithoutAnUpstreamHintOmitsTheHint is the case the
+// whole group exists for. There is no selection and the upstream published no hint,
+// and the answer is still a service mode carrying the key, with the parameter
+// ABSENT. It is checked as absent rather than as empty on purpose: hintOf refuses
+// an empty list as well as a missing parameter precisely because a client cannot
+// tell them apart, so an assertion that only asked for "not the selected address"
+// would pass against a record carrying an empty hint, which is the defect.
+func TestHTTPSWithoutASelectionAndWithoutAnUpstreamHintOmitsTheHint(t *testing.T) {
+	// Every shape of "no usable selection" is here, because they have to reach the
+	// same place: an address that is not an address, one this release does not
+	// install, and one that is not routable. None of them may be hinted, and none of
+	// them may cost the client its answer.
+	for _, selection := range []struct {
+		name  string
+		value netip.Addr
+	}{
+		{name: "no address at all", value: netip.Addr{}},
+		{name: "an IPv6 selection", value: netip.MustParseAddr("2606:4700::1111")},
+		{name: "a loopback selection", value: netip.MustParseAddr("127.0.0.1")},
+		{name: "a private selection", value: netip.MustParseAddr("10.0.0.1")},
+	} {
+		t.Run(selection.name, func(t *testing.T) {
+			upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, ".",
+				&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+			))
 			got, err := HTTPS(HTTPSInput{
 				Response: upstream,
 				QName:    "cdn.example.",
-				Selected: tt.selected,
+				Selected: selection.value,
 				ECH:      echFixture(t),
 				Policy:   FailClosed,
 			})
-			if err == nil {
-				t.Fatalf("HTTPS hinted an address nobody proved: %s", answered(got))
+			if err != nil {
+				t.Fatalf("a strict force-ECH answer failed closed over %s: %v, want the key installed with no hint at all", selection.name, err)
 			}
-			if got != nil {
-				t.Fatalf("HTTPS returned a message beside the error: %s", answered(got))
+			record := onlyHTTPS(t, got)
+
+			if ech := echOf(t, record); !bytes.Equal(ech, echFixture(t)) {
+				t.Fatal("the answer carries a key other than the one the source published")
 			}
-			if !errors.Is(err, ErrNoSelectedAddress) {
-				t.Fatalf("error = %v, want one a caller can recognise as %v", err, ErrNoSelectedAddress)
+			// The load-bearing assertion: absent, not empty.
+			if carries(record, dns.SVCB_IPV4HINT) {
+				t.Errorf("the record carries an ipv4hint with no address to put in it: %s", carried(record))
 			}
-			if errors.Is(err, ErrNoECHConfig) {
-				t.Errorf("an unusable address is reported as %v, so a caller cannot tell the two faults apart", ErrNoECHConfig)
+			if carries(record, dns.SVCB_IPV6HINT) {
+				t.Errorf("the record carries an ipv6hint the upstream never published: %s", carried(record))
+			}
+			// A record carrying the key and no hint is still a service mode, and a
+			// client resolves it normally. What it must not be is a record that names
+			// a mandatory key it does not carry, which is what a hardcoded
+			// ipv4hint-in-the-mandatory-list produces the moment the hint goes away.
+			selfConsistent(t, record)
+			if keys := mandatoryOf(t, record); !reflect.DeepEqual(keys, []dns.SVCBKey{dns.SVCB_ECHCONFIG}) {
+				t.Errorf("mandatory = %v, want [ech]: the record carries no hint, so a mandatory list naming one is a record a client may reject", keys)
+			}
+			// And it must not be an answer that says nothing is here.
+			if record.Priority != 1 || record.Target != "." {
+				t.Errorf("priority = %d, target = %q, want a service mode (1, \".\"): a priority of 0 is an alias and a client never connects to one",
+					record.Priority, record.Target)
 			}
 		})
+	}
+}
+
+// TestHTTPSEndpointsThatDisagreeAboutTheHintLeaveTheRecordWithoutOne is the
+// agreement rule applied to the address rather than beside it. Two retained
+// endpoints naming two different addresses are two descriptions of one service,
+// and picking either would be an address this router invented -- so the hint is
+// treated as though the upstream had published none, and the client resolves
+// normally. The degradation is reported, because a record that lost its hint is
+// still usable and nobody would otherwise learn that it had.
+func TestHTTPSEndpointsThatDisagreeAboutTheHintLeaveTheRecordWithoutOne(t *testing.T) {
+	upstream := response("cdn.example.", dns.TypeHTTPS,
+		httpsRecord("cdn.example.", 300, 1, ".", &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+			&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.1.1").To4()}}),
+		httpsRecord("cdn.example.", 300, 2, ".", &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+			&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.2.2").To4()}}),
+	)
+	in := HTTPSInput{
+		Response: upstream,
+		QName:    "cdn.example.",
+		Selected: netip.Addr{},
+		ECH:      echFixture(t),
+		Policy:   FailClosed,
+		Report:   func(Report) {},
+	}
+
+	got, err := HTTPS(in)
+	if err != nil {
+		t.Fatalf("HTTPS refused over a disagreement about the hint: %v", err)
+	}
+	record := onlyHTTPS(t, got)
+
+	if carries(record, dns.SVCB_IPV4HINT) {
+		t.Errorf("the record hints one of two addresses the endpoints described differently: %s", carried(record))
+	}
+	if ech := echOf(t, record); !bytes.Equal(ech, echFixture(t)) {
+		t.Fatal("the answer carries a key other than the one the source published")
+	}
+	if reason := droppedReason(reportOf(t, in), dns.SVCB_IPV4HINT); reason == "" {
+		t.Error("a hint this router refused to pick between was not reported: the record is usable, so nobody learns of the degradation otherwise")
+	}
+}
+
+// TestASelectionReplacesTheUpstreamsOwnHint is the other half of "choose per
+// source": when the selector HAS an address, that address is the hint and the
+// upstream's is not, even when the two disagree. This is the behaviour that
+// existed before the borrowed-key scheme and it has to survive it, because the
+// selection is the only address in this design that a component here proved.
+func TestASelectionReplacesTheUpstreamsOwnHint(t *testing.T) {
+	upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, ".",
+		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+		&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.1.1").To4()}},
+	))
+	in := HTTPSInput{
+		Response: upstream,
+		QName:    "cdn.example.",
+		Selected: selected(),
+		ECH:      echFixture(t),
+		Policy:   FailClosed,
+		Report:   func(Report) {},
+	}
+
+	got, err := HTTPS(in)
+	if err != nil {
+		t.Fatalf("HTTPS refused with a selection in hand: %v", err)
+	}
+	record := onlyHTTPS(t, got)
+
+	if hints := hintOf(t, record); !reflect.DeepEqual(hints, []string{selectedIP}) {
+		t.Errorf("ipv4hint = %v, want the selection [%s]: the selector's address is the one this router proved", hints, selectedIP)
+	}
+	if droppedReason(reportOf(t, in), dns.SVCB_IPV4HINT) == "" {
+		t.Error("the upstream's hint was replaced silently: a client that would have used it now connects somewhere else")
+	}
+}
+
+// TestHTTPSWithNoKeyStillFailsClosed is the control for this group, and it is the
+// one that can manufacture the defect. Everything above relaxes what happens when
+// there is no address, so the relaxation can be implemented by relaxing the wrong
+// gate: a synthesis that simply stopped refusing would install a record with no
+// key at all, and a client told to use ECH by a record that carries none connects
+// in the clear while believing it did not. No address is not a reason to lose the
+// key, and it is not a reason to lose the answer either -- but with no key there is
+// nothing to install, and strict means fail closed.
+//
+// It is written with NO selection on purpose. The case that holds the refusal with
+// a selection in hand passes under an implementation that only ever refused when
+// there was nothing to hint, and that implementation is exactly the defect.
+func TestHTTPSWithNoKeyStillFailsClosed(t *testing.T) {
+	upstream := response("cdn.example.", dns.TypeHTTPS, httpsRecord("cdn.example.", 300, 1, ".",
+		&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+		&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.1.1").To4()}},
+	))
+	// Both halves of the key gate, because a relaxation implemented in the wrong
+	// place removes one of them and not the other: an empty list is "the source has
+	// nothing", and an unparseable one is "the source published something this
+	// build will not forward". A client handed either gets a record with no key in
+	// it, which it reads as permission to connect in the clear.
+	keys := []struct {
+		name string
+		raw  []byte
+		want error
+	}{
+		{name: "no key at all", raw: nil, want: ErrNoECHConfig},
+		{name: "a key this build will not forward", raw: []byte{0x00, 0x00}, want: ErrInvalidECHConfig},
+	}
+	for _, key := range keys {
+		for _, selection := range []struct {
+			name  string
+			value netip.Addr
+		}{
+			{name: "with a selection", value: selected()},
+			{name: "with no selection", value: netip.Addr{}},
+		} {
+			t.Run(key.name+"/"+selection.name, func(t *testing.T) {
+				got, err := HTTPS(HTTPSInput{
+					Response: upstream,
+					QName:    "cdn.example.",
+					Selected: selection.value,
+					ECH:      key.raw,
+					Policy:   FailClosed,
+				})
+				if err == nil {
+					t.Fatalf("HTTPS installed a record with no usable key: %s", answered(got))
+				}
+				if !errors.Is(err, key.want) {
+					t.Fatalf("error = %v, want one wrapping %v", err, key.want)
+				}
+				if got != nil {
+					t.Fatalf("HTTPS returned a message beside the error: %s", answered(got))
+				}
+			})
+		}
 	}
 }
 
@@ -1569,90 +1790,6 @@ func TestHTTPSRefusesToSynthesizeBesideACnameAtTheQueriedOwner(t *testing.T) {
 		}
 		if after := packed(t, chained); string(after) != string(before) {
 			t.Errorf("HTTPS changed the response it was given:\n before %s\n after  %s", before, after)
-		}
-	})
-}
-
-// TestHTTPSFallsBackToTheOriginalWhenTheSelectorHasNoAddress is the health gate
-// reaching the record, and it is the one refusal whose two policies genuinely differ.
-//
-// The strict arm refuses. A record with no hint is a record that sends the client to
-// resolve the name, and for a force-ECH domain that resolution is the one this router
-// empties, so a hint at an address nobody proved -- or no hint at all -- is the failure
-// the project exists to prevent rather than a degraded answer.
-//
-// The fallback arm keeps working, and that is the decision the plan now specifies. A
-// selector that is down, or a winner that has not passed its health check, takes no
-// address away from anybody: the upstream's HTTPS record is still there, it still
-// describes the service, and a client that can use it should not be told SERVFAIL
-// because this router's own health check had a bad minute. Nothing is injected in its
-// place either, and that is the point: with no address to hint there is no hint to
-// write, and a record carrying the upstream's own address is one this router can
-// forward without claiming anything about it. The one thing it cannot do is encrypt the
-// ClientHello, which is what the refusal beside the message says.
-func TestHTTPSFallsBackToTheOriginalWhenTheSelectorHasNoAddress(t *testing.T) {
-	newUpstream := func() *dns.Msg {
-		return signedHTTPSResponse(httpsRecord("cdn.example.", 300, 1, ".",
-			&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
-			&dns.SVCBPort{Port: 443},
-			&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("104.16.1.1").To4()}},
-		))
-	}
-
-	t.Run("a strict caller is refused", func(t *testing.T) {
-		upstream := newUpstream()
-		got, err := HTTPS(HTTPSInput{
-			Response: upstream,
-			QName:    "cdn.example.",
-			Selected: netip.Addr{},
-			ECH:      echFixture(t),
-			Policy:   FailClosed,
-		})
-		if err == nil {
-			t.Fatalf("HTTPS answered without an address to hint: %s", answered(got))
-		}
-		if got != nil {
-			t.Fatalf("HTTPS returned a message beside the error: %s", answered(got))
-		}
-		if !errors.Is(err, ErrNoSelectedAddress) {
-			t.Fatalf("error = %v, want one a caller can recognise as %v", err, ErrNoSelectedAddress)
-		}
-	})
-
-	t.Run("a fallback caller keeps the upstream's own record", func(t *testing.T) {
-		upstream := newUpstream()
-		before := packed(t, upstream)
-
-		got, err := HTTPS(HTTPSInput{
-			Response: upstream,
-			QName:    "cdn.example.",
-			Selected: netip.Addr{},
-			ECH:      echFixture(t),
-			Policy:   FallbackToOriginal,
-		})
-		if !errors.Is(err, ErrNoSelectedAddress) {
-			t.Errorf("error = %v, want %v beside the message: the caller has to learn the selector failed or it flies blind", err, ErrNoSelectedAddress)
-		}
-		if got != upstream {
-			t.Fatalf("HTTPS built a new message where the policy was to keep the upstream's own: %s", answered(got))
-		}
-		assertUnmodified(t, upstream, before)
-
-		// The record the client reads is the upstream's, so the address in it is the
-		// upstream's own and no key was put into a record this router could not
-		// vouch for the address of.
-		out := keptHTTPS(t, got)
-		if hints := hintOf(t, out); !reflect.DeepEqual(hints, []string{"104.16.1.1"}) {
-			t.Errorf("ipv4hint = %v, want the upstream's own [104.16.1.1]: there is no address to hint, so no hint may be written", hints)
-		}
-		if carries(out, dns.SVCB_ECHCONFIG) {
-			t.Errorf("an ech parameter was added to a record with no address to point at: %s", carried(out))
-		}
-		if carries(out, dns.SVCB_MANDATORY) {
-			t.Errorf("a mandatory list was added to a record with no key in it: %s", carried(out))
-		}
-		if !got.AuthenticatedData {
-			t.Error("AD was cleared on a response this router did not modify")
 		}
 	})
 }

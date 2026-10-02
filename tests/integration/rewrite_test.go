@@ -172,6 +172,33 @@ func strictECHFixture() rewriteFixture {
 	}
 }
 
+// strictECHForcedFixture is strictECHFixture with forcedName already on the
+// allowlist, for the cases that are about the HTTPS answer and what it costs rather
+// than about the allowlist being reloaded.
+//
+// It exists because a black-box readiness probe has to ask the question, and asking
+// the question is exactly what those cases measure. Waiting for the reload by asking
+// an HTTPS query for the name under test spends the upstream lookup and the key
+// fetch that the case then asserts are spent by the client's own query, so the
+// measurement would be of the probe. The watcher is covered where it can be observed
+// without a query -- by the unit cases that read the plugin's own served list -- and
+// the reload is covered end to end by the case below, which does not measure the
+// cost of a first query.
+func strictECHForcedFixture() rewriteFixture {
+	fixture := strictECHFixture()
+	fixture.allowlist = "# forced from the start\n" + strings.TrimSuffix(forcedName, ".") + "\n"
+	return fixture
+}
+
+// strictECHForcedWithoutAKeyFixture is strictECHForcedFixture with an ECH source
+// that publishes nothing, so the strict arm has no key to install and must fail
+// closed. Same reason for starting with the name listed.
+func strictECHForcedWithoutAKeyFixture() rewriteFixture {
+	fixture := strictECHForcedFixture()
+	fixture.publishECHKey = false
+	return fixture
+}
+
 // write publishes the fixture's documents into a directory and returns the paths a
 // rendered configuration has to name for them. The ECH state document is the one
 // path nothing writes here: it is the plugin's to publish, and a case that wanted
@@ -401,19 +428,58 @@ func (rw *rewriteHarness) forceECH(t *testing.T, domains []string, inForce func(
 	}
 }
 
-// strictForced reports whether every named domain is answered with the strict empty
-// answer, which is what an allowlist entry in force looks like from outside under the
-// strict policy.
+// strictForced reports whether every one of these domains is being force-ECH'd under
+// a strict policy.
+//
+// It asks HTTPS rather than A, and that is not a preference. It used to ask A and
+// require an empty answer, which worked only because this router used to short
+// circuit a listed name's address queries without asking anybody at all. Ruling
+// 191(a) deleted that suppression: cdn_rewrite runs only in the foreign path, so the
+// domain had already been disclosed to the foreign resolver before the A lookup was
+// made, while the suppression left the client with no address to connect to. With no
+// difference left between a listed and an unlisted name on an address query, the
+// HTTPS answer is the only place the two differ -- which is all the force list was
+// ever about.
+//
+// Two outcomes count as forced, because whether a key is available is not this
+// predicate's business: a listed name under a strict policy either gets the key, and
+// an answer carrying it, or is refused for want of one -- and refusing is exactly what
+// the fixture that publishes no key is there to cause. An unlisted name gets the
+// upstream's own record either way: NOERROR, and no ech parameter in it.
 func (rw *rewriteHarness) strictForced(t *testing.T, domains ...string) bool {
 	t.Helper()
 	for _, domain := range domains {
 		question := dns.Fqdn(domain)
-		response := rw.ask(t, testdns.ProtocolTCP, question, dns.TypeA)
-		if response.Rcode != dns.RcodeSuccess || len(response.Answer) != 0 {
+		response := rw.ask(t, testdns.ProtocolTCP, question, dns.TypeHTTPS)
+		if response.Rcode != dns.RcodeSuccess {
+			// A strict listed name with nothing to install fails closed, and that is
+			// still evidence the list reached the plugin.
+			continue
+		}
+		if !carriesParameter(response, dns.SVCB_ECHCONFIG) {
 			return false
 		}
 	}
 	return true
+}
+
+// carriesParameter reports whether an answer carries a parameter under a key, without
+// insisting on a record being there at all: a name whose upstream published no HTTPS
+// record gets an answer with no record in it, and that is an answer rather than a
+// failure. The distinction matters to a readiness predicate and nowhere else.
+func carriesParameter(response *dns.Msg, key dns.SVCBKey) bool {
+	for _, record := range response.Answer {
+		typed, ok := record.(*dns.HTTPS)
+		if !ok {
+			continue
+		}
+		for _, pair := range typed.Value {
+			if pair.Key() == key {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // publishedAddresses is every address in an answer, skipping the signatures beside
@@ -1094,23 +1160,26 @@ func TestARewriteAcrossASelectorGenerationLeavesTheCachedObjectAlone(t *testing.
 	}
 }
 
-// TestAStrictForcedNameIsRefusedWithoutReachingTheCacheOrTheUpstream is the case
-// strict mode exists for, and the whole of it is that the answer costs nothing.
+// TestAForcedNameIsStillAnsweredFromTheCache is what became of the case that used to
+// assert a listed name's address queries were refused. They are not refused any more:
+// ruling 191(a) deleted the strict short circuit, because cdn_rewrite runs only in the
+// foreign path, so the domain had already been disclosed to the foreign resolver
+// before the address lookup, while refusing it left the client with nothing to connect
+// to and the encrypted ClientHello never sent.
 //
-// Both names are asked for BEFORE they are forced, so the cache holds a real,
-// unexpired answer for both of them and for both types: the Cloudflare one holds a
-// rewritten address, the mixed one holds the resolver's two addresses and its IPv6
-// answer. A strict query that came back with either of those would be a client
-// connecting in the clear.
-//
-// The mixed name is what makes the IPv6 half attributable. Its A answer was refused
-// by the classifier, so no IPv6 suppression is ever entered for it, so the only rule
-// in this router that can produce an empty answer for it is the strict short circuit.
+// So the claim inverts, and the machinery around it is kept because it is the part
+// worth having: a listed name is asked for BEFORE it is listed, so the cache holds a
+// real unexpired answer, and the question this case then asks is whether forcing a
+// name costs anything to answer. It costs nothing, but now because the CACHE serves
+// it rather than because this router refused to say -- and those two are different
+// answers with the same cost, which is exactly the distinction ruling 191(a) turns on.
+// A client cannot tell them apart and neither can a reader of the counts below, which
+// is why the addresses themselves are asserted and not only the totals.
 //
 // Every count is asserted: per name and type on the resolver, the resolver's total,
 // and the domestic resolver's total. The total is the strongest of them, because it
 // also covers an ECH fetch -- which goes to the same listener and would move it.
-func TestAStrictForcedNameIsRefusedWithoutReachingTheCacheOrTheUpstream(t *testing.T) {
+func TestAForcedNameIsStillAnsweredFromTheCache(t *testing.T) {
 	rw := newRewriteHarness(t, strictECHFixture())
 	rw.waitUntilAnswering(t)
 
@@ -1145,9 +1214,10 @@ func TestAStrictForcedNameIsRefusedWithoutReachingTheCacheOrTheUpstream(t *testi
 		return rw.strictForced(t, "ech.example.test", "forced-mixed.example.test")
 	})
 	before := rw.counts()
-	// The wait above asks each name once per attempt, so the count this case compares
-	// is taken here: from here on, one more query for a name and type is one lookup
-	// this router should not have made.
+	// The wait above asks each name for HTTPS once per attempt, so the count this
+	// case compares is taken here: from here on, one more query for a name and type
+	// is one lookup this router should not have made. The wait spends HTTPS entries
+	// and an ECH fetch, none of which is a name/type pair measured below.
 	primedCounts := map[string]int{}
 	for _, step := range primed {
 		primedCounts[step.name+"/"+dns.TypeToString[step.qtype]] = countType(rw, step.name, step.qtype)
@@ -1156,38 +1226,38 @@ func TestAStrictForcedNameIsRefusedWithoutReachingTheCacheOrTheUpstream(t *testi
 	for _, step := range primed {
 		response := rw.ask(t, testdns.ProtocolTCP, step.name, step.qtype)
 		if response.Rcode != dns.RcodeSuccess {
-			t.Errorf("%s %s while forced = %s, want NOERROR with an empty answer",
+			t.Errorf("%s %s while forced = %s, want NOERROR: a listed name's address query is an ordinary query",
 				step.name, dns.TypeToString[step.qtype], dns.RcodeToString[response.Rcode])
 		}
-		if len(response.Answer) != 0 {
-			t.Errorf("%s %s while forced carried %d record(s) (%v), want none: a client that resolved the name could connect in the clear",
-				step.name, dns.TypeToString[step.qtype], len(response.Answer), recordKinds(response))
-		}
-		if len(response.Ns) != 0 {
-			t.Errorf("%s %s while forced carried %d authority record(s), want none: an empty answer claims no negative caching TTL",
-				step.name, dns.TypeToString[step.qtype], len(response.Ns))
+		// The addresses are asserted, not only the count. An empty answer and a
+		// cached one cost the same and mean opposite things to a client, so a case
+		// that asserted only the totals would pass against the short circuit this
+		// package deleted as readily as against the fix.
+		if got := publishedAddresses(t, response); !equalStrings(got, step.want) {
+			t.Errorf("%s %s while forced = %v, want %v: a listed name still resolves, or it has nothing to connect to and the encrypted ClientHello is never sent",
+				step.name, dns.TypeToString[step.qtype], got, step.want)
 		}
 		if got := response.Question; len(got) != 1 || got[0].Name != step.name || got[0].Qtype != step.qtype {
 			t.Errorf("the answer echoes %v, want the one %s question that was sent", got, dns.TypeToString[step.qtype])
 		}
 	}
 
-	// Not one query left the router. The per-name counts say the cache was not asked
-	// and the upstream was not asked, the grand total says nothing at all was fetched
-	// -- including the ECH key, which is fetched over the same listener -- and the
-	// domestic count says the answer did not come from the other branch either.
+	// Not one query left the router. The per-name counts say the upstream was not
+	// asked, the grand total says nothing at all was fetched -- including the ECH
+	// key, which is fetched over the same listener -- and the domestic count says the
+	// answer did not come from the other branch either.
 	for _, step := range primed {
 		key := step.name + "/" + dns.TypeToString[step.qtype]
 		if got, was := countType(rw, step.name, step.qtype), primedCounts[key]; got != was {
-			t.Errorf("the foreign resolver was asked %d times for %s %s, want %d: a strict query must cost no lookup, and the cache held a real answer for it",
+			t.Errorf("the foreign resolver was asked %d times for %s %s, want %d: the cache held a real answer for it and the list does not change that",
 				got, step.name, dns.TypeToString[step.qtype], was)
 		}
 	}
 	if after := rw.counts().since(before); after.foreign != 0 {
-		t.Errorf("the foreign resolver was asked %d times while a strict name was queried, want 0: the cache and the upstream were both supposed to go untouched", after.foreign)
+		t.Errorf("the foreign resolver was asked %d times while a listed name was queried, want 0: the cache was supposed to serve all of them", after.foreign)
 	}
 	if after := rw.counts().since(before); after.domestic != 0 {
-		t.Errorf("the domestic resolver was asked %d times while a strict name was queried, want 0", after.domestic)
+		t.Errorf("the domestic resolver was asked %d times while a listed name was queried, want 0", after.domestic)
 	}
 }
 
@@ -1214,11 +1284,11 @@ func countType(rw *rewriteHarness, name string, qtype uint16) int {
 // The record is also compared against a literal in full, so the parameters this case
 // does not name by hand -- a port, a protocol set, a TTL -- are pinned too.
 func TestAForcedHTTPSQueryCarriesThePublishedKeyAndTheProvedAddress(t *testing.T) {
-	rw := newRewriteHarness(t, strictECHFixture())
+	rw := newRewriteHarness(t, strictECHForcedFixture())
 	rw.waitUntilAnswering(t)
-	rw.forceECH(t, []string{"ech.example.test"}, func() bool { return rw.strictForced(t, "ech.example.test") })
-	// The wait above asks the forced name on every attempt, so its count is taken
-	// here rather than before it: the claim is about the client's own query.
+	// The name is on the allowlist from the first query, so this case's exchange
+	// counts are the client's own and nothing is spent proving readiness first. See
+	// strictECHForcedFixture for why that matters here.
 	forcedBefore := rw.foreign.Count("", forcedName)
 	before := rw.counts()
 
@@ -1305,9 +1375,8 @@ func TestAForcedHTTPSQueryCarriesThePublishedKeyAndTheProvedAddress(t *testing.T
 // fetch per client query would be a query per client query on the listener this
 // router forwards everything else through.
 func TestAForcedHTTPSQueryDoesNotRefetchTheKeyEveryTime(t *testing.T) {
-	rw := newRewriteHarness(t, strictECHFixture())
+	rw := newRewriteHarness(t, strictECHForcedFixture())
 	rw.waitUntilAnswering(t)
-	rw.forceECH(t, []string{"ech.example.test"}, func() bool { return rw.strictForced(t, "ech.example.test") })
 
 	source := dns.Fqdn(echSourceName)
 	if first := rw.ask(t, testdns.ProtocolTCP, forcedName, dns.TypeHTTPS); len(first.Answer) != 1 {
@@ -1338,16 +1407,13 @@ func TestAForcedHTTPSQueryDoesNotRefetchTheKeyEveryTime(t *testing.T) {
 // clear with -- and the router says why, twice over: the plugin names the reason and
 // mosdns reports the entry that failed.
 func TestAStrictForcedHTTPSQueryFailsClosedWhenTheSourcePublishesNoKey(t *testing.T) {
-	fixture := strictECHFixture()
 	// A source that answers with a service mode and no key: the key was withdrawn,
 	// which is a different fault from an unreachable source and one the plugin
-	// refuses rather than forwards.
-	fixture.publishECHKey = false
-	rw := newRewriteHarness(t, fixture)
+	// refuses rather than forwards. Every forced query retries the fetch here, so
+	// the count this case asserts belongs to the client's own query alone -- which
+	// is why the name is on the allowlist from the start.
+	rw := newRewriteHarness(t, strictECHForcedWithoutAKeyFixture())
 	rw.waitUntilAnswering(t)
-	rw.forceECH(t, []string{"ech.example.test"}, func() bool { return rw.strictForced(t, "ech.example.test") })
-	// The wait above asks the forced name on every attempt, so its count is taken
-	// here rather than before it: the claim is about the client's own query.
 	forcedBefore := rw.foreign.Count("", forcedName)
 	before := rw.counts()
 

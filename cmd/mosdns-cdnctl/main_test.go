@@ -231,6 +231,17 @@ func TestRunStatusRejectsFutureStateFieldWithoutLeakingItsValue(t *testing.T) {
 }
 
 func TestRunRejectsInvalidCLIWithExitTwo(t *testing.T) {
+	// Every row here is refused during ARGUMENT PARSING, and that is a requirement
+	// rather than a convenience: a row that got past the parser would read the
+	// policy and the document directory this command defaults to, which are the
+	// installed ones under /etc, so its verdict would depend on whether the host
+	// has the package installed -- and run as root it would publish over the
+	// installed configuration. `render` with no arguments at all is therefore absent
+	// from this list because it is VALID, not because it is untested: the two flags
+	// default to the installed layout on purpose, TestRenderDefaultsAreTheInstalledPaths
+	// holds those defaults, and TestRenderPublishesTheReviewedDocumentPair is
+	// deliberately the no-argument invocation so the coverage cannot be lost by
+	// somebody tidying the call into an explicit one.
 	tests := [][]string{
 		nil,
 		{"unknown"},
@@ -238,7 +249,6 @@ func TestRunRejectsInvalidCLIWithExitTwo(t *testing.T) {
 		{"validate", "--policy"},
 		{"validate", "--documents"},
 		{"validate", "--policy", "policy.yaml", "--documents", ""},
-		{"render"},
 		{"render", "--out"},
 		{"render", "--policy"},
 		{"render", "--out", ""},

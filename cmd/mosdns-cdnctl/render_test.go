@@ -126,6 +126,14 @@ func runValidateCLI(t *testing.T, svc services, args ...string) (int, string, st
 // for byte, with nothing else in the directory. The routing document records the
 // policy path it was rendered from, so the expectation is the committed document
 // with that one path replaced by the policy the command was given.
+//
+// The call below names NO ARGUMENTS, and that is deliberate: `render` with no
+// arguments is a supported invocation, because both paths default to the installed
+// layout. This is therefore also the only coverage of that default actually running
+// the command, and it is why the table of invalid invocations in main_test.go does
+// not list bare `render` -- see the comment there. Making this call explicit would
+// look like tidying and would quietly delete the coverage, so the argument list is
+// empty on purpose.
 func TestRenderPublishesTheReviewedDocumentPair(t *testing.T) {
 	instance := newInstalled(t)
 	instance.withPolicy(t, nil)

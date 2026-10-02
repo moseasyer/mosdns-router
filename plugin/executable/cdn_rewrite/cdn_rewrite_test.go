@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -786,6 +787,43 @@ func svcParam(t *testing.T, record *dns.HTTPS, key dns.SVCBKey) (dns.SVCBKeyValu
 	return found, count == 1
 }
 
+// svcParamPresent asks whether one address parameter carries one address. It is
+// written as a question about a specific address rather than as "which hint is
+// there", because the case that matters is the one where two different addresses
+// are in play and the record must carry one of them and not the other: a test that
+// only checked that SOME hint was present would pass against a record pointing at
+// an address nothing proved, which is the half of the defect that is a privacy
+// claim rather than an availability one.
+func svcParamPresent(t *testing.T, record *dns.HTTPS, key dns.SVCBKey, address string) bool {
+	t.Helper()
+	pair, present := svcParam(t, record, key)
+	if !present {
+		return false
+	}
+	ip := net.ParseIP(address).To4()
+	if ip == nil {
+		t.Fatalf("%s is not an IPv4 address, which is the only hint this release writes", address)
+	}
+	switch hint := pair.(type) {
+	case *dns.SVCBIPv4Hint:
+		return len(hint.Hint) == 1 && hint.Hint[0].Equal(ip)
+	default:
+		t.Fatalf("the %d parameter is %T, want *dns.SVCBIPv4Hint", key, pair)
+		return false
+	}
+}
+
+// svcCarried lists the SvcParamKeys a record carries, in the order it carries them,
+// so a failure message names the record's shape instead of asserting it.
+func svcCarried(t *testing.T, record *dns.HTTPS) string {
+	t.Helper()
+	keys := make([]string, 0, len(record.Value))
+	for _, pair := range record.Value {
+		keys = append(keys, pair.Key().String())
+	}
+	return strings.Join(keys, " ")
+}
+
 // countType reports how many records of one type a message carries anywhere.
 func countType(msg *dns.Msg, rrtype uint16) int {
 	total := 0
@@ -1147,72 +1185,91 @@ func TestAAAAIsNotSuppressedOnTheStrengthOfThePreviousGeneration(t *testing.T) {
 	}
 }
 
-// --- Step 1: the strict force-ECH short circuit ---
+// --- Step 1: what the force-ECH list does to an address query ---
 
-func TestStrictForcedAIsAnsweredWithoutAskingDownstream(t *testing.T) {
-	h := newHarness(t)
-	h.next.response = answerWith(forceECHName, dns.TypeA, aRecord(forceECHName, cloudflareAddress, 300))
+// Nothing. A listed name's A and AAAA queries are asked downstream and answered
+// exactly as an unlisted name's are.
+//
+// They used to be answered from this router's own empty answer without asking
+// anybody, on the reasoning that a strict force-ECH name must not have its address
+// disclosed. That reasoning does not hold here, and the cost of acting on it was
+// the feature defeating itself. cdn_rewrite runs only in the foreign path, so the
+// HTTPS query that named the domain has ALREADY gone to the foreign resolver -- the
+// suppression never had anything to withhold from the party that mattered, because
+// that party had the domain name and the SNI before the A lookup was made. What it
+// did remove is the client's address, and a client with no address has nothing to
+// connect to, so the encrypted ClientHello this package works to produce was never
+// sent to anything.
+//
+// The comparison is against an unlisted name rather than against a literal, because
+// "the same as any other name" is the entire claim. An expectation written out
+// would pass against an implementation that suppressed A for one name and not
+// another.
+func TestTheForceECHListMakesNoDifferenceToAnAddressQuery(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		qtype uint16
+		// reply builds the upstream's answer for a name, because the record has to
+		// carry the name it was asked about: the classifier reads the name off the
+		// record, not off the question.
+		reply func(string) []dns.RR
+		// wantAddress is whether the answer must carry one. AAAA is suppressed by
+		// cdn.suppress_aaaa, which is a different mechanism from the short circuit
+		// this group deleted and is still wanted: an empty AAAA answer reached
+		// through the resolver is the suppression working, and the same empty answer
+		// with nothing asked is the bug.
+		wantAddress bool
+	}{
+		{
+			name:  "A",
+			qtype: dns.TypeA,
+			reply: func(name string) []dns.RR {
+				return []dns.RR{aRecord(name, cloudflareAddress, 300)}
+			},
+			wantAddress: true,
+		},
+		{
+			name:  "AAAA",
+			qtype: dns.TypeAAAA,
+			reply: func(name string) []dns.RR {
+				return []dns.RR{aaaaRecord(name, "2606:4700::1111", 300)}
+			},
+			wantAddress: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			listed := newHarness(t)
+			unlisted := newHarness(t)
+			listed.next.response = answerWith(forceECHName, tt.qtype, tt.reply(forceECHName)...)
+			unlisted.next.response = answerWith(cloudflareName, tt.qtype, tt.reply(cloudflareName)...)
 
-	response, err := h.exec(t, forceECHName, dns.TypeA)
-	if err != nil {
-		t.Fatalf("Exec: %v", err)
-	}
-	if response == nil {
-		t.Fatal("the plugin left no response, which mosdns answers as REFUSED rather than as the empty answer strict mode promises")
-	}
-	if h.next.calls != 0 {
-		t.Fatalf("the downstream sequence ran %d times, want 0: a strict force-ECH A query must cost no lookup", h.next.calls)
-	}
-	if asked := h.upstream.asked(); len(asked) != 0 {
-		t.Fatalf("the ECH client was asked %d queries, want 0: an A query needs no key", len(asked))
-	}
-	if response.Rcode != dns.RcodeSuccess {
-		t.Fatalf("rcode = %s, want NOERROR", dns.RcodeToString[response.Rcode])
-	}
-	if len(response.Answer) != 0 {
-		t.Fatalf("answer = %v, want no records at all", addressesIn(t, response.Answer))
-	}
-	if len(response.Ns) != 0 {
-		t.Fatalf("authority = %v, want nothing: an SOA would claim a negative caching TTL this router cannot honour", response.Ns)
-	}
-	if response.AuthenticatedData {
-		t.Fatal("AD is set on an answer this router wrote itself")
-	}
-	if got := response.Question[0]; got.Name != forceECHName || got.Qtype != dns.TypeA {
-		t.Fatalf("question = %+v, want the query echoed back", got)
-	}
-}
+			got := listed.mustExec(t, forceECHName, tt.qtype)
+			ordinary := unlisted.mustExec(t, cloudflareName, tt.qtype)
 
-func TestStrictForcedAAAAIsAnsweredWithoutAskingDownstream(t *testing.T) {
-	h := newHarness(t)
-	h.next.response = answerWith(forceECHName, dns.TypeAAAA, aaaaRecord(forceECHName, "2606:4700::1111", 300))
-
-	response, err := h.exec(t, forceECHName, dns.TypeAAAA)
-	if err != nil {
-		t.Fatalf("Exec: %v", err)
-	}
-	if response == nil {
-		t.Fatal("the plugin left no response, which mosdns answers as REFUSED rather than as the empty answer strict mode promises")
-	}
-	if h.next.calls != 0 {
-		t.Fatalf("the downstream sequence ran %d times, want 0: a strict force-ECH AAAA query must cost no lookup", h.next.calls)
-	}
-	if asked := h.upstream.asked(); len(asked) != 0 {
-		t.Fatalf("the ECH client was asked %d queries, want 0: an AAAA query needs no key", len(asked))
-	}
-	if response.Rcode != dns.RcodeSuccess {
-		t.Fatalf("rcode = %s, want NOERROR", dns.RcodeToString[response.Rcode])
-	}
-	if len(response.Answer) != 0 {
-		t.Fatalf("answer = %v, want no records at all", addressesIn(t, response.Answer))
-	}
-	if len(response.Ns) != 0 {
-		t.Fatalf("authority = %v, want nothing: an SOA would claim a negative caching TTL this router cannot honour", response.Ns)
+			if listed.next.calls != 1 {
+				t.Fatalf("the downstream sequence ran %d times for a listed name, want 1: the force-ECH list is a statement about the HTTPS answer and says nothing about %s",
+					listed.next.calls, dns.TypeToString[tt.qtype])
+			}
+			if got.Rcode != ordinary.Rcode {
+				t.Errorf("rcode = %s for a listed name, %s for an unlisted one: the list changed the shape of the answer",
+					dns.RcodeToString[got.Rcode], dns.RcodeToString[ordinary.Rcode])
+			}
+			if a, b := addressesIn(t, got.Answer), addressesIn(t, ordinary.Answer); !reflect.DeepEqual(a, b) {
+				t.Errorf("addresses = %v for a listed name, %v for an unlisted one: the list changed what the name resolves to", a, b)
+			}
+			if tt.wantAddress && len(addressesIn(t, got.Answer)) == 0 {
+				t.Errorf("a listed name's %s was answered with nothing at all: a client with no address has nothing to connect to, so the encrypted ClientHello this package builds for it is never sent",
+					dns.TypeToString[tt.qtype])
+			}
+			if asked := listed.upstream.asked(); len(asked) != 0 {
+				t.Errorf("the ECH client was asked %d queries by an address lookup, want 0: the key belongs to the HTTPS answer only", len(asked))
+			}
+		})
 	}
 }
 
 // A name the operator did not list is an ordinary query, and a strict policy
-// changes nothing about it: the short circuit is a property of the allowlist.
+// changes nothing about it.
 func TestStrictPolicyStillAsksDownstreamForANameItDoesNotForce(t *testing.T) {
 	h := newHarness(t)
 	h.next.response = answerWith(cloudflareName, dns.TypeA, aRecord(cloudflareName, cloudflareAddress, 300))
@@ -1220,7 +1277,7 @@ func TestStrictPolicyStillAsksDownstreamForANameItDoesNotForce(t *testing.T) {
 	h.mustExec(t, cloudflareName, dns.TypeA)
 
 	if h.next.calls != 1 {
-		t.Fatalf("the downstream sequence ran %d times, want 1: only a listed domain is short circuited", h.next.calls)
+		t.Fatalf("the downstream sequence ran %d times, want 1", h.next.calls)
 	}
 }
 
@@ -1365,57 +1422,104 @@ func TestAModifiedHTTPSAnswerDropsItsSignaturesAndItsADBit(t *testing.T) {
 	}
 }
 
-// The address a rewrite installs is the one the health check last proved, and a
-// window that has closed is not proved any more. Under strict that is fatal,
-// because a record with no hint sends the client to resolve a name whose
-// resolution this router has emptied.
-func TestStrictForcedHTTPSFailsClosedWhenTheProofWindowIsClosed(t *testing.T) {
+// A closed proof window used to be fatal under strict, and that was the defect
+// ruling 191(a) names: a window that has closed means the selector has no address,
+// and a strict force-ECH name was then answered SERVFAIL -- which is worse than not
+// listing the domain at all, because an unlisted name still gets a working ech-less
+// answer. It stayed fatal on a real install because nothing ever produces a winner
+// there: `mosdns-cdnctl test --apply` is the only producer of one, and neither the
+// installer nor the postinst calls it.
+//
+// So a closed window now costs the client the selector's address and nothing else.
+// The answer is a service mode carrying the ECH key, pointed at the address the
+// UPSTREAM published, because that is a claim somebody made. What it must not be is
+// a refusal, and it must not be a record pointing at an address nothing proved.
+func TestAClosedProofWindowStillAnswersWithTheKeyAndTheUpstreamsOwnAddress(t *testing.T) {
 	h := newHarness(t)
+	// Five minutes past the two-minute window the default selector carries, so the
+	// selector has no live winner at all.
 	h.now = time.Date(2026, 9, 25, 12, 5, 0, 0, time.UTC)
 	h.next.response = theHTTPSIn(t, forceECHName)
 
 	response, err := h.exec(t, forceECHName, dns.TypeHTTPS)
 
-	if err == nil {
-		t.Fatal("Exec returned no error, so a strict force-ECH name was answered from a selector nothing has proved")
+	if err != nil {
+		t.Fatalf("Exec refused a strict force-ECH name over a selector that has no address: %v", err)
 	}
-	if !errors.Is(err, dnsrewrite.ErrNoSelectedAddress) {
-		t.Fatalf("error = %v, want one wrapping ErrNoSelectedAddress, so the log line says the address is what failed", err)
+	record := theSynthesized(t, response)
+
+	ech, present := svcParam(t, record, dns.SVCB_ECHCONFIG)
+	if !present {
+		t.Fatal("the answer carries no ech parameter: the key is the whole point and it is the only thing that must never be dropped for want of an address")
 	}
-	if response != nil {
-		t.Fatalf("a failing strict answer was set on the context: %v", response.Answer)
+	if got := string(ech.(*dns.SVCBECHConfig).ECH); got != string(echFixture(t)) {
+		t.Fatal("the answer carries a key other than the one the source published")
+	}
+	// The address in it is the upstream's, and the winner's is nowhere: the window
+	// that authorised the winner has closed, so installing it would be installing an
+	// address this router cannot vouch for -- which is the one thing the hint has
+	// never been for.
+	if !svcParamPresent(t, record, dns.SVCB_IPV4HINT, cloudflareAddress) {
+		t.Errorf("the record does not carry the upstream's own published address %s: %s", cloudflareAddress, svcCarried(t, record))
+	}
+	if svcParamPresent(t, record, dns.SVCB_IPV4HINT, winnerAddress) {
+		t.Errorf("the record points at %s, which a closed proof window does not authorise", winnerAddress)
+	}
+	if h.next.calls != 1 {
+		t.Fatalf("the downstream sequence ran %d times, want 1", h.next.calls)
+	}
+	if asked := h.upstream.asked(); len(asked) != 1 {
+		t.Fatalf("the ECH client was asked %d queries, want 1: the key is still needed with no selector address", len(asked))
 	}
 }
 
 // The fallback arm is the one a caller gets wrong by returning as soon as it sees
-// an error: the rewrite package hands the upstream's own record back WITH the
-// refusal, and a caller that discards the record turns a working fallback domain
-// into a SERVFAIL through this router's own health gate.
-func TestFallbackForcedHTTPSWithAClosedProofWindowKeepsTheUpstreamRecord(t *testing.T) {
+// an error: the upstream's own record comes back, and a caller that throws it away
+// turns a working fallback domain into a SERVFAIL through this router's own health
+// gate. At this layer the refusal is reported in the LOG and Exec returns nil,
+// which is the whole contract -- the answer is the upstream's and forwarding it is
+// not an error condition, so returning one would make mosdns discard a good answer.
+//
+// What triggers the arm is now the key and nothing else. A closed proof window used
+// to be the other trigger, and it was the more common one on a real install, where
+// nothing ever populates the selector; ruling 191(a) removed it because refusing
+// over an address this router does not own cost every force-ECH name its answer.
+// So the case sets up the one refusal that survives: an ECH source that cannot be
+// read at all.
+func TestFallbackForcedHTTPSWithNoKeyKeepsTheUpstreamRecord(t *testing.T) {
 	h := newHarness(t, func(c *harnessConfig) {
 		c.mutatePolicy = func(p *config.Policy) { p.ECH.FailurePolicy = "fallback" }
 	})
-	h.now = time.Date(2026, 9, 25, 12, 5, 0, 0, time.UTC)
 	upstream := theHTTPSIn(t, forceECHName)
 	before := mustPack(t, upstream)
 	h.next.response = upstream
+	// The source is unreachable from the first query, so there is never a key.
+	h.upstream.failWith(errors.New("the listener is gone"))
 
 	response, err := h.exec(t, forceECHName, dns.TypeHTTPS)
 
 	if err != nil {
-		t.Fatalf("Exec: %v: a fallback name whose selector is down must keep the answer the upstream published", err)
+		t.Fatalf("Exec returned %v: the fallback arm forwards the upstream's answer and reports the refusal in the log, and an error here makes mosdns throw that answer away", err)
 	}
 	if h.next.calls != 1 {
 		t.Fatalf("the downstream sequence ran %d times, want exactly 1", h.next.calls)
 	}
 	if response == nil {
-		t.Fatal("the plugin left no response, which mosdns answers as REFUSED")
+		t.Fatal("the plugin left no response, which mosdns answers as REFUSED: the caller returned on the error and threw away the answer the upstream published")
 	}
 	if got := mustPack(t, response); string(got) != string(before) {
 		t.Fatalf("the upstream's own record was not kept:\n before %s\n after  %s", before, got)
 	}
+	if _, present := svcParam(t, theSynthesized(t, response), dns.SVCB_ECHCONFIG); present {
+		t.Error("a key was invented for a record there was no key to put in")
+	}
 	if got := theSynthesized(t, response); len(got.Value) == 0 {
 		t.Fatal("the kept record carries no parameters at all")
+	}
+	// And the refusal is still said out loud. Forwarding the upstream's record is
+	// safe; doing it silently is how a broken ECH source goes unnoticed for weeks.
+	if !h.loggedText("the ECH source could not be read") {
+		t.Error("the ECH source failure was swallowed: a caller reading only the log cannot tell a fallback from a rewrite")
 	}
 }
 
@@ -1589,9 +1693,22 @@ func TestARefreshIsDueAfterThePublishedTTL(t *testing.T) {
 	}
 }
 
-// A source that publishes a lifetime shorter than the floor is not asked once per
-// client query: the floor is the whole reason it exists.
-func TestAShortPublishedTTLIsRaisedToTheSixtySecondMinimum(t *testing.T) {
+// The cadence does not move with the TTL. It used to -- the lifetime was
+// max(TTL, 60s) -- and a source publishing anything under that floor was protected
+// from being asked once per client query, which was the whole reason the floor
+// existed. The cadence is now a fixed five minutes (echCadence, and
+// TestTheCadenceIsTheOneTheseCasesHold pins it), so the property that matters is
+// this one: whatever a source publishes, the client-query rate never sets the
+// refresh rate.
+//
+// The five-second TTL is the hostile case for it. A scheduler keyed on the TTL would
+// ask a source publishing five seconds sixty times a minute, on the listener this
+// router forwards every foreign query through, and the floor is what stopped that;
+// a scheduler keyed on the cadence asks it once. The cost, stated because it is a
+// real one, is that a publisher withdrawing its key is noticed up to one interval
+// late rather than up to its own TTL -- which is the trade the fixed cadence makes
+// deliberately, and which the measured 295-300s TTL puts inside one interval anyway.
+func TestTheRefreshRateIsTheCadenceWhateverTheSourcePublishes(t *testing.T) {
 	h := newHarness(t, func(c *harnessConfig) {
 		c.echAnswer = answerWithECH(echFixture(t), 5)
 		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
@@ -1599,16 +1716,28 @@ func TestAShortPublishedTTLIsRaisedToTheSixtySecondMinimum(t *testing.T) {
 	h.next.response = theHTTPSIn(t, forceECHName)
 	h.mustExec(t, forceECHName, dns.TypeHTTPS)
 
-	h.now = h.now.Add(30 * time.Second)
-	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+	// A minute is twelve times the five-second TTL the source published, and eight
+	// client queries' worth of asking if the TTL were the schedule.
+	for range 8 {
+		h.now = h.now.Add(5 * time.Second)
+		h.mustExec(t, forceECHName, dns.TypeHTTPS)
+	}
 	if asked := h.upstream.asked(); len(asked) != 1 {
-		t.Fatalf("a source publishing a 5 second TTL was asked %d times inside 30 seconds, want 1", len(asked))
+		t.Fatalf("a source publishing a 5 second TTL was asked %d times over 40 seconds, want 1: the refresh rate is the cadence, and a TTL-keyed one spends a query per client query on this router's listener", len(asked))
 	}
 
-	h.now = h.now.Add(31 * time.Second)
+	// One second short of the interval it is still the held key.
+	h.now = h.now.Add(echCadence - 41*time.Second)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+	if asked := h.upstream.asked(); len(asked) != 1 {
+		t.Fatalf("the ECH client was asked %d times one second before the cadence elapsed, want 1", len(asked))
+	}
+
+	// And at the interval a new source is due.
+	h.now = h.now.Add(2 * time.Second)
 	h.mustExec(t, forceECHName, dns.TypeHTTPS)
 	if asked := h.upstream.asked(); len(asked) != 2 {
-		t.Fatalf("the ECH client was asked %d times a minute after the fetch, want 2", len(asked))
+		t.Fatalf("the ECH client was asked %d times one second past the cadence, want 2", len(asked))
 	}
 }
 
@@ -1691,18 +1820,27 @@ func TestStrictForcedHTTPSFailsClosedAfterTheStaleGrace(t *testing.T) {
 	}
 }
 
-// A list two sources disagree about is not forwarded: a client that picks a config
-// out of it has two different answers to which name it is talking to, and choosing
-// between them is a decision no component of this router is placed to make. Every
-// source is read, because the agreement is only real if every source is asked.
-func TestTwoSourcesNamingDifferentPublicNamesAreRefused(t *testing.T) {
+// A refusal nobody can see is not a refusal an operator can act on, and this one is
+// the one they most need to act on: a source publishing a public name the router
+// will not install is a misconfiguration of `ech.sources`, and the two names in the
+// message are the only place both the offending source and the name it is being held
+// to appear together.
+//
+// It used to assert that BOTH sources were read and the pair refused, which was the
+// whole refresh failing over one disagreement -- the shape ruling 191(c) records as
+// the reason one bad source used to take every force-ECH domain on the router down.
+// The refusal itself is now held by
+// TestASourcePublishingADifferentPublicNameDoesNotReplaceTheHeldKey; this holds that
+// it is said out loud, and it says it with both names because "the sources disagree"
+// is not something an operator can act on from a log line.
+func TestARefusedReplacementNamesBothTheSourceAndTheHeldKey(t *testing.T) {
 	h := newHarness(t, func(c *harnessConfig) {
-		c.mutatePolicy = func(p *config.Policy) {
-			p.ECH.Sources = []string{"cloudflare-ech.com", "other-ech.example.com"}
-		}
+		c.mutatePolicy = rotationSources
 		c.echAnswer = func(question dns.Question) (*dns.Msg, error) {
-			// The public name is a name, so it is the source's name as a person
-			// writes one: without the dot the wire carries.
+			// A public name is a name, so it is the source's name as a person writes
+			// one: without the dot the wire carries. This is how defo.ie behaves --
+			// it publishes cover.defo.ie where the Cloudflare sources publish
+			// cloudflare-ech.com -- and an operator who adds it by mistake sees this.
 			publicName := strings.TrimSuffix(question.Name, ".")
 			return &dns.Msg{
 				MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
@@ -1715,20 +1853,312 @@ func TestTwoSourcesNamingDifferentPublicNamesAreRefused(t *testing.T) {
 	})
 	h.next.response = theHTTPSIn(t, forceECHName)
 
-	response, err := h.exec(t, forceECHName, dns.TypeHTTPS)
+	// The first fetch holds a key named after the first source; the interval after
+	// reaches the second, which names itself, and that is the disagreement.
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+	h.now = h.now.Add(echCadence)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
 
-	if err == nil {
-		t.Fatal("Exec returned no error, so a key two sources disagreed about was installed")
+	for _, want := range []string{
+		echSourceSecond,
+		"cdn.discordapp.com", // the name it published
+		echSourceFirst,
+		"cloudflare-ech.com", // the name in the key that is still in service
+	} {
+		if !h.loggedText(want) {
+			t.Errorf("the refusal does not name %q, and an operator cannot act on a disagreement they cannot see:\n%s",
+				want, h.routerDiagnostics())
+		}
 	}
-	if !errors.Is(err, dnsrewrite.ErrNoECHConfig) {
-		t.Fatalf("error = %v, want one wrapping ErrNoECHConfig", err)
+}
+
+// routerDiagnostics is every logged line, for a failure that has to quote the log it
+// is complaining about.
+func (h *harness) routerDiagnostics() string {
+	var out strings.Builder
+	for _, entry := range h.logs.All() {
+		fmt.Fprintf(&out, "  %s %v\n", entry.Message, entry.ContextMap())
 	}
-	if response != nil {
-		t.Fatalf("a refused key was installed anyway: %v", response.Answer)
+	return out.String()
+}
+
+// --- the ECH source rotation ---
+//
+// Three sources, one request every five minutes, so each of them is asked once
+// every fifteen. The three names below are not fixtures chosen for symmetry:
+// they are the three MEASURED on 2026-10-02 to publish a BYTE-IDENTICAL
+// ECHConfigList, all of them carrying public_name cloudflare-ech.com, which is
+// what makes rotation between them safe and what makes a fourth name a
+// decision rather than an addition.
+
+const (
+	echSourceFirst  = "cloudflare-ech.com"
+	echSourceSecond = "cdn.discordapp.com"
+	echSourceThird  = "discordapp.com"
+)
+
+// echCadence is the interval these cases hold the rotation to. It is written out here
+// rather than taken from the plugin's own constant on purpose: a test whose
+// expectation is imported from the code under test passes whatever that code says,
+// and the cadence is the whole subject of this group. TestTheCadenceIsTheOneThese
+// CasesHold pins the production constant to it, so changing the cadence has to
+// change a case rather than quietly move every expectation with it.
+const echCadence = 5 * time.Minute
+
+// TestTheCadenceIsTheOneTheseCasesHold is that pin. Five minutes is the product
+// decision ruling 191(c) records -- one request every five minutes over three
+// interchangeable sources, so each domain is asked once every fifteen -- and it is
+// written here rather than only in the plugin so that a change to it is a change
+// somebody made on purpose.
+func TestTheCadenceIsTheOneTheseCasesHold(t *testing.T) {
+	if echRotationInterval != echCadence {
+		t.Fatalf("the refresh cadence = %s, want %s: one request per interval over three sources is what makes each domain cost one fifteenth of the refresh traffic, and it is a decision rather than a consequence",
+			echRotationInterval, echCadence)
 	}
-	if asked := h.upstream.asked(); len(asked) != 2 {
-		t.Fatalf("the ECH client was asked %d queries, want 2", len(asked))
+}
+
+// echSourceTTL is what a source publishes. cloudflare-ech.com's HTTPS TTL
+// MEASURED 295-300s, so the fixture is the real number rather than one picked to
+// make the interval convenient -- which is also why the interval and the TTL are
+// the same size here, so a case about WHICH source is asked cannot be satisfied or
+// broken by a change to WHEN it is asked.
+const echSourceTTL = 300
+
+// rotationSources is the policy for the rotation cases: the three measured names,
+// in the order the rotation walks them.
+func rotationSources(p *config.Policy) {
+	p.ECH.Sources = []string{echSourceFirst, echSourceSecond, echSourceThird}
+}
+
+// rotationAnswer is what the three sources publish. The key each one is given is
+// passed in per source rather than baked in, because a disagreement is the case
+// the rotation has to survive and an answer that cannot disagree cannot test it.
+// A source the map does not name is an error rather than a key: an unlisted
+// source answering here would be a fourth source the rotation is not making, and
+// it would show up in the query list and read as one that was.
+func rotationAnswer(t *testing.T, keys map[string][]byte) func(dns.Question) (*dns.Msg, error) {
+	t.Helper()
+	return func(question dns.Question) (*dns.Msg, error) {
+		name := strings.TrimSuffix(question.Name, ".")
+		raw, ok := keys[name]
+		if !ok {
+			return nil, fmt.Errorf("%s was asked but no key was given to it to publish", name)
+		}
+		return &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Response: true, Rcode: dns.RcodeSuccess},
+			Question: []dns.Question{question},
+			Answer: []dns.RR{httpsRecord(question.Name, echSourceTTL, 1, ".",
+				&dns.SVCBAlpn{Alpn: []string{"h2", "h3"}},
+				&dns.SVCBECHConfig{ECH: raw},
+			)},
+		}, nil
 	}
+}
+
+// askedSources is the order the ECH client was queried in, as bare names. The
+// rotation is a property of WHICH source is asked and in WHAT ORDER, so the
+// evidence is the sequence: a count cannot tell a rotation that returned to the
+// first source from one that never left it, and a set cannot tell them from one
+// that asked all three at once.
+func askedSources(h *harness) []string {
+	asked := h.upstream.asked()
+	names := make([]string, 0, len(asked))
+	for _, query := range asked {
+		names = append(names, strings.TrimSuffix(query.question.Name, "."))
+	}
+	return names
+}
+
+// sameSources compares two sequences of source names by their joined text rather
+// than through reflect.DeepEqual, so a failure prints both orders side by side
+// instead of a bool.
+func sameSources(got, want []string) bool {
+	return strings.Join(got, " -> ") == strings.Join(want, " -> ")
+}
+
+// heldGeneration is the generation in the metadata document, which is the
+// evidence for whether a refresh STORED anything. The answer a client gets is
+// also worth reading, but it cannot tell a refused replacement from a refresh
+// that never happened: both leave the held key in service. Only the generation
+// moves when a fetch stored a key, so it is the half that distinguishes them.
+func heldGeneration(t *testing.T, h *harness) uint64 {
+	t.Helper()
+	var document state.ECHState
+	if err := state.ReadJSON(h.echStatePath, &document); err != nil {
+		t.Fatalf("read the ECH state document: %v", err)
+	}
+	return document.Generation
+}
+
+// Rotation, the first step. One request per interval, and the interval after the
+// first fetch asks the SECOND source rather than beginning the list again -- which
+// is also what makes the round cost a third of what a fetch of every source cost.
+func TestTheRotationAsksTheSecondSourceAtTheNextInterval(t *testing.T) {
+	key := echFixture(t)
+	h := newHarness(t, func(c *harnessConfig) {
+		c.mutatePolicy = rotationSources
+		c.echAnswer = rotationAnswer(t, map[string][]byte{
+			echSourceFirst: key, echSourceSecond: key, echSourceThird: key,
+		})
+		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
+	})
+	h.next.response = theHTTPSIn(t, forceECHName)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+
+	if got := askedSources(h); !sameSources(got, []string{echSourceFirst}) {
+		t.Fatalf("the first fetch asked %v, want only %s", got, echSourceFirst)
+	}
+
+	h.now = h.now.Add(echCadence)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+
+	// ONE query, and it is the second source. A rotation that asked all three here
+	// would still contain echSourceSecond, which is why this asserts the whole
+	// sequence and not the presence of one name.
+	want := []string{echSourceFirst, echSourceSecond}
+	if got := askedSources(h); !sameSources(got, want) {
+		t.Fatalf("asked %v, want %v: one interval asks the next source, once", got, want)
+	}
+}
+
+// Rotation, the whole cycle. Three intervals return to the first source, so the
+// three sources are covered evenly instead of the first one carrying every
+// request -- which is what makes a source going quiet cost one third of the key
+// rather than all of it.
+func TestTheRotationComesBackToTheFirstSourceAfterThreeIntervals(t *testing.T) {
+	key := echFixture(t)
+	h := newHarness(t, func(c *harnessConfig) {
+		c.mutatePolicy = rotationSources
+		c.echAnswer = rotationAnswer(t, map[string][]byte{
+			echSourceFirst: key, echSourceSecond: key, echSourceThird: key,
+		})
+		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
+	})
+	h.next.response = theHTTPSIn(t, forceECHName)
+
+	want := []string{echSourceFirst, echSourceSecond, echSourceThird, echSourceFirst}
+	for interval := range want {
+		if interval > 0 {
+			h.now = h.now.Add(echCadence)
+		}
+		h.mustExec(t, forceECHName, dns.TypeHTTPS)
+		if got := askedSources(h); !sameSources(got, want[:interval+1]) {
+			t.Fatalf("after interval %d the ECH client was asked %v, want %v", interval, got, want[:interval+1])
+		}
+	}
+}
+
+// A source that publishes a different public_name is refused WITHOUT replacing the
+// key that is held -- and, the half that is easy to get backwards, refusing it does
+// not stop the rotation: the interval after the disagreeing source lands on one
+// that agrees, and that refresh is stored. Those are the two halves of the relaxed
+// rule and each is a way the other can be implemented wrongly. Refusing a
+// disagreement by refusing to refresh at all passes the first half and fails the
+// second, and costs every force-ECH domain the interval as well as the disagreeing
+// source its own. Refreshing from the disagreeing source passes the second and
+// fails the first.
+//
+// The disagreement is present from the FIRST fetch, which is what makes this case
+// different from one that introduces it later. A refresh that reads every source
+// refuses the whole refresh the moment one of them disagrees, so it holds no key at
+// all and a strict force-ECH name SERVFAILs on the very first query -- the
+// availability half of the bug, and the reason one misconfigured source out of
+// three takes down every force-ECH domain on the router rather than costing one
+// third of its freshness.
+//
+// The disagreement is modelled on defo.ie, MEASURED on 2026-10-02 to publish
+// cover.defo.ie where the other three publish cloudflare-ech.com. Mixing it in
+// would make that name the inner SNI, which no other site's edge accepts.
+func TestASourcePublishingADifferentPublicNameDoesNotReplaceTheHeldKey(t *testing.T) {
+	agreed := echFixture(t)
+	// The second source disagrees from the start, and the first and third agree,
+	// so the disagreement is a property of the SOURCES rather than of a moment.
+	// The map is read by the closure on every exchange, so nothing here has to be
+	// rewired to change what a source publishes.
+	published := map[string][]byte{
+		echSourceFirst:  agreed,
+		echSourceSecond: echFixtureFor(t, "cover.defo.ie"),
+		echSourceThird:  agreed,
+	}
+	h := newHarness(t, func(c *harnessConfig) {
+		c.mutatePolicy = rotationSources
+		c.echAnswer = rotationAnswer(t, published)
+		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
+	})
+	h.next.response = theHTTPSIn(t, forceECHName)
+
+	// Every assertion below reads the response this query already produced. Asking
+	// again to look at an answer would be a second query, and on a key that is past
+	// its lifetime a second query is also a REFRESH -- so a helper that issued its
+	// own question would spend the very interval the case is counting, and the
+	// rotation would appear to ask sources this test never asked it to.
+	first := keyIn(t, h.mustExec(t, forceECHName, dns.TypeHTTPS))
+
+	// One disagreeing source out of three must not take the key down, so the very
+	// first fetch is answered from the agreed key the first source published.
+	if !bytes.Equal(first, agreed) {
+		t.Fatalf("the first answer carries a key other than the agreed one, with %s publishing cover.defo.ie and the other two publishing cloudflare-ech.com: one source that disagrees costs one third of the key's freshness, not all of it",
+			echSourceSecond)
+	}
+	if got := askedSources(h); !sameSources(got, []string{echSourceFirst}) {
+		t.Fatalf("the first fetch asked %v, want only %s", got, echSourceFirst)
+	}
+	firstGeneration := heldGeneration(t, h)
+
+	// The next interval is the one that reaches the disagreeing source. This is
+	// what makes the refusal observable at all: a rotation that never asked it
+	// would pass this case while never having checked anything.
+	h.now = h.now.Add(echCadence)
+	second := keyIn(t, h.mustExec(t, forceECHName, dns.TypeHTTPS))
+
+	if got := askedSources(h); !sameSources(got, []string{echSourceFirst, echSourceSecond}) {
+		t.Fatalf("asked %v, want the rotation to have reached %s, which is the source that disagrees",
+			got, echSourceSecond)
+	}
+	// Nothing was stored. The answer alone cannot carry this half, because a
+	// refused replacement and a refresh that never ran leave the client with the
+	// same bytes; the generation is what separates them, and it moves on a stored
+	// key and on nothing else.
+	if got := heldGeneration(t, h); got != firstGeneration {
+		t.Fatalf("generation = %d after %s published a different public_name, want %d unchanged: the disagreeing list must not replace the held key",
+			got, echSourceSecond, firstGeneration)
+	}
+	if !bytes.Equal(second, agreed) {
+		t.Fatal("a source publishing cover.defo.ie replaced the held key")
+	}
+
+	// The interval after that lands on the third source, which agrees, so the key
+	// IS refreshed. This is the half that separates refusing a disagreement from
+	// refusing to refresh -- and it is what fixes the position: a rotation that held
+	// on the disagreeing source would ask it again here, reach neither of the two
+	// healthy ones, and let the grace end with nothing stored.
+	h.now = h.now.Add(echCadence)
+	third := keyIn(t, h.mustExec(t, forceECHName, dns.TypeHTTPS))
+
+	want := []string{echSourceFirst, echSourceSecond, echSourceThird}
+	if got := askedSources(h); !sameSources(got, want) {
+		t.Fatalf("asked %v, want the rotation to have continued to %s", got, echSourceThird)
+	}
+	if got, want := heldGeneration(t, h), firstGeneration+1; got != want {
+		t.Fatalf("generation = %d after the agreeing source was fetched, want %d: one source that disagrees must not stop the refresh",
+			got, want)
+	}
+	if !bytes.Equal(third, agreed) {
+		t.Fatal("the agreeing source's refresh did not leave the agreed key in service")
+	}
+}
+
+// keyIn is the ECH key an answer carries. It reads a response the case already has
+// rather than asking a question of its own, because on a key past its lifetime a
+// question is a refresh, and a helper that issued one would spend the interval the
+// case is counting.
+func keyIn(t *testing.T, response *dns.Msg) []byte {
+	t.Helper()
+	ech, present := svcParam(t, theSynthesized(t, response), dns.SVCB_ECHCONFIG)
+	if !present {
+		t.Fatal("the answer carries no ech parameter at all")
+	}
+	return ech.(*dns.SVCBECHConfig).ECH
 }
 
 // The metadata document is what an operator and `mosdns-cdnctl status` read, and it
@@ -1755,10 +2185,20 @@ func TestTheECHStateDocumentRecordsTheKeyWithoutCarryingIt(t *testing.T) {
 		t.Fatalf("fetched_at = %s, want the clock's reading %s", document.FetchedAt, want)
 	}
 	if want := time.Date(2026, 9, 25, 12, 5, 0, 0, time.UTC); !document.ExpiresAt.Equal(want) {
-		t.Fatalf("expires_at = %s, want the fetch plus the published 300 second TTL, %s", document.ExpiresAt, want)
+		t.Fatalf("expires_at = %s, want the fetch plus one cadence, %s", document.ExpiresAt, want)
 	}
-	if want := time.Date(2026, 9, 25, 12, 20, 0, 0, time.UTC); !document.StaleUntil.Equal(want) {
-		t.Fatalf("stale_until = %s, want the expiry plus the policy's 900 second grace, %s", document.StaleUntil, want)
+	// The grace is the policy's, and the policy here is the shipped default. It is
+	// read from the defaults rather than written out, because it is a DERIVED number
+	// -- two refresh intervals, and the derivation lives in the comment on
+	// echStaleGraceSeconds -- and a literal here would be a fourth copy of it to go
+	// stale. defaults.go holds the reasoning; this holds that the document agrees
+	// with it.
+	if want := document.ExpiresAt.Add(time.Duration(config.Defaults().ECH.StaleGraceSeconds) * time.Second); !document.StaleUntil.Equal(want) {
+		t.Fatalf("stale_until = %s, want the expiry plus the shipped grace of %d seconds, %s",
+			document.StaleUntil, config.Defaults().ECH.StaleGraceSeconds, want)
+	}
+	if got, want := document.StaleUntil.Sub(document.ExpiresAt), 2*echCadence; got != want {
+		t.Fatalf("the grace is %s, want %s: it is two refresh intervals, one failed fetch and the retry after it, and a constant with no derivation is a constant that gets re-picked by whoever is next", got, want)
 	}
 	// The digest is of the list as published, so an operator can tell two keys
 	// apart without the router handing the key to everything that can read a file.
@@ -1860,8 +2300,25 @@ func TestACorruptSelectorReplacementKeepsTheLastValidGeneration(t *testing.T) {
 	}
 }
 
-// A new allowlist is served to the next query: the new domain is short circuited
-// and the domain that came off the list is not.
+// forcedIsServed asks whether a name is being force-ECH'd, by running the one query
+// the force list is actually about and looking for the key in the answer.
+//
+// These list cases used to probe it with an A query and the empty answer this router
+// used to write for a listed name, which made the short circuit a side effect
+// several unrelated tests came to depend on. With the short circuit deleted there is
+// no difference at all between a listed name and an unlisted one on an address
+// query -- that is the point of deleting it -- so the HTTPS answer is the only place
+// left where the two differ, and the list is only about that answer anyway.
+func forcedIsServed(t *testing.T, h *harness, name string) bool {
+	t.Helper()
+	h.next.response = theHTTPSIn(t, name)
+	record := theSynthesized(t, h.mustExec(t, name, dns.TypeHTTPS))
+	_, present := svcParam(t, record, dns.SVCB_ECHCONFIG)
+	return present
+}
+
+// A new allowlist is served to the next query: the new domain is forced and the
+// domain that came off the list is not.
 func TestANewForceECHListIsServedToTheNextQuery(t *testing.T) {
 	h := newHarness(t)
 	writeFile(t, h.forcePath, []byte("# the operator replaced the list\nsecure2.example.com\n"))
@@ -1869,13 +2326,11 @@ func TestANewForceECHListIsServedToTheNextQuery(t *testing.T) {
 		return len(h.plugin.force.Snapshot()) == 1 && h.plugin.force.Snapshot()[0] == "secure2.example.com"
 	})
 
-	listed := h.mustExec(t, "secure2.example.com.", dns.TypeA)
-	if len(listed.Answer) != 0 {
-		t.Fatalf("the newly listed domain was answered with %v", addressesIn(t, listed.Answer))
+	if !forcedIsServed(t, h, "secure2.example.com.") {
+		t.Error("the newly listed domain is not being force-ECH'd")
 	}
-	h.next.response = answerWith(forceECHName, dns.TypeA, aRecord(forceECHName, foreignAddress, 300))
-	if removed := h.mustExec(t, forceECHName, dns.TypeA); len(removed.Answer) != 1 {
-		t.Fatalf("a domain that came off the list was still short circuited: %v", addressesIn(t, removed.Answer))
+	if forcedIsServed(t, h, forceECHName) {
+		t.Error("a domain that came off the list is still being force-ECH'd")
 	}
 }
 
@@ -1889,13 +2344,11 @@ func TestACorruptForceECHListKeepsTheLastValidList(t *testing.T) {
 		return h.loggedRefusal() && h.loggedText("not a domain at all")
 	})
 
-	listed := h.mustExec(t, forceECHName, dns.TypeA)
-	if len(listed.Answer) != 0 {
-		t.Fatalf("the last valid list stopped being honoured: %v", addressesIn(t, listed.Answer))
+	if !forcedIsServed(t, h, forceECHName) {
+		t.Error("the last valid list stopped being honoured")
 	}
-	h.next.response = answerWith("secure3.example.com.", dns.TypeA, aRecord("secure3.example.com.", foreignAddress, 300))
-	if added := h.mustExec(t, "secure3.example.com.", dns.TypeA); len(added.Answer) != 1 {
-		t.Fatal("a domain from a list that was refused whole was short circuited anyway")
+	if forcedIsServed(t, h, "secure3.example.com.") {
+		t.Error("a domain from a list that was refused whole was forced anyway")
 	}
 }
 
@@ -1907,9 +2360,8 @@ func TestAZeroByteForceECHListKeepsTheLastValidList(t *testing.T) {
 	writeFile(t, h.forcePath, nil)
 	h.waitFor(t, "the empty allowlist to be reported", func() bool { return h.loggedRefusal() })
 
-	listed := h.mustExec(t, forceECHName, dns.TypeA)
-	if len(listed.Answer) != 0 {
-		t.Fatalf("a zero-byte allowlist dropped every forced domain: %v", addressesIn(t, listed.Answer))
+	if !forcedIsServed(t, h, forceECHName) {
+		t.Error("a zero-byte allowlist dropped every forced domain")
 	}
 }
 
@@ -2038,22 +2490,26 @@ func TestTheSequenceIsAskedAtMostOncePerQuery(t *testing.T) {
 		wantNext int
 	}{
 		{
-			name:  "a strict force-ECH A query",
+			// A listed name's address queries are ordinary queries now, so this row
+			// says one lookup like every other row. It used to say zero, and the zero
+			// was the short circuit this package deleted -- a client that cannot
+			// resolve the name has nothing to connect to.
+			name:  "an A query for a listed name",
 			qname: forceECHName,
 			qtype: dns.TypeA,
 			answer: func(t *testing.T) *dns.Msg {
 				return answerWith(forceECHName, dns.TypeA, aRecord(forceECHName, cloudflareAddress, 300))
 			},
-			wantNext: 0,
+			wantNext: 1,
 		},
 		{
-			name:  "a strict force-ECH AAAA query",
+			name:  "an AAAA query for a listed name",
 			qname: forceECHName,
 			qtype: dns.TypeAAAA,
 			answer: func(t *testing.T) *dns.Msg {
 				return answerWith(forceECHName, dns.TypeAAAA, aaaaRecord(forceECHName, "2606:4700::1111", 300))
 			},
-			wantNext: 0,
+			wantNext: 1,
 		},
 		{
 			name:  "an A query for a listed name",
@@ -2925,8 +3381,19 @@ func TestARefreshThatMovedTheTimesIsPublished(t *testing.T) {
 // only the clock. An operator comparing two digests is how they tell a rotated key
 // from a re-fetch of the same one, and a document that keeps the first digest after
 // a rotation says the key has not changed when it has.
+//
+// It is also the only case in this package where a source publishing a DIFFERENT
+// public name is right, because an upstream rotation moves the name with the key and
+// a client authenticates the name inside the config. So it holds both halves of the
+// rule, and the seam between them is the grace. Inside it the held key is worth
+// keeping and the rotation is refused, because a client is being served that key.
+// Past it there is nothing left to keep, and refusing would leave this router
+// refusing forever against a source that is answering perfectly well -- every
+// force-ECH name failing closed on a rotation it could have survived.
 func TestARefreshThatChangedTheKeyIsPublished(t *testing.T) {
+	const grace = 600
 	h := newHarness(t, func(c *harnessConfig) {
+		c.mutatePolicy = func(p *config.Policy) { p.ECH.StaleGraceSeconds = grace }
 		c.echAnswer = answerWithECH(echFixture(t), 300)
 		c.selector = provenFor(time.Date(2026, 9, 25, 13, 0, 0, 0, time.UTC))
 	})
@@ -2937,20 +3404,36 @@ func TestARefreshThatChangedTheKeyIsPublished(t *testing.T) {
 	// The source rotates its key. The public name moves with it, because a client
 	// authenticates the name inside the config.
 	rotated := echFixtureFor(t, "rotated-ech.example.com")
+	rotatedDigest := sha256.Sum256(rotated)
 	h.upstream.setAnswer(answerWithECH(rotated, 300))
-	h.now = h.now.Add(301 * time.Second)
+	h.now = h.now.Add(echCadence)
+	h.mustExec(t, forceECHName, dns.TypeHTTPS)
+
+	// Inside the grace the held key still serves, so the replacement is refused and
+	// the document keeps describing the key that is actually in service.
+	during := readECHState(t, h.echStatePath)
+	if during.ConfigSHA256 != first.ConfigSHA256 {
+		t.Fatalf("config_sha256 = %q while the held key is still inside its grace, want the held key's own %q: that is the key clients are being served",
+			during.ConfigSHA256, first.ConfigSHA256)
+	}
+
+	// Past the grace the held key is worth nothing, and the rotation is taken.
+	h.now = h.now.Add(grace * time.Second)
 	h.mustExec(t, forceECHName, dns.TypeHTTPS)
 
 	second := readECHState(t, h.echStatePath)
-	digest := sha256.Sum256(rotated)
-	if second.ConfigSHA256 != hex.EncodeToString(digest[:]) {
-		t.Fatalf("config_sha256 = %q, want the digest of the rotated key %q", second.ConfigSHA256, hex.EncodeToString(digest[:]))
+	if second.ConfigSHA256 != hex.EncodeToString(rotatedDigest[:]) {
+		t.Fatalf("config_sha256 = %q after the held key's grace ended, want the digest of the rotated key %q: refusing it from here on would leave this router refusing forever against a source that is working",
+			second.ConfigSHA256, hex.EncodeToString(rotatedDigest[:]))
 	}
 	if second.ConfigSHA256 == first.ConfigSHA256 {
-		t.Fatal("the document still carries the first key's digest after the source rotated it")
+		t.Fatal("the document still carries the first key's digest after the source rotated it and the held key expired")
 	}
 	if second.PublicName != "rotated-ech.example.com" {
 		t.Fatalf("public_name = %q, want the rotated key's own public name", second.PublicName)
+	}
+	if second.Generation <= during.Generation {
+		t.Fatalf("generation = %d, want more than the %d the refused window left behind: the rotation was stored, not merely tolerated", second.Generation, during.Generation)
 	}
 }
 
