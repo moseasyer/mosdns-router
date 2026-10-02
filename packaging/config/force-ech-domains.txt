@@ -9,23 +9,68 @@
 # The shipped file is empty OF ENTRIES ON PURPOSE, and it carries this comment
 # rather than being zero bytes, because a zero-byte list is REFUSED by the
 # response rewriter. A file of nothing but comments is how this project ships
-# "forcing off": the router starts with an empty list and one warning, and an
-# operator adds a name here and restarts mosdns-router to have it forced.
+# "forcing off": the router starts with an empty list and one warning.
 #
-# Two things to know before you add a name:
+# NO RESTART IS NEEDED TO EDIT THIS FILE. The rewriter reads it about twice a
+# second, so a name you add is in force before you have finished reading this
+# comment. What DOES need a restart is /etc/mosdns/policy.yaml, because
+# ech.enabled, ech.failure_policy and ech.stale_grace are resolved once when the
+# router starts. So:
 #
-#   * forcing ECH costs a DNS lookup, and that is deliberate. The rewriter answers
-#     an A or AAAA query for a listed name itself, with an empty NOERROR, and asks
-#     nobody. A censored name must not be leaked by looking it up.
-#   * the policy's ech.failure_policy decides what happens when a forced name
-#     cannot be protected. The shipped policy says "strict", which fails the name
-#     closed. Set it to "fallback" if you would rather have a working lookup than
-#     a protected one, and say so in your own notes, because the two are not
-#     equivalent and only you know which one you want.
+#   * editing THIS file: nothing to do, it is picked up on its own;
+#   * editing the policy:  sudo systemctl restart mosdns-router
 #
-# After editing, check the policy and restart the router so the list is reloaded:
+# This file is a conffile, so an upgrade of the package asks you whether to keep
+# your copy rather than overwriting it.
+#
+# What forcing a name actually costs, since it is not free:
+#
+#   * The router answers an HTTPS (type 65) query for a listed name itself,
+#     whether or not the name is censored. The key it installs is BORROWED from
+#     the ECH sources named in the policy; it is not a key the origin published
+#     for that name, and it does not have to be.
+#   * It still looks the name up. A listed name's A and AAAA queries are ordinary
+#     queries, answered exactly as an unlisted name's are. An earlier release
+#     refused them here instead, on the theory that resolving a censored name is
+#     itself the disclosure. That theory does not hold on this router, because it
+#     runs only on the foreign path: the HTTPS query has already gone to the
+#     foreign resolver before any address lookup follows, so there was nothing
+#     left to withhold from the party that mattered, while the client was left
+#     with nothing to connect to and the encrypted ClientHello was never sent. If
+#     you need a name to resolve without leaving this machine, do not force ECH
+#     for it; the foreign branch is where that question is decided.
+#   * A listed name gets the address the CDN selector proved when there is one,
+#     and the address the upstream published when there is not, and no hint at all
+#     when neither exists. The record is a service mode carrying the key either
+#     way.
+#
+# What your BROWSER has to be told, or the key arrives and is ignored. Firefox
+# 129 and later default both of these to the unsafe side:
+#
+#   * network.dns.force_waiting_https_rr = true
+#     Otherwise a slow HTTPS record is treated as no HTTPS record and the browser
+#     silently connects UNENCRYPTED.
+#   * network.dns.echconfig.fallback_to_origin_when_all_failed = false
+#     Otherwise a failed ECH connection falls back to the origin name in
+#     plaintext, which is exactly what ECH exists to prevent.
+#
+# Set both in about:config. This package cannot set them for you: it has no
+# business writing to a browser profile, and this file says STATED, NOT CHECKED.
+# Nothing here reads your browser, so nobody -- including this package -- can tell
+# you that you did it.
+#
+# The policy's ech.failure_policy decides what happens when a forced name cannot
+# be protected. The shipped policy says "strict", which fails the name closed. Set
+# it to "fallback" if you would rather have a working lookup than a protected one,
+# and say so in your own notes, because the two are not equivalent and only you
+# know which one you want.
+#
+# After editing, check the policy is still what you think it is:
 #
 #   sudo mosdns-cdnctl validate --policy /etc/mosdns/policy.yaml
-#   sudo systemctl restart mosdns-router
+#
+# and see what the key is doing with:
+#
+#   sudo mosdns-cdnctl status --ech /var/lib/mosdns/runtime/ech-state.json
 #
 # See mosdns-router(8) and the force-ech-domains stanza of /etc/mosdns/policy.yaml.

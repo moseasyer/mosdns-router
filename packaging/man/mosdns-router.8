@@ -142,8 +142,42 @@ documents. Validate it with
 .BR "mosdns\-cdnctl validate" (1).
 .TP
 .I /etc/mosdns/force\-ech\-domains.txt
-Domains to force ECH for. Ships with no entries, and carries a comment line
-rather than being zero bytes because a zero\-byte list is refused.
+Domains to force ECH for. One per line; a line whose first non\-space character is
+# is a comment, a blank line is nothing, and everything after a # on a line ends the
+entry. Ships with no entries, and carries a comment line rather than being zero bytes
+because a zero\-byte list is refused.
+.PP
+No restart is needed to edit this file: the rewriter reads it about twice a second,
+so a new entry is in force immediately. /etc/mosdns/policy.yaml is the file that
+needs
+.BR "systemctl restart mosdns\-router" ,
+because
+.BR ech.enabled ,
+.BR ech.failure_policy
+and
+.BR ech.stale_grace
+are resolved once at start\-up. This file is a conffile, so a package upgrade asks
+before replacing it.
+.PP
+Forcing a name is not free. The router answers the name's HTTPS (type 65) query
+itself, and the ECH key it installs is BORROWED from the sources named in the policy
+rather than published by the origin for that name. A listed name's A and AAAA queries
+are ordinary queries and are answered as such: this router runs only on the foreign
+path, so the HTTPS query has already disclosed the name to the foreign resolver
+before any address lookup follows, and withholding the address bought no privacy
+while leaving the client with nothing to connect to. The synthesized record carries
+the address the CDN selector proved, or the upstream's own published address when
+there is no proved one, and no hint at all when there is neither.
+.PP
+A browser must be told to use the key or it will arrive and be ignored. Firefox 129
+and later default both of these to the unsafe side, and both are in about:config:
+.B network.dns.force_waiting_https_rr
+must be true, or a slow HTTPS record is treated as no HTTPS record and the browser
+silently connects unencrypted; and
+.B network.dns.echconfig.fallback_to_origin_when_all_failed
+must be false, or a failed ECH connection falls back to the plaintext origin name.
+This package does not set them and does not read your browser profile, so this is
+stated, not checked.
 .TP
 .I /etc/mosdns/cloudflare.txt
 Addresses and prefixes to measure in addition to the published ones. Ships empty.

@@ -2541,6 +2541,93 @@ class ShippedDocumentTests(_Staged):
         )
         self.assertGreater(len(text), 0)
 
+    def test_the_forced_ech_documentation_does_not_describe_deleted_behaviour(self):
+        """Ruling 191(a) deleted the strict-mode A/AAAA suppression for a listed
+        name, and the operator-facing documents described it as a FEATURE: "the
+        rewriter answers an A or AAAA query for a listed name itself, with an empty
+        NOERROR, and asks nobody". Shipping that after deleting it is worse than
+        shipping nothing, because an operator who reads it will believe a listed
+        name resolves without leaving this machine -- which is the one thing this
+        router does not do, and which the foreign branch is where it is decided.
+
+        The same file also told the operator to restart the router after editing the
+        list, which was never true: the list is polled about twice a second
+        (statewatch.DefaultPollInterval). Only policy.yaml needs a restart, because
+        ech.enabled, ech.failure_policy and ech.stale_grace are resolved once in
+        Init. An operator following the old instruction would restart the router to
+        pick up a list change that was already live, and would conclude from the
+        restart that the list needs one.
+        """
+        page = gzip.decompress(self.read_bytes(MAN_ROOT + "/man8/mosdns-router.8.gz")).decode()
+        documents = {
+            CONFIG_DIRECTORY + "/force-ech-domains.txt": self.read(CONFIG_DIRECTORY + "/force-ech-domains.txt"),
+            "mosdns-router.8": page,
+        }
+        # Lowercased before matching, because a document that shouts a phrase is
+        # making it as loudly as one that says it quietly, and a case that only
+        # matched lowercase would hold one spelling of a claim rather than the
+        # claim. The phrases themselves are written the way the shipped files wrote
+        # them, because a paraphrase here would pass against prose that still makes
+        # the assertion in different words.
+        documents = {where: text.lower() for where, text in documents.items()}
+        withdrawn = (
+            "asks nobody",
+            "with an empty noerror",
+            "must not be leaked by looking it up",
+            "a censored name must not be leaked",
+        )
+        for where, text in documents.items():
+            for phrase in withdrawn:
+                with self.subTest(document=where, phrase=phrase):
+                    self.assertNotIn(
+                        phrase, text,
+                        f"{where} still describes the A/AAAA suppression that ruling 191(a) deleted",
+                    )
+        # And the reload instruction, which points at the wrong file.
+        for where, text in documents.items():
+            with self.subTest(document=where):
+                self.assertNotIn(
+                    "restart mosdns-router to have it forced", text,
+                    f"{where} tells the operator to restart the router to reload the list, which is polled and needs no restart",
+                )
+
+    def test_the_forced_ech_documentation_states_the_browser_settings_and_the_cost(self):
+        """Ruling 191(b): Firefox is NOT fixed by this package, and both of the
+        settings that make it work default to the unsafe side. Total-ECH's README is
+        explicit about both, and neither of them is about anything this router can
+        observe -- so the only place an operator can learn them is this project's
+        own documentation, and the only honest way to say it is that it is STATED
+        rather than checked.
+
+        The cost is stated for the same reason. "Forcing ECH" reads like a free
+        privacy win, and it is not: the router answers the name's HTTPS query
+        itself, with a key BORROWED from the ECH sources rather than one the origin
+        published, and a listed name's A and AAAA are ordinary queries.
+        """
+        page = gzip.decompress(self.read_bytes(MAN_ROOT + "/man8/mosdns-router.8.gz")).decode()
+        # Lowercased for the same reason as the withdrawn-phrase case: the conffile
+        # shouts what the manual says quietly, and both are saying it.
+        documents = {
+            CONFIG_DIRECTORY + "/force-ech-domains.txt": self.read(CONFIG_DIRECTORY + "/force-ech-domains.txt").lower(),
+            "mosdns-router.8": page.lower(),
+        }
+        required = (
+            # The two settings, named exactly as about:config spells them.
+            "network.dns.force_waiting_https_rr",
+            "network.dns.echconfig.fallback_to_origin_when_all_failed",
+            # That nobody here can check them.
+            "not checked",
+            # And that editing the list needs no restart, while the policy does.
+            "policy.yaml",
+        )
+        for where, text in documents.items():
+            for phrase in required:
+                with self.subTest(document=where, phrase=phrase):
+                    self.assertIn(
+                        phrase, text,
+                        f"{where} does not say {phrase!r}, and an operator reading only this file would run Firefox with both settings on the unsafe side",
+                    )
+
     def test_the_user_candidate_and_profile_files_ship_empty_but_documented(self):
         """The candidate list is empty because there is nothing to measure, and the
         profile document declares an empty profile list because a per-hostname
