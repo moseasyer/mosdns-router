@@ -227,24 +227,41 @@ PROVISIONED = (RUNTIME_DIR, LISTS_DIR)
 # needs a volatile path: see the router's row above.
 VOLATILE_PREFIXES = ("/run/", "/var/run/", "/tmp/", "/dev/shm/")
 
-# The identity each unit runs as, and the group it runs under. Both mosdns service
-# users have `mosdns` as their primary group, which is the group the state
-# directories' default ACL names; dnscrypt-proxy shares no state with either, so it
-# has its own group and its own umask.
+# The identity each unit runs as, and the group it runs under. Both state-writing
+# service users have the shared state group as their primary group, which is the
+# group the state directories' default ACL names; the resolver shares no state with
+# either, so it has a group of its own and its own umask.
+#
+# Every name carries this package's own. They used to be `mosdns`, `mosdns-cdn` and
+# `dnscrypt-proxy`, and the third of those is the upstream dnscrypt-proxy package's
+# own account -- ruling 191(d), and the reason a purge can now remove them at all.
 IDENTITIES = {
-    ROUTER: ("mosdns", "mosdns"),
-    OPTIMIZER: ("mosdns-cdn", "mosdns"),
-    HEALTH: ("mosdns-cdn", "mosdns"),
-    LIST_CHECK: ("mosdns-cdn", "mosdns"),
-    DNSCRYPT: ("dnscrypt-proxy", "dnscrypt-proxy"),
-    # root, explicitly and with an empty bounding set. The verb this unit runs
-    # execs `mosdns-cdnctl emergency-rollback`, which refuses a non-root uid, so
-    # a unit that ran it as a service identity would fail at the action every time
+    ROUTER: ("mosdns-router", "mosdns-router"),
+    OPTIMIZER: ("mosdns-router-cdn", "mosdns-router"),
+    HEALTH: ("mosdns-router-cdn", "mosdns-router"),
+    LIST_CHECK: ("mosdns-router-cdn", "mosdns-router"),
+    DNSCRYPT: ("mosdns-router-dnscrypt", "mosdns-router-dnscrypt"),
+    # root, explicitly and with an empty bounding set: the verb this unit execs
+    # is `mosdns-cdnctl emergency-rollback`, which refuses a non-root uid, so a
+    # unit that ran it as a service identity would fail at the action every time
     # with a message about privileges rather than about DNS. It needs no
     # capability: the action reaches NetworkManager over D-Bus and the daemon at
     # the other end does the writing.
     WATCHDOG: ("root", "root"),
 }
+
+# The one group the two state-writing identities share, read out of the table rather
+# than written down a fourth time. The sharing is a decision and the cases below
+# assert its SHAPE -- one group, shared by everything but the resolver, different
+# from the resolver's -- so the name itself only has to be somewhere.
+SHARED_STATE_GROUP = IDENTITIES[ROUTER][1]
+assert IDENTITIES[OPTIMIZER][1] == IDENTITIES[HEALTH][1] == IDENTITIES[LIST_CHECK][1], (
+    "the table says the state-writing units do not all share one group, and the "
+    "assertions that read SHARED_STATE_GROUP would then be checking nothing"
+)
+assert SHARED_STATE_GROUP != IDENTITIES[DNSCRYPT][1], (
+    "the resolver shares the state group, so nothing distinguishes the two identities"
+)
 
 # Only the router binds a privileged port, and only the router gets a capability.
 # 15353 is unprivileged, so dnscrypt-proxy needs none, and a unit that needs none
@@ -308,8 +325,8 @@ UNIT_DIRECTIVES = {
         ),
         "Service": (
             ("Type", "simple"),
-            ("User", "mosdns"),
-            ("Group", "mosdns"),
+            ("User", IDENTITIES[ROUTER][0]),
+            ("Group", IDENTITIES[ROUTER][1]),
             ("ExecStart", f"{ROUTER_BINARY} start -c {ROUTER_CONFIG}"),
             ("AmbientCapabilities", "CAP_NET_BIND_SERVICE"),
             ("CapabilityBoundingSet", "CAP_NET_BIND_SERVICE"),
@@ -339,8 +356,8 @@ UNIT_DIRECTIVES = {
         ),
         "Service": (
             ("Type", "simple"),
-            ("User", "dnscrypt-proxy"),
-            ("Group", "dnscrypt-proxy"),
+            ("User", IDENTITIES[DNSCRYPT][0]),
+            ("Group", IDENTITIES[DNSCRYPT][1]),
             ("ExecStart", f"{DNSCRYPT_BINARY} -config {DNSCRYPT_CONFIG}"),
             # An empty bounding set, not an inherited one: this resolver binds an
             # unprivileged port and runs no privileged operation, so there is
@@ -369,8 +386,8 @@ UNIT_DIRECTIVES = {
         ),
         "Service": (
             ("Type", "oneshot"),
-            ("User", "mosdns-cdn"),
-            ("Group", "mosdns"),
+            ("User", IDENTITIES[OPTIMIZER][0]),
+            ("Group", IDENTITIES[OPTIMIZER][1]),
             ("ExecStart", f"{CDNCTL_BINARY} test --apply"),
             # 512 candidates at 3 s each is 25 minutes of transfers before the
             # identity and proof phases, and the 90 s default for a oneshot would
@@ -402,8 +419,8 @@ UNIT_DIRECTIVES = {
         ),
         "Service": (
             ("Type", "oneshot"),
-            ("User", "mosdns-cdn"),
-            ("Group", "mosdns"),
+            ("User", IDENTITIES[HEALTH][0]),
+            ("Group", IDENTITIES[HEALTH][1]),
             ("ExecStart", f"{CDNCTL_BINARY} health-check"),
             # The second command, and the whole of the "nothing notices the router
             # stopped" gap: `health-check` proves the CDN address, not the machine's
@@ -443,8 +460,8 @@ UNIT_DIRECTIVES = {
         ),
         "Service": (
             ("Type", "oneshot"),
-            ("User", "mosdns-cdn"),
-            ("Group", "mosdns"),
+            ("User", IDENTITIES[LIST_CHECK][0]),
+            ("Group", IDENTITIES[LIST_CHECK][1]),
             ("ExecStart", f"{CDNCTL_BINARY} update-lists --check"),
             # `update-lists --check` makes at most two HTTP requests against a
             # 60 s client timeout each, so 90 s would cut a slow origin off before
@@ -497,8 +514,8 @@ UNIT_DIRECTIVES = {
             # root, because the verb execs `mosdns-cdnctl emergency-rollback`,
             # which refuses a non-root uid. No capability: the action talks to
             # NetworkManager over D-Bus.
-            ("User", "root"),
-            ("Group", "root"),
+            ("User", IDENTITIES[WATCHDOG][0]),
+            ("Group", IDENTITIES[WATCHDOG][1]),
             ("ExecStart", f"{INSTALLER} watchdog"),
             # Above the action's own budget, on purpose: a watchdog killed part
             # way through a restore prints nothing, and a rollback killed
@@ -570,7 +587,7 @@ def parse_unit(text, name="<unit>"):
     repository ships and this test reads has no reason to use anything the strict
     reading of a unit file does not allow. In particular a value carrying ``#`` or
     ``;`` is refused: systemd does not strip a trailing comment, so
-    ``User=mosdns # the router`` is a user named "mosdns # the router" and a
+    ``User=someone # the router`` is a user named "someone # the router" and a
     ``ReadWritePaths=/var/lib/mosdns # state`` is a path that does not exist. That
     is not a stylistic rule -- it was checked against systemd-analyze on this host
     -- and a directive that reads as commented out but is not is a privilege
@@ -926,8 +943,14 @@ class UnitTextTests(unittest.TestCase):
                     # an ACL grants by group and per-service groups would let only
                     # one of them replace the other's files; the resolver shares no
                     # state with either, so it has a group of its own.
+                    # Read out of the table above rather than restated, because a
+                    # copy of the table beside this assertion agrees with a table
+                    # that is itself wrong. What is asserted here is therefore the
+                    # STRUCTURE the table is supposed to have, which is falsifiable
+                    # in a way a restatement is not: exactly one unit is root, the
+                    # rest share ONE group, and the resolver's is a different one.
                     "root" if name == WATCHDOG
-                    else ("mosdns" if name != DNSCRYPT else "dnscrypt-proxy"),
+                    else (IDENTITIES[DNSCRYPT][1] if name == DNSCRYPT else SHARED_STATE_GROUP),
                     "the identity table is what says which of this package's three "
                     "identities a unit runs as, and each of the three has a reason",
                 )
@@ -1042,7 +1065,8 @@ class UnitTextTests(unittest.TestCase):
             write_path_problems(OPTIMIZER, sections, WRITE_TABLE[OPTIMIZER]),
             [
                 "/var/lib/mosdns is writable but nothing this unit runs writes it: "
-                f"{sorted(WRITE_TABLE[OPTIMIZER])!r} is the whole write set of mosdns-cdn"
+                f"{sorted(WRITE_TABLE[OPTIMIZER])!r} is the whole write set of "
+                f"{IDENTITIES[OPTIMIZER][0]}"
             ],
             "the write-set check has to reject a broader grant, or it accepts any",
         )

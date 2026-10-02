@@ -188,7 +188,7 @@ STATE_DIRECTORIES = (
 CONTROL_LOCK = "/var/lib/mosdns/runtime/control.lock"
 LOCK_MODE_OCTAL = "640"
 STATE_OWNER = "root"
-STATE_GROUP = "mosdns"
+STATE_GROUP = "mosdns-router"
 # The units whose states the preflight reads, and the fixture's own list rather
 # than the module's: this suite asserts the exact sequence of commands a
 # transaction issues, and a sequence derived from the constant under test would
@@ -948,7 +948,7 @@ class TransactionFixture(unittest.TestCase):
         for unit in PROJECT_UNITS:
             self.returncodes[("systemctl", "is-active", unit)] = 3
         for relative in STATE_DIRECTORIES:
-            answers[STAT_FIELDS + (str(self.rooted(relative)),)] = f"2770 root mosdns {stat.S_IFDIR | 0o2770:x}"
+            answers[STAT_FIELDS + (str(self.rooted(relative)),)] = f"2770 root mosdns-router {stat.S_IFDIR | 0o2770:x}"
         # The control lock, stat-able. The transaction now TAKES this lock (it is
         # the exclusion that stops the resolver watchdog acting underneath an
         # install), so a test that runs the transaction twice leaves a real lock
@@ -1374,7 +1374,7 @@ class TransactionOrderTests(TransactionFixture):
         # refuses never reaches the capture, the backup or any unit.
         self.build_state_directories(mode="2777")
         answers = {
-            STAT_FIELDS + (str(self.rooted(relative)),): f"2777 root mosdns {stat.S_IFDIR | 0o2777:x}"
+            STAT_FIELDS + (str(self.rooted(relative)),): f"2777 root mosdns-router {stat.S_IFDIR | 0o2777:x}"
             for relative in STATE_DIRECTORIES
         }
         runner = self.good_runner(outputs=answers)
@@ -2389,7 +2389,7 @@ class MarkerTests(TransactionFixture):
     def test_a_preflight_never_writes_the_marker(self):
         self.build_state_directories(mode="2777")
         answers = {
-            STAT_FIELDS + (str(self.rooted(relative)),): f"2777 root mosdns {stat.S_IFDIR | 0o2777:x}"
+            STAT_FIELDS + (str(self.rooted(relative)),): f"2777 root mosdns-router {stat.S_IFDIR | 0o2777:x}"
             for relative in STATE_DIRECTORIES
         }
         installer.install(self.root, self.good_runner(outputs=answers), clock=self.clock, probe=self.probe_for())
@@ -4138,7 +4138,7 @@ class CliTransactionTests(TransactionFixture):
     def test_a_refused_machine_exits_one(self):
         self.build_state_directories(mode="2777")
         answers = {
-            STAT_FIELDS + (str(self.rooted(relative)),): f"2777 root mosdns {stat.S_IFDIR | 0o2777:x}"
+            STAT_FIELDS + (str(self.rooted(relative)),): f"2777 root mosdns-router {stat.S_IFDIR | 0o2777:x}"
             for relative in STATE_DIRECTORIES
         }
         status, out, err = self.install_cli(self.good_runner(outputs=answers))

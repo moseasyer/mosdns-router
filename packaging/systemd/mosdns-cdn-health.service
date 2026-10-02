@@ -33,8 +33,8 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=mosdns-cdn
-Group=mosdns
+User=mosdns-router-cdn
+Group=mosdns-router
 ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl health-check
 # The second command, and the whole of the "nothing notices the router stopped"
 # gap this unit used to have. `health-check` proves the CDN ADDRESS in service --

@@ -200,7 +200,7 @@ The state directories are
 and
 .BR /run/mosdns ,
 each
-.BR root:mosdns " 2770"
+.BR root:mosdns\-router " 2770"
 with a default ACL granting the group
 .BR rwx .
 One group serves two service users, because a default ACL grants by group and
@@ -228,7 +228,7 @@ in the group\-writable
 .B /run/mosdns
 above could still be deleted, or replaced with a streak that has already reached
 its window, by
-.BR mosdns\-cdn .
+.BR mosdns\-router\-cdn .
 No other identity in this package reads the record.
 .PP
 The record is on a tmpfs, so it does not survive a reboot, and a machine that has
@@ -260,33 +260,46 @@ rather than acted on.
 .SH ACCOUNTS AND REMOVAL
 A purge removes
 .BR /var/lib/mosdns ,
-the ownership marker, and the NetworkManager dispatcher hook under
-.IR /etc/NetworkManager/dispatcher.d/no-wait.d/ .
-It does
-.B not
-remove the three service accounts
-.RB ( mosdns ,
-.BR mosdns-cdn ,
-.BR dnscrypt-proxy )
-or the two groups
-.RB ( mosdns ,
-.BR dnscrypt-proxy ),
-which outlive the package. That is a decision rather than an omission: a system
-account may be shared, and the upstream
-.B dnscrypt-proxy
-package creates a group and a user of the same name, so a
-.B deluser
-or
-.B delgroup
-run from this package's
-.B postrm
-would remove an identity another installed package still needs. Remove them by
-hand with
-.B deluser
-and
-.B delgroup
-if you are certain nothing else on the machine uses them.
+the ownership marker, the NetworkManager dispatcher hook under
+.IR /etc/NetworkManager/dispatcher.d/no-wait.d/ ,
+and the bridge's
+.B __pycache__
+directory under
+.IR /usr/lib/mosdns-router/mosdns_dhcp_bridge/ .
+The last of those is not a package file: Python writes the cache beside the bridge
+module the first time anything imports it, so it appears after unpacking, and
+.BR dpkg (1)
+leaves a directory it does not own with the warning "not empty so not removed".
 .PP
+A purge also removes the three service accounts
+.RB ( mosdns\-router ,
+.BR mosdns\-router\-cdn ,
+.BR mosdns\-router\-dnscrypt )
+and the two groups
+.RB ( mosdns\-router ,
+.BR mosdns\-router\-dnscrypt ).
+Each name carries this package's own, which is the point of them: before, they were
+.BR mosdns ,
+.BR mosdns\-cdn
+and
+.BR dnscrypt\-proxy ,
+and the third of those is the upstream
+.B dnscrypt\-proxy
+package's own account. An upgrade from the earlier names moves the four state
+directories to the new group and then removes the old accounts; a purge that finds
+an account still in use leaves it and says so, rather than taking the name away from
+a process that is using it.
+.PP
+"Still in use" is two checks, and both are reported by name. A process running as
+the account, or a file outside this package's own four directories that the account
+owns, means something else is using the identity. The account is then
+.B left alone
+and the message names the command that would remove it
+.RB ( deluser\ \-\-system
+or
+.BR delgroup\ \-\-system ),
+because that is a decision for whoever owns the machine rather than one a package
+should take for them.
 The recorded NetworkManager settings are the one thing a removal cannot recreate.
 A plain
 .B dpkg \-\-remove

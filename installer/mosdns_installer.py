@@ -160,7 +160,7 @@ STATE_DIRECTORIES = (
     "/run/mosdns",
 )
 STATE_OWNER = "root"
-STATE_GROUP = "mosdns"
+STATE_GROUP = "mosdns-router"
 # The one mode a state directory may have: the owner writes, the group writes --
 # both service identities are in it and both write here -- the world gets
 # nothing, and setgid is set so a new file takes this group rather than its
@@ -5600,18 +5600,20 @@ WATCHDOG_RECORD_DIR = "/run/mosdns/watchdog"
 # this record but the root watchdog. A record no other identity needs to read is
 # not a document to share.
 #
-# The directory: `/run/mosdns` is 2770 root:mosdns with a default ACL granting the
+# The directory: `/run/mosdns` is 2770 root:mosdns-router with a default ACL
+# granting the
 # group `w`, deliberately (ruling 142, measured -- `mosdns_dhcp_bridge` publishes
-# `dhcp-upstreams.json` there as `mosdns-cdn` and needs directory `w`). Unlink and
-# rename are decided by the CONTAINING directory and not by the file's own mode, so
-# a 0600 file in that directory could still be deleted, and still be replaced with
-# a document claiming a threshold of 99 and a first failure long past. `mosdns-cdn`
-# is the identity the Go health check runs as, and either of those switches the
+# `dhcp-upstreams.json` there as `mosdns-router-cdn` and needs directory `w`).
+# Unlink and rename are decided by the CONTAINING directory and not by the file's
+# own mode, so a 0600 file in that directory could still be deleted, and still be
+# replaced with a document claiming a threshold of 99 and a first failure long
+# past. `mosdns-router-cdn` is the identity the Go health check runs as, and
+# either of those switches the
 # only automatic DNS protection on the machine off. So the record gets a
 # root-owned subdirectory of its own, and the two are asserted together in
 # `installer/tests/test_watchdog.py` -- a case that reads the shipped tmpfiles
 # entry and the shipped `postinst`, and two that actually try the unlink and the
-# rename as the real `mosdns-cdn` uid.
+# rename as the real `mosdns-router-cdn` uid.
 WATCHDOG_RECORD_MODE = 0o600
 WATCHDOG_RECORD_DIR_MODE = 0o700
 WATCHDOG_RECORD_SCHEMA_VERSION = 2

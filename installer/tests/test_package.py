@@ -760,6 +760,250 @@ def postinst_step_body(text, number):
     return text[start : following.start()]
 
 
+class _Purge:
+    """One `postrm purge` run: what it printed and what it removed.
+
+    `removed` and `removed_groups` are read out of the STUBS rather than out of the
+    script, because "the script contains a deluser" is a sentence about a file and
+    this is a question about what happened on a machine. The stubs append the name
+    they were asked to remove to a file, so a purge that removed an account and a
+    purge that merely said it did are different results.
+    """
+
+    def __init__(self, root, result, removed_file, groups_file):
+        self.root = root
+        self.returncode = result.returncode
+        self.stdout = result.stdout
+        self.stderr = result.stderr
+        self._removed = removed_file
+        self._groups = groups_file
+
+    @property
+    def removed(self):
+        return tuple(_lines(self._removed))
+
+    @property
+    def removed_groups(self):
+        return tuple(_lines(self._groups))
+
+
+# Every absolute path the purge touches, longest first so a parent is not replaced
+# before a child. A path this script does not name is not rewritten, so the rewrite
+# below cannot invent a condition.
+_PURGE_PATHS = (
+    "/etc/NetworkManager/dispatcher.d",
+    "/usr/lib/mosdns-router/mosdns_dhcp_bridge",
+    "/usr/lib/mosdns-router",
+    "/usr/share/mosdns-router",
+    "/var/lib/mosdns",
+    "/etc/mosdns",
+    "/run/mosdns",
+)
+
+
+def _rooted(text, root):
+    """The shipped script with its absolute paths moved under `root`.
+
+    One pass, and the order of the alternatives inside it is longest-first for a
+    reason that cost a case to find: replacing the paths one at a time rewrites
+    `/usr/lib/mosdns-router/mosdns_dhcp_bridge` first and then finds
+    `/usr/lib/mosdns-router` *inside the result*, so the bridge directory came out
+    rooted twice and nothing the purge does to it happens in the tree the case then
+    inspects. `re.sub` consumes each position once, so a single alternation cannot
+    rewrite its own output.
+
+    Nothing else is touched: no conditional is rewritten, no guard dropped and no
+    message changed, so what runs is the shipped text pointed at a throwaway tree.
+    """
+    pattern = re.compile("|".join(re.escape(p) for p in sorted(_PURGE_PATHS, key=len, reverse=True)))
+    return pattern.sub(lambda m: root + m.group(0), text)
+
+
+def _lines(path):
+    try:
+        return [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    except FileNotFoundError:
+        return []
+
+
+class purged_sandbox:
+    """Run the shipped `postrm purge` against a throwaway tree, to completion.
+
+    Every tool that touches the machine's ACCOUNT database is stubbed, because this is
+    a build machine and the whole subject of the cases is what the purge DECIDES about
+    accounts. `getent` answers from what the fixture says exists, `deluser` and
+    `delgroup` record what they were asked to remove, `ps` reports the processes the
+    fixture says are running, and `find` reports the foreign files it planted.
+    `rm`, `rmdir`, `ls` and `[` are the real ones: the removals under test are those.
+
+    The context manager runs the script on entry, so a case reads a finished run and
+    there is no ordering question about when to look at the tree.
+    """
+
+    def __init__(self, accounts=(), running=(), foreign=(), symlinked_cache_to=None):
+        self.accounts = tuple(accounts)
+        # `running` is an iterable of (account, count) pairs, or of accounts that
+        # default to one process each -- normalised here so a case can say
+        # `running=["mosdns-router"]` and mean one, and `running=[("mosdns-router",
+        # 3)]` and mean three.
+        self.running = tuple(
+            (item, 1) if isinstance(item, str) else item for item in running
+        )
+        self.foreign = tuple(foreign)
+        self.symlinked_cache_to = symlinked_cache_to
+
+    def __enter__(self):
+        root = Path(scratch_directory("mosdns-postrm-purge.")) / "root"
+        if root.exists():
+            subprocess.run(["rm", "-rf", str(root)], check=True)
+        binroot = root / "stub-bin"
+        binroot.mkdir(parents=True)
+        state = root / "stub-state"
+        state.mkdir()
+        removed = state / "removed-users"
+        groups = state / "removed-groups"
+        removed.write_text("", encoding="utf-8")
+        groups.write_text("", encoding="utf-8")
+
+        # A coherent little account database: `getent passwd NAME`,
+        # `getent group NAME`, and the bare `getent passwd` the purge reads to find
+        # which users still hold a group. The gids are real rather than constant
+        # because the holder check compares a user's primary gid against a group by
+        # NUMBER -- a fixture where all three groups were gid 900 would say every
+        # user holds every group, and the check would refuse to remove any of them
+        # for a reason that is an artefact of the fixture.
+        gid = {name: 900 + i for i, name in enumerate(self.accounts)}
+        # A user's primary group is the one whose name it shares, except for the
+        # control identity, which is in the shared state group -- the same shape the
+        # shipped package provisions.
+        state_group = next((n for n in self.accounts if n == "mosdns-router"), None)
+        primary = {}
+        for name in self.accounts:
+            primary[name] = state_group if name.endswith("-cdn") and state_group else name
+        account_file = state / "passwd"
+        account_file.write_text(
+            "".join(
+                f"{a}:x:900:{gid[primary[a]]}::{a}:/nonexistent:/usr/sbin/nologin\n"
+                for a in self.accounts
+            ),
+            encoding="utf-8",
+        )
+        (binroot / "getent").write_text(
+            '#!/bin/sh\n'
+            'database="${1:-}"; name="${2:-}"\n'
+            # Bare `getent passwd`: the whole passwd database, which is how the
+            # purge asks which users hold a group. Read from the LIVE file, so an
+            # account `deluser` removed is not a holder on the next question.
+            'if [ -z "$name" ]; then\n'
+            '  if [ "$database" = passwd ]; then cat "' + str(account_file) + '"; fi\n'
+            '  exit 0\n'
+            'fi\n'
+            # The key carries a trailing colon so the patterns can end in one, which
+            # is what keeps `passwd:mosdns-router` from also matching a longer
+            # account name that starts with it.
+            'key="$database:$name:"\n'
+            'case "$key" in\n'
+            + "".join(
+                f'passwd:{a}:) printf "{a}:x:900:{gid[primary[a]]}::{a}:/nonexistent:/usr/sbin/nologin\\n"; exit 0;;\n'
+                for a in self.accounts
+            )
+            + "".join(
+                f'group:{a}:) printf "{a}:x:{gid[a]}:\\n"; exit 0;;\n'
+                for a in self.accounts
+            )
+            + 'esac\nexit 2\n',
+            encoding="utf-8",
+        )
+        # `deluser --system NAME` / `delgroup --system NAME`: record and succeed. The
+        # `--system` is skipped rather than assumed to be first, because the script
+        # writes it that way and a stub that only understood one spelling would make
+        # a removal silently not happen.
+        # `deluser` also DELETES the account from the fixture's database, because a
+        # purge that has removed a user must not go on seeing it as a group holder.
+        # A stub that only recorded the name made the holder check see a user that no
+        # longer existed, and the shared group survived every clean purge.
+        (binroot / "deluser").write_text(
+            '#!/bin/sh\nname=\n'
+            'while [ $# -gt 0 ]; do case "$1" in --system) shift;; *) name="$1"; shift;; esac; done\n'
+            f'printf "%s\\n" "$name" >> "{removed}"\n'
+            f'grep -v "^$name:" "{account_file}" > "{account_file}.new" 2>/dev/null || true\n'
+            f'[ -f "{account_file}.new" ] && mv "{account_file}.new" "{account_file}"\n'
+            'exit 0\n',
+            encoding="utf-8",
+        )
+        (binroot / "delgroup").write_text(
+            '#!/bin/sh\nname=\n'
+            'while [ $# -gt 0 ]; do case "$1" in --system) shift;; *) name="$1"; shift;; esac; done\n'
+            f'printf "%s\\n" "$name" >> "{groups}"\n'
+            'exit 0\n',
+            encoding="utf-8",
+        )
+        (binroot / "ps").write_text(
+            "#!/bin/sh\n"
+            + "".join(f'printf "%s\\n" "{a}"\n' * int(n) for a, n in self.running)
+            + "exit 0\n",
+            encoding="utf-8",
+        )
+        # `find` answers for the account it was ASKED about and for no other. A stub
+        # that printed its whole fixture for every call kept all three accounts the
+        # moment one of them had a foreign file, which reads exactly like a purge that
+        # refuses to remove anything it was ever asked about.
+        (binroot / "find").write_text(
+            '#!/bin/sh\nasked=\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  if [ "$1" = "-user" ]; then asked="$2"; fi\n'
+            "  shift\n"
+            'done\n'
+            + "".join(
+                f'if [ "$asked" = "{a}" ]; then printf "%s/foreign/{a}.txt\\n"; exit 0; fi\n'
+                for a in self.foreign
+            )
+            + "exit 0\n",
+            encoding="utf-8",
+        )
+
+        # Executable. Without this the stub is on PATH but cannot run, the shell
+        # falls THROUGH it to the real tool in /usr/bin, and the case reads the real
+        # machine's accounts -- which is exactly the thing NO-HOST-MUTATION forbids
+        # and, here, silently reported "no accounts exist" for every fixture.
+        for stub in binroot.iterdir():
+            stub.chmod(0o755)
+
+        # The tree the removals act on.
+        (root / "var/lib/mosdns/runtime").mkdir(parents=True)
+        (root / "var/lib/mosdns/runtime/ech-state.json").write_text("{}\n", encoding="utf-8")
+        (root / "run/mosdns/watchdog").mkdir(parents=True)
+        bridge = root / "usr/lib/mosdns-router/mosdns_dhcp_bridge"
+        bridge.mkdir(parents=True)
+        # The module itself is NOT planted: it is a package file, so dpkg has
+        # already removed it by the time postrm runs and the directory holds only
+        # what dpkg cannot see. Planting it would leave the directory non-empty for
+        # a reason that has nothing to do with the residue under test.
+        if self.symlinked_cache_to:
+            elsewhere = root / self.symlinked_cache_to
+            elsewhere.mkdir(exist_ok=True)
+            (elsewhere / "keep.txt").write_text("not this package's\n", encoding="utf-8")
+            (bridge / "__pycache__").symlink_to(elsewhere)
+        else:
+            (bridge / "__pycache__").mkdir()
+            (bridge / "__pycache__/publish.cpython-311.pyc").write_bytes(b"\x00pyc")
+        hook = root / "etc/NetworkManager/dispatcher.d/no-wait.d"
+        hook.mkdir(parents=True)
+        (hook / "10-mosdns-dhcp-bridge").write_text("#!/bin/sh\n", encoding="utf-8")
+
+        script = root / "postrm"
+        script.write_text(_rooted(SCRIPTS["postrm"].read_text(), str(root)), encoding="utf-8")
+        result = subprocess.run(
+            ["sh", str(script), "purge"],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PATH": f"{binroot}{os.pathsep}{os.environ['PATH']}"},
+        )
+        return _Purge(root, result, removed, groups)
+
+    def __exit__(self, *exc):
+        return False
+
+
 def sandboxed_postinst_step(number, published, source_pair, text=None, absent=()):
     """Run one `postinst` step's own lines in a throwaway tree, and return the tree.
 
@@ -1711,9 +1955,10 @@ def tmpfiles_findings(text):
     if not creating:
         findings.append("/run/mosdns is never created on a boot")
     for kind, _path, fields in creating:
-        if fields[:3] != ["2770", "root", "mosdns"]:
+        if fields[:3] != ["2770", "root", STATE_GROUP_NAME]:
             findings.append(
-                f"the /run/mosdns line is {' '.join([kind] + fields)}, want 2770 root mosdns"
+                f"the /run/mosdns line is {' '.join([kind] + fields)}, "
+                    f"want 2770 root {STATE_GROUP_NAME}"
             )
     acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
     if not acls:
@@ -1773,6 +2018,42 @@ def tmpfiles_findings(text):
 # --- the provisioning order --------------------------------------------------
 
 
+def identities_from(text):
+    """The four identity names, read out of the shipped ``postinst``.
+
+    Returned rather than written as constants here on purpose. A test that restates
+    the names it is checking holds a second copy of a decision, and the two copies
+    drift: the script is renamed for a reason and the constant is not, and the case
+    then either fails for no reason or -- worse -- passes because both still say
+    ``mosdns`` while the shipped script says something else and the units agree with
+    the script. Reading them means this suite cannot be wrong about what the package
+    calls its own accounts.
+    """
+    variables = shell_assignments(text)
+    missing = [name for name in ("STATE_GROUP", "ROUTER_USER", "CONTROL_USER", "RESOLVER_USER") if name not in variables]
+    if missing:
+        raise AssertionError(f"postinst does not assign {missing}, so its identities cannot be read")
+    return {
+        "group": variables["STATE_GROUP"],
+        "router": variables["ROUTER_USER"],
+        "control": variables["CONTROL_USER"],
+        "resolver": variables["RESOLVER_USER"],
+    }
+
+
+def source_identities():
+    """The identity names, read from the ``postinst`` in this checkout.
+
+    For the readers and helpers that take one document and are called before any
+    staging root exists. The class-based cases read the STAGED copy instead, because
+    the staged copy is what ships and a case about the package should read the
+    package; both come from the same file, so a name that differs between them is a
+    build that shipped something other than this checkout.
+    """
+    return identities_from((REPO / "packaging/debian/postinst").read_text(encoding="utf-8"))
+
+
+
 def provisioning_steps(text):
     """What ``postinst`` provisions, in the order it does it.
 
@@ -1784,6 +2065,7 @@ def provisioning_steps(text):
     every default-ACL check while neither service identity can write it.
     """
     variables = shell_assignments(text)
+    names = identities_from(text)
     steps = []
     for line in text.splitlines():
         if line.lstrip().startswith("#"):
@@ -1791,10 +2073,14 @@ def provisioning_steps(text):
         # One expansion, and it is a single command: `expand_shell` returns a
         # string, and iterating a string one character at a time matches nothing.
         command = expand_shell(line, variables)
-        if re.search(r"\b(addgroup|groupadd)\b", command) and re.search(r"\bmosdns\b", command):
-            steps.append(("group", "mosdns"))
-        if re.search(r"\b(adduser|useradd)\b", command) and re.search(r"\bmosdns\b", command):
-            steps.append(("user", "mosdns"))
+        # Matched against the name the script uses, not against a word-boundary
+        # search for `mosdns`: the renamed identities all CONTAIN `mosdns`, and
+        # `-` is a word boundary, so a reader written that way reported three
+        # accounts named `mosdns` for a script that creates `mosdns-router*`.
+        if re.search(r"\b(addgroup|groupadd)\b", command) and re.search(rf"(?<![\w-]){re.escape(names['group'])}(?![\w-])", command):
+            steps.append(("group", names["group"]))
+        if re.search(r"\b(adduser|useradd)\b", command) and re.search(rf"(?<![\w-]){re.escape(names['router'])}(?![\w-])", command):
+            steps.append(("user", names["router"]))
         if re.search(r"\binstall\s+-d\b", command):
             for directory in STATE_DIRECTORIES:
                 if re.search(r"(^|[\s/'\"])" + re.escape(directory) + r"([\s'\"]|$)", command):
@@ -1855,6 +2141,20 @@ POSTINST_STEPS = (
     "enable-timers",
 )
 
+
+
+# The three identities and the group they share, named once from the shipped
+# script so that no case below carries a second copy of the decision ruling
+# 191(d) made. Here rather than beside identities_from, because reading the
+# script is a CALL and this module executes top to bottom: a constant defined
+# before shell_assignments exists raises NameError at import, which turns a
+# helper placed for readability into a suite that does not load at all.
+# so that no case below carries a second copy of the decision ruling 191(d) made.
+_IDENTITY_NAMES = source_identities()
+STATE_GROUP_NAME = _IDENTITY_NAMES["group"]
+ROUTER_USER_NAME = _IDENTITY_NAMES["router"]
+CONTROL_USER_NAME = _IDENTITY_NAMES["control"]
+RESOLVER_USER_NAME = _IDENTITY_NAMES["resolver"]
 
 def postinst_steps(text):
     """Where postinst performs each of the three steps, in script order.
@@ -1952,13 +2252,23 @@ def order_findings(text):
         # boundary between the space in front of a path and the path itself, and a
         # `\b` there never matches. The lookarounds are what say "this argument, and
         # not the longer path that starts with it".
-        expected = r"install\s+-d[^\n]*-o\s+root[^\n]*-g\s+mosdns[^\n]*-m\s+2770[^\n]*" + \
+        # The group is matched by NAME from the script's own variables, because the
+        # shipped line is `install -d -o root -g "$STATE_GROUP" -m 2770` -- the
+        # literal `mosdns` never appears in it, and a reader written against the old
+        # spelling found nothing in a postinst that provisions four directories
+        # correctly.
+        names = identities_from(text)
+        expected = (
+            r"install\s+-d[^\n]*-o\s+root[^\n]*-g\s+"
+            r"(?:\"\$STATE_GROUP\"|" + re.escape(names["group"]) + r")"
+            r"[^\n]*-m\s+2770[^\n]*" +
             r"(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])"
+        )
         if not re.search(expected, text):
             findings.append(
-                f"{path} is not created with `install -d -o root -g mosdns -m 2770`; the mode is "
-                "2770 and not 2750, because 2750 caps the group at r-x and a default ACL cannot "
-                "restore what the mask removed"
+                f"{path} is not created with `install -d -o root -g {names['group']} "
+                "-m 2770`; the mode is 2770 and not 2750, because 2750 caps the group at "
+                "r-x and a default ACL cannot restore what the mask removed"
             )
         if not re.search(
             r"setfacl\s+-d\s+-m\s+g::rwx[^\n]*(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])",
@@ -1968,11 +2278,11 @@ def order_findings(text):
                 f"{path} is not given `setfacl -d -m g::rwx`, the default ACL the two service "
                 "identities share"
             )
-    group = next((i for i, s in enumerate(steps) if s == ("group", "mosdns")), None)
+    group = next((i for i, s in enumerate(steps) if s == ("group", STATE_GROUP_NAME)), None)
     if group is None:
         findings.append("the shared service group is never created")
     for kind in ("directory", "user"):
-        first = next((i for i, s in enumerate(steps) if s == (kind, "mosdns")), None)
+        first = next((i for i, s in enumerate(steps) if s == (kind, ROUTER_USER_NAME)), None)
         if group is not None and first is not None and first < group:
             findings.append(f"the {kind} mosdns is created before the group it belongs to")
     for path in STATE_DIRECTORIES:
@@ -3075,25 +3385,192 @@ class MaintainerScriptTests(_Staged):
                     "configured",
                 )
 
+    # --- ruling 191(d): the identities, and ruling 191(e): the purge -----------
+
+    def test_the_three_identities_carry_this_packages_own_name(self):
+        """The whole of ruling 191(d), and the reason a purge can remove one.
+
+        The resolver's used to be `dnscrypt-proxy`, which is the upstream package's
+        own account, and postinst used to admit in as many words that a machine
+        carrying both was sharing one identity. Every one of the three now carries
+        this package's own name, so none of them can be somebody else's and the
+        purge's fail-loud checks below have something they can actually check.
+        """
+        names = identities_from(POSTINST.read_text())
+        self.assertEqual(
+            [names["group"], names["router"], names["control"], names["resolver"]],
+            ["mosdns-router", "mosdns-router", "mosdns-router-cdn", "mosdns-router-dnscrypt"],
+            "an identity name does not carry this package's own",
+        )
+        # And nothing else in the package still creates one of the old names. The
+        # legacy names are READ by the migration, so the check is for the verbs that
+        # CREATE one.
+        run = "\n".join(executed_lines(POSTINST.read_text()))
+        for legacy in ("mosdns", "mosdns-cdn", "dnscrypt-proxy"):
+            creating = re.search(
+                rf"\b(?:addgroup|adduser|groupadd|useradd)\b[^\n]*(?<![\w-]){re.escape(legacy)}(?![\w-])",
+                run,
+            )
+            self.assertIsNone(
+                creating, f"postinst still creates an identity named {legacy}: "
+                f"{creating.group(0) if creating else ''}",
+            )
+
+    def test_an_upgrade_moves_the_state_directories_before_it_drops_the_old_group(self):
+        """The order inside the migration, and it is the whole of it.
+
+        A state directory still owned by a group that is about to be deleted leaves
+        the units unable to write it, and nothing in the transaction would say why:
+        the preflight refuses on the group, the router cannot publish, and the
+        message names a permission rather than a rename. So the chown and the ACL
+        come first and the `delgroup` last, in the script's own text.
+        """
+        run = "\n".join(executed_lines(POSTINST.read_text()))
+        chgrp = run.index('chgrp "$STATE_GROUP"')
+        acl = run.index('setfacl -d -m g::rwx')
+        deluser = run.index('deluser --system')
+        delgroup = run.index('delgroup --system')
+        self.assertLess(
+            chgrp, delgroup,
+            "the old group is removed before the state directories are handed to the "
+            "new one, so the units have nothing to write and preflight says nothing "
+            "about a rename",
+        )
+        self.assertLess(
+            acl, delgroup,
+            "the old group is removed before the default ACL is re-applied, and a "
+            "default ACL grants by group, so the re-application has to follow the chown",
+        )
+        self.assertLess(deluser, delgroup, "a user is removed after the group that is its primary group")
+        # Every one of the four directories is chowned, not just the parent. The
+        # runtime and lists directories are where every published file lands, and a
+        # parent-only chown leaves them on the old group.
+        for directory in STATE_DIRECTORIES:
+            with self.subTest(directory=directory):
+                self.assertRegex(
+                    run,
+                    r'for directory in [^\n]*' + re.escape(directory),
+                    f"{directory} is not in the migration's list at all",
+                )
+
+    def test_a_purge_removes_the_bytecode_cache_dpkg_cannot_see(self):
+        """Ruling 191(e). dpkg owns every file this package lists and `__pycache__`
+        is not one of them: Python writes it beside the bridge module the first time
+        anything imports it, so it appears after unpacking. dpkg's own warning --
+        "directory ... not empty so not removed" -- is the symptom, and it leaves
+        the directory behind as well.
+
+        Run rather than read, because the guard is the thing under test and a
+        substring cannot see a `rm -rf` behind an `if`.
+        """
+        with purged_sandbox(accounts=(), running=(), foreign=()) as purge:
+            self.assertEqual(
+                purge.returncode, 0, f"purge failed: {purge.stdout}{purge.stderr}"
+            )
+            self.assertFalse(
+                (purge.root / "usr/lib/mosdns-router/mosdns_dhcp_bridge/__pycache__").exists(),
+                "the bytecode cache survives a purge, which is the residue dpkg warns "
+                "about and cannot remove",
+            )
+            self.assertFalse(
+                (purge.root / "usr/lib/mosdns-router/mosdns_dhcp_bridge").exists(),
+                "the emptied bridge directory survives a purge",
+            )
+
+    def test_a_purge_leaves_a_bytecode_cache_that_is_a_symbolic_link(self):
+        """The same three conditions as the state directory, applied to a path the
+        bridge may have been replaced with. A symlink is not followed, only a
+        directory is removed, and an absent directory is not an error."""
+        with purged_sandbox(
+            accounts=(), running=(), foreign=(), symlinked_cache_to="elsewhere",
+        ) as purge:
+            outside = purge.root / "elsewhere"
+            self.assertTrue(
+                (outside / "keep.txt").exists(),
+                "the purge followed a symbolic link and removed what was behind it",
+            )
+
+    def test_a_purge_keeps_an_account_a_process_is_still_running_as(self):
+        """Fail-loud rather than forced. `deluser --system` takes the NAME away, and
+        a process still running under it then writes as a number nothing resolves --
+        so the account is kept, and the message says which one and why."""
+        with purged_sandbox(accounts=("mosdns-router",), running=[("mosdns-router", 3)], foreign=()) as purge:
+            self.assertIn(
+                "mosdns-router", purge.stderr,
+                "the purge did not name the account it kept, so an operator cannot tell "
+                "which one is still there",
+            )
+            self.assertIn(
+                "LEFT ALONE", purge.stderr,
+                "the purge did not say it left the account alone rather than forcing it",
+            )
+            self.assertIn(
+                "deluser --system mosdns-router", purge.stderr,
+                "the purge did not give the command that would remove it",
+            )
+            self.assertEqual(
+                purge.removed, (),
+                f"the purge removed an account a process was running as: {purge.removed}",
+            )
+
+    def test_a_purge_keeps_an_account_that_still_owns_a_file_elsewhere(self):
+        """The other half of the same rule, and it is the one that catches the case
+        the name cannot: an account this package created whose name nothing else
+        uses, still owning a file in a tree this package does not own."""
+        with purged_sandbox(accounts=("mosdns-router-cdn",), running=(), foreign=("mosdns-router-cdn",)) as purge:
+            self.assertIn("outside this package's", purge.stderr)
+            self.assertEqual(purge.removed, (), f"the purge removed an account that still owns a file: {purge.removed}")
+
+    def test_a_purge_removes_the_accounts_nothing_is_using(self):
+        """And the other half again: fail-loud that never says anything is a purge
+        that removes nothing, which is what it did before ruling 191(d)."""
+        with purged_sandbox(
+            accounts=("mosdns-router", "mosdns-router-cdn", "mosdns-router-dnscrypt"),
+            running=(), foreign=(),
+        ) as purge:
+            self.assertEqual(
+                purge.removed,
+                ("mosdns-router", "mosdns-router-cdn", "mosdns-router-dnscrypt"),
+                f"a purge with nothing using the identities removed {purge.removed}",
+            )
+            for group in ("mosdns-router", "mosdns-router-dnscrypt"):
+                self.assertIn(group, purge.removed_groups)
+
     def test_postinst_reports_a_service_account_it_did_not_create(self):
         """`addgroup --system dnscrypt-proxy` exits 0 when the group is already there,
         so on a machine that also carries the upstream dnscrypt-proxy package this
         one silently adopts its group. That is worth a line on the install's own
         output, because nothing else in the transaction would ever mention it."""
         text = POSTINST.read_text()
-        self.assertIn("RESOLVER_USER=dnscrypt-proxy", text)
-        check = 'getent group "$RESOLVER_USER"'
+        names = identities_from(text)
+        self.assertEqual(names["resolver"], RESOLVER_USER_NAME)
+        # The check covers the shared state group too, which the old script did not:
+        # both are names this package could collide with, and only one of them was
+        # asked about.
+        check = 'getent group "$account"'
         self.assertIn(
             check, text,
-            "postinst never asks whether the resolver group is already there, and "
-            "`addgroup --system` exits 0 when it is, so a collision with the upstream "
-            "dnscrypt-proxy package is adopted silently",
+            "postinst never asks whether a group it is about to create is already "
+            "there, and `addgroup --system` exits 0 when it is, so a collision is "
+            "adopted silently",
+        )
+        self.assertIn(
+            f'for account in "$STATE_GROUP" "$RESOLVER_USER"', text,
+            "postinst checks one group and not the other, so a machine whose state "
+            "group belongs to another package is not told",
         )
         # The check has to come BEFORE the addgroup, or it reports a group this
         # script created itself and calls that a collision on every upgrade.
         self.assertLess(
-            text.index(check), text.index('addgroup --system "$RESOLVER_USER"'),
-            "the resolver group is created before postinst asks whether it already existed",
+            text.index(check), text.index('addgroup --system "$STATE_GROUP"'),
+            "a group is created before postinst asks whether it already existed",
+        )
+        # And the message has to say the group belongs to ANOTHER package, which is
+        # only true now that none of the three names is one this package also uses.
+        self.assertIn(
+            "belongs to another package", text,
+            "the collision report does not say whose group it found, and the old "
+            "wording admitted this install might be looking at its own",
         )
 
     def test_postinst_provisions_the_state_directories_in_the_load_bearing_order(self):
@@ -3934,8 +4411,9 @@ class TmpfilesTests(_Staged):
         for kind, _path, fields in creating:
             with self.subTest(kind=kind):
                 self.assertEqual(
-                    fields[:3], ["2770", "root", "mosdns"],
-                    f"the /run/mosdns line is {' '.join([kind] + fields)}, want 2770 root mosdns",
+                    fields[:3], ["2770", "root", STATE_GROUP_NAME],
+                    f"the /run/mosdns line is {' '.join([kind] + fields)}, "
+                    f"want 2770 root {STATE_GROUP_NAME}",
                 )
         acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
         self.assertTrue(acls, f"{TMPFILES_PATH} sets no ACL on /run/mosdns")
@@ -4026,34 +4504,55 @@ class InstalledProgramsTests(_Staged):
                 )
 
     def test_the_man_page_says_the_service_accounts_outlive_a_purge(self):
-        """A purge removes three service accounts and two groups unless it says so.
+        """A purge removes three service accounts and two groups, and says so.
 
-        Either `postrm purge` removes the ones it created, guarded -- or the manual
-        page says they are still there. The second is what ships, and the reason is
-        a collision this package cannot see: the upstream `dnscrypt-proxy` package
-        creates a user and a group of the same name, so a `deluser`/`delgroup` from
-        here would remove an identity another installed package still needs. What
-        cannot ship is silence, because an operator who purges and then finds three
-        accounts they did not ask for has learned that from the machine.
+        It did not, once. The accounts were named `mosdns`, `mosdns-cdn` and
+        `dnscrypt-proxy`, the third of which is the upstream dnscrypt-proxy package's
+        own, so a `deluser` from here could take an identity another installed
+        package still needed -- and the shipped answer was to leave all three behind
+        and document that. Ruling 191(d) removed the reason instead of the risk: the
+        names are now this package's own, so `postrm purge` removes them, and the
+        manual page has to say that rather than the opposite.
+
+        Both directions are held. A `postrm` that removes the accounts and a manual
+        page that says they outlive the package is the defect in the other half, and
+        it is the more likely one, because the old sentence is still true of some
+        other package.
         """
         page = gzip.decompress(self.read_bytes(MAN_ROOT + "/man8/mosdns-router.8.gz")).decode()
+        script = "\n".join(executed_lines(POSTRM.read_text()))
+        # roff escapes the hyphens: the page says `mosdns\-router\-cdn`, and a
+        # reader looking for the bare name finds nothing in a page that names the
+        # account on every line. Escaped the way man(1) would, so a name with a
+        # hyphen in it is comparable and a name without one still is.
+        def roff(name):
+            return name.replace("-", r"\-")
         self.assertIn(".SH ACCOUNTS AND REMOVAL", page)
-        for account in ("mosdns", "mosdns-cdn", "dnscrypt-proxy"):
+        for account in (ROUTER_USER_NAME, CONTROL_USER_NAME, RESOLVER_USER_NAME):
             with self.subTest(account=account):
-                self.assertIn(account, page)
-        # Named as outliving the package, and removable by hand rather than by
-        # this package -- the two halves that make the sentence useful.
-        self.assertIn("outlive the package", page)
+                self.assertIn(roff(account), page)
+                self.assertIn(f'deluser --system "$user"', script)
+        for name in (STATE_GROUP_NAME, RESOLVER_USER_NAME):
+            with self.subTest(group=name):
+                # The page escapes the hyphen; the script does not, because it is
+                # shell and roff escapes mean nothing to it. Comparing the escaped
+                # form against the script is how this case ended up asserting a
+                # group name is absent from a shell script that names it plainly.
+                self.assertIn(f'delgroup --system "$group"', script)
+                self.assertIn(name, script)
+                self.assertIn(roff(name), page)
+        # The withdrawn sentence, in either spelling of the claim.
+        for withdrawn in ("outlive the package", "which outlive the package"):
+            self.assertNotIn(
+                withdrawn, page,
+                f"the manual page still says the accounts {withdrawn!r}, and a purge now removes them",
+            )
+        # And the two reasons a purge leaves one alone, both of which have to be in
+        # the page as well as in the script: an operator whose account survived
+        # needs to know which of the two applied and what to do about it.
+        self.assertIn("left alone", page.lower())
         self.assertIn("deluser", page)
-        # And the reason, because "they are still there" without a why is the note
-        # an operator has to take on trust.
         self.assertIn("upstream", page)
-        self.assertNotIn(
-            "deluser", "\n".join(
-                line for line in executed_lines(POSTRM.read_text())
-            ),
-            "postrm purges the service accounts, so the manual page would be wrong",
-        )
 
     def test_the_three_named_manual_pages_are_the_three_this_package_documents(self):
         installed = sorted(
@@ -4871,8 +5370,24 @@ class ControlTests(unittest.TestCase):
             self.assertNotIn(
                 token, run, "the control no longer reproduces the script the old gate passed"
             )
+        # The mutation is only a control if it really removed the guard, and the
+        # guard is the `if` line `unconditional_publish` replaced. Asserting that
+        # the publish is still there -- rather than that a particular `install` line
+        # reads a particular way -- is what says the mutation did the thing; the
+        # install line names the group through a variable now, so a literal here
+        # would be holding a spelling this package no longer ships.
+        self.assertIn("if true; then", broken)
+        self.assertNotIn(
+            'if [ ! -r "$PUBLISHED_LIST" ] || [ ! -r "$PUBLISHED_LOCK" ]; then', broken,
+            "the mutation did not remove the guard, so this control would pass against "
+            "a script that was never defective",
+        )
+        names = identities_from(broken)
         self.assertIn(
-            'install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"', broken
+            f'install -o root -g "$STATE_GROUP" -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"',
+            broken,
+            f"the publish of the pair is gone entirely, so this is not the old script "
+            f"but a different defect; the group it names is {names['group']}",
         )
 
     def test_a_capture_closed_before_the_arms_is_reported_by_the_method(self):
@@ -5189,8 +5704,24 @@ class ControlTests(unittest.TestCase):
         )
 
     def test_a_directory_created_without_its_group_is_reported(self):
-        broken = POSTINST.read_text().replace("-g mosdns", "-g root")
-        self.assertNotIn("-g mosdns", broken, "the mutation changed nothing")
+        # The group is named through a variable in the shipped script, so the
+        # mutation changes the VARIABLE's value rather than a flag on a command
+        # line. Rewriting `-g mosdns` on the install line changed nothing at all --
+        # the text is not there -- and the control passed against a postinst that
+        # was never defective.
+        good = POSTINST.read_text()
+        broken = re.sub(
+            r"(?m)^(STATE_GROUP=)\S+$", r"\1root", good, count=1,
+        )
+        self.assertNotEqual(
+            broken, good,
+            "the mutation changed nothing: postinst does not assign STATE_GROUP at the "
+            "start of a line, so the reader cannot be exercised this way",
+        )
+        self.assertEqual(
+            identities_from(broken)["group"], "root",
+            "the mutation did not move the group the reader resolves",
+        )
         self.assertMethodFails(
             MaintainerScriptTests,
             "test_postinst_provisions_the_state_directories_in_the_load_bearing_order",

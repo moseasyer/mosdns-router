@@ -58,6 +58,137 @@ purge)
 		echo "postrm: NetworkManager event against a state directory that is gone." >&2
 		rm -f "$hook"
 	fi
+	# The bridge's bytecode cache, and it is here for the same three conditions and
+	# one more reason: dpkg owns every file this package lists, and `__pycache__` is
+	# not one of them. Python writes it beside the bridge module the first time
+	# anything imports that module, so it appears AFTER unpacking and is owned by
+	# nobody dpkg knows about. dpkg's own warning is the symptom -- "directory
+	# /usr/lib/mosdns-router/mosdns_dhcp_bridge/__pycache__ not empty so not
+	# removed" -- and it leaves the directory behind as well, so both residues in
+	# the uninstall audit were this block's absence.
+	bridge=/usr/lib/mosdns-router/mosdns_dhcp_bridge
+	if [ -L "$bridge/__pycache__" ]; then
+		echo "postrm: $bridge/__pycache__ is a symbolic link, so nothing behind it is" >&2
+		echo "postrm: this package's to remove. It has been left alone." >&2
+	elif [ -d "$bridge/__pycache__" ]; then
+		rm -rf "$bridge/__pycache__"
+	fi
+	# The directory itself, if removing the cache emptied it. Only this package's
+	# own subdirectory: a replaced or symlinked bridge directory is not this
+	# package's to remove, which is the guard above applied one level up.
+	if [ -d "$bridge" ] && [ ! -L "$bridge" ] && [ -z "$(ls -A "$bridge" 2>/dev/null)" ]; then
+		rmdir "$bridge" 2>/dev/null || true
+	fi
+
+	# The three service identities, and this is the only place in this package that
+	# removes one. The handoff records why it is now safe to try: the names used to
+	# be `mosdns`, `mosdns-cdn` and `dnscrypt-proxy`, and the third of those is the
+	# upstream dnscrypt-proxy package's own account. postinst used to admit in as
+	# many words that a machine carrying both was sharing one identity -- so a purge
+	# here could have removed an account a second installed package still needs.
+	# Ruling 191(d) renamed all three to `mosdns-router*`, which removes the
+	# collision instead of reporting it.
+	#
+	# Fail-loud rather than forced, and the two checks before the removal are the
+	# whole of it. A process still running as one of these accounts, or a file
+	# outside this package's own tree that one of them still owns, means something
+	# else is using the identity; `deluser --system` would take the name out from
+	# under it and leave that thing writing as a number nothing resolves. So the
+	# account is KEPT, named on stderr, with the command that would remove it.
+	#
+	# Every one of those is an `if` and never an `&&` chain. This script runs with
+	# `set -e`, and a chain whose first test is false is a non-zero list: written as
+	# a chain, "nothing is running as this account" would end the purge.
+	for user in mosdns-router mosdns-router-cdn mosdns-router-dnscrypt; do
+		if ! getent passwd "$user" >/dev/null 2>&1; then
+			continue
+		fi
+		# `|| true`, and for the reason the paragraph above this loop names: an
+		# assignment takes the exit status of its command substitution, so a
+		# `grep -c` that matches nothing -- which is the COMMON case, an account
+		# nothing is running as -- returns 1 and `set -e` ends the purge there.
+		# That was the first version of this line, and it removed an account
+		# nothing was using in the only case where nothing was using it.
+		running=$(ps -eo user= 2>/dev/null | grep -cx "$user" || true)
+		if [ "${running:-0}" -ne 0 ]; then
+			echo "postrm: the $user account is still running $running process(es), so it" >&2
+			echo "postrm: has been LEFT ALONE rather than removed out from under them." >&2
+			echo "postrm: Stop those processes, then remove it by hand:" >&2
+			echo "postrm:   sudo deluser --system $user" >&2
+			continue
+		fi
+		# Files outside the tree this package owns. Everything under
+		# /usr/lib/mosdns-router, /etc/mosdns, /var/lib/mosdns and
+		# /usr/share/mosdns-router was removed above or by dpkg, so what is left
+		# under those paths is not this account's to be judged on. Anything
+		# ANYWHERE else is somebody else's file that happens to be owned by an
+		# identity this package created, and deleting it is not a decision this
+		# script is placed to make.
+		# `find` exits non-zero on a path it cannot read, and this one walks `/`,
+		# so the `|| true` is the same guard as above rather than a second habit.
+		foreign=$(find / -xdev \
+			\( -path /proc -o -path /sys -o -path /run -o -path /dev \) -prune -o \
+			\( -user "$user" \
+			   -not -path '/usr/lib/mosdns-router/*' \
+			   -not -path '/etc/mosdns/*' \
+			   -not -path '/var/lib/mosdns/*' \
+			   -not -path '/usr/share/mosdns-router/*' \
+			   -print \) 2>/dev/null | head -5 || true)
+		if [ -n "$foreign" ]; then
+			echo "postrm: the $user account still owns files outside this package's" >&2
+			echo "postrm: tree, so it has been LEFT ALONE rather than forcing it. The" >&2
+			echo "postrm: first of them:" >&2
+			printf 'postrm:   %s\n' $foreign >&2
+			echo "postrm: Review them, then remove the account by hand:" >&2
+			echo "postrm:   sudo deluser --system $user" >&2
+			continue
+		fi
+		if deluser --system "$user"; then
+			echo "postrm: removed the $user account." >&2
+		else
+			echo "postrm: could not remove the $user account; it has been left alone, and" >&2
+			echo "postrm: nothing else in this purge depends on it being gone." >&2
+		fi
+	done
+	# The resolver's own group, then the shared state group. The users went first
+	# because a group is a user's primary group and cannot go while a user holds it --
+	# and a user KEPT above still holds it. Removing the group under a running
+	# process is the same defect one level down: the process keeps its uid, loses the
+	# name, and every file it creates lands in a group nothing resolves. So a group
+	# whose user survived is kept with it, and the message says so.
+	for group in mosdns-router-dnscrypt mosdns-router; do
+		if ! getent group "$group" >/dev/null 2>&1; then
+			continue
+		fi
+		# By GID and not by name: the fourth field of a passwd entry is a NUMBER,
+		# and comparing it to a group NAME is a string comparison that never matches,
+		# so the first version of this line reported no holders for any group and
+		# removed the group under a process that was still running as a member of it.
+		#
+		# `cut` and `grep` rather than `awk '$4 == g'`, and the reason is a gate this
+		# package holds on itself: a maintainer script may not read `$1`..`$7`
+		# unguarded, because dpkg passes seven and a script that reads the fourth
+		# without a default reads an empty string on the other six calls. An awk
+		# program is not a positional parameter, but it is `$4` in the file, and the
+		# gate cannot tell the two apart -- so the question is settled by not writing
+		# the text at all.
+		group_gid=$(getent group "$group" | cut -d: -f3 || true)
+		holders=$(getent passwd | cut -d: -f1,4 | grep ":$group_gid\$" | cut -d: -f1 || true)
+		if [ -n "$holders" ]; then
+			echo "postrm: the $group group is still the primary group of:" >&2
+			printf 'postrm:   %s\n' $holders >&2
+			echo "postrm: so it has been LEFT ALONE as well: a process still running as" >&2
+			echo "postrm: one of those would keep its uid and lose the name. Remove the" >&2
+			echo "postrm: account first, then:" >&2
+			echo "postrm:   sudo delgroup --system $group" >&2
+			continue
+		fi
+		if delgroup --system "$group"; then
+			echo "postrm: removed the $group group." >&2
+		else
+			echo "postrm: could not remove the $group group; it has been left alone." >&2
+		fi
+	done
 	;;
 remove | upgrade | abort-install | abort-upgrade | disappear | failed-upgrade)
 	# Every one of these keeps /var/lib/mosdns, and the reason is the same for all of

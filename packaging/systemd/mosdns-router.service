@@ -56,8 +56,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=mosdns
-Group=mosdns
+User=mosdns-router
+Group=mosdns-router
 ExecStart=/usr/lib/mosdns-router/mosdns-router start -c /etc/mosdns/mosdns.yaml
 # CAP_NET_BIND_SERVICE is in both directives on purpose. AmbientCapabilities is
 # what the process holds; CapabilityBoundingSet is what stops anything from

@@ -12,7 +12,7 @@
 # umask is 0077 rather than 0007.
 #
 # STEP 2 is the state directories, and the order inside it is measured rather than
-# reasoned about. For each directory: `install -d -o root -g mosdns -m 2770` and
+# reasoned about. For each directory: `install -d -o root -g $STATE_GROUP -m 2770` and
 # THEN `setfacl -d -m g::rwx`. The reverse order is wrong, and the way it is wrong
 # is not obvious: install's chmod sets the group-class MASK, so a setfacl that ran
 # first has its mask narrowed by the chmod that follows, and the directory is left
@@ -23,7 +23,7 @@
 # is visible here to a reader and to the test that holds it.
 #
 # The mode is 2770 and not the 2750 this plan first wrote. A member of a
-# root:mosdns directory's own group cannot create a file in it at all at 2750 --
+# root:$STATE_GROUP directory's own group cannot create a file in it at all at 2750 --
 # measured on the system-level test machine -- and can at 2770. There is no third
 # option, because when a directory carries an extended ACL the mode's group field IS
 # the group-class mask, so 2750 caps the group at r-x and no default ACL can
@@ -74,10 +74,26 @@
 # sentences below say which of those happened.
 set -e
 
-STATE_GROUP=mosdns
-ROUTER_USER=mosdns
-CONTROL_USER=mosdns-cdn
-RESOLVER_USER=dnscrypt-proxy
+STATE_GROUP=mosdns-router
+ROUTER_USER=mosdns-router
+CONTROL_USER=mosdns-router-cdn
+RESOLVER_USER=mosdns-router-dnscrypt
+
+# The identities this package used before ruling 191(d), kept only so an upgrade can
+# move the machine off them. They are the names most likely to be somebody else's:
+# `dnscrypt-proxy` is the upstream package's own group, and `mosdns` is short enough
+# that an unrelated system package can plausibly have claimed it. The postinst used
+# to say so out loud when it found the resolver group already present -- "this
+# install is using it rather than creating it ... the two are now sharing one
+# identity" -- which is an admission that this package could take an identity away
+# from a purge. Renaming removes the collision rather than reporting it.
+#
+# These are read, never created. A machine that has never run this package has no
+# old accounts and the migration below does nothing at all.
+LEGACY_STATE_GROUP=mosdns
+LEGACY_ROUTER_USER=mosdns
+LEGACY_CONTROL_USER=mosdns-cdn
+LEGACY_RESOLVER_USER=dnscrypt-proxy
 INSTALLER=/usr/lib/mosdns-router/mosdns_installer.py
 SOURCE_LIST=/usr/share/mosdns-router/cn-domains.txt
 SOURCE_LOCK=/usr/share/mosdns-router/source-lock.json
@@ -116,59 +132,110 @@ esac
 # already there, and refusing that would make a `dpkg --configure` retry impossible.
 # The message says which state it found, so an operator can see which package the
 # group came from and decide.
-if getent group "$RESOLVER_USER" >/dev/null 2>&1; then
-	echo "postinst: the $RESOLVER_USER group already exists ($(getent group "$RESOLVER_USER"))" >&2
-	echo "postinst: and this install is using it rather than creating it. If the upstream" >&2
-	echo "postinst: dnscrypt-proxy package is also installed on this machine, the two" >&2
-	echo "postinst: are now sharing one identity." >&2
-fi
+for account in "$STATE_GROUP" "$RESOLVER_USER"; do
+	if getent group "$account" >/dev/null 2>&1; then
+		echo "postinst: the $account group already exists ($(getent group "$account"))" >&2
+		echo "postinst: and this install is using it rather than creating it. Nothing in" >&2
+		echo "postinst: this package creates that name, so it belongs to another package," >&2
+		echo "postinst: and the two will share one identity until one of them is removed." >&2
+	fi
+done
 addgroup --system "$STATE_GROUP"
 adduser --system --no-create-home --home /nonexistent \
 	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
-	--gecos "mosdns DNS router" "$ROUTER_USER"
+	--gecos "mosdns-router DNS router" "$ROUTER_USER"
 adduser --system --no-create-home --home /nonexistent \
 	--ingroup "$STATE_GROUP" --shell /usr/sbin/nologin \
-	--gecos "mosdns CDN optimizer and health check" "$CONTROL_USER"
+	--gecos "mosdns-router CDN optimizer and health check" "$CONTROL_USER"
 # Its own group, not the shared one: it creates no file and shares no state with
 # either of the other identities, and giving it the shared group would hand it
 # write access to the state directories for no reason.
 addgroup --system "$RESOLVER_USER"
 adduser --system --no-create-home --home /nonexistent \
 	--ingroup "$RESOLVER_USER" --shell /usr/sbin/nologin \
-	--gecos "DNSCrypt foreign resolver" "$RESOLVER_USER"
+	--gecos "mosdns-router DNSCrypt foreign resolver" "$RESOLVER_USER"
+
+# --- STEP 1b: move an upgraded machine off the identities it used before ------
+#
+# The unit files are package files, so `User=`/`Group=` became the new names the
+# moment dpkg unpacked them, which is why this runs before anything is started. All
+# that is left is to hand the four state directories to the new group and then drop
+# the old accounts, and the order of those two is the whole of it: a directory still
+# owned by a group that is about to be deleted leaves the units unable to write it,
+# and nothing in the transaction would say why.
+#
+# The ACL needs re-applying rather than inheriting. `setfacl -d -m g::rwx` records a
+# permission on the OWNING GROUP and does not name it, so the chgrp above is what
+# moves the grant to the new group -- there is no stale named-group entry to clear.
+# The line is run anyway because it is the one that states the grant, and a
+# directory from before the rename is one this script cannot have inspected.
+for directory in /var/lib/mosdns /var/lib/mosdns/runtime /var/lib/mosdns/lists /run/mosdns; do
+	if [ -d "$directory" ]; then
+		chgrp "$STATE_GROUP" "$directory"
+		setfacl -d -m g::rwx "$directory"
+	fi
+done
+# Then the old accounts, and only those this package's own postinst created: the
+# three users, then the two groups. `deluser --system` removes the account and leaves
+# files it owns alone, which is the behaviour wanted here -- a file owned by the old
+# `mosdns` group outside the four directories above is left for an operator, and is
+# named in postrm's purge arm if it is still there at that point.
+#
+# Every removal is `||` a message rather than fatal: an upgrade that cannot drop an
+# old account has still moved the state directories, and refusing to finish leaves a
+# machine that cannot resolve rather than one with a stale account.
+for user in "$LEGACY_ROUTER_USER" "$LEGACY_CONTROL_USER"; do
+	if getent passwd "$user" >/dev/null 2>&1; then
+		deluser --system "$user" || echo "postinst: could not remove the old $user account; it is" \
+			"left alone rather than forced, and postrm will say so again on a purge." >&2
+	fi
+done
+if getent passwd "$LEGACY_RESOLVER_USER" >/dev/null 2>&1; then
+	# Its own group has to go too, and the user first because the group is its
+	# primary group.
+	deluser --system "$LEGACY_RESOLVER_USER" || echo "postinst: could not remove the old" \
+		"$LEGACY_RESOLVER_USER account; it is left alone rather than forced." >&2
+fi
+for group in "$LEGACY_RESOLVER_USER" "$LEGACY_STATE_GROUP"; do
+	if getent group "$group" >/dev/null 2>&1; then
+		delgroup --system "$group" || echo "postinst: could not remove the old $group group; it" \
+			"is left alone rather than forced, and files owned by it are named in" \
+			"postrm's purge arm." >&2
+	fi
+done
 
 # --- STEP 2: the state directories, mode first and then the ACL -------------
 
-install -d -o root -g mosdns -m 2770 /var/lib/mosdns
+install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns
 setfacl -d -m g::rwx /var/lib/mosdns
 
-install -d -o root -g mosdns -m 2770 /var/lib/mosdns/runtime
+install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns/runtime
 setfacl -d -m g::rwx /var/lib/mosdns/runtime
 
-install -d -o root -g mosdns -m 2770 /var/lib/mosdns/lists
+install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns/lists
 setfacl -d -m g::rwx /var/lib/mosdns/lists
 
-install -d -o root -g mosdns -m 2770 /run/mosdns
+install -d -o root -g "$STATE_GROUP" -m 2770 /run/mosdns
 setfacl -d -m g::rwx /run/mosdns
 
-# ...and the ONE directory in this step that is not 2770 root:mosdns with a
+# ...and the ONE directory in this step that is not 2770 root:$STATE_GROUP with a
 # default ACL: the resolver watchdog's failure record, in a directory of its own.
 #
-# `mosdns-cdn` is in the `mosdns` group and the directory above gives that group
-# `w`, and a `0600` file inside a group-WRITABLE directory is still deletable and
-# still replaceable -- unlink and rename are the containing directory's decision,
-# not the file's. So in `/run/mosdns` that identity could delete the record, which
-# switches off the only automatic DNS protection on the machine with nothing
-# written anywhere, or replace it with a document claiming a threshold of 99 and a
-# first failure long past, which tears the machine down on the next run with no
-# window in front of it. 0700 root:root, no setfacl, because unlike the four above
-# nothing here is read by any other identity: the watchdog runs as root and is
-# the only reader.
+# `mosdns-router-cdn` is in the `mosdns-router` group and the directory above gives
+# that group `w`, and a `0600` file inside a group-WRITABLE directory is still
+# deletable and still replaceable -- unlink and rename are the containing
+# directory's decision, not the file's. So in `/run/mosdns` that identity could
+# delete the record, which switches off the only automatic DNS protection on the
+# machine with nothing written anywhere, or replace it with a document claiming a
+# threshold of 99 and a first failure long past, which tears the machine down on
+# the next run with no window in front of it. 0700 root:root, no setfacl, because
+# unlike the four above nothing here is read by any other identity: the watchdog
+# runs as root and is the only reader.
 #
 # A subdirectory rather than a change to `/run/mosdns` itself, because the 2770
-# above is measured, not preferred: the DHCP bridge publishes as `mosdns-cdn` and
-# needs directory `w`. Both directories are needed and they are not the same
-# directory.
+# above is measured, not preferred: the DHCP bridge publishes as
+# `mosdns-router-cdn` and needs directory `w`. Both directories are needed and
+# they are not the same directory.
 #
 # This one is here as well as in the tmpfiles.d entry, and both is right for the
 # reason the entry exists at all: /run is a tmpfs, so the mode and the ownership
@@ -204,11 +271,11 @@ install -d -o root -g root -m 0700 /run/mosdns/watchdog
 # lock alone.
 if [ ! -r "$PUBLISHED_LIST" ] || [ ! -r "$PUBLISHED_LOCK" ]; then
 	# `install` rather than `cp`, so the mode and the group are the published ones
-	# and not whatever the caller's umask left behind: 0640 root:mosdns is the mode
+	# and not whatever the caller's umask left behind: 0640 root:$STATE_GROUP is the mode
 	# internal/rules publishes at, and it is the mode that lets the list-check
 	# identity read a document the optimizer replaces.
-	install -o root -g mosdns -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"
-	install -o root -g mosdns -m 0640 "$SOURCE_LOCK" "$PUBLISHED_LOCK"
+	install -o root -g "$STATE_GROUP" -m 0640 "$SOURCE_LIST" "$PUBLISHED_LIST"
+	install -o root -g "$STATE_GROUP" -m 0640 "$SOURCE_LOCK" "$PUBLISHED_LOCK"
 	echo "postinst: placed the reviewed snapshot this package ships at $PUBLISHED_LIST," >&2
 	echo "postinst: because the published pair was absent or unreadable. Nothing has" >&2
 	echo "postinst: been re-pinned." >&2

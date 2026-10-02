@@ -121,7 +121,7 @@ STATE_DIRECTORIES = (
     "/run/mosdns",
 )
 STATE_OWNER = "root"
-STATE_GROUP = "mosdns"
+STATE_GROUP = "mosdns-router"
 # A gid that is nobody's here, used to build a named ACL entry for a group that is
 # not the directory's own. That is what creates a mask: an entry for the owning
 # group is redundant, and one for the owning group would leave the mask wide.

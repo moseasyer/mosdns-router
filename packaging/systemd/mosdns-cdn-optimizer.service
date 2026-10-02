@@ -30,8 +30,8 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=mosdns-cdn
-Group=mosdns
+User=mosdns-router-cdn
+Group=mosdns-router
 ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl test --apply
 # The shipped policy allows 512 candidates at 3 seconds and 10 MiB each, so the
 # transfers alone are up to 25 minutes before the identity and proof phases. The

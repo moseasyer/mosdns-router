@@ -31,8 +31,8 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=mosdns-cdn
-Group=mosdns
+User=mosdns-router-cdn
+Group=mosdns-router
 ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl update-lists --check
 # At most two requests against a 60-second client timeout each, so the 90-second
 # default for a oneshot would cut a slow origin off before it could report that it
