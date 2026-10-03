@@ -15,7 +15,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
+
 	"mosdns-router/internal/candidate"
+	"mosdns-router/internal/config"
 	"mosdns-router/internal/filelock"
 	"mosdns-router/internal/optimizer"
 	"mosdns-router/internal/prober"
@@ -84,6 +87,15 @@ type services struct {
 	// the installer, and it is a field so a test can see the exact array instead
 	// of running the installer on whatever machine the test runs on.
 	runInstaller func(argv []string) error
+	// loadPolicy reads the policy the route is configured in. It is a field so the
+	// connectivity check can be handed a policy that is not the installed one,
+	// which is the only way to ask "would an operator who added an entry see it?"
+	// without writing to /etc on the machine the test runs on.
+	loadPolicy func(path string) (config.Policy, error)
+	// newUpstream builds a dialable upstream. It is a field so the connectivity
+	// check can be handed an upstream that answers, refuses, or never answers,
+	// without a network and without a DNS server.
+	newUpstream func(addr string, opt upstream.Opt) (upstream.Upstream, error)
 }
 
 // productionServicesWith is productionServices with the two boundaries the
@@ -118,6 +130,10 @@ func productionServices() services {
 		now:            time.Now,
 		effectiveUID:   os.Geteuid,
 		runInstaller:   runInstallerScript,
+		loadPolicy:     config.Load,
+		newUpstream: func(addr string, opt upstream.Opt) (upstream.Upstream, error) {
+			return upstream.NewUpstream(addr, opt)
+		},
 	}
 }
 

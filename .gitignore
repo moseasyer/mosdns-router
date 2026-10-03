@@ -3,3 +3,9 @@
 /build/
 __pycache__/
 *.pyc
+
+# The compiled command, named as the module's main package path. `go build
+# ./cmd/mosdns-cdnctl` writes it into the working directory, and without this an
+# accidental build leaves a 29MB binary in `git status` where it reads as a change
+# somebody meant to make. The packaging build writes into /build/ and is unaffected.
+/mosdns-cdnctl
