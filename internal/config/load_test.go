@@ -14,6 +14,16 @@ schedule: "03:00"
 foreign:
   default_provider: Quad9 Secure DNSCrypt v2
   ecs: false
+  concurrent: 2
+  upstreams:
+    - kind: dnscrypt
+      name: quad9-dnscrypt
+    - kind: upstream
+      name: quad9-doq
+      addr: quic://dns.quad9.net:853
+      bootstrap:
+        - 9.9.9.9:53
+        - 149.112.112.9:53
 cdn:
   ip_version: IPv4
   suppress_aaaa: true
@@ -49,6 +59,10 @@ dhcp:
   failure_policy: disable-current
 cache:
   persistent_dump: false
+foreign_cache:
+  size: 1024
+  ttl_max: 0
+  ttl_min: 0
 `
 
 func TestDefaultsMatchApprovedSpec(t *testing.T) {
@@ -59,6 +73,21 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 		Foreign: ForeignPolicy{
 			DefaultProvider: "Quad9 Secure DNSCrypt v2",
 			ECS:             false,
+			Concurrent:      2,
+			// Written out rather than referenced through
+			// defaultForeignUpstreams(), for the same reason the ECH sources
+			// below are: this test IS the assertion that Defaults() still says
+			// what was approved, and a reference would pass for any route anyone
+			// liked.
+			Upstreams: []ForeignUpstream{
+				{Kind: UpstreamKindDNSCrypt, Name: "quad9-dnscrypt"},
+				{
+					Kind:      UpstreamKindUpstream,
+					Name:      "quad9-doq",
+					Addr:      "quic://dns.quad9.net:853",
+					Bootstrap: []string{"9.9.9.9:53", "149.112.112.9:53"},
+				},
+			},
 		},
 		CDN: CDNPolicy{
 			IPVersion:                "IPv4",
@@ -98,8 +127,9 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 				"mail.encryptedsni.com",
 			},
 		},
-		DHCP:  DHCPPolicy{FailurePolicy: "disable-current"},
-		Cache: CachePolicy{PersistentDump: false},
+		DHCP:         DHCPPolicy{FailurePolicy: "disable-current"},
+		Cache:        CachePolicy{PersistentDump: false},
+		ForeignCache: ForeignCache{Size: 1024, TTLMax: 0, TTLMin: 0},
 	}
 
 	if !reflect.DeepEqual(got, want) {

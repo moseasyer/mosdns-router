@@ -9,6 +9,16 @@ schedule: "03:00"
 foreign:
   default_provider: Quad9 Secure DNSCrypt v2
   ecs: false
+  concurrent: 2
+  upstreams:
+    - kind: dnscrypt
+      name: quad9-dnscrypt
+    - kind: upstream
+      name: quad9-doq
+      addr: quic://dns.quad9.net:853
+      bootstrap:
+        - 9.9.9.9:53
+        - 149.112.112.9:53
 cdn:
   ip_version: IPv4
   suppress_aaaa: true
@@ -44,3 +54,7 @@ dhcp:
   failure_policy: disable-current
 cache:
   persistent_dump: false
+foreign_cache:
+  size: 1024
+  ttl_max: 0
+  ttl_min: 0

@@ -89,6 +89,31 @@ func Defaults() Policy {
 		Foreign: ForeignPolicy{
 			DefaultProvider: "Quad9 Secure DNSCrypt v2",
 			ECS:             false,
+			// 2, not mosdns's own 1, and the reason is in the spec: at 1 the
+			// selection is `rand.IntN` plus a modular walk
+			// (pkg/executable/forward/forward.go:265-267), which is load balancing
+			// and not redundancy. This package's own dhcp_forward already uses 2.
+			// The cost is one extra outbound attempt per query and a warn line per
+			// failure -- NOT latency, because each attempt carries its own timeout
+			// (forward.go:272) and the loop returns on the first non-error answer
+			// (forward.go:302-319).
+			Concurrent: 2,
+			// Two transports out, not two addresses for one process: the packaged
+			// DNSCrypt resolver, and a DoQ endpoint mosdns dials itself. Quad9 is the
+			// same provider and the same trust root on both roads.
+			Upstreams: defaultForeignUpstreams(),
+		},
+		ForeignCache: ForeignCache{
+			// The value the renderer already wrote as a constant
+			// (internal/mosdnsconfig/render.go), which was explicitly NOT a
+			// measurement. Moving it here does not make it one.
+			Size: 1024,
+			// 0 means no clamp, and the ttl plugin is then not rendered at all --
+			// because ApplyMaximumTTL(m, 0) sets every record to TTL 0
+			// (pkg/dnsutils/msg.go:65-67 -> :94-112, the clamp at :101-104). 0 is
+			// also what keeps the committed routing document byte-identical.
+			TTLMax: 0,
+			TTLMin: 0,
 		},
 		CDN: CDNPolicy{
 			IPVersion:                requiredIPVersion,
@@ -118,6 +143,25 @@ func Defaults() Policy {
 		},
 		Cache: CachePolicy{
 			PersistentDump: false,
+		},
+	}
+}
+
+// defaultForeignUpstreams is the shipped foreign route.
+//
+// The DoQ entry's bootstrap is the same two plain-DNS Quad9 addresses the DNSCrypt
+// renderer already uses, for the same reason: this machine's only resolver is the
+// router, so a domain upstream has to name somewhere else to resolve its own name.
+// A bootstrap is not a query path -- foreign queries never go there -- and both
+// addresses are outside every set this package refuses.
+func defaultForeignUpstreams() []ForeignUpstream {
+	return []ForeignUpstream{
+		{Kind: UpstreamKindDNSCrypt, Name: "quad9-dnscrypt"},
+		{
+			Kind:      UpstreamKindUpstream,
+			Name:      "quad9-doq",
+			Addr:      "quic://dns.quad9.net:853",
+			Bootstrap: []string{"9.9.9.9:53", "149.112.112.9:53"},
 		},
 	}
 }

@@ -29,11 +29,25 @@ type Policy struct {
 	ECH           ECHPolicy     `yaml:"ech"`
 	DHCP          DHCPPolicy    `yaml:"dhcp"`
 	Cache         CachePolicy   `yaml:"cache"`
+	ForeignCache  ForeignCache  `yaml:"foreign_cache"`
 }
 
 type ForeignPolicy struct {
-	DefaultProvider string `yaml:"default_provider"`
-	ECS             bool   `yaml:"ecs"`
+	DefaultProvider string            `yaml:"default_provider"`
+	ECS             bool              `yaml:"ecs"`
+	Concurrent      int               `yaml:"concurrent"`
+	Upstreams       []ForeignUpstream `yaml:"upstreams"`
+}
+
+// ForeignCache is the router's own foreign-branch answer cache.
+type ForeignCache struct {
+	Size int `yaml:"size"`
+	// TTLMax and TTLMin are bounds in seconds, and 0 means NO bound -- which is why
+	// the renderer omits the whole clamp plugin rather than writing a zero: mosdns's
+	// ApplyMaximumTTL(m, 0) sets every record's TTL to 0, and ApplyMinimalTTL(m, 0)
+	// likewise floors everything at 0.
+	TTLMax int `yaml:"ttl_max"`
+	TTLMin int `yaml:"ttl_min"`
 }
 
 type CDNPolicy struct {
@@ -91,6 +105,24 @@ func (p Policy) Validate() error {
 	}
 	if p.Foreign.DefaultProvider == "" {
 		return fmt.Errorf("foreign.default_provider must not be empty")
+	}
+	if err := ValidateForeignUpstreams(p.Foreign.Upstreams); err != nil {
+		return err
+	}
+	// 1 is mosdns's own default and it is a RANDOM PICK, not a race
+	// (pkg/executable/forward/forward.go:265-267), so an operator who set it to 1
+	// has a valid policy with no failover between their upstreams. 3 is mosdns's
+	// own hard cap, so a larger value would be silently truncated.
+	if p.Foreign.Concurrent < 1 || p.Foreign.Concurrent > 3 {
+		return fmt.Errorf("foreign.concurrent must be between 1 and 3, got %d; 1 is mosdns's own "+
+			"default and means a random pick with no failover, and 3 is the cap mosdns enforces",
+			p.Foreign.Concurrent)
+	}
+	if p.ForeignCache.Size <= 0 {
+		return fmt.Errorf("foreign_cache.size must be greater than zero")
+	}
+	if p.ForeignCache.TTLMax < 0 || p.ForeignCache.TTLMin < 0 {
+		return fmt.Errorf("foreign_cache.ttl_max and foreign_cache.ttl_min must not be negative")
 	}
 	if p.CDN.IPVersion != requiredIPVersion {
 		return fmt.Errorf("cdn.ip_version must be %s", requiredIPVersion)

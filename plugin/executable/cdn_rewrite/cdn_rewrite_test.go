@@ -581,6 +581,14 @@ func policyDocument(t *testing.T, mutate func(*config.Policy)) []byte {
 		"foreign:\n" +
 		"  default_provider: \"" + policy.Foreign.DefaultProvider + "\"\n" +
 		"  ecs: false\n" +
+		"  concurrent: " + itoa(policy.Foreign.Concurrent) + "\n" +
+		// The upstream list is rendered from the POLICY rather than written out,
+		// for the reason the rest of this fixture is: a case that changes one field
+		// must change exactly one. And it has to be here at all, because a policy
+		// with no upstream list no longer validates -- which is the point of the
+		// rule, but it means this fixture is a second reader of the new schema.
+		"  upstreams:\n" +
+		upstreamLines(policy.Foreign.Upstreams) +
 		"cdn:\n" +
 		"  ip_version: IPv4\n" +
 		"  suppress_aaaa: " + yesNo(policy.CDN.SuppressAAAA) + "\n" +
@@ -607,8 +615,37 @@ func policyDocument(t *testing.T, mutate func(*config.Policy)) []byte {
 		"dhcp:\n" +
 		"  failure_policy: disable-current\n" +
 		"cache:\n" +
-		"  persistent_dump: false\n"
+		"  persistent_dump: false\n" +
+		"foreign_cache:\n" +
+		"  size: " + itoa(policy.ForeignCache.Size) + "\n" +
+		"  ttl_max: " + itoa(policy.ForeignCache.TTLMax) + "\n" +
+		"  ttl_min: " + itoa(policy.ForeignCache.TTLMin) + "\n"
 	return []byte(document)
+}
+
+// upstreamLines renders the foreign route's upstream list, every entry of it. The
+// omitted keys are omitted rather than written empty, which is what the config
+// package's own marshaller does and therefore what the plugin reads in production.
+func upstreamLines(upstreams []config.ForeignUpstream) string {
+	out := ""
+	for _, entry := range upstreams {
+		out += "    - kind: " + string(entry.Kind) + "\n"
+		out += "      name: " + entry.Name + "\n"
+		if entry.Addr != "" {
+			out += "      addr: \"" + entry.Addr + "\"\n"
+		}
+		// The list header comes once, before its items. Writing it inside the loop
+		// is the bug this shape exists to prevent: two bootstrap resolvers would
+		// emit the key twice and the strict decoder would refuse the document, so
+		// the fixture would only ever work for an entry with at most one.
+		if len(entry.Bootstrap) > 0 {
+			out += "      bootstrap:\n"
+			for _, resolver := range entry.Bootstrap {
+				out += "        - " + resolver + "\n"
+			}
+		}
+	}
+	return out
 }
 
 // sourceLines renders the policy's ECH source list, every entry of it: a policy
