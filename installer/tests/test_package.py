@@ -258,7 +258,29 @@ FORBIDDEN_PROVIDERS = (
     # loopback socket.
     "cloudflare-dns.com",
     "dns.google",
-    "dns.quad9.net",
+    # dns.quad9.net was HERE and is not any more, and the reason is worth more
+    # than the line it occupied.
+    #
+    # The denylist existed to keep this package from configuring a resolver it
+    # refuses, and the shipped policy only ever named a provider as a STRING
+    # (`default_provider: Quad9 Secure DNSCrypt v2`) which nothing read. So the
+    # endpoint was not on any machine: the DNSCrypt resolver dialled the provider's
+    # stamps out of its own conffile, and the routing document's only foreign
+    # upstream was a loopback socket.
+    #
+    # `foreign.upstreams` changes that. An operator can now put
+    # `quic://dns.quad9.net:853` in the policy, and when they do this package IS
+    # configuring that endpoint -- so a denylist entry naming it would fail the
+    # legitimate configuration it was written to catch, and removing the entry would
+    # leave the domestic DoH endpoints below unguarded.
+    #
+    # So the gate is inverted instead of relaxed. ROUTE_ALLOWED_PROVIDERS is the
+    # closed set of provider names a shipped policy may put in an upstream address,
+    # and Quad9's own two are in it; everything else in the list above is still
+    # refused, and so is every provider nobody has written down. That is the same
+    # reason ALLOWED_ADDRESSES exists: a denylist cannot know an endpoint nobody has
+    # heard of, and this package's whole claim is that it configures nothing it did
+    # not choose deliberately.
     "dns.adguard.com",
     "doh.opendns.com",
     "doh.mullvad.net",
@@ -395,6 +417,81 @@ def address_findings(root, documents=CONFIG_VALUE_DOCUMENTS, inventory=None):
 # checked to be one of the four rule forms the gateway can read, which is what
 # keeps it a list of names rather than anything else.
 ROUTE_SCAN_EXEMPT = (CHINA_LIST,)
+
+# The CLOSED set of provider host names a shipped policy may put in a
+# `foreign.upstreams[].addr`, and the reason it is an allowlist rather than one
+# more denylist entry is in the note on FORBIDDEN_PROVIDERS above: this package now
+# configures the endpoint an operator names, so "is this forbidden?" is the wrong
+# question and "is this one of the two the package chose?" is the right one.
+#
+# Two names, both Quad9's, and they are the same provider the DNSCrypt document has
+# always used -- so an operator moving from the packaged resolver to a mosdns-dialed
+# upstream is changing the transport, not the party the machine's DNS queries go
+# to. A shipped policy naming anything else is a finding, and so is one naming a
+# resolver nobody has heard of, which is the hole a denylist could not close.
+ROUTE_ALLOWED_PROVIDERS = (
+    "dns.quad9.net",
+)
+
+
+def route_provider_findings(root, documents, inventory=None):
+    """Every provider host name in a shipped policy that is not one of the allowed ones.
+
+    Scoped to `foreign.upstreams[].addr` rather than to the whole document on
+    purpose. The policy's other strings are a provider LABEL the router never dials
+    and a set of ECH source names, which this gate has never had an opinion about;
+    reading every hostname in the file would make the gate fail on the ECH source
+    list the first time anybody added one, and a gate that fails on a legitimate
+    change is a gate that gets deleted.
+    """
+    import ipaddress
+    import re as _re
+    from urllib.parse import urlsplit
+
+    # Read with urlsplit rather than by splitting on "://" and "/" by hand. The
+    # first version of this did the latter and read the SCHEME as a host name, so
+    # every legitimate entry was reported as `quic` or `https` -- a gate that fails
+    # on the configuration it exists to allow, which is how gates get deleted.
+    findings = []
+    for document in documents:
+        path = Path(root) / document.lstrip("/")
+        if not path.exists():
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped.startswith("addr:"):
+                continue
+            value = _re.sub(r"^addr:\s*", "", stripped).strip().strip("\"'")
+            if not value:
+                continue
+            try:
+                host = urlsplit(value).hostname or ""
+            except ValueError:
+                # A URL the standard parser refuses is not something to route
+                # through; the config package refuses it too, and that refusal is
+                # where the operator is told. Naming it here as a bad provider
+                # would be a second, weaker opinion about the same input.
+                continue
+            if not host:
+                continue
+            try:
+                ipaddress.ip_address(host.strip("[]"))
+            except ValueError:
+                pass
+            else:
+                # A bare address is already covered by ALLOWED_ADDRESSES and the
+                # address scan, and this gate is about provider NAMES.
+                continue
+            if host not in ROUTE_ALLOWED_PROVIDERS:
+                findings.append(
+                    f"{document}:{number}: {host} is not one of the providers this "
+                    f"package is allowed to configure, and a policy may only route the "
+                    f"foreign branch through {', '.join(ROUTE_ALLOWED_PROVIDERS)}"
+                )
+    return findings
+
+
+
 
 # The metadata that was decided, read back out of packaging/debian/control.
 CONTROL_FIELDS = {
@@ -3631,6 +3728,85 @@ class ForbiddenContentTests(_Staged):
             "refuses to configure:\n"
             + "\n".join(f"  {path}: {needle}" for path, needle in findings),
         )
+
+    def test_a_shipped_policy_routes_only_through_the_allowed_providers(self):
+        """The allowlist that replaced `dns.quad9.net` in the denylist.
+
+        `foreign.upstreams` means this package now configures whatever endpoint an
+        operator names, so a denylist entry for the one legitimate provider would
+        fail the configuration it was written to catch while every domestic DoH
+        endpoint beside it went unmentioned. This is the gate that closes the hole
+        in the other direction: not "is this forbidden?" but "is this one of the two
+        the package chose?".
+        """
+        findings = route_provider_findings(self.root, CONFIG_VALUE_DOCUMENTS, self.inventory)
+        self.assertEqual(
+            findings, [],
+            "a shipped policy routes the foreign branch through a provider this package "
+            "does not allow:\n" + "\n".join(f"  {finding}" for finding in findings),
+        )
+
+    def test_the_provider_gate_actually_reads_a_forbidden_provider(self):
+        """A gate that finds nothing is indistinguishable from a gate that is not
+        looking. This writes the two shapes the gate reads -- an allowed provider and
+        a forbidden one -- into a copy of the shipped policy and asks it about each,
+        so the test that says the shipped policy is clean is not the only thing that
+        exercises the reader.
+
+        The first version of the reader passed this by accident in the other
+        direction: it reported the SCHEME as the host name, so the forbidden case
+        passed for the wrong reason (`quic` is not an allowed provider) while a
+        genuine foreign provider would have been reported as `quic` too and nobody
+        could tell the two apart.
+        """
+        import tempfile
+
+        document = CONFIG_DIRECTORY + "/policy.yaml"
+        shipped = self.read(document)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, addr, expected in (
+                ("allowed.yaml", "quic://dns.quad9.net:853", []),
+                ("forbidden.yaml", "quic://dns.alidns.com:853", ["dns.alidns.com"]),
+                ("bare-ip.yaml", "quic://9.9.9.9:853", []),
+            ):
+                with self.subTest(policy=name):
+                    # Replace the whole upstream list with the one address, so the
+                    # only finding possible is the one this row is about.
+                    document_text = re.sub(
+                        r"(?ms)^  upstreams:\n(?:    - .*\n|      .*\n)+",
+                        f"  upstreams:\n    - kind: upstream\n      name: probe\n"
+                        f"      addr: {addr}\n",
+                        shipped,
+                    )
+                    self.assertIn("  upstreams:", document_text, "the rewrite did not apply")
+                    (root / "policy.yaml").write_text(document_text, encoding="utf-8")
+                    findings = route_provider_findings(root, ("/policy.yaml",))
+                    if expected:
+                        self.assertTrue(
+                            any(host in finding for finding in findings for host in expected),
+                            f"{addr} should be a finding, got {findings}",
+                        )
+                    else:
+                        self.assertEqual(findings, [], f"{addr} should be allowed")
+
+    def test_the_provider_allowlist_is_a_closed_set_of_two_quad9_names(self):
+        """An allowlist is a hole in a gate, so the hole is asserted rather than
+        trusted: it is two names, both Quad9's, and adding a third has to be a
+        decision somebody wrote down here."""
+        self.assertEqual(ROUTE_ALLOWED_PROVIDERS, ("dns.quad9.net",))
+        for name in ROUTE_ALLOWED_PROVIDERS:
+            with self.subTest(provider=name):
+                self.assertNotIn(
+                    name,
+                    ("dns.alidns.com", "doh.pub", "dot.pub", "cloudflare-dns.com",
+                     "dns.google", "dns.adguard.com", "doh.opendns.com", "doh.mullvad.net",
+                     "dns.nextdns.io"),
+                    "an allowed provider is also on the refused list, so the two disagree",
+                )
+        # And the two names are the same party the DNSCrypt document has always used,
+        # so an operator switching transport has not switched provider.
+        self.assertIn("dns.quad9.net", ROUTE_ALLOWED_PROVIDERS)
 
     def test_the_provider_scan_exempts_exactly_the_one_file_that_may_name_them(self):
         """An exemption is a hole in the gate, so the hole is one named file, it is
