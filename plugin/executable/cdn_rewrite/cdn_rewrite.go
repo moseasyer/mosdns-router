@@ -130,11 +130,16 @@ func New(args Args, bp *coremain.BP) (sequence.RecursiveExecutable, error) {
 // logger it can read. Nothing here changes a decision: it only decides which
 // clock a decision is measured against and whether a fetch opened a socket.
 type options struct {
-	logger     *zap.Logger
-	now        func() time.Time
-	newClient  func(addr string, opt upstream.Opt) (upstream.Upstream, error)
-	pollEvery  time.Duration
-	echTimeout time.Duration
+	logger    *zap.Logger
+	now       func() time.Time
+	newClient func(addr string, opt upstream.Opt) (upstream.Upstream, error)
+	pollEvery time.Duration
+	// echRefreshEvery is the ECH key's background refresh period. Zero leaves the
+	// production cadence in place, so a caller that is not about the refresher cannot
+	// be made to pass or fail by it; it exists so the wiring case can drive the
+	// ticker at a speed a test can wait on.
+	echRefreshEvery time.Duration
+	echTimeout      time.Duration
 }
 
 // withDefaults fills in what a caller left out and refuses nothing, because every
@@ -300,6 +305,17 @@ func newPlugin(args Args, o options) (*Plugin, error) {
 		logger:    resolved.logger,
 		now:       resolved.now,
 		newClient: resolved.newClient,
+		// The background refresh runs at the SAME interval that decides how long a
+		// key is fresh, which is the only period that keeps the two consistent: a
+		// key is fresh for exactly one refresh period, so a tick that fires once
+		// per period replaces it before it can go stale on an idle machine.
+		//
+		// It used not to run at all, and that is why forced ECH worked after an
+		// install and stopped working later: the only fetch was the one inside a
+		// client's query, so the fifteen-minute tolerance budget was spent only by
+		// traffic and a machine that was not being queried through a forced name
+		// simply aged out.
+		refreshEvery: echRefreshPeriod(resolved),
 	})
 	if err != nil {
 		_ = plugin.forceWatcher.Close()
@@ -307,7 +323,23 @@ func newPlugin(args Args, o options) (*Plugin, error) {
 		_ = plugin.prefixWatcher.Close()
 		return nil, fmt.Errorf("%s: ECH provider: %w", PluginType, err)
 	}
+	// Started here and not inside newECHProvider, because a provider is built in a
+	// plugin's Init and a ticker that started before construction returned would be
+	// a goroutine writing to a state path this plugin does not own yet. Every other
+	// watcher in this plugin starts the same way.
+	plugin.ech.startRefreshing()
 	return plugin, nil
+}
+
+// echRefreshPeriod is the background refresh's period, and a caller that named none
+// gets the production cadence. It is a function rather than an inline default so the
+// production value is named in exactly one place and a case can substitute a period
+// a test can wait on.
+func echRefreshPeriod(o options) time.Duration {
+	if o.echRefreshEvery > 0 {
+		return o.echRefreshEvery
+	}
+	return echRotationInterval
 }
 
 // refuseUnsafeUpstream refuses a foreign upstream this plugin will not fetch an

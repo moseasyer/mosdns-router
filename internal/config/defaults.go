@@ -26,22 +26,60 @@ const (
 	echStaleGraceSeconds = 600
 )
 
-// echDefaultSources are the three domains the ECH key is fetched from, and they are
-// the three MEASURED on 2026-10-02 to publish a byte-identical ECHConfigList, all
-// carrying public_name cloudflare-ech.com. That is what makes rotating between them
-// safe: the key does not change, so which domain answered last week is not a fact a
-// client can observe, and three sources instead of one means one of them going quiet
-// costs one third of the key's freshness.
+// echDefaultSources are the nine domains the ECH key is fetched from.
+//
+// **All nine were MEASURED on 2026-10-03 to publish a byte-identical
+// ECHConfigList** -- sha256 of the base64 payload 336cc2eb9ee1f248..., public_name
+// cloudflare-ech.com for every one of them -- and that is what makes rotating
+// between them safe: the key does not change, so which domain answered is not a fact
+// a client can observe, and the public_name refusal in ech_provider never fires.
+//
+// **The list is spread over FIVE DISTINCT DNS ZONES, and the spread is the point
+// rather than a decoration.** ECH is enabled per zone, not per platform: a zone
+// dropping it is one edit, and a list made of nine hostnames inside one zone would
+// lose all nine at the same instant. So the five zones here are
+// cloudflare-ech.com, crypto.cloudflare.com, discordapp.com, cdn.discordapp.com
+// and encryptedsni.com, and the remaining four entries are additional paths inside
+// the zone that was measured to have it enabled throughout (every subdomain of
+// encryptedsni.com tried returned an ech parameter).
+//
+// **A source that stops publishing an ech parameter costs nothing, and the reason
+// is in ech_provider.refreshTick.** A tick asks successive sources until one of
+// them ANSWERS rather than asking one and waiting for the next tick, because the
+// rotation position advances once per attempt and the grace is fifteen to twenty
+// minutes: a refresher that asked exactly one source per tick would walk nine
+// sources in 45 minutes and the key would die before the rotation reached a source
+// that answers. That is what makes a list this long survivable, and it is also why
+// the number of sources does not change how often a source is asked.
 //
 // Two domains measured to publish an ECHConfigList are NOT here and must not be
 // added. `defo.ie` publishes one whose public_name is cover.defo.ie, which is not
 // interchangeable: it would become the inner SNI of every ClientHello this router
 // rewrites, and no other site's edge accepts it. `cf.ech`, which Total-ECH
 // recommends, does not resolve.
+//
+// **And a domain measured NOT to publish one must not be added either**, which is
+// most of Cloudflare: cloudflare.com, www, developers, cdnjs, blog, dash, support,
+// cloudflare-dns and cdn.cloudflare.com all return a NOERROR HTTPS record with no
+// ech parameter. About ninety hostnames were probed on 2026-10-03 and only the five
+// zones above answer with one.
 var echDefaultSources = []string{
+	// zone 1 of 5
 	"cloudflare-ech.com",
-	"cdn.discordapp.com",
+	// zone 2 of 5
+	"crypto.cloudflare.com",
+	// zone 3 of 5
 	"discordapp.com",
+	// zone 4 of 5
+	"cdn.discordapp.com",
+	// zone 5 of 5, and the zone measured to have ECH enabled throughout, so the
+	// remaining four entries are additional independent paths rather than four more
+	// names for one zone's single outage.
+	"encryptedsni.com",
+	"www.encryptedsni.com",
+	"ech.encryptedsni.com",
+	"api.encryptedsni.com",
+	"mail.encryptedsni.com",
 }
 
 func Defaults() Policy {

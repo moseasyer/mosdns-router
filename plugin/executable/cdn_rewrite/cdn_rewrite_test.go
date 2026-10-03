@@ -245,6 +245,11 @@ type harnessConfig struct {
 	upstreamError error
 	// foreignUpstream is the URL the ECH key would be fetched through.
 	foreignUpstream string
+	// echRefreshEvery is the ECH background refresh's period. Zero leaves the plugin's
+	// own value, which is the production cadence — so every case that is not about
+	// the refresher keeps the real five minutes and cannot be made to pass or fail by
+	// it.
+	echRefreshEvery time.Duration
 	// blankArg names one argument to leave empty, which is how the construction
 	// refusals are presented: every one of the six paths is required, and the test
 	// says which one it took away.
@@ -352,9 +357,10 @@ func buildHarness(t *testing.T, configure ...func(*harnessConfig)) (*harness, er
 	h.logs = logs
 	client := h.upstream
 	plugin, err := newPlugin(args, options{
-		logger:    zap.New(core),
-		now:       func() time.Time { return h.now },
-		pollEvery: testPollInterval,
+		logger:          zap.New(core),
+		now:             func() time.Time { return h.now },
+		pollEvery:       testPollInterval,
+		echRefreshEvery: settings.echRefreshEvery,
 		newClient: func(string, upstream.Opt) (upstream.Upstream, error) {
 			if settings.upstreamError != nil {
 				return nil, settings.upstreamError

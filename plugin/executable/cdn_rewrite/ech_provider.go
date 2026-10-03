@@ -125,6 +125,11 @@ type echProviderOptions struct {
 	logger    *zap.Logger
 	now       func() time.Time
 	newClient func(addr string, opt upstream.Opt) (upstream.Upstream, error)
+	// refreshEvery is the background refresh's period, and it is injected so a test
+	// does not have to wait five minutes to see a refresh. The production value is
+	// echRotationInterval and it is set by newPlugin, which is the only thing that
+	// knows what the production period is.
+	refreshEvery time.Duration
 }
 
 // echConfig is one key this router is holding and everything about it except the
@@ -153,8 +158,13 @@ type echProvider struct {
 	sources   []string
 	grace     time.Duration
 	timeout   time.Duration
-	logger    *zap.Logger
-	now       func() time.Time
+	// refreshEvery is the background refresh's period. Zero disables the refresher
+	// entirely, which is what a caller that wants a provider driven only by queries
+	// asks for -- and refusing a NEGATIVE one is the constructor's job, because a
+	// negative period reaches time.NewTicker and panics.
+	refreshEvery time.Duration
+	logger       *zap.Logger
+	now          func() time.Time
 	// nextID numbers this provider's own queries. The id is never a client's: a
 	// fetch is not a transaction anybody is waiting on, and a fixed zero would be
 	// a fingerprint on every key this router fetches.
@@ -170,6 +180,21 @@ type echProvider struct {
 	// reader has to see the same position the writer advanced. The zero value is the
 	// first source, which is where every provider starts.
 	next int
+	// generationFloor is where this provider's counter starts, and it is the one
+	// thing that keeps the state document writable across a restart.
+	//
+	// MEASURED defect: the counter used to start at 0 in every process while
+	// state.WriteJSONAtomic refuses a generation rollback (internal/state/atomic.go,
+	// the generation rule). So after every `systemctl restart mosdns-router` the
+	// document on disk carried a HIGHER generation than anything the new process
+	// could produce, every publish was refused, and -- because publish recorded the
+	// document BEFORE writing it -- none of them was retried. `mosdns-cdnctl status
+	// --ech` then reported status=fresh with an expires_at in the past while the
+	// router was failing closed, and the shipped force-ech-domains.txt tells an
+	// operator to read exactly that document. The floor is read once at
+	// construction and the counter continues from it, so a restart publishes
+	// generation N+1 rather than asking for generation 1.
+	generationFloor uint64
 	// published is what the metadata document on disk was last written from, so a
 	// document that would be byte-identical is not written again and an older
 	// snapshot cannot replace a newer one.
@@ -210,21 +235,149 @@ func newECHProvider(o echProviderOptions) (*echProvider, error) {
 	if o.newClient == nil {
 		o.newClient = func(addr string, opt upstream.Opt) (upstream.Upstream, error) { return upstream.NewUpstream(addr, opt) }
 	}
+	if o.refreshEvery < 0 {
+		return nil, fmt.Errorf("the ECH refresh period must not be negative, got %s", o.refreshEvery)
+	}
 	client, err := o.newClient(o.upstream, upstream.Opt{Logger: o.logger})
 	if err != nil {
 		return nil, fmt.Errorf("the ECH source client for %s: %w", o.upstream, err)
 	}
-	return &echProvider{
-		addr:      o.upstream,
-		client:    client,
-		statePath: o.statePath,
-		sources:   append([]string(nil), o.sources...),
-		grace:     o.grace,
-		timeout:   o.timeout,
-		logger:    o.logger,
-		now:       o.now,
-		closed:    make(chan struct{}),
-	}, nil
+	provider := &echProvider{
+		addr:         o.upstream,
+		client:       client,
+		statePath:    o.statePath,
+		sources:      append([]string(nil), o.sources...),
+		grace:        o.grace,
+		timeout:      o.timeout,
+		refreshEvery: o.refreshEvery,
+		logger:       o.logger,
+		now:          o.now,
+		closed:       make(chan struct{}),
+	}
+	// The generation floor, read from whatever the previous process left. A
+	// document that is absent or unreadable contributes nothing rather than being
+	// a refusal: this is a floor, not a gate, and refusing to build a provider
+	// because a state file is corrupt would take forced ECH down over a file whose
+	// whole purpose is to describe a key that is gone anyway.
+	var existing state.ECHState
+	if err := state.ReadJSON(o.statePath, &existing); err == nil {
+		provider.generationFloor = existing.Generation
+	}
+	return provider, nil
+}
+
+// startRefreshing begins the background refresh, and it is SEPARATE from
+// newECHProvider because a provider is built in a plugin's Init and the ticker must
+// not start until construction has succeeded \u2014 a goroutine that outlives a failed
+// Init is a goroutine writing to a state path nobody owns.
+//
+// Why there is a ticker at all, because this is the defect that made forced ECH
+// "work after an install and stop working later":
+//
+//   - The fetch used to be reachable ONLY from Config, which is only called from a
+//     forced-ECH HTTPS query. No timer, no systemd unit, no CLI verb.
+//   - expires_at is fetched_at + echRotationInterval (five minutes, fixed) and
+//     stale_until is expires_at + stale_grace, so the whole tolerance budget was
+//     fifteen minutes on a shipped policy.
+//   - Every second of it was spent only by query ARRIVALS. A machine that is not
+//     being queried through a forced name never refreshed, so the key aged out and
+//     failure_policy: strict answered SERVFAIL.
+//
+// So the refresher's job is the one the design actually needs: the key in service is
+// current because a timer keeps it current, not because traffic happened to arrive.
+func (e *echProvider) startRefreshing() {
+	if e.refreshEvery <= 0 {
+		return
+	}
+	go e.refreshLoop()
+}
+
+func (e *echProvider) refreshLoop() {
+	ticker := time.NewTicker(e.refreshEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.closed:
+			return
+		case <-ticker.C:
+			e.refreshTick()
+		}
+	}
+}
+
+// refreshTick is ONE tick, and it asks SUCCESSIVE SOURCES until one of them
+// answers rather than exactly one and waiting for the next tick.
+//
+// That is what makes a source list longer than the grace survivable, and it is not
+// a detail: the rotation position advances once per ATTEMPT, so a ticker that asked
+// one source per tick would walk nine sources in 45 minutes. The grace is fifteen
+// to twenty. With sources that no longer publish a key in that list -- which is
+// exactly what a source dropping ECH looks like, and the reason the list is nine
+// long -- the key would die before the rotation ever reached a source that answers.
+//
+// Bounded by the number of sources, so a tick cannot spin: every attempt advances
+// the position, and the position is taken modulo len(sources).
+func (e *echProvider) refreshTick() {
+	for attempt := 0; attempt < len(e.sources); attempt++ {
+		select {
+		case <-e.closed:
+			return
+		default:
+		}
+		fetched, err := e.fetchOnce(e.tickContext())
+		if err == nil {
+			// PUBLISHED, and this is a real requirement rather than tidiness.
+			//
+			// The publish call lives in Config, not in fetchOnce, because Config is
+			// where a caller's decision is made. A background tick that stored a key
+			// and published nothing would leave `mosdns-cdnctl status --ech`
+			// describing the PREVIOUS key while the new one is the one in service --
+			// the same class of defect as the generation freeze below, in the one
+			// place the operator is told to look.
+			e.publish(echStatusFresh, fetched)
+			return
+		} else if errors.Is(err, errECHNotRefetched) {
+			// A fetch is already running \u2014 a client's own query, or an earlier
+			// tick \u2014 and this tick has nothing to add. One more attempt would ask
+			// the next source for a key that running fetch will not produce, so the
+			// tick is done either way.
+			return
+		}
+	}
+	// Every source in the list was asked inside this tick and none of them
+	// answered. The held key is what stands, and logFetchFailure is what says so:
+	// this is the call path that used to be silent.
+	e.logFetchFailure(errECHNoSourceAnswered(len(e.sources)))
+}
+
+// tickContext is the context a refresh runs under, and it is the provider's own
+// clock rather than a client's.
+//
+// The reason is a measured one: fetchOne derives its timeout from the context it is
+// given, so a refresh driven by a client's query inherits that client's remaining
+// budget. A browser query that has already spent most of its own timeout then fails
+// the ECH fetch instantly, even though the identical fetch would have succeeded ten
+// milliseconds later \u2014 which is why a browser and a dig could disagree about
+// whether ECH worked. A refresh nobody is waiting on has no such budget.
+func (e *echProvider) tickContext() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), e.refreshBudget())
+	go func() {
+		select {
+		case <-e.closed:
+			cancel()
+		case <-time.After(e.refreshBudget()):
+			cancel()
+		}
+	}()
+	return ctx
+}
+
+// refreshBudget is how long ONE tick may spend asking sources before it gives up
+// and waits for the next one. It is a whole number of fetch timeouts, which is the
+// only bound that can be stated without inventing a second timeout: a tick that
+// ran past it would hold the listener a client's own query is waiting on.
+func (e *echProvider) refreshBudget() time.Duration {
+	return time.Duration(len(e.sources)+1) * e.timeout
 }
 
 // Config returns the key a force-ECH answer should carry, or the refusal that says
@@ -311,6 +464,21 @@ func (e *echProvider) Config(ctx context.Context) ([]byte, error) {
 			e.logFetchFailure(err)
 			return nil, err
 		}
+		// A refresh that failed while a key is still in service IS REPORTED, and
+		// this line is where it was missing.
+		//
+		// The path used to reach the stale-key answer without saying anything: the
+		// two call sites of logFetchFailure were "no key has ever been held" and
+		// "both attempts were exhausted", so a refresh that failed on a key still
+		// inside its grace logged nothing. The caller's error here is nil -- the
+		// stale key IS the answer -- so cdn_rewrite's own "there is no usable ECH
+		// key to install" warning does not fire either.
+		//
+		// The consequence was that the entire episode an operator most needs to read
+		// -- the source going quiet, with only the grace holding forced ECH up --
+		// was invisible in the journal. It ended when the grace ended and a strict
+		// name started failing closed, which looks like a different fault entirely.
+		e.logFetchFailure(err)
 		e.publish(status, held)
 		if status == echStatusInvalid {
 			return nil, fmt.Errorf("%w: it expired at %s and its grace ended at %s",
@@ -395,6 +563,18 @@ func (e *echProvider) fetchOnce(ctx context.Context) (echConfig, error) {
 // this call did not do it. It never reaches a query: Config's loop reads the stored
 // value again and decides from that.
 var errECHNotRefetched = errors.New(PluginType + ": another caller fetched the key; read it again")
+
+// errECHNoSourceAnswered is what a background tick reports when it asked every
+// source in the list inside one tick and none of them answered.
+//
+// It is its own error rather than the last attempt's failure on purpose. "The
+// source is unreachable" is a fact about one domain and an operator's next question
+// is usually "is any of them reachable", which is a fact about the whole list; and
+// the last attempt's failure would name whichever domain happened to be last in the
+// rotation, which reads as though that one domain were the problem.
+func errECHNoSourceAnswered(count int) error {
+	return fmt.Errorf("%w: none of the %d sources answered inside one refresh", ErrECHUnusable, count)
+}
 
 // statusLocked is the freshness decision, and the three answers are the three the
 // state document has. It must be called with the lock held.
@@ -501,7 +681,17 @@ func (e *echProvider) fetch(ctx context.Context) (echConfig, error) {
 	fetched.digest = hex.EncodeToString(digest[:])
 
 	e.mu.Lock()
+	// The floor, not a bare +1 from zero. The state writer refuses a generation
+	// rollback, so a counter that restarts at zero in every process freezes the
+	// document after every `systemctl restart mosdns-router`: the file carries the
+	// previous process's generation, this one cannot reach it, every publish is
+	// refused, and `mosdns-cdnctl status --ech` keeps reporting the first key's
+	// expiry \u2014 in the past \u2014 for the life of the router. The floor is read once
+	// at construction, so the first fetch after a restart publishes generation N+1.
 	fetched.generation = e.current.generation + 1
+	if fetched.generation <= e.generationFloor {
+		fetched.generation = e.generationFloor + 1
+	}
 	e.bytes += int64(len(fetched.raw))
 	read := e.bytes
 	remaining := len(e.sources) - e.next
@@ -714,8 +904,36 @@ func (e *echProvider) publish(status string, current echConfig) {
 		status,
 	)
 	if err := state.WriteJSONAtomic(e.statePath, document); err != nil {
+		// The document is FORGOTTEN again, and this is the second half of the defect
+		// the generation floor fixes.
+		//
+		// It used to be recorded above the write, so a write the state writer
+		// refused -- a generation rollback before the floor existed, a path owned by
+		// somebody else, a filesystem that was momentarily read-only -- was never
+		// attempted again for that (generation, status) pair. The refusal was logged
+		// once and the file was then simply wrong for the rest of the process's
+		// life, which is how `mosdns-cdnctl status --ech` came to describe a key
+		// nobody was serving.
+		//
+		// Forgetting it means the next publish of the same key retries the write. A
+		// refusal is therefore no longer silent-and-permanent but silent-and-repeated,
+		// which is the direction that recovers; and the write is a rename of a small
+		// file, so a repeated one costs nothing an operator would notice.
+		e.forgetPublished(current.generation, status)
 		e.logger.Warn("cdn_rewrite: the ECH state document could not be written; the key itself is unaffected",
 			zap.String("path", e.statePath), zap.Error(err))
+	}
+}
+
+// forgetPublished drops the memory of one (generation, status) pair, and only that
+// pair, so the next publish of the same key retries. Every other pair's memory is
+// left alone: the point is to make a REFUSAL recoverable, not to make every publish
+// unconditional.
+func (e *echProvider) forgetPublished(generation uint64, status string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.published.generation == generation && e.published.status == status {
+		e.published = publishedKey{}
 	}
 }
 

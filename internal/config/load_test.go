@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -36,8 +37,14 @@ ech:
   stale_grace: 600
   sources:
     - cloudflare-ech.com
-    - cdn.discordapp.com
+    - crypto.cloudflare.com
     - discordapp.com
+    - cdn.discordapp.com
+    - encryptedsni.com
+    - www.encryptedsni.com
+    - ech.encryptedsni.com
+    - api.encryptedsni.com
+    - mail.encryptedsni.com
 dhcp:
   failure_policy: disable-current
 cache:
@@ -74,7 +81,22 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 			Enabled:           true,
 			FailurePolicy:     "strict",
 			StaleGraceSeconds: 600,
-			Sources:           []string{"cloudflare-ech.com", "cdn.discordapp.com", "discordapp.com"},
+			// The nine measured names, written out rather than referenced, because
+			// this test IS the assertion that Defaults() still says what was
+			// approved: `Sources: echDefaultSources` would pass for any list anyone
+			// liked. The Yaml fixture above is a second copy for the same reason and
+			// has to be edited together with this one.
+			Sources: []string{
+				"cloudflare-ech.com",
+				"crypto.cloudflare.com",
+				"discordapp.com",
+				"cdn.discordapp.com",
+				"encryptedsni.com",
+				"www.encryptedsni.com",
+				"ech.encryptedsni.com",
+				"api.encryptedsni.com",
+				"mail.encryptedsni.com",
+			},
 		},
 		DHCP:  DHCPPolicy{FailurePolicy: "disable-current"},
 		Cache: CachePolicy{PersistentDump: false},
@@ -83,6 +105,56 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected defaults:\n got: %#v\nwant: %#v", got, want)
 	}
+}
+
+// TestTheECHSourcesAreSpreadOverMoreThanOneZone is the property the list is FOR,
+// and nothing else in this file holds it.
+//
+// The count is held by TestDefaultsMatchApprovedSpec, which writes the nine names
+// out. What that cannot see is whether they are nine NAMES or nine PATHS INTO ONE
+// ZONE, and ECH is enabled per zone: a zone that drops it is one edit, so a list of
+// nine subdomains of a single zone loses all nine at the same instant and is worth
+// exactly one.
+//
+// The heuristic is the registrable domain by its last two labels, and it
+// UNDERCOUNTS on purpose. `crypto.cloudflare.com` and `cloudflare-ech.com` are two
+// distinct DNS zones but share the label pair `cloudflare.com`, so a list that
+// spread over five real zones reads here as four. Asserting four therefore holds
+// "more than one zone" with a margin, and it is the direction that matters: the case
+// that must fail is a list made entirely of one zone's subdomains, and that scores
+// 1.
+func TestTheECHSourcesAreSpreadOverMoreThanOneZone(t *testing.T) {
+	registrable := map[string]bool{}
+	for _, source := range Defaults().ECH.Sources {
+		labels := strings.Split(strings.TrimSuffix(source, "."), ".")
+		if len(labels) < 2 {
+			t.Fatalf("the source %q has fewer than two labels, so it cannot be a hostname this "+
+				"project measured", source)
+		}
+		registrable[strings.Join(labels[len(labels)-2:], ".")] = true
+	}
+	const wantZones = 4
+	if len(registrable) < wantZones {
+		t.Fatalf("the %d shipped ECH sources span %d registrable domains (%v), want at least %d: ECH "+
+			"is enabled per zone, so a list concentrated in one zone is worth one source however many "+
+			"names it has. The nine measured names span five real zones and this counts four, because "+
+			"crypto.cloudflare.com and cloudflare-ech.com share a label pair.",
+			len(Defaults().ECH.Sources), len(registrable), keysOf(registrable), wantZones)
+	}
+	if len(Defaults().ECH.Sources) < 9 {
+		t.Fatalf("the shipped ECH source list has %d names, want at least 9: the list exists so that a "+
+			"zone dropping ECH does not end forced ECH, and its length is that margin",
+			len(Defaults().ECH.Sources))
+	}
+}
+
+func keysOf(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestLoadAcceptsOneDocumentAndLoadsPolicy(t *testing.T) {

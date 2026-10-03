@@ -32,8 +32,14 @@ ech:
   stale_grace: 600
   sources:
     - cloudflare-ech.com
-    - cdn.discordapp.com
+    - crypto.cloudflare.com
     - discordapp.com
+    - cdn.discordapp.com
+    - encryptedsni.com
+    - www.encryptedsni.com
+    - ech.encryptedsni.com
+    - api.encryptedsni.com
+    - mail.encryptedsni.com
 dhcp:
   failure_policy: disable-current
 cache:
