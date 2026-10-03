@@ -34,9 +34,22 @@ type ForeignUpstream struct {
 	Enabled *bool `yaml:"enabled,omitempty"`
 	// Addr is the URL mosdns dials. Required for `upstream`, refused for `dnscrypt`.
 	Addr string `yaml:"addr,omitempty"`
-	// Bootstrap resolves THIS entry's own host name and is never a query path.
-	// The machine's only resolver is the router, so a domain upstream without one
+	// Bootstrap resolves THIS entry's own host name and is never a query path. The
+	// machine's only resolver is the router, so a domain upstream without one
 	// cannot be dialled at all.
+	//
+	// **A list of at most one, and that is forced by mosdns rather than by taste.**
+	// The plugin takes a single string (forward.UpstreamConfig.Bootstrap, type
+	// string) and hands it to parseBootstrapAp, which splits off the port and calls
+	// netip.ParseAddr on the REST -- so "9.9.9.9:53,149.112.112.9:53" is refused as
+	// one malformed address (measured: pkg/upstream/utils.go:77-90, and
+	// bootstrap.New takes a single netip.AddrPort at :47-60). A comma-joined list
+	// was what the design plan assumed and it does not load.
+	//
+	// So a second resolver has to be a second ENTRY. Which costs an operator
+	// nothing here: the bootstrap is not a query path, so a second entry with the
+	// same addr and a different bootstrap is one more upstream in the race, and the
+	// answer they get is the same either way.
 	Bootstrap []string `yaml:"bootstrap,omitempty"`
 }
 
@@ -146,6 +159,17 @@ func validateUpstreamAddr(u ForeignUpstream) error {
 	}
 	if port := parsed.Port(); port != "" && port == "53" {
 		return fmt.Errorf("foreign.upstreams[] addr %q is on port %d, which belongs to the system resolver", u.Addr, systemResolverPort)
+	}
+	// At most ONE bootstrap, for the measured reason on the field: mosdns parses the
+	// whole string as a single address. Two would render into a document that the
+	// router refuses to load, and the operator would learn it at startup rather than
+	// at the moment they wrote the policy.
+	if len(u.Bootstrap) > 1 {
+		return fmt.Errorf("foreign.upstreams[] bootstrap names %d resolvers (%v) but mosdns reads exactly "+
+			"ONE per upstream -- it hands the string to parseBootstrapAp, which parses the whole thing "+
+			"as a single address (pkg/upstream/utils.go:77-90). Give each resolver its own entry; the "+
+			"bootstrap is not a query path, so a second entry with the same addr answers the same queries "+
+			"from the same place", len(u.Bootstrap), u.Bootstrap)
 	}
 	for _, resolver := range u.Bootstrap {
 		address, err := netip.ParseAddrPort(resolver)

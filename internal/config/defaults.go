@@ -149,19 +149,24 @@ func Defaults() Policy {
 
 // defaultForeignUpstreams is the shipped foreign route.
 //
-// The DoQ entry's bootstrap is the same two plain-DNS Quad9 addresses the DNSCrypt
-// renderer already uses, for the same reason: this machine's only resolver is the
-// router, so a domain upstream has to name somewhere else to resolve its own name.
-// A bootstrap is not a query path -- foreign queries never go there -- and both
-// addresses are outside every set this package refuses.
+// The DoQ entry's bootstrap is one of the same plain-DNS Quad9 addresses the
+// DNSCrypt renderer already uses, for the same reason: this machine's only resolver
+// is the router, so a domain upstream has to name somewhere else to resolve its own
+// name. A bootstrap is not a query path -- foreign queries never go there -- and the
+// address is outside every set this package refuses.
 func defaultForeignUpstreams() []ForeignUpstream {
 	return []ForeignUpstream{
 		{Kind: UpstreamKindDNSCrypt, Name: "quad9-dnscrypt"},
 		{
-			Kind:      UpstreamKindUpstream,
-			Name:      "quad9-doq",
-			Addr:      "quic://dns.quad9.net:853",
-			Bootstrap: []string{"9.9.9.9:53", "149.112.112.9:53"},
+			Kind: UpstreamKindUpstream,
+			Name: "quad9-doq",
+			Addr: "quic://dns.quad9.net:853",
+			// ONE bootstrap, not two. mosdns reads exactly one per upstream
+			// (pkg/upstream/utils.go:77-90 parses the whole string as one
+			// address), so a second resolver here would render into a document the
+			// router refuses to load. The plan assumed a comma-joined list and that
+			// does not parse.
+			Bootstrap: []string{"9.9.9.9:53"},
 		},
 	}
 }

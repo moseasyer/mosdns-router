@@ -448,13 +448,14 @@ func newHarnessWithList(t *testing.T, fixture stateFixture, list chinaListFixtur
 	if err != nil {
 		t.Fatalf("split the domestic address %q: %v", h.domestic.Address(), err)
 	}
-	document, err := mosdnsconfig.Render(config.Defaults(), withRewriteFiles(mosdnsconfig.Paths{
+	listener := "tcp://" + h.foreign.Address()
+	document, err := mosdnsconfig.Render(mockRoute(listener), withRewriteFiles(mosdnsconfig.Paths{
 		CNDomains: h.cnList,
 		DHCPState: h.stateFile,
 		// The foreign branch is entered over TCP, so the resolver is a tcp://
 		// listener. The renderer refuses the system resolver's port, so an
 		// ephemeral one is what it can be pointed at.
-		ForeignListener: "tcp://" + h.foreign.Address(),
+		ForeignListener: listener,
 		Listen:          h.listen,
 		// A published state carries a bare address, so the port it is dialled on
 		// is this document's to state. Without it the plugin would dial 53, and the
@@ -1267,8 +1268,8 @@ func TestRoutingSplitSendsEachNameToOnlyItsOwnBranch(t *testing.T) {
 	if got := h.foreign.Count("", chinaName); got != 0 {
 		t.Errorf("the foreign resolver was asked for %s %d times, want 0: a China name must never be forwarded abroad", chinaName, got)
 	}
-	if got := h.foreign.Count("", foreignName); got != 1 {
-		t.Errorf("the foreign resolver was asked for %s %d times, want 1", foreignName, got)
+	if got := h.foreign.Count("", foreignName); got != raced(1) {
+		t.Errorf("the foreign resolver was asked for %s %d times, want %d", foreignName, got, raced(1))
 	}
 	if got := h.domestic.Count("", foreignName); got != 0 {
 		t.Errorf("the domestic resolver was asked for %s %d times, want 0: a foreign name must never be re-asked inside the network the user is leaving", foreignName, got)
@@ -1280,8 +1281,8 @@ func TestRoutingSplitSendsEachNameToOnlyItsOwnBranch(t *testing.T) {
 	if after.domestic != 1 {
 		t.Errorf("the domestic resolver was asked %d times in total, want 1: the only query that should have reached it was for %s", after.domestic, chinaName)
 	}
-	if after.foreign != 1 {
-		t.Errorf("the foreign resolver was asked %d times in total, want 1: the only query that should have reached it was for %s", after.foreign, foreignName)
+	if after.foreign != raced(1) {
+		t.Errorf("the foreign resolver was asked %d times in total, want %d: the only query that should have reached it was for %s", after.foreign, raced(1), foreignName)
 	}
 }
 
@@ -1301,15 +1302,19 @@ func TestAForeignQueryReachesTheResolverOnlyOverTCP(t *testing.T) {
 	// Asked over udp, so the client's transport is not what decides the upstream's.
 	h.ask(t, testdns.ProtocolUDP, foreignName, dns.TypeA)
 
-	if got := h.foreign.Count(testdns.ProtocolTCP, foreignName); got != 1 {
-		t.Errorf("the foreign resolver received %d queries for %s over tcp, want 1", got, foreignName)
+	// TCP and only TCP, and that half is kept on its own: it is the measured fact that
+	// the ECH fetch must not use the UDP transport, and it was the one half of the old
+	// "exactly one TCP, zero UDP" assertion that a route which is now a list does not
+	// make false. The COUNT is raced, because the route asks two upstreams now.
+	if got := h.foreign.Count(testdns.ProtocolTCP, foreignName); got != raced(1) {
+		t.Errorf("the foreign resolver received %d queries for %s over tcp, want %d", got, foreignName, raced(1))
 	}
 	if got := h.foreign.Count(testdns.ProtocolUDP, foreignName); got != 0 {
 		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0: the foreign forward is a tcp:// upstream", got, foreignName)
 	}
 	after := h.counts().since(before)
-	if after.foreign != 1 {
-		t.Errorf("the foreign resolver was asked %d times in total, want 1", after.foreign)
+	if after.foreign != raced(1) {
+		t.Errorf("the foreign resolver was asked %d times in total, want %d", after.foreign, raced(1))
 	}
 	if after.domestic != 0 {
 		t.Errorf("the domestic resolver was asked %d times, want 0", after.domestic)
@@ -1551,8 +1556,8 @@ func TestStartupFailsClosedWithoutAPublishableState(t *testing.T) {
 			// A count for this name, not a change in the grand total: the readiness
 			// poll used a different name, so only this case's own query can be
 			// carrying it.
-			if got := h.foreign.Count("", foreignName); got != 1 {
-				t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, foreignName)
+			if got := h.foreign.Count("", foreignName); got != raced(1) {
+				t.Errorf("the foreign resolver was asked %d times for %s, want %d", got, foreignName, raced(1))
 			}
 
 			// The domestic branch fails closed, and the rcode says it failed rather
@@ -1647,8 +1652,8 @@ func TestTheForeignCacheNeverChangesWhatTheDomesticPathReturns(t *testing.T) {
 	if want := []string{foreignAddress, foreignAddress, foreignAddress}; !equalStrings(foreignAnswers, want) {
 		t.Errorf("three %s answers = %v, want %v: the answer set has to be stable", foreignName, foreignAnswers, want)
 	}
-	if got := h.foreign.Count("", foreignName); got != 1 {
-		t.Errorf("the foreign resolver was asked %d times for %s, want 1: the second and third queries must be answered from the cache", got, foreignName)
+	if got := h.foreign.Count("", foreignName); got != raced(1) {
+		t.Errorf("the foreign resolver was asked %d times for %s, want %d: the second and third queries must be answered from the cache", got, foreignName, raced(1))
 	}
 }
 
@@ -1680,8 +1685,8 @@ func TestAChinaListWithNoRulesSendsEveryNameAbroad(t *testing.T) {
 		t.Errorf("%s with a rule-less China list = %v, want the foreign resolver's answer %v: with no rule to match, every name takes the foreign branch",
 			chinaName, got, want)
 	}
-	if got := h.foreign.Count("", chinaName); got != 1 {
-		t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, chinaName)
+	if got := h.foreign.Count("", chinaName); got != raced(1) {
+		t.Errorf("the foreign resolver was asked %d times for %s, want %d", got, chinaName, raced(1))
 	}
 
 	// The domestic resolver saw nothing: not the China name, and nothing else
@@ -1696,7 +1701,7 @@ func TestAChinaListWithNoRulesSendsEveryNameAbroad(t *testing.T) {
 	if got, want := answeredAddresses(t, foreign), []string{foreignAddress}; !equalStrings(got, want) {
 		t.Errorf("%s with a rule-less China list = %v, want %v", foreignName, got, want)
 	}
-	if after := h.counts().since(before); after.foreign != 2 || after.domestic != 0 {
+	if after := h.counts().since(before); after.foreign != raced(2) || after.domestic != 0 {
 		t.Errorf("resolvers were asked %+d since this case began, want both names abroad and nothing domestic", after)
 	}
 
@@ -1945,4 +1950,51 @@ func (o *recordedOutcome) Fatalf(format string, args ...any) {
 	o.calls++
 	o.last = "fail"
 	o.message = fmt.Sprintf(format, args...)
+}
+
+// mockRoute is the foreign route these router-starting tests use.
+//
+// **It is NOT config.Defaults(), and the reason is that the shipped policy names a
+// real DoQ endpoint.** A test that starts a real mosdns with the shipped upstreams
+// asks the real internet: on a machine with no route it fails, spends five seconds
+// per query while it does, and proves nothing about the router. The full suite found
+// this by running it; reading the file did not.
+//
+// Two entries rather than one, deliberately. The shipped route races two upstreams
+// and `concurrent: 2` has to be exercised by the tests that start a real router, or
+// it is untested anywhere that matters. The second entry is the SAME mock, so the
+// race is two queries to a local socket with no second dependency on the network.
+// No bootstrap, because a mock is named by IP.
+//
+// The dnscrypt entry is what makes the injected listener the ECH source, which is
+// what the routing cases below check the rewriter against.
+func mockRoute(foreignListener string) config.Policy {
+	policy := config.Defaults()
+	policy.Foreign.Upstreams = []config.ForeignUpstream{
+		{Kind: config.UpstreamKindDNSCrypt, Name: "mock-resolver"},
+		{Kind: config.UpstreamKindUpstream, Name: "mock-second", Addr: foreignListener},
+	}
+	return policy
+}
+
+// raced converts a count of CLIENT queries into the count of UPSTREAM queries the
+// foreign route produces for them.
+//
+// The route races `concurrent` upstreams per uncached query (mosdns forward.go:
+// 265-267), and mockRoute points both of its entries at the same mock, so one
+// client query reaches the mock `concurrent` times.
+//
+// Every "was asked N times" assertion in this package is about how many times the
+// ROUTER decided to go out -- cache hits, branch routing, one-fetch rules -- and
+// none of them is about how many racers there are. `raced(N)` keeps them saying
+// that; a literal would silently re-assert "there is one upstream", which is the
+// thing this change made false.
+//
+// `raced(0)` is 0, so the "must never be forwarded abroad" assertions need no
+// change at all -- they are already expressed as zero and stay correct.
+//
+// It does NOT apply to the domestic branch: that is one dhcp_forward with its own
+// concurrency, unrelated to the foreign route's.
+func raced(clientQueries int) int {
+	return clientQueries * config.Defaults().Foreign.Concurrent
 }

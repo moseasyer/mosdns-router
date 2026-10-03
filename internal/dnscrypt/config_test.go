@@ -644,3 +644,26 @@ func decodeStamp(t *testing.T, value string) decodedStamp {
 		proto:          stamp.Proto,
 	}
 }
+
+// TestTheExportedListenerIsTheOneTheDocumentBinds exists because the routing
+// renderer has to name this same address, and the two agreeing is the whole of
+// what the ECH fetch's correctness rests on: the key is fetched through the
+// listener this document binds.
+//
+// A second copy of the string in the routing package would make that agreement a
+// coincidence, and a coincidence is invisible until the day someone edits one and
+// not the other. Asserting ListenAddress equals the constant the document was
+// rendered with turns the coincidence into a compile-time-ish fact.
+func TestTheExportedListenerIsTheOneTheDocumentBinds(t *testing.T) {
+	rendered, err := Render(config.Defaults(), Defaults())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if !strings.Contains(string(rendered), foreignListener) {
+		t.Fatalf("the rendered resolver document does not bind %s", foreignListener)
+	}
+	if ListenAddress != foreignListener {
+		t.Fatalf("ListenAddress is %q but the document binds %q, so the routing renderer "+
+			"would read a different address than the resolver listens on", ListenAddress, foreignListener)
+	}
+}

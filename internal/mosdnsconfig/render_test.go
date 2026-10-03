@@ -3,6 +3,7 @@ package mosdnsconfig
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/config"
+	"mosdns-router/internal/dnscrypt"
 	"mosdns-router/internal/optimizer"
 	"mosdns-router/internal/state"
 	"mosdns-router/internal/testdns"
@@ -59,6 +61,12 @@ var ipv4Address = regexp.MustCompile(`[0-9]{1,3}(\.[0-9]{1,3}){3}`)
 type rendered struct {
 	Log     renderedLog     `yaml:"log"`
 	Plugins []renderedEntry `yaml:"plugins"`
+	// API is decoded here rather than being left out of the type on purpose: the
+	// decoder is a KnownFields one, so a document that grows an `api` block while
+	// this type has no field for it would fail to decode -- which is the decoder
+	// doing its job, and the reason the field has to be added rather than the test
+	// relaxed.
+	API renderedAPI `yaml:"api"`
 }
 
 type renderedLog struct {
@@ -104,10 +112,22 @@ type renderedCDNRewrite struct {
 	CloudflareCIDRFile string `yaml:"cloudflare_cidr_file"`
 }
 
+// renderedForward is the foreign forward's argument set, decoded into this test's
+// own type. Bootstrap is here because an entry's bootstrap is rendered into the
+// document and nothing else in the tests would notice its absence.
 type renderedForward struct {
-	Upstreams []struct {
-		Addr string `yaml:"addr"`
+	Concurrent int `yaml:"concurrent"`
+	Upstreams  []struct {
+		Addr      string `yaml:"addr"`
+		Bootstrap string `yaml:"bootstrap"`
 	} `yaml:"upstreams"`
+}
+
+// renderedAPI is the document's api block. It is a separate type from `rendered`
+// only because a missing block and an empty one have to be told apart, and a
+// missing block decodes to the zero value of a missing field.
+type renderedAPI struct {
+	HTTP string `yaml:"http"`
 }
 
 type renderedServer struct {
@@ -565,6 +585,14 @@ func TestTheCommittedConfigNamesThePathsTheOtherComponentsPublish(t *testing.T) 
 // The two are one value, and the control case is the proof of it: move the listener
 // and both the forward's upstream and the plugin's carry the new address. A renderer
 // that gave the plugin its own literal would leave one of the two behind.
+//
+// **The forward may now carry SEVERAL upstreams while the ECH fetch still goes to
+// one**, and this case had to be rewritten rather than deleted when that became true.
+// The property it was written for -- "the two cannot disagree about where the
+// resolver is" -- is still worth holding, and it now reads as: the ECH source is
+// either the injected listener or one of the forward's own upstreams. What is NOT
+// true any more is that it is the forward's only upstream, because the whole point
+// of the route being a list is that it is not.
 func TestTheECHKeyIsFetchedThroughTheSameListenerTheForeignBranchDials(t *testing.T) {
 	for name, listener := range map[string]string{
 		"the production listener":    "tcp://127.0.0.1:15353",
@@ -576,13 +604,20 @@ func TestTheECHKeyIsFetchedThroughTheSameListenerTheForeignBranchDials(t *testin
 			parsed := decodeRendered(t, document)
 
 			forward := argsOf[renderedForward](t, parsed.entry(t, "foreign_forward"))
-			if len(forward.Upstreams) != 1 {
-				t.Fatalf("the foreign forward has %d upstreams, want exactly one: %+v", len(forward.Upstreams), forward.Upstreams)
+			if len(forward.Upstreams) == 0 {
+				t.Fatal("the foreign forward names no upstream, so the foreign branch has nowhere to send a query")
 			}
 			rewriter := argsOf[renderedCDNRewrite](t, parsed.entry(t, "cdn_rewrite"))
-			if rewriter.ForeignUpstream != forward.Upstreams[0].Addr {
-				t.Errorf("cdn_rewrite fetches ECH through %q while the foreign forward enters %q: the two can disagree about where the resolver is",
-					rewriter.ForeignUpstream, forward.Upstreams[0].Addr)
+			// The ECH source is reachable from the route: it is the injected
+			// listener, or it is one of the addresses the forward actually dials.
+			// An ECH source the forward never enters would be a resolver the
+			// rewriter uses and the route does not -- which works right up until
+			// the operator removes that entry and nothing says why ECH stopped.
+			if rewriter.ForeignUpstream != listener && !containsAddr(forward, rewriter.ForeignUpstream) {
+				t.Errorf("cdn_rewrite fetches ECH through %q, which the foreign forward does not "+
+					"enter (it enters %v and was injected with %q): the rewriter would use a "+
+					"resolver the route does not",
+					rewriter.ForeignUpstream, forwardAddrs(forward), listener)
 			}
 			if !strings.HasPrefix(rewriter.ForeignUpstream, "tcp://") {
 				t.Errorf("cdn_rewrite fetches ECH through %q, want a tcp:// URL: the UDP transport re-sends and drops answers", rewriter.ForeignUpstream)
@@ -598,28 +633,79 @@ func TestTheECHKeyIsFetchedThroughTheSameListenerTheForeignBranchDials(t *testin
 	}
 }
 
-// TestTheForeignForwardUsesOnlyTheDNSCryptListenerOverTCP covers the transport
-// and the single upstream. The listener is the loopback DNSCrypt resolver, which
-// the foreign path must reach over TCP: mosdns's stock UDP transport re-sends a
-// query that has not been answered and can drop an answer that arrives before its
-// exchange waits for it, and a second upstream would be a second route out.
-func TestTheForeignForwardUsesOnlyTheDNSCryptListenerOverTCP(t *testing.T) {
-	document, err := Render(config.Defaults(), ProductionPaths())
-	if err != nil {
-		t.Fatalf("Render: %v", err)
-	}
+// TestTheForeignForwardCarriesEveryEnabledEntryOverATCPTransport covers the
+// transport and the list. It USED to be named ...UsesOnlyTheDNSCryptListener... and
+// asserted a single upstream, and both of those are gone: the route is a policy
+// list now, so "only" is the opposite of the property.
+//
+// What is kept, and what the name now says, is the part that is still true and
+// still load-bearing:
+//
+//   - the packaged resolver IS entered, over tcp://, when its entry is on -- a
+//     policy that leaves it on and renders a forward that never dials it is a
+//     document that ignores the operator's own configuration;
+//   - every enabled `upstream` entry becomes exactly one upstream, in policy order;
+//   - the DNSCrypt listener comes from the dnscrypt package rather than a second
+//     copy of the string, which is what makes the two documents agree by
+//     construction instead of by two literals happening to agree today.
+func TestTheForeignForwardCarriesEveryEnabledEntryOverATCPTransport(t *testing.T) {
+	document := mustRenderPolicy(t, config.Defaults())
 	parsed := decodeRendered(t, document)
 
-	forward := argsOf[renderedForward](t, parsed.entry(t, "foreign_forward"))
-	if len(forward.Upstreams) != 1 {
-		t.Fatalf("the foreign forward has %d upstreams, want exactly one: %+v", len(forward.Upstreams), forward.Upstreams)
+	forward := argsOf[renderedForward](t, parsed.entry(t, tagForeignForward))
+	// The expectation is DERIVED from the policy rather than written out, and it is
+	// derived as the LIST the policy describes: the packaged listener when the
+	// dnscrypt entry is on, then one address per enabled upstream entry. Writing
+	// three literals here would be a second copy of the policy that could drift.
+	var enabled []string
+	for _, entry := range config.Defaults().Foreign.Upstreams {
+		if entry.IsEnabled() && entry.Kind == config.UpstreamKindDNSCrypt {
+			enabled = append(enabled, productionForeignListener)
+			continue
+		}
+		if entry.IsEnabled() && entry.Kind == config.UpstreamKindUpstream {
+			enabled = append(enabled, entry.Addr)
+		}
 	}
-	if got := forward.Upstreams[0].Addr; got != productionForeignListener {
-		t.Fatalf("the foreign forward enters %q, want %q", got, productionForeignListener)
+	got := forwardAddrs(forward)
+	if len(got) != len(enabled) {
+		t.Fatalf("the foreign forward carries %v, want one upstream per enabled upstream entry %v",
+			got, enabled)
 	}
-	if !strings.HasPrefix(forward.Upstreams[0].Addr, "tcp://") {
-		t.Errorf("the foreign upstream is %q, want a tcp:// URL", forward.Upstreams[0].Addr)
+	for index, addr := range enabled {
+		if got[index] != addr {
+			t.Fatalf("upstream %d is %q, want %q: the document's order is the policy's order",
+				index, got[index], addr)
+		}
 	}
+	// The packaged listener has to be one of them, because the dnscrypt entry is on
+	// in the shipped policy and it is a process this route has to reach.
+	if !containsAddr(forward, productionForeignListener) {
+		t.Errorf("the foreign forward carries %v, none of them the packaged resolver %q, "+
+			"so an enabled dnscrypt entry is not in the route", got, productionForeignListener)
+	}
+	// And the packaged listener is the dnscrypt package's own constant, so the two
+	// documents cannot name different sockets.
+	if want := "tcp://" + dnscrypt.ListenAddress; !containsAddr(forward, want) {
+		t.Errorf("the foreign forward carries %v, none of them %q: this renderer holds a "+
+			"second copy of the resolver's address", got, want)
+	}
+	for _, addr := range got {
+		if strings.HasPrefix(addr, "udp://") {
+			t.Errorf("the foreign upstream %q is udp, and the ECH fetch shares this branch: "+
+				"mosdns's UDP transport re-sends an unanswered query and can drop an early answer",
+				addr)
+		}
+	}
+}
+
+func containsAddr(forward renderedForward, addr string) bool {
+	for _, upstream := range forward.Upstreams {
+		if upstream.Addr == addr {
+			return true
+		}
+	}
+	return false
 }
 
 // TestBothServersListenOnTheSameLoopbackAddressForMain covers the only two
@@ -660,7 +746,6 @@ func TestRenderRefusesAPathSetThatCannotBeServed(t *testing.T) {
 		"no policy path":                 {withoutPolicy(ProductionPaths()), "must not be empty"},
 		"no China list path":             {withoutCNDomains(ProductionPaths()), "must not be empty"},
 		"no state document path":         {withoutDHCPState(ProductionPaths()), "must not be empty"},
-		"no foreign listener":            {withoutForeignListener(ProductionPaths()), "must not be empty"},
 		"no listen address":              {withoutListen(ProductionPaths()), "must not be empty"},
 		"no selector path":               {withoutSelector(ProductionPaths()), "must not be empty"},
 		"no force-ECH allowlist":         {withoutForceECH(ProductionPaths()), "must not be empty"},
@@ -963,19 +1048,46 @@ func TestTheForeignListenerIsWhereTheCommittedDNSCryptProxyListens(t *testing.T)
 	}
 }
 
-// TestNoAddressButLoopbackIsCommitted proves the committed routing file names no
+// TestNoMachineLocalAddressIsCommitted proves the committed routing file names no
 // user-specific address. The list and the state document carry the addresses, and
 // a repository that named one of them would ship a machine's network to everyone
 // who cloned it.
-func TestNoAddressButLoopbackIsCommitted(t *testing.T) {
+//
+// **The rule was "loopback only" and it is now "loopback, or a published public
+// resolver".** `foreign.upstreams[].bootstrap` puts an address in this document for
+// the first time: a domain upstream has to be told where to resolve its own name,
+// because the machine's only resolver is the router. The default is Quad9's
+// published 9.9.9.9, which identifies nothing about the machine.
+//
+// So the property is not "every address is loopback" -- it is "every address is one
+// this package chose deliberately". That is the same inversion the policy's own
+// address gate needed (internal/config/marshal_test.go), and it is the stronger
+// claim: a LAN resolver or a DHCP-discovered nameserver in a bootstrap is refused
+// here, where the old rule would have refused Quad9 too.
+func TestNoMachineLocalAddressIsCommitted(t *testing.T) {
 	committed, err := os.ReadFile(filepath.Clean(committedMosdnsConfig))
 	if err != nil {
 		t.Fatalf("cannot read the committed %s: %v", committedMosdnsConfig, err)
 	}
+	// The closed set this document may name. Loopback is this machine's own; the
+	// Quad9 address is published by Quad9 and is the only non-loopback bootstrap the
+	// shipped policy uses. A denylist could not be used here: it cannot know an
+	// address nobody has written down, and the failure this guards against is
+	// precisely an address somebody's own network contributed.
+	allowed := map[string]bool{"127.0.0.1": true, "9.9.9.9": true}
 	for _, address := range ipv4Address.FindAllString(string(committed), -1) {
-		if address != "127.0.0.1" {
-			t.Errorf("the committed %s names %s, want only the loopback 127.0.0.1", committedMosdnsConfig, address)
+		if !allowed[address] {
+			t.Errorf("the committed %s names %s, which is neither loopback nor one of the "+
+				"published resolvers %v this package is allowed to configure: a bootstrap "+
+				"pointing into somebody's own network would ship that network to every clone",
+				committedMosdnsConfig, address, allowed)
 		}
+	}
+	// And the set is closed, so adding a fourth kind of address to the shipped
+	// document has to be a decision somebody wrote down here.
+	if !allowed["127.0.0.1"] || !allowed["9.9.9.9"] {
+		t.Fatal("the allowed set no longer contains what the shipped document uses; the set " +
+			"and the document have drifted and one of them is wrong")
 	}
 }
 
@@ -987,7 +1099,7 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	foreign := startForeignMock(t)
 	paths, listenAddress := temporaryPaths(t, "tcp://"+foreign.Address())
 
-	document, err := Render(config.Defaults(), paths)
+	document, err := Render(mockRoute(paths.ForeignListener), paths)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -1010,11 +1122,32 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	if got := addressesIn(t, foreignResponse); len(got) != 1 || got[0] != "203.0.113.10" {
 		t.Errorf("%s over the rendered config = %v, want the mock's answer [203.0.113.10]", foreignDomain, got)
 	}
-	if count := foreign.Count(testdns.ProtocolTCP, foreignDomain); count != 1 {
-		t.Errorf("the foreign resolver received %d queries for %s over tcp, want 1: the forward is a tcp:// upstream", count, foreignDomain)
+	// The count is the ROUTE's count, not one upstream's: `concurrent: 2` asks two
+	// upstreams for every uncached query, and this test's two entries are the same
+	// mock, so one client query is two upstream queries. It was `want 1` before the
+	// route became a list, and `want 1` was the assertion that said "one upstream".
+	//
+	// What is still held here, and is the part worth holding, is the transport: TCP
+	// only, and never UDP. A udp:// upstream in the list would be routable and
+	// would break the ECH fetch, which shares this branch.
+	// mosdns picks `concurrent` upstreams out of the list, starting at a random
+	// offset (forward.go:265-267). Two upstreams and concurrent 2 means it picks
+	// both, whichever offset it starts from -- so the count is `concurrent`, not
+	// len(upstreams) times concurrent.
+	concurrent := config.Defaults().Foreign.Concurrent
+	if len(config.Defaults().Foreign.Upstreams) < concurrent {
+		t.Fatalf("this case needs at least `concurrent` upstreams; the default route has %d and "+
+			"concurrent is %d", len(config.Defaults().Foreign.Upstreams), concurrent)
+	}
+	raced := concurrent
+	if count := foreign.Count(testdns.ProtocolTCP, foreignDomain); count != raced {
+		t.Errorf("the foreign resolver received %d queries for %s over tcp, want %d: one per racer "+
+			"per upstream for concurrent=%d", count, foreignDomain, raced, concurrent)
 	}
 	if count := foreign.Count(testdns.ProtocolUDP, foreignDomain); count != 0 {
-		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0", count, foreignDomain)
+		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0: the UDP transport "+
+			"re-sends an unanswered query and can drop an early answer, and the ECH fetch shares this branch",
+			count, foreignDomain)
 	}
 
 	// Asking again is answered by the foreign cache, and the resolver is not
@@ -1026,8 +1159,9 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	if got := addressesIn(t, ask(t, listenAddress, foreignDomain)); len(got) != 1 || got[0] != "203.0.113.10" {
 		t.Errorf("the repeated %s = %v, want the cached answer [203.0.113.10]", foreignDomain, got)
 	}
-	if count := foreign.Count("", foreignDomain); count != 1 {
-		t.Errorf("the foreign resolver received %d queries for %s in total, want 1: the second must come from the cache", count, foreignDomain)
+	if count := foreign.Count("", foreignDomain); count != raced {
+		t.Errorf("the foreign resolver received %d queries for %s in total, want %d: the repeated query "+
+			"must come from the cache and add NO upstream query at all", count, foreignDomain, raced)
 	}
 
 	instance.CloseWithErr(nil)
@@ -1055,7 +1189,7 @@ func TestASuccessfulDomesticAnswerIsNeverReplacedByTheForeignCache(t *testing.T)
 	domestic := startDomesticMock(t)
 	paths, listenAddress := temporaryPaths(t, "tcp://"+foreign.Address())
 
-	document, err := Render(config.Defaults(), paths)
+	document, err := Render(mockRoute(paths.ForeignListener), paths)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -1109,6 +1243,31 @@ func TestASuccessfulDomesticAnswerIsNeverReplacedByTheForeignCache(t *testing.T)
 // unstartable document would be proving nothing. The selector is disabled and the
 // allowlist is a comment, so a test that is not about the rewrite gets a plugin
 // that starts and changes nothing.
+// mockRoute is the foreign route every router-starting test in this file uses.
+//
+// **It replaced config.Defaults()'s own upstreams, and that was not optional.** The
+// shipped policy names `quic://dns.quad9.net:853`, and a test that starts a real
+// mosdns with it asks the real internet -- which is a test that fails on a machine
+// without a route, takes five seconds per query while it does, and proves nothing
+// about the router.
+//
+// Two entries rather than one, deliberately: the shipped route races two upstreams
+// and these tests must exercise that shape or `concurrent: 2` is untested. The
+// second is the SAME mock, so the race is real (two queries, two answers) without a
+// second dependency on the network. No bootstrap, because the mock is given by IP.
+func mockRoute(foreignListener string) config.Policy {
+	policy := config.Defaults()
+	policy.Foreign.Upstreams = []config.ForeignUpstream{
+		{Kind: config.UpstreamKindDNSCrypt, Name: "mock-resolver"},
+		{
+			Kind: config.UpstreamKindUpstream,
+			Name: "mock-second",
+			Addr: foreignListener,
+		},
+	}
+	return policy
+}
+
 func temporaryPaths(t *testing.T, foreignListener string) (Paths, string) {
 	t.Helper()
 	temporary := t.TempDir()
@@ -1453,4 +1612,235 @@ func withoutForeignListener(paths Paths) Paths {
 
 func withoutListen(paths Paths) Paths {
 	return withListen(paths, "")
+}
+
+// --- the foreign route as the policy configures it ---
+
+// Every enabled `upstream` entry becomes exactly one forward upstream, in policy
+// order, and a `dnscrypt` entry becomes none -- it is a process, not an address.
+func TestEveryEnabledUpstreamEntryBecomesOneForwardUpstream(t *testing.T) {
+	policy := config.Defaults()
+	policy.Foreign.Upstreams = append(policy.Foreign.Upstreams, config.ForeignUpstream{
+		Kind: config.UpstreamKindUpstream, Name: "extra", Addr: "tls://dns.quad9.net:853",
+	})
+	parsed := decodeRendered(t, mustRenderPolicy(t, policy))
+	forward := argsOf[renderedForward](t, parsed.entry(t, tagForeignForward))
+	// The packaged listener first (the dnscrypt entry is still on), then one address
+	// per enabled upstream entry, in policy order. Derived from the policy above the
+	// renderer runs rather than written out, so this case fails if the ORDER is wrong
+	// and not merely if the count is.
+	want := []string{"tcp://127.0.0.1:15353", "quic://dns.quad9.net:853", "tls://dns.quad9.net:853"}
+	if len(forward.Upstreams) != len(want) {
+		t.Fatalf("the forward names %d upstreams %v, want %v", len(forward.Upstreams), forwardAddrs(forward), want)
+	}
+	for index, addr := range want {
+		if forward.Upstreams[index].Addr != addr {
+			t.Fatalf("upstream %d is %q, want %q: the document's order is the policy's "+
+				"order, because a reader comparing the two needs them to be comparable",
+				index, forward.Upstreams[index].Addr, addr)
+		}
+	}
+}
+
+func TestADisabledEntryIsNotRenderedButIsStillInThePolicy(t *testing.T) {
+	off := false
+	policy := config.Defaults()
+	policy.Foreign.Upstreams = append(policy.Foreign.Upstreams, config.ForeignUpstream{
+		Kind: config.UpstreamKindUpstream, Name: "spare", Addr: "tls://1.1.1.1:853", Enabled: &off,
+	})
+	parsed := decodeRendered(t, mustRenderPolicy(t, policy))
+	for _, addr := range forwardAddrs(argsOf[renderedForward](t, parsed.entry(t, tagForeignForward))) {
+		if addr == "tls://1.1.1.1:853" {
+			t.Fatal("a disabled entry was rendered into the forward, so disabling an entry " +
+				"does not take it out of the route")
+		}
+	}
+	// And it is still IN the policy, or "disabled" would mean "deleted" and an
+	// operator switching an entry off would lose their configuration.
+	if len(policy.Foreign.Upstreams) != 3 {
+		t.Fatalf("the policy has %d entries after adding one, want 3: rendering must not "+
+			"reach back and edit the policy it read", len(policy.Foreign.Upstreams))
+	}
+}
+
+// A udp:// entry is routable and is never the ECH source, because cdn_rewrite
+// refuses every non-tcp transport for the ECH fetch (cdn_rewrite.go:353). This is
+// the shape of the mistake an operator makes when they add a DoH upstream and
+// switch the packaged resolver off.
+func TestAUdpEntryIsRoutableButIsNeverTheECHSource(t *testing.T) {
+	off := false
+	policy := config.Defaults()
+	// Port 853 rather than 53: config.Validate refuses a foreign upstream on the
+	// system resolver's port, which is the right refusal and is not what this case
+	// is about. The plan's example said :53 and would have been testing that rule
+	// twice instead of this one.
+	policy.Foreign.Upstreams = []config.ForeignUpstream{
+		{Kind: config.UpstreamKindUpstream, Name: "plain", Addr: "udp://9.9.9.9:853"},
+		{Kind: config.UpstreamKindDNSCrypt, Name: "packaged", Enabled: &off},
+	}
+	// This policy is REFUSED, and that is the point: with the dnscrypt entry off
+	// and only a udp entry left, there is nothing ECH may be fetched through.
+	if err := policy.Validate(); !errors.Is(err, config.ErrNoECHSource) {
+		t.Fatalf("a udp-only route with the packaged resolver off was accepted (err = %v), "+
+			"so an operator can leave the ECH fetch with no transport at all", err)
+	}
+	// With a tcp:// entry added it renders, the udp entry IS routed, and the ECH
+	// source is the tcp entry rather than either of the other two.
+	policy.Foreign.Upstreams = append(policy.Foreign.Upstreams, config.ForeignUpstream{
+		Kind: config.UpstreamKindUpstream, Name: "stream", Addr: "tcp://9.9.9.9:5353",
+	})
+	parsed := decodeRendered(t, mustRenderPolicy(t, policy))
+	forward := argsOf[renderedForward](t, parsed.entry(t, tagForeignForward))
+	if got := forwardAddrs(forward); len(got) != 2 || got[0] != "udp://9.9.9.9:853" {
+		t.Fatalf("the forward carries %v, want the udp entry routed first and the tcp entry "+
+			"second: a udp entry being routable is the premise of this case", got)
+	}
+	rewrite := argsOf[renderedCDNRewrite](t, parsed.entry(t, tagCDNRewrite))
+	if rewrite.ForeignUpstream != "tcp://9.9.9.9:5353" {
+		t.Fatalf("the ECH source is %q, want the tcp:// entry's addr", rewrite.ForeignUpstream)
+	}
+}
+
+// scanForChinesePublicDNS already scans the WHOLE finished document
+// (render.go:298), so an upstream entry that renders into that document is covered
+// without a line of new code. "It is covered automatically" is a claim about code
+// nobody changed, and the only thing that makes it more than a claim is a case that
+// puts a Chinese resolver where a new entry can put one and refuses the render.
+func TestAChineseResolverIsRefusedWhereverAnUpstreamEntryPutsIt(t *testing.T) {
+	for _, chinese := range chinesePublicDNSAddresses {
+		policy := config.Defaults()
+		policy.Foreign.Upstreams = append(policy.Foreign.Upstreams, config.ForeignUpstream{
+			Kind: config.UpstreamKindUpstream, Name: "extra",
+			Addr: "https://" + chinese + "/dns-query",
+		})
+		if _, err := Render(policy, ProductionPaths()); err == nil {
+			t.Errorf("%s was rendered into the document, so an operator can point the "+
+				"foreign branch at a resolver this package exists to avoid", chinese)
+		}
+	}
+	// And the case that matters more, because it is the one an operator reaches by
+	// accident: a bootstrap pointing at a Chinese resolver. The forward list would
+	// carry a public DoQ endpoint and look entirely correct, while the machine
+	// resolved this router's own upstream name in China.
+	policy := config.Defaults()
+	policy.Foreign.Upstreams[1].Bootstrap = []string{chinesePublicDNSAddresses[0] + ":53"}
+	if _, err := Render(policy, ProductionPaths()); err == nil {
+		t.Errorf("a bootstrap of %s was rendered, so the one place a Chinese resolver "+
+			"would arrive without looking wrong is unchecked", chinesePublicDNSAddresses[0])
+	}
+	// And the clean default is not caught by any of this.
+	if _, err := Render(config.Defaults(), ProductionPaths()); err != nil {
+		t.Errorf("the shipped route was refused alongside the Chinese-resolver cases: %v", err)
+	}
+}
+
+func TestConcurrentIsWrittenIntoTheForward(t *testing.T) {
+	for _, value := range []int{1, 2, 3} {
+		policy := config.Defaults()
+		policy.Foreign.Concurrent = value
+		parsed := decodeRendered(t, mustRenderPolicy(t, policy))
+		if got := argsOf[renderedForward](t, parsed.entry(t, tagForeignForward)).Concurrent; got != value {
+			t.Fatalf("the forward says concurrent = %d, want %d: at 1 mosdns picks RANDOMLY "+
+				"(forward.go:265-267) and an operator who asked for two upstreams would have "+
+				"neither redundancy nor a document that says so", got, value)
+		}
+	}
+}
+
+// The api block is what makes the cache plugin's OWN flush endpoint reachable: the
+// plugin registers GET /flush unconditionally (mosdns cache.go:320-324, mounted at
+// :108) and the server only starts when the document carries api.http
+// (coremain/mosdns.go:67). This package emitted no api key, so the endpoint has
+// been unreachable in every document shipped so far.
+func TestTheAPIListenerIsLoopbackAndPresent(t *testing.T) {
+	parsed := decodeRendered(t, mustRenderPolicy(t, config.Defaults()))
+	if parsed.API.HTTP != apiListenAddress {
+		t.Fatalf("api.http is %q, want %q: without it the cache plugin's own flush "+
+			"endpoint (mosdns cache.go:320-324) is registered and unreachable",
+			parsed.API.HTTP, apiListenAddress)
+	}
+	if !strings.HasPrefix(parsed.API.HTTP, "127.0.0.1:") {
+		t.Fatalf("api.http is %q, which is not loopback; this package's promise is that "+
+			"every listener it configures is loopback-only", parsed.API.HTTP)
+	}
+}
+
+// The api address must not collide with anything else the document binds. Two
+// listeners on one port means the second one fails at startup, which is a router
+// that does not start rather than a router that misbehaves.
+func TestTheAPIListenerCollidesWithNothingTheDocumentBinds(t *testing.T) {
+	document := mustRenderPolicy(t, config.Defaults())
+	parsed := decodeRendered(t, document)
+	for _, tag := range []string{tagUDPServer, tagTCPServer} {
+		entry := parsed.entry(t, tag)
+		var server renderedServer
+		if err := entry.Args.Decode(&server); err != nil {
+			t.Fatalf("the %s arguments do not decode: %v", tag, err)
+		}
+		if server.Listen == parsed.API.HTTP {
+			t.Fatalf("api.http is %s, which the %s server also binds", parsed.API.HTTP, tag)
+		}
+	}
+}
+
+// mustRenderPolicy is the other shape: a caller that wants to render a policy
+// other than the default, which is most of what the foreign-route cases below do.
+func mustRenderPolicy(t *testing.T, policy config.Policy) []byte {
+	t.Helper()
+	document, err := Render(policy, ProductionPaths())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	return document
+}
+
+func forwardAddrs(forward renderedForward) []string {
+	out := make([]string, 0, len(forward.Upstreams))
+	for _, upstream := range forward.Upstreams {
+		out = append(out, upstream.Addr)
+	}
+	return out
+}
+
+// TestTheForeignListenerIsDerivedRatherThanConfigured is the case that replaced
+// "no foreign listener" in the refusal table.
+//
+// That row asserted an empty Paths.ForeignListener is a fault. It stopped being one
+// and the row had to go, because ProductionPaths() now leaves the field EMPTY on
+// purpose: the listener is derived from the policy's dnscrypt entry so that the
+// routing document and the resolver document cannot name different sockets. So the
+// property worth holding is the derivation itself, and it is held here instead:
+//
+//   - ProductionPaths() really does leave it empty, which is what makes the
+//     derivation the production path rather than a fallback nobody exercises;
+//   - the derived value is dnscrypt.ListenAddress, read from the package that
+//     renders the resolver -- not a literal in this package;
+//   - an INJECTED listener still wins, because it is the seam the integration tests
+//     point at a mock resolver, and a seam that stopped working would silently turn
+//     every integration test into a test of the real socket.
+func TestTheForeignListenerIsDerivedRatherThanConfigured(t *testing.T) {
+	if got := ProductionPaths().ForeignListener; got != "" {
+		t.Fatalf("ProductionPaths().ForeignListener is %q; it must be EMPTY so the production "+
+			"document derives the listener from the policy's dnscrypt entry", got)
+	}
+
+	derived := decodeRendered(t, mustRenderPolicy(t, config.Defaults()))
+	if got := argsOf[renderedForward](t, derived.entry(t, tagForeignForward)).Upstreams[0].Addr; got != "tcp://"+dnscrypt.ListenAddress {
+		t.Fatalf("the derived forward enters %q, want the dnscrypt package's own %q: a literal "+
+			"here is the second copy this derivation exists to remove", got, "tcp://"+dnscrypt.ListenAddress)
+	}
+	if got := argsOf[renderedCDNRewrite](t, derived.entry(t, tagCDNRewrite)).ForeignUpstream; got != "tcp://"+dnscrypt.ListenAddress {
+		t.Fatalf("the derived ECH source is %q, want %q", got, "tcp://"+dnscrypt.ListenAddress)
+	}
+
+	// And the injection seam, which the integration tests depend on.
+	const injected = "tcp://127.0.0.2:25353"
+	seam := decodeRendered(t, mustRender(t, withForeignListener(ProductionPaths(), injected)))
+	if got := argsOf[renderedCDNRewrite](t, seam.entry(t, tagCDNRewrite)).ForeignUpstream; got != injected {
+		t.Fatalf("an injected listener of %q produced an ECH source of %q: the seam the "+
+			"integration tests use to reach a mock resolver is not working", injected, got)
+	}
+	if got := argsOf[renderedForward](t, seam.entry(t, tagForeignForward)).Upstreams[0].Addr; got != injected {
+		t.Fatalf("an injected listener of %q produced a forward entering %q", injected, got)
+	}
 }

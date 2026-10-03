@@ -350,10 +350,11 @@ func newRewriteHarness(t *testing.T, fixture rewriteFixture) *rewriteHarness {
 	if err != nil {
 		t.Fatalf("split the domestic address %q: %v", rw.domestic.Address(), err)
 	}
-	document, err := mosdnsconfig.Render(config.Defaults(), withRewriteFiles(mosdnsconfig.Paths{
+	listener := "tcp://" + rw.foreign.Address()
+	document, err := mosdnsconfig.Render(mockRoute(listener), withRewriteFiles(mosdnsconfig.Paths{
 		CNDomains:       rw.cnList,
 		DHCPState:       rw.stateFile,
-		ForeignListener: "tcp://" + rw.foreign.Address(),
+		ForeignListener: listener,
 		Listen:          rw.listen,
 		// A published state carries a bare address, so the port it is dialled on
 		// is the document's to state.
@@ -880,10 +881,10 @@ func TestARewrittenCloudflareAnswerCarriesTheSelectedAddressAndNoProof(t *testin
 
 	// One query reached the resolver and nothing reached the domestic branch: the
 	// rewrite is a post-processing step, not a second lookup.
-	if got := rw.foreign.Count("", cloudflareName); got != 1 {
+	if got := rw.foreign.Count("", cloudflareName); got != raced(1) {
 		t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, cloudflareName)
 	}
-	if after := rw.counts().since(before); after.foreign != 1 || after.domestic != 0 {
+	if after := rw.counts().since(before); after.foreign != raced(1) || after.domestic != 0 {
 		t.Errorf("resolvers were asked %+d since this case began, want one foreign query and nothing domestic", after)
 	}
 }
@@ -940,7 +941,7 @@ func TestTheIPv6AnswerOfARewrittenNameIsEmptied(t *testing.T) {
 	// The IPv6 answer really was fetched, and really was emptied rather than
 	// refused: a name that reached no upstream at all would also be empty, and this
 	// case is about what happens to an answer that arrives.
-	if got := rw.foreign.Count("", cloudflareName); got != 2 {
+	if got := rw.foreign.Count("", cloudflareName); got != raced(2) {
 		t.Errorf("the foreign resolver was asked %d times for %s, want 2: the A answer and the IPv6 answer that was emptied", got, cloudflareName)
 	}
 }
@@ -968,7 +969,7 @@ func TestAMixedCDNAnswerIsLeftExactlyAsPublished(t *testing.T) {
 		rrsigOver(mixedName, dns.TypeA),
 	)
 	keepsItsProofs(t, response)
-	if got := rw.foreign.Count("", mixedName); got != 1 {
+	if got := rw.foreign.Count("", mixedName); got != raced(1) {
 		t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, mixedName)
 	}
 
@@ -1029,7 +1030,7 @@ func TestAPerHostnameMappingRewritesThatNameAndNoOther(t *testing.T) {
 		rrsigOver(siblingName, dns.TypeA),
 	)
 	keepsItsProofs(t, sibling)
-	if got := rw.foreign.Count("", siblingName); got != 1 {
+	if got := rw.foreign.Count("", siblingName); got != raced(1) {
 		t.Errorf("the foreign resolver was asked %d times for %s, want 1", got, siblingName)
 	}
 }
@@ -1117,7 +1118,7 @@ func TestARewriteAcrossASelectorGenerationLeavesTheCachedObjectAlone(t *testing.
 	if got, want := publishedAddresses(t, first), []string{selectedAddress}; !equalStrings(got, want) {
 		t.Fatalf("generation 1: %s A = %v, want the selected address %v", cloudflareName, got, want)
 	}
-	if got := rw.foreign.Count("", cloudflareName); got != 1 {
+	if got := rw.foreign.Count("", cloudflareName); got != raced(1) {
 		t.Fatalf("the foreign resolver was asked %d times for %s, want 1", got, cloudflareName)
 	}
 
@@ -1135,7 +1136,7 @@ func TestARewriteAcrossASelectorGenerationLeavesTheCachedObjectAlone(t *testing.
 	if got, want := publishedAddresses(t, third), []string{successorAddress}; !equalStrings(got, want) {
 		t.Errorf("generation 2, second query: %s A = %v, want the new winner %v", cloudflareName, got, want)
 	}
-	if got := rw.foreign.Count("", cloudflareName); got != 1 {
+	if got := rw.foreign.Count("", cloudflareName); got != raced(1) {
 		t.Errorf("the foreign resolver was asked %d times for %s across three queries, want 1: the later two came from the cache", got, cloudflareName)
 	}
 
@@ -1155,7 +1156,7 @@ func TestARewriteAcrossASelectorGenerationLeavesTheCachedObjectAlone(t *testing.
 	if got, want := publishedAddresses(t, restored), []string{selectedAddress}; !equalStrings(got, want) {
 		t.Errorf("generation 4: %s A = %v, want the selected address %v", cloudflareName, got, want)
 	}
-	if got := rw.foreign.Count("", cloudflareName); got != 1 {
+	if got := rw.foreign.Count("", cloudflareName); got != raced(1) {
 		t.Errorf("the foreign resolver was asked %d times for %s across the whole case, want 1: nothing in this case may re-fetch", got, cloudflareName)
 	}
 }
@@ -1346,8 +1347,16 @@ func TestAForcedHTTPSQueryCarriesThePublishedKeyAndTheProvedAddress(t *testing.T
 	// key fetch, which is a client of the plugin's own pointed at the same listener
 	// rather than a re-entry into the sequence this plugin sits in.
 	after := rw.counts().since(before)
-	if after.foreign != 2 {
-		t.Errorf("the foreign resolver was asked %d times, want 2: the forced name's own question and one fetch of %s", after.foreign, dns.Fqdn(echSourceName))
+	// The client's own question is RACED -- it goes through the forward, which asks
+	// `concurrent` upstreams -- while the key fetch is NOT: cdn_rewrite dials its own
+	// foreign_upstream directly, deliberately bypassing ExecNext
+	// (ech_provider.go:29-38), so it is one exchange whatever the route does.
+	//
+	// That asymmetry is the whole reason the ECH source is derived separately from
+	// the forward list rather than being "the first upstream": a route that races
+	// cannot also be the thing that fetches a key with no client watching it.
+	if after.foreign != raced(1)+1 {
+		t.Errorf("the foreign resolver was asked %d times, want %d: the forced name's own question and one fetch of %s", after.foreign, raced(1)+1, dns.Fqdn(echSourceName))
 	}
 	source := dns.Fqdn(echSourceName)
 	if got := rw.foreign.Count(testdns.ProtocolTCP, source); got != 1 {
@@ -1356,7 +1365,7 @@ func TestAForcedHTTPSQueryCarriesThePublishedKeyAndTheProvedAddress(t *testing.T
 	if got := rw.foreign.Count(testdns.ProtocolUDP, source); got != 0 {
 		t.Errorf("the ECH key was fetched %d times over udp, want 0: that transport re-sends and drops answers", got)
 	}
-	if got, was := rw.foreign.Count("", forcedName), forcedBefore; got != was+1 {
+	if got, was := rw.foreign.Count("", forcedName), forcedBefore; got != was+raced(1) {
 		t.Errorf("the forced name was asked for %d times, want %d: one question of the client's own, and the key fetch is a query about the source rather than about the name", got, was+1)
 	}
 
@@ -1429,7 +1438,7 @@ func TestAStrictForcedHTTPSQueryFailsClosedWhenTheSourcePublishesNoKey(t *testin
 	// The client's own question was asked downstream and the source was asked once.
 	// A strict HTTPS query is not short-circuited: the service parameters are what
 	// the synthesis inherits, so the question has to be asked.
-	if got, was := rw.foreign.Count("", forcedName), forcedBefore; got != was+1 {
+	if got, was := rw.foreign.Count("", forcedName), forcedBefore; got != was+raced(1) {
 		t.Errorf("the forced name was asked for %d times, want %d: one question of the client's own", got, was+1)
 	}
 	if got := rw.foreign.Count("", dns.Fqdn(echSourceName)); got != 1 {

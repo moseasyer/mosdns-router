@@ -1360,18 +1360,71 @@ class ShippedConfigListenerTests(unittest.TestCase):
             "both are loopback; a wildcard or a bare port here is a resolver on the LAN",
         )
 
-    def test_the_routing_document_forwards_to_the_loopback_resolver(self):
+    def test_the_routing_document_forwards_to_exactly_the_enabled_upstreams(self):
+        """The routing document's forward IS the policy's enabled upstream entries.
+
+        It used to be compared against a literal `["tcp://127.0.0.1:15353"]`, which
+        was a second copy of the configuration and could drift from it: a document
+        naming a different route than the operator configured would have failed for
+        the wrong reason, and one naming the right route for the wrong reason would
+        have passed.
+
+        So the expectation is READ from the shipped policy -- the file an operator
+        edits -- and the order has to match too, because a reader comparing the two
+        documents side by side needs them comparable.
+        """
+        import yaml
+
         text = (CONFIG_DIR / "mosdns.yaml").read_text(encoding="utf-8")
-        upstreams = re.findall(r"^\s*-\s*addr:\s*(\S+)\s*$", text, flags=re.MULTILINE)
+        rendered = re.findall(r"^\s*-\s*addr:\s*(\S+)\s*$", text, flags=re.MULTILINE)
+
+        policy = yaml.safe_load((CONFIG_DIR / "policy.yaml").read_text(encoding="utf-8"))
+        # The packaged resolver, which a `dnscrypt` entry stands for, plus one address
+        # per enabled `upstream` entry. Both are in the document and neither is a
+        # second copy of the policy written out here.
+        enabled = []
+        for entry in policy["foreign"]["upstreams"]:
+            if not entry.get("enabled", True):
+                continue
+            if entry["kind"] == "dnscrypt":
+                enabled.append("tcp://127.0.0.1:15353")
+            elif entry["kind"] == "upstream":
+                enabled.append(entry["addr"])
+        self.assertTrue(enabled, "the shipped policy enables no upstream, so there is no route")
         self.assertEqual(
-            upstreams,
-            ["tcp://127.0.0.1:15353"],
-            "the foreign branch reaches the resolver this package ships, on loopback",
+            rendered,
+            enabled,
+            "the routing document's forward is not the policy's enabled upstream "
+            "entries; an operator who edits policy.yaml must not get a document that "
+            "routes somewhere else",
         )
         self.assertEqual(
             re.findall(r"^\s*foreign_upstream:\s*(\S+)\s*$", text, flags=re.MULTILINE),
             ["tcp://127.0.0.1:15353"],
-            "the ECH fetch goes through the same loopback resolver, never a LAN address",
+            "the ECH fetch goes through the packaged loopback resolver, never a LAN "
+            "address and never a second resolver: cdn_rewrite refuses every non-tcp "
+            "transport for it, so the dnscrypt entry's listener is the only answer",
+        )
+
+    def test_the_routing_document_never_routes_a_foreign_query_over_udp(self):
+        """The transport half, kept on its own now that the route is a list.
+
+        A `udp://` upstream is ROUTABLE -- the policy validation allows it -- and is
+        never the ECH source, because cdn_rewrite refuses it on a measured ground
+        (mosdns's UDP upstream re-sends an unanswered query and can drop an early
+        answer, and the ECH fetch has no client watching it). So a document carrying
+        one is correct, and this case is about the one thing that must never appear:
+        a foreign query leaving this machine in the clear.
+        """
+        text = (CONFIG_DIR / "mosdns.yaml").read_text(encoding="utf-8")
+        forward = text[text.index("tag: foreign_forward"):]
+        forward = forward[: forward.index("- tag:")]
+        self.assertNotIn(
+            "udp://",
+            forward,
+            "the shipped foreign forward carries a udp:// upstream, so a foreign "
+            "query would leave the machine unencrypted where the DNSCrypt hop exists "
+            "to prevent exactly that",
         )
 
     def test_the_resolver_document_binds_loopback_15353(self):

@@ -23,7 +23,6 @@ foreign:
       addr: quic://dns.quad9.net:853
       bootstrap:
         - 9.9.9.9:53
-        - 149.112.112.9:53
 cdn:
   ip_version: IPv4
   suppress_aaaa: true
@@ -85,7 +84,7 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 					Kind:      UpstreamKindUpstream,
 					Name:      "quad9-doq",
 					Addr:      "quic://dns.quad9.net:853",
-					Bootstrap: []string{"9.9.9.9:53", "149.112.112.9:53"},
+					Bootstrap: []string{"9.9.9.9:53"},
 				},
 			},
 		},

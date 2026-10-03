@@ -54,8 +54,11 @@ plugins:
   - tag: foreign_forward
     type: forward
     args:
+      concurrent: 2
       upstreams:
         - addr: tcp://127.0.0.1:15353
+        - addr: quic://dns.quad9.net:853
+          bootstrap: 9.9.9.9:53
   - tag: cn_path
     type: sequence
     args:
@@ -88,3 +91,5 @@ plugins:
     args:
       entry: main
       listen: 127.0.0.1:53
+api:
+  http: 127.0.0.1:15354

@@ -26,6 +26,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 	"mosdns-router/internal/config"
+	"mosdns-router/internal/dnscrypt"
 
 	// The document names plugin types, so this package links the plugins it
 	// names: importing it registers them, and a consumer that loads a rendered
@@ -183,9 +184,15 @@ func ProductionPaths() Paths {
 		CNDomains:          "/var/lib/mosdns/lists/cn-domains.txt",
 		CloudflarePrefixes: "/var/lib/mosdns/lists/cloudflare-prefixes.txt",
 		DHCPState:          "/run/mosdns/dhcp-upstreams.json",
-		ForeignListener:    "tcp://127.0.0.1:15353",
-		Listen:             "127.0.0.1:53",
-		DHCPUpstreamPort:   53,
+		// ForeignListener is deliberately EMPTY. It is the injection seam the
+		// integration tests use to point the document at a mock resolver, and in
+		// production the listener is DERIVED from the policy's dnscrypt entry --
+		// read from the dnscrypt package, so the routing document and the resolver
+		// document cannot name different addresses for the same socket. A constant
+		// here would be the second copy that derivation exists to remove.
+		ForeignListener:  "",
+		Listen:           "127.0.0.1:53",
+		DHCPUpstreamPort: 53,
 	}
 }
 
@@ -195,10 +202,32 @@ func ProductionPaths() Paths {
 // pinned mosdns release reads it under, and Args is filled with the argument
 // types of the plugins themselves, so the document is assembled from typed values
 // and marshalled once, never concatenated out of strings.
+// document is the whole configuration. API is here because the cache plugin
+// registers its own flush endpoint unconditionally -- `GET /flush` on the plugin's
+// own mux (mosdns plugin/executable/cache/cache.go:320-324), mounted at /plugins/<tag>
+// by :108's `bp.RegAPI(c.Api())` -- and the server only starts when the document
+// carries an `api.http` address (mosdns coremain/mosdns.go:67).
+//
+// This package emitted no `api` key, so that endpoint has been registered and
+// unreachable in every document shipped so far. It is loopback for the same reason
+// every other listener in this file is, and unprivileged because the router binds
+// 53: an api listener that needed privilege would be one more thing that cannot
+// run as an unprivileged service user.
 type document struct {
 	Log     logArgs      `yaml:"log"`
 	Plugins []pluginArgs `yaml:"plugins"`
+	API     apiArgs      `yaml:"api"`
 }
+
+type apiArgs struct {
+	HTTP string `yaml:"http"`
+}
+
+// apiListenAddress is the address the document's api block binds. It is a constant
+// rather than a policy field because it is not an operator's decision to make:
+// there is one HTTP endpoint, it belongs to this machine, and a second one would be
+// a second thing to bind.
+const apiListenAddress = "127.0.0.1:15354"
 
 type logArgs struct {
 	Level string `yaml:"level"`
@@ -253,12 +282,34 @@ type (
 		ForeignUpstream    string `yaml:"foreign_upstream"`
 		CloudflareCIDRFile string `yaml:"cloudflare_cidr_file"`
 	}
-	// forwardArgs is the foreign forward, into the DNSCrypt resolver.
+	// forwardArgs is the foreign forward: how many of the upstreams ONE query
+	// races, and which upstreams those are.
+	//
+	// Concurrent is written rather than defaulted because mosdns's own default of 1
+	// is a RANDOM PICK rather than a race (pkg/executable/forward/forward.go:265-267:
+	// `rand.IntN` plus `us[(r+i)%len(us)]`), which is load balancing and not
+	// redundancy. An operator who configures two upstreams and reads a document that
+	// does not mention `concurrent` has no way to tell they got load balancing, so
+	// the document states it. The value is bounded to 1..3 by config.Validate, and 3
+	// is mosdns's own cap.
 	forwardArgs struct {
-		Upstreams []upstreamArgs `yaml:"upstreams"`
+		Concurrent int            `yaml:"concurrent"`
+		Upstreams  []upstreamArgs `yaml:"upstreams"`
 	}
 	upstreamArgs struct {
 		Addr string `yaml:"addr"`
+		// Bootstrap resolves THIS upstream's own host name and is never a query
+		// path. The machine's only resolver is the router, so a domain upstream
+		// without one cannot be dialled at all -- which is why it is rendered even
+		// though it is easy to mistake for "send these queries here".
+		//
+		// ONE address, not a list. mosdns takes a single string
+		// (forward.UpstreamConfig.Bootstrap) and calls netip.ParseAddr on all of it
+		// after splitting the port (pkg/upstream/utils.go:77-90), so a
+		// comma-joined pair is one malformed address. omitempty because an upstream
+		// given by IP address needs none, and writing `bootstrap: ""` would be a
+		// key mosdns would then have to reject.
+		Bootstrap string `yaml:"bootstrap,omitempty"`
 	}
 	// serverArgs is a listener, over either transport.
 	serverArgs struct {
@@ -278,7 +329,7 @@ type (
 // path or a wrong upstream is a resolver that answers from somewhere nobody
 // chose.
 func Render(policy config.Policy, paths Paths) ([]byte, error) {
-	resolved, err := resolve(paths)
+	resolved, err := resolve(policy, paths)
 	if err != nil {
 		return nil, err
 	}
@@ -307,6 +358,7 @@ func Render(policy config.Policy, paths Paths) ([]byte, error) {
 func renderable(policy config.Policy, paths resolvedPaths) document {
 	return document{
 		Log: logArgs{Level: logLevel},
+		API: apiArgs{HTTP: apiListenAddress},
 		Plugins: []pluginArgs{
 			{
 				Tag:  tagCNDomains,
@@ -369,7 +421,7 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 					// listener and not through mosdns's UDP transport, which
 					// re-sends an unanswered query and can drop an answer that
 					// arrived early.
-					ForeignUpstream: paths.ForeignListener,
+					ForeignUpstream: paths.echUpstream,
 					// The PUBLISHED prefix list, not the API's cached document: one
 					// prefix per line, written by the same fetch that writes the
 					// envelope. See candidate.DefaultCloudflarePrefixFileName.
@@ -379,12 +431,15 @@ func renderable(policy config.Policy, paths resolvedPaths) document {
 			{
 				Tag:  tagForeignCache,
 				Type: "cache",
-				Args: cacheArgs{Size: foreignCacheEntries},
+				Args: cacheArgs{Size: policy.ForeignCache.Size},
 			},
 			{
 				Tag:  tagForeignForward,
 				Type: "forward",
-				Args: forwardArgs{Upstreams: []upstreamArgs{{Addr: paths.ForeignListener}}},
+				Args: forwardArgs{
+					Concurrent: policy.Foreign.Concurrent,
+					Upstreams:  paths.forwardUpstreams,
+				},
 			},
 			{
 				// The domestic branch. The forwarder is the only executable: a
@@ -520,12 +575,26 @@ type resolvedPaths struct {
 	ForeignListener    string
 	Listen             string
 	DHCPUpstreamPort   int
+
+	// echUpstream is the ONE address the ECH key is fetched through. It is derived
+	// here rather than in renderable so that the routing document and the
+	// rewriter's own argument cannot disagree about it: it is the same value, read
+	// once, and there is no second place it is written.
+	//
+	// It is not the same thing as ForeignListener and it is not required to be. The
+	// foreign branch may forward to several upstreams while the ECH fetch -- which
+	// has no client watching it and no second answer to fall back on -- goes to the
+	// one that satisfies cdn_rewrite's tcp:// requirement.
+	echUpstream string
+	// forwardUpstreams is the enabled `upstream` entries, in policy order, already
+	// in the form the document carries. Derived here for the same reason.
+	forwardUpstreams []upstreamArgs
 }
 
 // resolve checks the paths and returns them in the form the document will carry.
 // A path is cleaned first, so a path that only looks outside /etc cannot be
 // rendered into it, and every refusal names the value that caused it.
-func resolve(paths Paths) (resolvedPaths, error) {
+func resolve(policy config.Policy, paths Paths) (resolvedPaths, error) {
 	resolved := resolvedPaths{}
 
 	for _, field := range []struct {
@@ -539,7 +608,6 @@ func resolve(paths Paths) (resolvedPaths, error) {
 		{"China list path", paths.CNDomains},
 		{"Cloudflare prefix list path", paths.CloudflarePrefixes},
 		{"state document path", paths.DHCPState},
-		{"foreign listener", paths.ForeignListener},
 		{"listen address", paths.Listen},
 	} {
 		if strings.TrimSpace(field.value) == "" {
@@ -613,7 +681,51 @@ func resolve(paths Paths) (resolvedPaths, error) {
 	if err != nil {
 		return resolvedPaths{}, err
 	}
-	foreign, err := checkForeignListener(strings.TrimSpace(paths.ForeignListener))
+	// The foreign route is DERIVED from the policy, and the packaged resolver's
+	// address is dnscrypt.ListenAddress() rather than a second copy of the string
+	// in this package.
+	//
+	// Paths.ForeignListener is still read, and still WINS when it is set, because it
+	// is the injection seam the integration tests use to point the document at a
+	// mock resolver (tests/integration/routing_test.go:457). ProductionPaths()
+	// leaves it empty, so the production document derives the listener from the
+	// dnscrypt entry -- and reads it from the dnscrypt package, so the two
+	// documents cannot disagree about where the resolver listens.
+	//
+	// What is derived here, in order, because each step needs the previous one:
+	//
+	//  1. the forward's upstream list, which is every enabled `upstream` entry in
+	//     policy order. A `dnscrypt` entry contributes none: it is a process, not
+	//     an address. Its listener becomes a forward upstream only when the
+	//     dnscrypt entry is on AND it is the injected listener (below), which is
+	//     the shape the tests inject.
+	//  2. the ECH source, which is the dnscrypt entry's listener when that entry is
+	//     on, and otherwise the first enabled tcp:// entry's address.
+	//
+	// cdn_rewrite refuses every non-tcp transport for the ECH fetch
+	// (plugin/executable/cdn_rewrite/cdn_rewrite.go:353) on a measured ground, so
+	// the udp and DoH entries an operator adds are ROUTED and are never the ECH
+	// source. config.Validate has already refused a policy with no ECH source at
+	// all; this is where a validated policy's ECH source is read once.
+	injected := strings.TrimSpace(paths.ForeignListener)
+	if injected != "" {
+		if _, err := checkForeignListener(injected); err != nil {
+			return resolvedPaths{}, err
+		}
+	}
+	// The dnscrypt entry's own listener, from the package that renders it.
+	listener := "tcp://" + dnscrypt.ListenAddress
+	if injected != "" {
+		listener = injected
+	}
+	resolved.ForeignListener = listener
+
+	if err := resolveForeignRoute(&resolved, policy, listener); err != nil {
+		return resolvedPaths{}, err
+	}
+
+	// The listener the router will dial, as an address it can be compared with.
+	foreign, err := checkForeignListener(listener)
 	if err != nil {
 		return resolvedPaths{}, err
 	}
@@ -631,7 +743,6 @@ func resolve(paths Paths) (resolvedPaths, error) {
 			listen, foreign,
 		)
 	}
-	resolved.ForeignListener = foreignURL(foreign)
 
 	port, err := checkDHCPUpstreamPort(paths.DHCPUpstreamPort)
 	if err != nil {
@@ -639,6 +750,87 @@ func resolve(paths Paths) (resolvedPaths, error) {
 	}
 	resolved.DHCPUpstreamPort = port
 	return resolved, nil
+}
+
+// resolveForeignRoute derives the forward's upstream list and the ECH source from
+// the policy, and writes both onto resolved. It is separate from resolve() because
+// it is the one part of path resolution that reads the POLICY rather than the
+// paths, and because it is the part with the reasoning worth keeping whole.
+//
+// listener is the address the dnscrypt entry stands for, already decided by the
+// caller: the packaged resolver's own address, or the injected one.
+func resolveForeignRoute(resolved *resolvedPaths, policy config.Policy, listener string) error {
+	// Every enabled `upstream` entry becomes exactly one forward upstream, in policy
+	// order, so the document and the policy are comparable by reading them side by
+	// side. A `dnscrypt` entry contributes none of its own: the entry names a
+	// process, and the address that reaches the process is the listener, which is
+	// added below when that entry is the route.
+	//
+	// The dnscrypt listener IS added when its entry is enabled, because a policy
+	// whose dnscrypt entry is on and which renders a forward that never dials it
+	// is a document that ignores the entry the operator left switched on. It is
+	// added FIRST when it is enabled, because the packaged resolver is the road an
+	// ECH failure is diagnosable against, and a document that races it against a
+	// DoQ endpoint it cannot diagnose is worse than one that offers both in order.
+	resolved.forwardUpstreams = nil
+	// The dnscrypt entry, when it is on, contributes the listener -- ALWAYS, and not
+	// only when no other upstream is configured.
+	//
+	// The first version of this added it in the "no upstream entries" branch, on the
+	// reasoning that a dnscrypt entry "names a process, not an address". That
+	// reasoning stopped one step short: the entry does not carry an address, but the
+	// route still has to REACH the process, and the only way to reach it is its
+	// listener. So the default policy -- one dnscrypt entry and one DoQ entry --
+	// rendered a forward that never dialled the packaged resolver at all, and the
+	// test that says the enabled entry is in the route is what caught it.
+	//
+	// It goes FIRST because it is the road an ECH failure is diagnosable against: a
+	// document that races the packaged resolver against a DoQ endpoint whose
+	// behaviour nothing in this project can observe is worse than one that offers
+	// both, in an order a reader can follow.
+	if config.ECHSource(policy.Foreign.Upstreams, listener) != "" {
+		packaged := false
+		for _, entry := range policy.Foreign.Upstreams {
+			if entry.IsEnabled() && entry.Kind == config.UpstreamKindDNSCrypt {
+				packaged = true
+				break
+			}
+		}
+		if packaged {
+			resolved.forwardUpstreams = append(resolved.forwardUpstreams, upstreamArgs{Addr: listener})
+		}
+	}
+	for _, entry := range policy.Foreign.Upstreams {
+		if !entry.IsEnabled() || entry.Kind != config.UpstreamKindUpstream {
+			continue
+		}
+		// The policy's list holds at most one entry, enforced by
+		// config.ValidateOneUpstream against mosdns's own single-address parsing.
+		// Joining a list here would render a document the router refuses to load,
+		// so the first entry is taken and the validation is what makes that safe.
+		bootstrap := ""
+		if len(entry.Bootstrap) > 0 {
+			bootstrap = entry.Bootstrap[0]
+		}
+		resolved.forwardUpstreams = append(resolved.forwardUpstreams, upstreamArgs{
+			Addr:      entry.Addr,
+			Bootstrap: bootstrap,
+		})
+	}
+	if len(resolved.forwardUpstreams) == 0 {
+		// The policy validated, so this means the dnscrypt entry is the route and
+		// it is on. That is the DEFAULT configuration, not a fault.
+		return config.ErrNoECHSource
+	}
+	resolved.echUpstream = config.ECHSource(policy.Foreign.Upstreams, listener)
+	if resolved.echUpstream == "" {
+		// config.Validate refuses this policy before it reaches here, so an empty
+		// source at this point means the caller handed a policy that was never
+		// validated. Refusing it here is what keeps the renderer from producing a
+		// document whose ECH fetch silently has nowhere to go.
+		return config.ErrNoECHSource
+	}
+	return nil
 }
 
 // checkDHCPUpstreamPort resolves the port a published DHCP DNS address is dialled

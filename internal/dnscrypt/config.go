@@ -24,7 +24,18 @@ import (
 // is not reachable from off-host, and not port 53 so it can never be mistaken
 // for the system resolver this router is meant to keep out of foreign queries.
 const (
-	listenAddress = "127.0.0.1:15353"
+	// ListenAddress is the address the rendered resolver document binds, as
+	// host:port. It is EXPORTED so the routing renderer reads the same value this
+	// document writes.
+	//
+	// A second copy of this string in the routing package is how a test asserting
+	// the two documents agree comes to pass while they do not agree -- and the
+	// agreement is the whole of what the ECH fetch's correctness rests on, because
+	// cdn_rewrite fetches the key through this address. Exported, it is a name the
+	// other package has to reference rather than a literal it can drift from.
+	ListenAddress = "127.0.0.1:15353"
+
+	listenAddress = ListenAddress
 	netprobeHost  = "9.9.9.9:443"
 
 	// netprobeTimeoutSeconds bounds how long the resolver waits for the network

@@ -96,7 +96,7 @@ func TestAWellFormedEntryIsAccepted(t *testing.T) {
 	for _, entry := range []ForeignUpstream{
 		{Kind: UpstreamKindDNSCrypt, Name: "quad9-dnscrypt"},
 		{Kind: UpstreamKindUpstream, Name: "quad9-doq", Addr: "quic://dns.quad9.net:853",
-			Bootstrap: []string{"9.9.9.9:53", "149.112.112.9:53"}},
+			Bootstrap: []string{"9.9.9.9:53"}},
 		{Kind: UpstreamKindUpstream, Name: "off", Addr: "tls://dns.quad9.net:853", Enabled: &enabled},
 		// A DoH endpoint REQUIRES its path, because mosdns passes the whole URL
 		// through as the endpoint (upstream.go:474). An earlier version of this
@@ -297,5 +297,28 @@ func TestTheDefaultPolicySatisfiesTheNoECHSourceRule(t *testing.T) {
 func TestTheDefaultPolicyValidates(t *testing.T) {
 	if err := Defaults().Validate(); err != nil {
 		t.Fatalf("Defaults() does not validate: %v", err)
+	}
+}
+
+// mosdns reads ONE bootstrap per upstream, and the way it reads it makes two a
+// malformed address rather than a list: parseBootstrapAp splits the port off and
+// calls netip.ParseAddr on the rest (pkg/upstream/utils.go:77-90). So a second
+// resolver has to be a second entry, and this case says so rather than leaving the
+// operator to find out at startup.
+func TestTwoBootstrapsAreRefusedBecauseMosdnsReadsOnlyOne(t *testing.T) {
+	entry := ForeignUpstream{
+		Kind: UpstreamKindUpstream, Name: "doq", Addr: "quic://dns.quad9.net:853",
+		Bootstrap: []string{"9.9.9.9:53", "149.112.112.9:53"},
+	}
+	err := ValidateOneUpstream(entry)
+	if err == nil {
+		t.Fatal("two bootstraps were accepted, so they render into one comma-joined " +
+			"string that mosdns refuses as a malformed address")
+	}
+	for _, want := range []string{"ONE", "utils.go:77-90"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q, so an operator cannot tell that "+
+				"the limit is mosdns's rather than arbitrary: %v", want, err)
+		}
 	}
 }
