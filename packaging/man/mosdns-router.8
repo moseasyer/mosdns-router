@@ -23,10 +23,109 @@ A hand edit to it is an edit the next render overwrites, and the file says in it
 own header that it is generated and by what.
 .SS The two branches
 There are two and there is no third. A name the pinned China list matches goes to
-the DNS servers the DHCP lease published, and every other name goes to the loopback
-DNSCrypt resolver over TCP. There is no fallback between them: a foreign query
-that cannot be answered fails, and is never re\-asked inside the network the user
-is leaving.
+the DNS servers NetworkManager has in use for that device, and every other name
+goes to the loopback DNSCrypt resolver over TCP. There is no fallback between them:
+a foreign query that cannot be answered fails, and is never re\-asked inside the
+network the user is leaving.
+.SS "Where the domestic branch gets its resolvers"
+A NetworkManager dispatcher hook publishes the resolvers in use, and the router
+reads what it published. The hook is not this package's idea of a DHCP client: it
+asks NetworkManager, in order, for the raw lease's
+.B domain_name_servers
+, then this event's own dispatcher variables, then the device's effective DNS, and
+only then
+.BR "resolvectl dns" .
+The first of those that answers is the one recorded, and it is recorded as the
+SOURCE rather than the event \(em a lease renewal, an interface coming up, and a
+resolver list that changed are one state when the addresses did not move, and
+treating them as three would flush the router's cache for resolvers that never
+changed.
+.PP
+So a
+.B manually configured
+resolver is found, and found the ordinary way: a connection with
+.B ipv4.method manual
+has no lease at all, the lease queries answer with nothing, and the device's
+effective DNS is the operator's own
+.BR ipv4.dns .
+The event that carries it is
+.BR dns\-change ,
+which is the one whose name promises a lease and never delivers one.
+.PP
+Two things about that case are worth knowing.
+.IP \(bu 2
+The install records and restores
+.BR ipv4.dns ,
+.BR ipv6.dns ,
+and both
+.B ignore\-auto\-dns
+properties, so an operator's manual resolver list survives an uninstall. It is
+recorded whether or not this package changed it, because a hand restore is how a
+machine ends up with no DNS.
+.IP \(bu 2
+A statically configured resolver that is
+.B changed
+is picked up without rebooting the interface. The hook fires on
+.B dns\-change
+and the router adopts the new list on its next query.
+.PP
+The one thing that is not automatic is the resolver being reachable. This package
+records what the machine was told to use; it does not keep a hand\-typed address
+alive.
+.SH WHEN THE NETWORK CHANGES
+The hook runs for
+.BR up ,
+.BR dhcp4\-change ,
+.BR dhcp6\-change " and " dns\-change ,
+and does nothing at all for any other event NetworkManager sends it \(em it exits
+zero without touching a file, because NetworkManager calls it for events that have
+nothing to do with DNS and an error there would be noise in its log).
+.PP
+.B down
+is the one event that publishes rather than collects, and it publishes an
+EMPTY list: the addresses the collector would find belong to a lease that no
+longer exists. The router's domestic branch then fails closed, by design \(em
+forwarding a domestic query to a resolver on a network that is gone would be a
+worse answer than no answer. Foreign names are unaffected; they go to the loopback
+DNSCrypt resolver and never depended on the lease.
+.PP
+On a machine that is unplugged for a while, that means domestic names do not
+resolve until the interface comes back and a
+.B up
+or
+.B dhcp4\-change
+event arrives. This is the shipped behaviour and it is a policy rather than a
+default:
+.B dhcp.failure_policy
+in
+.IR /etc/mosdns/policy.yaml
+is
+.BR disable\-current ,
+and
+.B use\-last\-good
+instead keeps serving the last published set that had resolvers and reports how old
+it is. Both are honest answers; only one of them will talk to a dead address.
+.SS "What the router does while nothing has changed"
+It re\-reads the published state on every query rather than at start\-up, comparing
+the file's device and inode as well as its size and timestamp, so a replacement
+that happens to be the same length and the same age is still a new document. A
+generation that is not newer than the one in service is refused, and a read that
+fails leaves the current generation serving and is retried on the next query rather
+than at the next event.
+.PP
+A replaced generation keeps its clients for sixty seconds while the new one takes
+over, so a resolver change does not interrupt an exchange already in flight. That
+window is a fixed property of the plugin and not a policy key: the only settings
+for
+.B dhcp_forward
+are in the generated routing document, and
+.IR dhcp.failure_policy
+in
+.I /etc/mosdns/policy.yaml
+is the one an operator is expected to change.
+.PP
+To see what the router believes, without reading JSON:
+.RB " sudo mosdns\-cdnctl status \-\-dhcp /run/mosdns/dhcp\-upstreams.json"
 .SS What is rewritten
 Only what comes back from the foreign branch, and only that:
 .B cdn_rewrite

@@ -21,9 +21,18 @@ mosdns\-cdnctl \- render, measure, prove and publish this router's configuration
 .B mosdns\-cdnctl
 .I test
 .RB [ \-\-apply ]
+.RB [ \-\-report\ \fIPATH\fR ]
+.br
+.B mosdns\-cdnctl
+.I apply
+.I REPORT
 .br
 .B mosdns\-cdnctl
 .I health\-check
+.br
+.B mosdns\-cdnctl
+.I status
+.RB ( \-\-selector\ \fIPATH\fR | \-\-dhcp\ \fIPATH\fR | \-\-ech\ \fIPATH\fR )
 .br
 .B mosdns\-cdnctl
 .I pin
@@ -118,16 +127,298 @@ how old the snapshot is.
 Where the two pinned files above are, defaulting to the paths this package
 installs them at. The installer runs this command with no paths at all, so the
 defaults are the only thing that makes an offline install possible.
-.SS test, pin, unpin
-The measurement. One invocation of
+.SS test
+Measures which Cloudflare address serves this machine best, and reports it. One
+invocation of
 .B test \-\-apply
-is the whole nightly: the measurement phases and the final identity proof, so the
-address that is published was proved against what was just measured rather than
-against a report written two hours ago.
+is the whole nightly: the measurement phases and the final identity proof in one
+run, so the address that is published was proved against what was just measured
+rather than against a report written two hours ago. That is why the unit runs this
+verb and not
+.BR "apply" (1).
+.PP
+Without
+.B \-\-apply
+it publishes nothing and changes nothing, and it still spends the bandwidth budget
+\(em the measurement is the expensive part and the write is free. A report\-only run
+is therefore not a free look at the network.
+.PP
+Run it by hand as root; the published files are owned by the control identity and
+mode 0640, so an unprivileged run cannot write them.
+.RB [ \-\-report\ \fIPATH\fR ]
+writes the measurement document there as well as to standard output, and is what
+makes
+.BR apply (1)
+possible. It refuses rather than overwriting an existing file, so a report is never
+destroyed by re\-running the command that wrote it.
+.PP
+.SS "What the measurement does"
+Seven phases, in this order, and the order is the design rather than an
+implementation detail:
+.TP
+.B collect
+Candidates are grouped by provider and hostname. The addresses already in service
+are added back as retained candidates, so a measurement cannot forget the address
+that is currently working.
+.TP
+.B tcp
+Three connection samples per candidate, giving p50, p95, jitter and loss.
+.TP
+.B identity
+An HTTPS request per identity profile, proving the candidate is the provider it
+claims to be and measuring TLS, TTFB and total time. A candidate that fails here
+is never scored.
+.TP
+.B latency
+The proved candidates are ranked by latency and the best
+.I cdn.latency_candidate_count
+(10 by default) go on to the expensive phase.
+.TP
+.B bandwidth
+A bounded download per candidate. This is what the daily budget is spent on.
+.TP
+.B score
+Latency, bandwidth and stability are combined as 0.45, 0.45 and 0.10. Candidates
+are drawn from the union of the top few by latency and the top few by bandwidth, so
+neither measurement alone decides. A candidate over the loss or latency ceiling is
+excluded rather than ranked.
+.TP
+.B final\-proof
+With
+.B \-\-apply
+only: the winner is proved once more under the control lock, immediately before it
+is written. An address that stopped serving between the measurement and the write
+is refused here and nothing is published.
+.PP
+A candidate is not replaced merely by scoring higher. The new address has to beat
+the one in service by
+.IR cdn.switch_improvement_percent " (10 by default),"
+or the current address is kept. A run that cannot find an improvement is a normal
+outcome, not a failure.
+.SS "The report"
+Standard output, one
+.I key: value
+per line, and every line name below is stable. What a reader usually wants is:
+.TP
+.B outcome:
+the run's own verdict. Per\-group
+.B outcome:
+lines follow, and the two are not the same answer \(em one group publishing while
+another keeps its mapping is "published" overall and "kept" for the group that did
+not. A group that kept its address says why in
+.BR outcome\-reason: .
+.TP
+.B applied: \fIADDRESS\fR
+What is now in service, or
+.B "applied: nothing"
+when
+.B \-\-apply
+was not given.
+.TP
+.BR budget\-used\-bytes: ", " budget\-limit\-bytes: ", " budget\-remaining\-bytes:
+The day's budget. See
+.B BANDWIDTH BUDGET
+below before running this by hand.
+.TP
+.BR budget\-exhausted: ", " settle\-refused:
+Set when the run could not measure. Every group then keeps its mapping.
+.TP
+.B final\-proof:
+Whether the address about to be published was proved again.
+.B "not run"
+is the correct line for a report\-only run and does not mean anything failed.
+.TP
+.BR "  candidate: ", "    detail: ", "  winner: ", "  no\-winner: "
+Per\-candidate lines, indented under their
+.BR group: .
+A candidate that was excluded says which ceiling it was over; one that qualified
+carries its score and whether a switch was allowed.
+.PP
+.BR generated\-at: ", " config\-sha256:
+The report's own timestamp and the digest of the configuration it measured. The
+configuration digest is what
+.B apply
+checks, so a report written against one policy cannot be applied to another.
+.PP
+.BR stale\-candidates: ", " p10\-bytes\-per\-second: ", " identity\-body\-bytes: ", " skipped\-retained: ,
+Measurement detail. A stale candidate set means the ranges in use no longer match
+what the source publishes today.
+.SS apply
+Publishes an address from a report written earlier, without measuring again. The
+report is at most two hours old, measured from
+.BR generated\-at: ,
+and was written against the configuration this machine is still running; a report
+failing either check is refused and nothing is published.
+.PP
+This is the verb to reach for when a measurement has already been taken and read,
+and the answer is not to change anything now. When the answer is to change something
+with fresh evidence, run
+.B test \-\-apply
+instead \(em it re\-measures and re\-proves in one invocation, so an operator who
+wants a current answer is never stuck with an old report. Nothing schedules this
+verb; it is an operator's.
+.SS "pin, unpin"
 .B pin
-and
+stops the optimizer for one address, which is how an operator keeps a chosen IP in
+service. As root:
+.RB " sudo mosdns\-cdnctl pin " 203.0.113.7
+proves the address against every identity profile under the control lock before
+storing it, so a pin cannot publish an address that does not serve. The selector
+goes to
+.BR manual .
+.PP
+Three consequences of that mode, all of them intended and none of them obvious:
+.TP
+.IP \(bu 2
+The nightly run refuses to publish anything and exits
+.BR 3 .
+The unit's
+.B SuccessExitStatus=4
+does not excuse 3, so the timer shows a failure. That failure is the pin working.
+.TP
+.IP \(bu 2
 .B unpin
-stop the optimizer for one address.
+returns the selector to
+.BR auto ,
+and until the next nightly runs there is
+.B no address in service:
+the pinned address moves to
+.B fallback_ip
+and the proof is cleared. Queries use the provider's own answer until then, which
+is correct but is not the same as an optimization. This is the one to know about
+before unpinning on a machine that was relying on it.
+.TP
+.IP \(bu 2
+The health check can still move a pinned address out of service.
+.B health\-check
+does not honour the pin: if the pinned address fails
+.I cdn.health.failure_threshold
+times it is moved to the fallback. A pin is a statement about which address to
+prefer, not a claim that the address is immortal.
+.PP
+A per\-hostname CloudFront mapping in
+.I cloudfront\-domains.yaml
+is not affected by either verb.
+.SS "Turning the optimization off"
+Three ways, and they are not equivalent.
+.TP
+.B "Stop scheduling it"
+.B sudo systemctl disable \-\-now mosdns\-cdn\-optimizer.timer
+Nothing runs nightly. Whatever address is published stays published until its
+proof window closes \(em see below.
+.TP
+.B "Stop it and use one address"
+.BR pin ,
+then
+.BR "systemctl disable \-\-now mosdns\-cdn\-optimizer.timer" .
+This is the setting for an operator who has a preferred address and does not want
+anything else considered.
+.TP
+.B "Stop rewriting entirely"
+Set
+.B "mode: disabled"
+in
+.IR /var/lib/mosdns/runtime/cdn\-selector.json .
+The rewriter then returns the provider's own address for every query, the health
+check does nothing, and
+.B test \-\-apply
+and
+.B pin
+both refuse against a disabled selector.
+.PP
+Nothing in this package writes that mode. It is reachable only by hand, deliberately:
+there is no flag for it, because a switch that silently stops an optimization
+nobody asked to stop is a worse default than no switch. Edit the file while the
+router is running; the rewriter reads it about twice a second.
+.SS status
+Prints published state as sorted
+.I key=value
+lines, and writes nothing. It is the supported way to see what the router is
+actually using, rather than what a report said at some earlier moment.
+.PP
+At least one path is required. The three state documents are independent and may
+be asked for together, in which case each is prefixed with its name.
+.TP
+.B \-\-selector \fIPATH\fR
+The CDN selector. On a default installation:
+.RB " sudo mosdns\-cdnctl status \-\-selector /var/lib/mosdns/runtime/cdn\-selector.json"
+prints
+.BR generation: ", " mode: ", " provider: ", " schema_version: ",\nand then
+.BR winner_ip: ", " fallback_ip: ", " winner_proof_until: " and " last_success:
+when they are set. An empty optional field is omitted rather than printed blank, so
+a missing winner cannot be mistaken for a configured one.
+.B winner_proof_until
+in the past means the address is published but
+.B not being used
+\(em see
+.BR "The proof window" .
+.PP
+.B "mode: auto, manual or disabled"
+is the whole of the selector's state, and a fourth value is refused rather than
+interpreted.
+.TP
+.B \-\-dhcp \fIPATH\fR
+The DHCP bridge's published upstream set \(em which resolvers the domestic branch is
+forwarding to, which interface they came from, and which source answered.
+.IR /run/mosdns/dhcp\-upstreams.json .
+.TP
+.B \-\-ech \fIPATH\fR
+The forced\-ECH state \(em which source the key came from, its
+.BR public_name: ", its digests and its expiry.
+.IR /var/lib/mosdns/runtime/ech\-state.json .
+.PP
+A missing or invalid document is a named refusal on standard error and exit 3; a
+missing file is the normal answer on a machine where that feature has never run.
+Values containing a control character are refused whole rather than printed.
+.SS "The proof window"
+The rewriter only substitutes an address while
+.B winner_proof_until
+is in the future, and the window is five minutes. It is refreshed by
+.B health\-check
+on every passing run, which is why that timer runs every two minutes.
+.PP
+This has a consequence worth stating plainly: if
+.BR mosdns\-cdn\-health.timer (5)
+is stopped, or the health check keeps failing,
+.B the rewrite stops about five minutes later and nothing anywhere says so.
+DNS keeps working \(em queries get the provider's own address \(em but the
+optimization is gone, silently. If the address in service appears to have stopped
+being used, check that timer first:
+.BR "systemctl status mosdns\-cdn\-health.timer" .
+.SS "BANDWIDTH BUDGET"
+The daily budget is what makes a nightly measurement affordable, and it is
+.I cdn.bandwidth.daily_budget
+(104857600 by default, which is
+.I per_candidate_limit
+times ten). Each candidate's measurement is bounded by
+.I per_candidate_limit
+and
+.IR per_candidate_seconds .
+.PP
+The shipped numbers mean one full run of
+.B test
+spends the entire day's budget:
+.I latency_candidate_count
+is 10 and
+.I per_candidate_limit
+is one tenth of the day. So the first
+.B test
+an operator runs by hand is the last measurement that day, and the next nightly
+find
+.B budget-exhausted: true
+\(em which is
+.B not
+a failure. It exits 0, and every group keeps the mapping it already had, because a
+run that cannot afford to measure does not get to change the address in service.
+.PP
+Read
+.B budget\-remaining\-bytes:
+in the report before running this by hand on a machine you care about. Waiting for
+the 03:00 timer, or raising
+.I daily_budget
+in
+.IR policy.yaml ,
+both work; what does not work is expecting a hand run to be free.
 .SS health\-check
 Takes the address in service out of service if it is failing. It proves the
 published winner and every published per\-hostname mapping against their own
@@ -192,9 +483,9 @@ The watchdog's failure streak, mode 0600, in a directory of its own at 0700
 .BR root:root .
 Both are deliberate:
 .BR /run/mosdns " itself is"
-.BR root:mosdns " 2770 with a default ACL, because the DHCP bridge publishes"
+.BR "root:mosdns\-router 2770 with a default ACL, because the DHCP bridge publishes"
 there as
-.BR mosdns-cdn ,
+.BR mosdns\-router\-cdn ,
 and unlink and rename are the containing directory's decision rather than a
 file's, so a 0600 file in that directory could still be deleted or replaced by
 that identity. Nothing but the watchdog reads this record.
@@ -240,11 +531,55 @@ transaction and the rollback create it.
 The pinned China domain list, published by
 .B update\-lists
 and verified against
-.IR source\-lock.json .
+.IR source\-lock.json ,
+mode 0640. Both are the operator's rather than the package's: an upgrade never
+replaces them, because replacing a list somebody reviewed is how a reviewed pin
+becomes one nobody reviewed.
+.I source\-lock.json
+records the digest of the list beside it, so the pair is self\-describing; a list
+whose digest does not match its lock is refused at install time rather than
+classified against.
+.TP
+.I /var/lib/mosdns/runtime/cdn\-selector.json
+The published address in service, mode 0640, and the file the whole optimization
+exists to write. Read it with
+.B status \-\-selector
+rather than by eye; the fields are
+.BR generation: ", " mode: ", " provider: ", " schema_version: ", " winner_ip: ", "
+.BR fallback_ip: ", " winner_proof_until: " and " last_success: ,
+and the two timestamps are RFC 3339 in UTC.
+.PP
+It is a conffile's worth of state in a directory dpkg does not own, and it is
+written by the optimizer, the health check and an operator's own
+.BR pin ,
+so
+.B generation
+increases monotonically and a reader that sees it go backwards is looking at a
+document that was replaced rather than updated. A selector naming a winner with no
+.B last_success
+is refused by the router, which is what stops a stale file being treated as a live
+one.
+.TP
+.I /var/lib/mosdns/runtime/health.json
+The health check's verdict on the address in service and on every published
+per\-hostname mapping, at mode 0640. Its consecutive\-failure count is what
+.I cdn.health.failure_threshold
+is compared against before the winner and the fallback are swapped. Read
+.B health\-check 's own output rather than this file: it prints the same facts
+along with the reason a proof was refused.
+.TP
+.I /var/lib/mosdns/runtime/bandwidth\-budget.json
+What the day's budget has been spent on, with its lock beside it. This is why a
+second
+.B test
+on the same day measures no bandwidth \(em see
+.BR "BANDWIDTH BUDGET" .
+Delete it to reset the day, which is occasionally useful on a router being
+diagnosed and is not something to do routinely.
 .TP
 .I /var/lib/mosdns/lists/cloudflare\-prefixes.txt
-The prefix list the response rewriter classifies against. It is a hard start
-requirement: the plugin refuses to CONSTRUCT without it, so a router with no
+The prefix list the response rewriter classifies against, mode 0644. It is a hard
+start requirement: the plugin refuses to CONSTRUCT without it, so a router with no
 published ranges binds nothing on port 53.
 .B \-\-refresh\-ranges
 publishes it, beside
@@ -285,7 +620,9 @@ The verb did what was asked.
 A usage error, or a report the command wrote to standard output.
 .TP
 .B 3
-The command produced no report at all, or refused to publish.
+The command produced no report at all, or refused to publish. It is also what a
+pinned selector produces when a measurement tries to apply, which is the pin
+working rather than a fault.
 .TP
 .B 4
 The shared control lock was held by another process, or a state could not be

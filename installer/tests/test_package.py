@@ -2947,6 +2947,264 @@ class PinnedRangeSnapshotTests(_Staged):
         # the words are the words.
         self.assertIn("without asking", conffiles.lower())
 
+    def test_the_manual_documents_every_verb_the_tool_implements(self):
+        """A verb that exists and is not in the SYNOPSIS is a verb nobody can find.
+
+        The gap this exists for is measured. `apply` and `status` were both fully
+        implemented and neither appeared in the SYNOPSIS or the DESCRIPTION; the
+        only mention of `status` anywhere in shipped documentation was one example
+        line inside a conffile, for the ECH state rather than the selector. An
+        operator reading this manual could not have discovered that
+        `mosdns-cdnctl status --selector` is the supported way to see which
+        preferred address is in service.
+
+        **Read the SYNOPSIS, and read it as a reader would.** The verb list is cut
+        out of the roff between `.SH SYNOPSIS` and `.SH DESCRIPTION` and the
+        macro noise is stripped, rather than the verbs being restated as constants
+        here: a test that holds its own copy of a list is a second thing that can
+        disagree with the manual, and this project has shipped that defect
+        repeatedly.
+        """
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-cdnctl.1")
+        # **The raw roff, not `shipped_prose`.** That helper exists because a
+        # sentence has to be read as a sentence, and it does its job by JOINING
+        # every line of the document into one string -- which destroys the one
+        # thing this case is about. A SYNOPSIS is a list: the verb is on its own
+        # line and the flags are on the next, and `(?m)^\s*verb\b` is exactly the
+        # assertion that reads that shape. The first version ran it over the
+        # flattened prose and reported all ten verbs missing from a SYNOPSIS that
+        # lists all ten, which is the third time in this project that a gate
+        # failed for reading a document in a shape the document does not have.
+        raw = (REPO / "packaging" / "man" / "mosdns-cdnctl.1").read_text(encoding="utf-8")
+        section = re.search(r"^\.SH SYNOPSIS$(.*?)^\.SH DESCRIPTION$", raw, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(
+            section, "mosdns-cdnctl(1) has no SYNOPSIS section, so there is nowhere a reader "
+            "would look to find out what this tool can do",
+        )
+        synopsis = section.group(1)
+        # The macro prefix is part of the line, and a SYNOPSIS line is `.I render`
+        # rather than `render` -- so the assertion allows an optional macro before
+        # the verb. Removing the macro NAME is what `shipped_prose` does elsewhere,
+        # and doing it here too is what keeps the two readers agreeing about the
+        # same file.
+        prologue = r"(?:\.[A-Za-z]+(?:\([^)]*\))?\s*)*"
+        # **The hyphen is optional-backslash-or-nothing, and it has to be.** roff
+        # writes a hyphen as `\-` so it cannot be read as a hyphen-minus option, so
+        # the SYNOPSIS says `update\-lists` while the dispatch table says
+        # `update-lists` and `re.escape` reduces the Go side to a bare `-`. The
+        # first version matched the three hyphenated verbs against the literal and
+        # reported them missing from a SYNOPSIS that lists them. `\\?` is a regex
+        # for an optional literal backslash, which is exactly what is between the
+        # two spellings.
+        def as_roff(verb):
+            return r"\\?-".join(re.escape(part) for part in verb.split("-"))
+        # The tool's own dispatch table, so the expectation is the code rather than
+        # a list written beside it. **`case` arms of the TOP-LEVEL dispatch only**,
+        # and that is a real narrowing rather than a convenience: the first version
+        # took every `case "…":` in the file and picked up `dhcp` and `ech`, which
+        # are the `--dhcp` and `--ech` FLAGS of `status` and not verbs at all. A
+        # gate that cannot tell a verb from a flag reports a manual for documenting
+        # commands that do not exist.
+        dispatch = (REPO / "cmd" / "mosdns-cdnctl" / "main.go").read_text(encoding="utf-8")
+        table = re.search(r"switch args\[0\] \{(.*?)\n\t\}", dispatch, re.DOTALL)
+        self.assertIsNotNone(
+            table, "the top-level verb dispatch was not found in main.go, so this case cannot "
+            "know what the tool implements"
+        )
+        implemented = sorted(set(re.findall(r'case "([a-z][a-z-]*)":', table.group(1))))
+        self.assertTrue(implemented, "no verb was read out of the tool's own dispatch table")
+        for verb in implemented:
+            with self.subTest(verb=verb):
+                self.assertRegex(
+                    synopsis, rf"(?m)^\s*{prologue}{as_roff(verb)}\b",
+                    f"mosdns-cdnctl implements `{verb}` and the SYNOPSIS does not list it, so "
+                    "the one place a reader looks for what this tool can do does not mention it",
+                )
+        # `status` needs a flag, and the SYNOPSIS cannot say that with an
+        # alternation. A reader who typed the bare verb gets a refusal, so the
+        # refusal has to be in the manual rather than being the first thing the
+        # tool says to them.
+        self.assertIn(
+            "at least one path is required", manual,
+            "the SYNOPSIS shows `status` with an alternation of flags and the manual never says "
+            "one is required, so the first thing `mosdns-cdnctl status` says to an operator who "
+            "read the manual is a usage refusal",
+        )
+
+    def test_the_manual_documents_the_state_documents_an_operator_has_to_read(self):
+        """The published state is invisible in the manual, and one of the four is the
+        whole point of the feature.
+
+        `cdn-selector.json` holds the preferred address in service. It was in
+        neither manual's FILES section, along with `health.json` and
+        `bandwidth-budget.json`, so the only way to find out what the router was
+        using was to read the source.
+
+        **The paths come from the code**, not from constants here, for the reason
+        the rest of this file keeps giving: two files spelling one path is how they
+        drift. Each default is read out of the module that owns it and then required
+        to be in the manual's FILES section, which also means renaming a state file
+        fails this case instead of quietly leaving the documentation behind.
+        """
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-cdnctl.1")
+        for variable, source, description in (
+            ("DefaultSelectorPath", REPO / "internal" / "optimizer" / "runner.go", "the preferred address in service"),
+            ("DefaultHealthPath", REPO / "internal" / "health" / "checker.go", "the health verdict"),
+            ("DefaultBudgetPath", REPO / "internal" / "optimizer" / "budget.go", "the day's bandwidth spend"),
+        ):
+            with self.subTest(constant=variable):
+                match = re.search(
+                    rf'{variable}\s*=\s*"([^"]+)"', source.read_text(encoding="utf-8")
+                )
+                self.assertIsNotNone(
+                    match, f"{variable} was not found in {source.name}, so this case cannot name the path"
+                )
+                self.assertIn(
+                    match.group(1), manual,
+                    f"{description} lives at {match.group(1)} and the manual's FILES section does "
+                    "not list it, so an operator cannot find the file the feature exists to write",
+                )
+
+    def test_the_manual_states_the_outcomes_an_operator_cannot_infer_from_a_success(self):
+        """A run that reports success and changed nothing is the worst kind, and it
+        has to be documented rather than discovered.
+
+        Three cases, and all three are silent on the exit status a timer records:
+
+          * **the daily bandwidth budget ran out.** The shipped numbers make one
+            hand-run `test` exhaust the day, and the run then keeps every mapping
+            and exits 0. An operator who ran `test --apply` to fix something sees
+            `applied: <address>` and concludes their change took effect.
+          * **the proof window closed.** If the health timer is stopped the rewrite
+            stops about five minutes later, with nothing anywhere saying so. DNS
+            keeps working, which is what makes it hard to notice.
+          * **`pin` refuses the nightly.** A pinned selector exits 3, which the
+            unit's `SuccessExitStatus=4` does not excuse, so a correctly pinned
+            router shows a failing timer forever.
+
+        Asserted as prose because that is what it takes: each of these is a sentence
+        an operator has to be able to find, and none of them is a code path a
+        substring over the source can check.
+        """
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-cdnctl.1")
+        # Lower-cased, because `shipped_prose` lower-cases: it is a reader of
+        # sentences, and roff has no case to preserve a proper noun with. An
+        # assertion written against the raw casing would fail on a manual that
+        # says the thing in the sentence rather than in a variable name, which is
+        # the wrong way round for a documentation gate.
+        lowered = manual.lower()
+        for phrase, because in (
+            ("budget-exhausted", "the budget running out looks exactly like a successful run"),
+            ("winner_proof_until", "an address published but not used has to be distinguishable from one in service"),
+            ("successexitstatus", "a pinned router's nightly exits 3 forever and that is the pin working"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase, lowered,
+                    f"mosdns-cdnctl(1) does not mention {phrase!r}, so an operator meets "
+                    f"{because} with nothing written down to explain it",
+                )
+
+    def test_the_manual_documents_the_selector_modes_and_how_to_stop_the_feature(self):
+        """Three ways to stop it, none of them equivalent, and all three were absent.
+
+        The selector has three modes -- `auto`, `manual`, `disabled` -- and the
+        manual named none of them. `disabled` in particular is reachable only by
+        hand-editing the state file, because nothing in the project writes it, which
+        makes it both the most complete way to stop rewriting and the one an
+        operator has no way to guess.
+
+        The modes are read out of the validator rather than restated, so a fourth
+        mode fails this case.
+        """
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-cdnctl.1")
+        modes = re.findall(
+            r'"(auto|manual|disabled)"',
+            (REPO / "internal" / "state" / "types.go").read_text(encoding="utf-8"),
+        )
+        self.assertTrue(modes, "no selector mode was read out of the validator")
+        for mode in sorted(set(modes)):
+            with self.subTest(mode=mode):
+                # **In the same sentence as `mode:`, not as a bare word.** `manual`
+                # and `auto` are ordinary English and occur all over a manual that
+                # says "runs this by hand" and "the watchdog's default is on" -- a
+                # bare substring would pass on a manual naming neither mode, which
+                # is the state this case exists to catch. The window is generous
+                # because `shipped_prose` joins roff arguments with `", "`, so an
+                # enumeration of three modes never lands as three adjacent words.
+                self.assertRegex(
+                    manual,
+                    rf"mode:[^.]{{0,60}}\b{re.escape(mode)}\b"
+                    rf"|\b{re.escape(mode)}\b[^.]{{0,60}}mode:",
+                    f"the selector accepts `mode: {mode}` and the manual never names it as one of "
+                    "the three, so an operator reading the manual cannot tell what state their "
+                    "router is in",
+                )
+        self.assertIn(
+            "mosdns-cdn-optimizer.timer", manual,
+            "the manual does not say how to stop the optimizer being scheduled, which is the "
+            "first thing an operator who wants their address left alone would try",
+        )
+
+    def test_the_router_manual_documents_the_network_cases_an_operator_will_hit(self):
+        """Three cases the manual was silent on, and they are the three that happen.
+
+        The DHCP bridge handles all three correctly and none of them was written
+        down anywhere:
+
+          * **a statically configured resolver.** A connection with
+            `ipv4.method manual` has no lease, so the resolvers come from the
+            device's effective DNS rather than from `domain_name_servers`. An
+            operator who configured their own resolver had no way to learn that it
+            works, or that `dns-change` is the event that tells the router their
+            list moved.
+          * **unplugging the cable.** `down` publishes an EMPTY upstream list by
+            design, so the domestic branch fails closed until an `up` or
+            `dhcp4-change` arrives. That is deliberate rather than a bug, it is
+            the opposite of what "the network went away" intuitively means, and it
+            is the one behaviour of this package an operator is most likely to
+            report as a defect.
+          * **`dhcp.failure_policy`.** The knob that decides between failing closed
+            and keeping the last resolvers, in a policy file the manual otherwise
+            tells the operator to edit.
+
+        The event names are read out of the bridge rather than restated, so a
+        renamed action fails this case instead of leaving the manual describing a
+        machine that does not exist.
+        """
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-router.8")
+        lowered = manual.lower()
+        for phrase, because in (
+            ("ipv4.method manual", "an operator with a hand-configured resolver cannot tell "
+                                   "that it is used, or which event reports a change to it"),
+            ("dns-change", "the event a static-IP machine actually produces was named nowhere"),
+            ("empty list", "unplugging the cable fails the domestic branch closed by design, and "
+                           "that reads exactly like a defect when nobody has said so"),
+            ("dhcp.failure_policy", "the knob that decides between failing closed and keeping the "
+                                    "last resolvers was undocumented"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase, lowered,
+                    f"mosdns-router(8) does not mention {phrase!r}, so an operator meets "
+                    f"{because}",
+                )
+        # And the two policies the bridge actually implements, read from its own
+        # source rather than from a list here: a manual that names one of them and
+        # not the other describes a machine with half a choice.
+        plugin = (REPO / "plugin" / "executable" / "dhcp_forward" / "dhcp_forward.go").read_text(
+            encoding="utf-8"
+        )
+        policies = sorted(set(re.findall(r'failurePolicy\w+\s*=\s*"([a-z-]+)"', plugin)))
+        self.assertTrue(policies, "no dhcp failure policy was read out of the plugin's own constants")
+        for policy in policies:
+            with self.subTest(policy=policy):
+                self.assertIn(
+                    policy, lowered,
+                    f"the plugin implements `{policy}` and the manual never names it, so the "
+                    "documented way to choose is not a way this build has",
+                )
+
 
 # --- the payload -------------------------------------------------------------
 

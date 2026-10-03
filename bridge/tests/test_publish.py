@@ -1084,6 +1084,97 @@ class DispatcherCommandLineTests(unittest.TestCase):
         data = self.published()
         self.assertEqual((data["source"], data["upstreams"]), ("nm-effective", ["192.168.1.9"]))
 
+    def test_a_statically_configured_resolver_is_published_on_a_dns_change(self):
+        """The whole static-IP path, as one dispatcher event, and it is a different
+        shape from every case above.
+
+        A connection with ``ipv4.method manual`` has no DHCP lease at all: both
+        ``DHCPn.OPTION`` queries answer with no ``domain_name_servers`` key, so the
+        collector falls through to the device's effective DNS. And the event that
+        carries the news is ``dns-change``, not ``dhcp4-change`` -- which is the
+        one event whose name promises a lease and never delivers one.
+
+        Both halves were reachable and neither was named. The existing
+        ``nm-effective`` case is written as "every DHCP source is empty", which is
+        also what a lease that named no resolver looks like, and its action is
+        ``up``. So a change to ``COLLECTING_ACTIONS`` that dropped ``dns-change``
+        would have left every green case here green while a statically configured
+        machine stopped learning that its resolvers moved -- and it would learn it
+        only when the interface happened to bounce.
+
+        ``last_good`` is asserted and not left out, because it is the field that
+        decides whether ``dhcp_forward`` forwards at all. A published upstream
+        that is recorded as anything but ``last_good`` is a domestic branch that
+        fails closed with a resolvable address sitting right there.
+        """
+        answers = {
+            ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE): "192.168.1.9\n",
+            ("nmcli", "-g", "IP6.DNS", "device", "show", INTERFACE): "",
+        }
+        runner = RecordingRunner(answers)
+        code, stderr, runner = self.call(
+            self.event("dns-change", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=runner,
+        )
+        self.assertEqual(code, 0, stderr)
+        data = self.published()
+        self.assertEqual(
+            (data["source"], data["upstreams"], data["last_good"]),
+            ("nm-effective", ["192.168.1.9"], True),
+            "a statically configured resolver was not published as a usable upstream, so the "
+            "domestic branch fails closed on a machine whose DNS this package never touched",
+        )
+        # And the event was asked the question a static connection can answer. A
+        # collector that reached for `resolvectl` here would have got the loopback
+        # stub this package installs rather than the operator's own resolver.
+        self.assertIn(
+            ("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE), runner.calls,
+            "the effective device DNS was never asked for, so the operator's statically "
+            "configured resolver was not the source that answered",
+        )
+        self.assertNotIn(
+            ("resolvectl", "dns", INTERFACE), runner.calls,
+            "resolved was asked before the device's own DNS, and on this machine resolved "
+            "answers with the loopback stub rather than the operator's resolver",
+        )
+
+    def test_a_static_resolver_change_is_a_new_generation_not_a_rewrite(self):
+        """An operator editing a static resolver list is a real change, and the
+        identity check has to see it as one.
+
+        The publisher refuses to rewrite an unchanged identity tuple, which is what
+        stops a lease renewal from flushing the plugin's cache. A statically
+        configured machine has the opposite problem: the address really did move,
+        and every event for it looks the same to the publisher unless the address
+        list is part of the identity \\u2014 which it is, and this pins that it stays
+        that way.
+        """
+        runner = RecordingRunner(
+            {("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE): "192.168.1.9\n"}
+        )
+        code, stderr, _ = self.call(
+            self.event("dns-change", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=runner,
+        )
+        self.assertEqual(code, 0, stderr)
+        first = self.published()
+        # The same event again, with the operator's new resolver in place.
+        runner = RecordingRunner(
+            {("nmcli", "-g", "IP4.DNS", "device", "show", INTERFACE): "192.168.1.10\n"}
+        )
+        code, stderr, _ = self.call(
+            self.event("dns-change", DEVICE_IP_IFACE=INTERFACE, CONNECTION_UUID=UUID),
+            runner=runner,
+        )
+        self.assertEqual(code, 0, stderr)
+        second = self.published()
+        self.assertEqual(
+            (first["generation"], second["generation"], second["upstreams"]),
+            (1, 2, ["192.168.1.10"]),
+            "a statically configured resolver that moved was not published as a new "
+            "generation, so the router kept forwarding to an address the operator replaced",
+        )
+
     def test_resolvectl_is_recorded_when_it_is_the_only_readable_source(self):
         runner = RecordingRunner(
             {("resolvectl", "dns", INTERFACE): "Link 2 (enp3s0): 192.168.1.1"},
