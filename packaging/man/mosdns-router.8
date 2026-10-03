@@ -239,6 +239,44 @@ it. Regenerate it with
 The policy both generated documents are rendered from. Edit this, not the
 documents. Validate it with
 .BR "mosdns\-cdnctl validate" (1).
+.PP
+Its
+.B foreign
+block names the route foreign queries leave by:
+.B foreign.upstreams
+is a list whose entries are either the packaged resolver
+.RB ( kind:\ dnscrypt ,
+which carries no address because that listener is the resolver's own) or an
+address mosdns dials
+.RB ( kind:\ upstream ).
+.B foreign.concurrent
+is how many of them one query is sent to, and
+.B 1
+is a random pick rather than a race \(em the shipped value is
+.BR 2 .
+Each upstream's
+.B bootstrap
+resolves that upstream's own host name and is
+.I not
+a query path.
+.B foreign_cache
+carries the router's own answer cache size and, optionally, a record-time bound
+in seconds.
+.PP
+A policy left with no enabled entry the ECH key can be fetched through is refused
+by name rather than rendered, because the consequence of rendering it is that every
+force\-ECH domain fails closed once the key's grace ends with nothing in the log
+saying why. Add a
+.B dnscrypt
+entry, or one whose
+.B addr
+is
+.BR tcp:// .
+.PP
+.BR "mosdns\-cdnctl check\-upstream" (1)
+reports which of them can be reached, and
+.BR "mosdns\-cdnctl flush\-cache" (1)
+empties the router's answer cache.
 .TP
 .I /etc/mosdns/force\-ech\-domains.txt
 Domains to force ECH for. One per line; a line whose first non\-space character is

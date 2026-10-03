@@ -42,6 +42,14 @@ mosdns\-cdnctl \- render, measure, prove and publish this router's configuration
 .I unpin
 .br
 .B mosdns\-cdnctl
+.I check\-upstream
+.RB ( \-\-all | \fINAME\fR )
+.RB [ \-\-policy\ \fIPATH\fR ]
+.br
+.B mosdns\-cdnctl
+.I flush\-cache
+.br
+.B mosdns\-cdnctl
 .I emergency\-rollback
 .SH DESCRIPTION
 .BR mosdns\-cdnctl (1)
@@ -419,6 +427,197 @@ the 03:00 timer, or raising
 in
 .IR policy.yaml ,
 both work; what does not work is expecting a hand run to be free.
+.SS "The foreign route"
+.PP
+Foreign queries leave this machine through a
+.B list
+of upstreams named in
+.BR policy.yaml (5),
+not through one address baked into a program. Each entry is either the resolver
+this package installs or an address mosdns dials itself:
+.PP
+.RS
+.nf
+foreign:
+  concurrent: 2
+  upstreams:
+    - kind: dnscrypt
+      name: quad9\-dnscrypt
+    - kind: upstream
+      name: quad9\-doq
+      addr: quic://dns.quad9.net:853
+      bootstrap:
+        - 9.9.9.9:53
+.fi
+.RE
+.PP
+.B kind
+says what the entry is.
+.B dnscrypt
+means the packaged resolver, reached on its own loopback listener; such an entry
+carries no
+.BR addr ,
+because that listener is not a configured address and two copies of it in two
+files is how the two documents come to disagree about where the resolver is.
+.B upstream
+means an address mosdns dials, in any scheme mosdns accepts.
+.B name
+identifies the entry in every report, refusal and log line, and must be unique.
+.B enabled
+defaults to true; set it false to keep an entry without using it.
+.B addr
+and
+.B bootstrap
+are described below.
+.PP
+.SS "concurrent: 1 is a random pick, not a race"
+.PP
+.B concurrent
+is how many upstreams
+.I one query
+is sent to. It defaults to
+.BR 2 .
+.PP
+At
+.B 1
+mosdns picks ONE upstream at random. That is load balancing, not redundancy: a
+reader who has configured four upstreams and set
+.B concurrent: 1
+has four routes and no failover, and nothing in the document will say so. At
+.BR 2 ,
+one query is sent to two upstreams and the first answer is returned, so one
+unreachable upstream does not stop the query \(em which is what the shipped
+.B dnscrypt
+entry is there for, since a resolver outage would otherwise be a total loss of
+foreign resolution.
+.PP
+The cost of 2 is one extra outbound attempt per query and one log line per
+failed attempt. It is
+.I not
+latency: each attempt carries its own timeout and the query returns on the first
+answer that arrives, so a slow upstream cannot delay a fast one.
+.PP
+.BR concurrent: 3
+is the largest value mosdns honours and
+.B 1
+is the only value that changes what the setting
+.I means
+rather than how much work is done.
+.PP
+.SS "bootstrap is not a query path"
+.PP
+.B bootstrap
+names resolvers that resolve
+.I this entry's own host name
+and nothing else. It is not a list of resolvers foreign queries are sent to, and
+reading
+.B policy.yaml
+alone cannot tell the difference \(em a domain upstream carrying a bootstrap looks,
+in that file, exactly like a route through those resolvers. It is there because
+this machine's only resolver is the router itself, so an entry naming a domain
+cannot be dialled until something else resolves that domain.
+.PP
+At most one bootstrap per entry. mosdns parses the whole value as a single
+address, so two would render into a configuration the router refuses to load. Give
+each resolver its own entry; the same
+.B addr
+with a different
+.B bootstrap
+answers the same queries from the same place.
+.PP
+.SS "The ECH key is fetched through one of them"
+.PP
+The key a force\-ECH domain needs is fetched through a separate address from the
+one queries use, and the policy must leave at least one enabled entry that can
+carry it. The rule is measured rather than stylistic: mosdns's UDP upstream re\-sends
+a query that has gone unanswered and can drop an answer that arrived early, and an
+ECH fetch is the one exchange on this path with no client watching it. So the key
+is fetched over TCP only, and a
+.B dnscrypt
+entry is preferred over any other because the packaged resolver is already running
+and already proven at install time \(em an ECH failure is diagnosable against it.
+.PP
+A policy left with no such entry is
+.B refused by name
+rather than rendered. The consequence of ignoring that refusal is that every
+force\-ECH domain fails closed once the key's grace period ends, with nothing in
+the log saying why. A
+.B udp://
+entry is still routable and is never chosen for this.
+.PP
+.SS "Disabling the dnscrypt entry does not stop the resolver"
+.PP
+Setting
+.B enabled: false
+on the
+.B dnscrypt
+entry stops
+.I this router
+from sending queries there. It does not stop
+.BR dnscrypt\-proxy.service ,
+which keeps running and keeps binding its listener, and the installer still
+requires that listener to answer before it reports success. An operator who expects
+the unit to be gone will find it running; stopping it is a separate decision made
+with
+.BR systemctl .
+.PP
+.SS "Resolvers this package ships"
+.PP
+The DNSCrypt stamps stay in
+.BR dnscrypt\-proxy.toml (5),
+which is a conffile, so adding a DNSCrypt provider is a hand edit there followed
+by a restart \(em it is deliberately not in
+.BR policy.yaml ,
+because a provider is a trust decision rather than a routing one. The committed
+policy names at most one upstream per provider, so the rendered routing document is
+reproducible from
+.B policy.yaml
+alone; a policy naming a resolver outside the published set is refused by the
+package's own gate.
+.PP
+.SS check\-upstream
+.PP
+Reports whether each enabled entry of the foreign route can be dialled and can
+answer, one line per entry, in policy order, whether it answered or not.
+.PP
+It exists because "is my DNS working" has two very different answers \(em the
+router is fine and one upstream is unreachable, or every upstream is unreachable
+\(em and from the router's behaviour they look identical: foreign names simply do
+not resolve. This verb asks each entry directly and says which one.
+.PP
+Every entry is asked about
+.BR example.com ,
+IANA's reserved example domain, which every recursive resolver is required to
+answer. That is a decision rather than a default: a failure is therefore the
+transport or the reachability and not one provider's filtering, which asking a
+named provider's own domain would have mixed in.
+.PP
+The
+.B dnscrypt
+entry is checked over TCP against the packaged listener, which is the same road
+the ECH key is fetched through \(em so that line also answers "can this machine
+still fetch an ECH key".
+.PP
+A resolver that
+.I answers
+but refuses is reported with the rcode it answered and is not the same finding as
+one that could not be reached: the first needs a policy and the second needs a
+route.
+.PP
+Exit status is reachability and nothing else: 0 when every enabled entry answered,
+3 when at least one did not. It writes nothing and takes no lock.
+.PP
+.SS flush\-cache
+.PP
+Empties the router's foreign answer cache, through the cache plugin's own endpoint.
+It is not a second mechanism this project invented: there is no second flush path
+that could disagree with the router's.
+.PP
+It writes nothing, takes no lock and restarts nothing \(em an operator clearing a
+cache is not refused because a measurement happened to be publishing. When the
+router refuses, the router's own words are reported, because a router that is not
+listening on its API address and a router that is down are different faults.
+.PP
 .SS health\-check
 Takes the address in service out of service if it is failing. It proves the
 published winner and every published per\-hostname mapping against their own

@@ -49,7 +49,7 @@ REPO = Path(__file__).resolve().parents[2]
 # `test_watchdog.py` rather than copied: a second one is a second thing that can
 # be wrong about the same file, and the two would disagree about the documents
 # they both read.
-from test_watchdog import shipped_prose  # noqa: E402
+from test_watchdog import shipped_prose, shipped_prose_from  # noqa: E402
 
 BUILD_SCRIPT = REPO / "scripts" / "build-deb.sh"
 PACKAGING = REPO / "packaging"
@@ -3043,6 +3043,135 @@ class PinnedRangeSnapshotTests(_Staged):
         # Debian control file rather than roff: it shouts the consequence, and
         # the words are the words.
         self.assertIn("without asking", conffiles.lower())
+
+    @staticmethod
+    def foreign_route_section():
+        """Just the manual's foreign-route section, as a reader would see it.
+
+        **Scoped, and the scoping is the whole of what these gates are for.** The
+        first versions asserted keywords against the whole document, and two
+        mutations proved that was worthless: rewriting "picks ONE upstream at
+        random" as "picks ONE upstream by some rule" left `random` matching
+        somewhere else in a 700-line manual, and deleting the sentence saying the
+        cost is not latency matched a stray `.B not` four hundred lines away. Both
+        mutations reported the gate green on a manual that had lost the claim.
+
+        So the assertions read the section the claim is written in. A keyword that
+        appears elsewhere in the manual is not evidence that it appears here.
+        """
+        raw = (REPO / "packaging" / "man" / "mosdns-cdnctl.1").read_text(encoding="utf-8")
+        # **To the next UNQUOTED `.SS`, not to the next `.SS` at all.** This manual
+        # marks a subsection's title with quotes and a section's without, so the
+        # convention is already in the document and reading it is better than
+        # inventing one. The first version stopped at the next `.SS` of either kind
+        # and so read only the section's own preamble -- which is where none of the
+        # four claims are written, and the gates reported a documented manual as
+        # undocumented.
+        section = re.search(
+            # **No `|$` alternative in the lookahead.** `re.MULTILINE` makes `$`
+            # match at the end of EVERY line, so adding it meant the lookahead
+            # succeeded immediately after the heading and the lazy group matched
+            # nothing -- a section reader that reads an empty section, and then four
+            # gates reporting a documented manual as undocumented. The document
+            # always has another `.SS` or `.SH`, so the two alternatives are enough.
+            r'^\.SS "The foreign route"$(.*?)(?=^\.SH |^\.SS [^"])',
+            raw, re.MULTILINE | re.DOTALL,
+        )
+        if section is None:
+            raise AssertionError(
+                "mosdns-cdnctl(1) has no 'The foreign route' section, so an operator has "
+                "nowhere to read what the policy's upstreams do"
+            )
+        return shipped_prose_from(section.group(1))
+
+    def test_the_manual_documents_the_configurable_foreign_route(self):
+        """Four things an operator cannot guess, and every one of them is a
+        decision rather than an implementation detail.
+
+          * **concurrent: 1 is a random pick, not a race.** An operator who sets it
+            to 1 and has four upstreams believes they have redundancy; they have
+            load balancing. The manual has to say so in those words.
+          * **bootstrap is not a query path.** A domain upstream with a bootstrap
+            looks like the router forwards foreign queries to 9.9.9.9 in the clear.
+            It does not, and an operator reading only the YAML cannot tell.
+          * **disabling the dnscrypt entry does not stop the unit.** It stops the
+            router using it. Nothing else changes, and an operator who expected
+            dnscrypt-proxy to be gone will find it running.
+          * **a route with no TCP route for the ECH key is refused.** The
+            consequence -- every force-ECH domain failing closed once the key's
+            grace ends -- is the single most surprising thing this configuration
+            can do.
+        """
+        section = self.foreign_route_section().lower()
+        for phrase, because in (
+            ("random", "concurrent 1 is a random pick, and an operator with four "
+                       "upstreams believes they have redundancy"),
+            ("bootstrap", "a bootstrap looks like the router forwards foreign "
+                          "queries in the clear, and it does not"),
+            ("does not stop", "an operator who disables the dnscrypt entry expects "
+                              "the unit to be gone"),
+            ("fails closed", "a route with no tcp:// entry is refused, and the "
+                             "consequence is every force-ECH domain failing closed"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase, section,
+                    f"the 'The foreign route' section of mosdns-cdnctl(1) does not mention "
+                    f"{phrase!r}, so an operator meets {because} with nothing written down",
+                )
+
+    def test_the_manual_says_concurrency_costs_an_attempt_and_not_latency(self):
+        """The claim is falsifiable and it was nearly written wrong.
+
+        At `concurrent: 2` a query IS sent twice, so the obvious reading is "slower".
+        It is not latency -- each attempt has its own timeout and the query returns
+        on the first answer -- and an operator deciding whether to raise the number
+        is deciding on this sentence alone.
+
+        The gate is on BOTH halves, because a manual that said only "not latency"
+        would read as marketing and one that said only "an extra attempt" would
+        leave the latency question open.
+        """
+        lowered = self.foreign_route_section().lower()
+        self.assertIn(
+            "one extra outbound attempt", lowered,
+            "the 'The foreign route' section does not state what concurrent: 2 costs",
+        )
+        # And the sentence that says so has to be the one about the cost, not a
+        # stray "not" somewhere in a document this long.
+        # **Across a sentence boundary, and that is why the pattern is bounded by a
+        # LENGTH rather than by `.`.** The manual states the cost in one sentence and
+        # the latency answer in the next, so `[^.]*not` cannot match it -- and a gate
+        # whose pattern cannot match the sentence it was written for reports a
+        # documented claim as missing. A bounded gap matches the claim wherever the
+        # two halves sit and cannot wander into an unrelated paragraph.
+        self.assertRegex(
+            lowered,
+            r"one extra outbound attempt.{0,240}?is not latency",
+            "the manual states the cost of concurrent: 2 without stating, close beside "
+            "it, that it is not latency -- which is the half an operator is deciding on",
+        )
+
+    def test_the_router_manual_documents_the_foreign_route_block(self):
+        """The other manual has to carry the shape too, because an operator who
+        edits the policy reads mosdns-router(8) for what the file is and
+        mosdns-cdnctl(1) for what the commands are. A block documented in only one
+        of them is documented for half the readers."""
+        manual = shipped_prose(REPO / "packaging" / "man" / "mosdns-router.8")
+        lowered = manual.lower()
+        for phrase in ("foreign.upstreams", "concurrent", "bootstrap", "foreign_cache"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase, lowered,
+                    f"mosdns-router(8) does not describe {phrase}, so an operator reading "
+                    f"the policy's FILES entry cannot tell what the key does",
+                )
+        # And the refusal, which is the consequence that matters.
+        self.assertIn(
+            "refused", lowered,
+            "mosdns-router(8) describes the foreign route without saying that a policy "
+            "with no ECH-capable upstream is refused, which is the surprising part",
+        )
 
     def test_the_manual_documents_every_verb_the_tool_implements(self):
         """A verb that exists and is not in the SYNOPSIS is a verb nobody can find.
