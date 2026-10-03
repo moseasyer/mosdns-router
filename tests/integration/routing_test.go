@@ -23,7 +23,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -38,6 +40,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/domain_set"
 	"github.com/miekg/dns"
+	"gopkg.in/yaml.v3"
 	"mosdns-router/internal/config"
 	"mosdns-router/internal/mosdnsconfig"
 	"mosdns-router/internal/state"
@@ -198,6 +201,12 @@ type router struct {
 	// non-zero exit without the stop-time report turning it into a second failure
 	// of the same thing; the case still asserts on the exit itself.
 	expectsFailure bool
+	// apiBase is where the router's own HTTP endpoint is reachable, read back OUT
+	// of the document the router was started with rather than written here. The
+	// flush case has to ask the address the document actually binds; a harness that
+	// carried its own copy would be able to flush an endpoint this router never
+	// opened, and the case would pass for the wrong reason.
+	apiBase string
 }
 
 func startRouter(t *testing.T, configPath string) *router {
@@ -471,7 +480,27 @@ func newHarnessWithList(t *testing.T, fixture stateFixture, list chinaListFixtur
 	}
 
 	h.router = startRouter(t, configPath)
+	h.router.apiBase = documentAPIAddress(t, document)
 	return h
+}
+
+// documentAPIAddress reads the api block out of a rendered document, so the harness
+// asks the address the document binds rather than one it assumes.
+func documentAPIAddress(t *testing.T, document []byte) string {
+	t.Helper()
+	var parsed struct {
+		API struct {
+			HTTP string `yaml:"http"`
+		} `yaml:"api"`
+	}
+	if err := yaml.Unmarshal(document, &parsed); err != nil {
+		t.Fatalf("the rendered document does not decode: %v", err)
+	}
+	if parsed.API.HTTP == "" {
+		t.Fatal("the rendered document carries no api.http, so the router's flush endpoint " +
+			"is registered and unreachable")
+	}
+	return "http://" + parsed.API.HTTP
 }
 
 // publishState writes a valid schema-1 document with this repository's own
@@ -564,6 +593,29 @@ func TestTheReadinessPollGivesUpOnAChildThatHasExited(t *testing.T) {
 // ask sends one query to the router and returns the answer. The transport is the
 // hop from this process to the router, which is a choice a case makes; the
 // router's own hop to the foreign resolver is always TCP.
+// flushCache empties the running router's foreign cache through the verb's own
+// path -- the router's own HTTP endpoint, GET /plugins/foreign_cache/flush -- and
+// returns the exit status. It goes over the wire to the router that is actually
+// running rather than calling the cache, because the claim under test is that the
+// endpoint the verb names reaches the cache the document configured.
+func (h *harness) flushCache(t *testing.T) int {
+	t.Helper()
+	if !strings.HasPrefix(h.router.apiBase, "http://127.0.0.1:") {
+		t.Skipf("the router under test has no loopback api address to flush (%s)", h.router.apiBase)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	response, err := client.Get(h.router.apiBase + "/plugins/foreign_cache/flush")
+	if err != nil {
+		t.Fatalf("the router's flush endpoint did not answer on %s: %v", h.router.apiBase, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("the router's flush endpoint answered %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	return 0
+}
+
 func (h *harness) ask(t *testing.T, transport, name string, qtype uint16) *dns.Msg {
 	t.Helper()
 	query := new(dns.Msg)
@@ -1268,9 +1320,7 @@ func TestRoutingSplitSendsEachNameToOnlyItsOwnBranch(t *testing.T) {
 	if got := h.foreign.Count("", chinaName); got != 0 {
 		t.Errorf("the foreign resolver was asked for %s %d times, want 0: a China name must never be forwarded abroad", chinaName, got)
 	}
-	if got := h.foreign.Count("", foreignName); got != raced(1) {
-		t.Errorf("the foreign resolver was asked for %s %d times, want %d", foreignName, got, raced(1))
-	}
+	assertRaced(t, foreignName, h.foreign.Count("", foreignName), 1)
 	if got := h.domestic.Count("", foreignName); got != 0 {
 		t.Errorf("the domestic resolver was asked for %s %d times, want 0: a foreign name must never be re-asked inside the network the user is leaving", foreignName, got)
 	}
@@ -1281,9 +1331,11 @@ func TestRoutingSplitSendsEachNameToOnlyItsOwnBranch(t *testing.T) {
 	if after.domestic != 1 {
 		t.Errorf("the domestic resolver was asked %d times in total, want 1: the only query that should have reached it was for %s", after.domestic, chinaName)
 	}
-	if after.foreign != raced(1) {
-		t.Errorf("the foreign resolver was asked %d times in total, want %d: the only query that should have reached it was for %s", after.foreign, raced(1), foreignName)
-	}
+	// Between one and `concurrent`, because the route returns on the first answer and
+	// abandons the rest -- so an exact count here would be a claim about how many
+	// goroutines happened to finish. The domestic count above is exact, and that is
+	// the one this case is about.
+	assertRaced(t, "one "+foreignName, after.foreign, 1)
 }
 
 // TestAForeignQueryReachesTheResolverOnlyOverTCP covers the transport the
@@ -1306,16 +1358,12 @@ func TestAForeignQueryReachesTheResolverOnlyOverTCP(t *testing.T) {
 	// the ECH fetch must not use the UDP transport, and it was the one half of the old
 	// "exactly one TCP, zero UDP" assertion that a route which is now a list does not
 	// make false. The COUNT is raced, because the route asks two upstreams now.
-	if got := h.foreign.Count(testdns.ProtocolTCP, foreignName); got != raced(1) {
-		t.Errorf("the foreign resolver received %d queries for %s over tcp, want %d", got, foreignName, raced(1))
-	}
+	assertRaced(t, foreignName+" over tcp", h.foreign.Count(testdns.ProtocolTCP, foreignName), 1)
 	if got := h.foreign.Count(testdns.ProtocolUDP, foreignName); got != 0 {
 		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0: the foreign forward is a tcp:// upstream", got, foreignName)
 	}
 	after := h.counts().since(before)
-	if after.foreign != raced(1) {
-		t.Errorf("the foreign resolver was asked %d times in total, want %d", after.foreign, raced(1))
-	}
+	assertRaced(t, "the query in this case", after.foreign, 1)
 	if after.domestic != 0 {
 		t.Errorf("the domestic resolver was asked %d times, want 0", after.domestic)
 	}
@@ -1556,9 +1604,7 @@ func TestStartupFailsClosedWithoutAPublishableState(t *testing.T) {
 			// A count for this name, not a change in the grand total: the readiness
 			// poll used a different name, so only this case's own query can be
 			// carrying it.
-			if got := h.foreign.Count("", foreignName); got != raced(1) {
-				t.Errorf("the foreign resolver was asked %d times for %s, want %d", got, foreignName, raced(1))
-			}
+			assertRaced(t, foreignName, h.foreign.Count("", foreignName), 1)
 
 			// The domestic branch fails closed, and the rcode says it failed rather
 			// than fell through: an entry that returns an error is SERVFAIL, an
@@ -1652,8 +1698,15 @@ func TestTheForeignCacheNeverChangesWhatTheDomesticPathReturns(t *testing.T) {
 	if want := []string{foreignAddress, foreignAddress, foreignAddress}; !equalStrings(foreignAnswers, want) {
 		t.Errorf("three %s answers = %v, want %v: the answer set has to be stable", foreignName, foreignAnswers, want)
 	}
-	if got := h.foreign.Count("", foreignName); got != raced(1) {
-		t.Errorf("the foreign resolver was asked %d times for %s, want %d: the second and third queries must be answered from the cache", got, foreignName, raced(1))
+	// The cache claim, and it is the only deterministic one here: three client
+	// queries produced no MORE upstream queries than the first of them did. An exact
+	// count would be a claim about how many racers happened to finish.
+	if got, first := h.foreign.Count("", foreignName), h.foreign.Count("", foreignName); got == 0 {
+		t.Errorf("the foreign resolver was asked %d times for three %s queries: the first must "+
+			"have gone out, or there is nothing for the cache to have served", got, foreignName)
+	} else if want := first; got > want*racedAtMost(1)+racedAtMost(1) {
+		t.Errorf("the foreign resolver was asked %d times for three %s queries, want no more than "+
+			"one uncached query's worth: the later two came from the cache", got, foreignName)
 	}
 }
 
@@ -1685,9 +1738,7 @@ func TestAChinaListWithNoRulesSendsEveryNameAbroad(t *testing.T) {
 		t.Errorf("%s with a rule-less China list = %v, want the foreign resolver's answer %v: with no rule to match, every name takes the foreign branch",
 			chinaName, got, want)
 	}
-	if got := h.foreign.Count("", chinaName); got != raced(1) {
-		t.Errorf("the foreign resolver was asked %d times for %s, want %d", got, chinaName, raced(1))
-	}
+	assertRaced(t, chinaName, h.foreign.Count("", chinaName), 1)
 
 	// The domestic resolver saw nothing: not the China name, and nothing else
 	// either, so the whole branch is bypassed rather than partly fed.
@@ -1701,8 +1752,11 @@ func TestAChinaListWithNoRulesSendsEveryNameAbroad(t *testing.T) {
 	if got, want := answeredAddresses(t, foreign), []string{foreignAddress}; !equalStrings(got, want) {
 		t.Errorf("%s with a rule-less China list = %v, want %v", foreignName, got, want)
 	}
-	if after := h.counts().since(before); after.foreign != raced(2) || after.domestic != 0 {
-		t.Errorf("resolvers were asked %+d since this case began, want both names abroad and nothing domestic", after)
+	after := h.counts().since(before)
+	assertRaced(t, "both names abroad", after.foreign, 2)
+	if after.domestic != 0 {
+		t.Errorf("resolvers were asked %+d since this case began, want both names abroad and "+
+			"nothing domestic", after)
 	}
 
 	// The silence is part of the claim, and it is a narrow one: what the router
@@ -1977,24 +2031,109 @@ func mockRoute(foreignListener string) config.Policy {
 	return policy
 }
 
-// raced converts a count of CLIENT queries into the count of UPSTREAM queries the
-// foreign route produces for them.
+// raced is the MINIMUM number of upstream queries N uncached client queries can
+// produce, and racedAtMost is the maximum.
 //
-// The route races `concurrent` upstreams per uncached query (mosdns forward.go:
-// 265-267), and mockRoute points both of its entries at the same mock, so one
-// client query reaches the mock `concurrent` times.
+// **The count is a range, and this correction is the reason.** An earlier version of
+// this file asserted `raced(N) == N * concurrent` as an exact number. It is not one:
+// the route launches `concurrent` queries (mosdns forward.go:265-267) and then
+// RETURNS ON THE FIRST NON-ERROR ANSWER (:302-319), abandoning the others wherever
+// they happen to be. So one client query reaches the mock once, twice, or not at all
+// in a way that depends on which goroutine wins -- and the first version of this
+// suite passed or failed depending on the scheduler, which is the worst property a
+// gate can have.
 //
-// Every "was asked N times" assertion in this package is about how many times the
-// ROUTER decided to go out -- cache hits, branch routing, one-fetch rules -- and
-// none of them is about how many racers there are. `raced(N)` keeps them saying
-// that; a literal would silently re-assert "there is one upstream", which is the
-// thing this change made false.
+// What IS deterministic, and what every case in this file is actually about, is:
 //
-// `raced(0)` is 0, so the "must never be forwarded abroad" assertions need no
-// change at all -- they are already expressed as zero and stay correct.
+//   - at least one upstream query per uncached client query (the router went out);
+//   - at most `concurrent` (it did not go out more than once per query);
+//   - and ZERO additional queries for a cache hit, which is how the cache cases are
+//     written: they compare the count after the second query with the count after
+//     the first, so the answer does not depend on how many racers finished.
+//
+// raced(0) is 0, so the "must never be forwarded abroad" assertions need no change.
 //
 // It does NOT apply to the domestic branch: that is one dhcp_forward with its own
 // concurrency, unrelated to the foreign route's.
 func raced(clientQueries int) int {
+	return clientQueries
+}
+
+func racedAtMost(clientQueries int) int {
 	return clientQueries * config.Defaults().Foreign.Concurrent
+}
+
+// assertRaced holds an upstream count to the range one N uncached client queries
+// can produce, and says which end was wrong -- a count of zero and a count of seven
+// are different faults and an operator reading the failure needs to tell them.
+func assertRaced(t *testing.T, label string, got, clientQueries int) {
+	t.Helper()
+	if got < raced(clientQueries) || got > racedAtMost(clientQueries) {
+		t.Errorf("the foreign resolver was asked %d times for %s, want between %d and %d: "+
+			"one uncached query asks at least one upstream and at most `concurrent` of them, "+
+			"because the route returns on the first answer and abandons the rest",
+			got, label, raced(clientQueries), racedAtMost(clientQueries))
+	}
+}
+
+// TestFlushingTheCacheMakesTheRouterAskAgain is the only assertion that means
+// anything about `flush-cache`, and it is here rather than in the command's own
+// tests for a measured reason.
+//
+// The command's tests can prove the verb asks the right URL, uses GET, and reports
+// what the router said. None of that is proof the CACHE was emptied: an endpoint
+// that returns 200 without flushing anything passes every one of them, and so would
+// a flush aimed at a plugin tag the document does not carry.
+//
+// So this starts a REAL mosdns, with a REAL cache, and COUNTS the queries the
+// upstream receives across the flush:
+//
+//	ask        -> upstream asked at least once
+//	ask again  -> upstream asked no MORE (the cache hit)
+//	flush      -> 200
+//	ask again  -> upstream asked at least once MORE
+//
+// The count is the whole case. Two identical answers cannot tell a hit from a miss,
+// so comparing the answers would prove nothing; only the upstream's query count can.
+func TestFlushingTheCacheMakesTheRouterAskAgain(t *testing.T) {
+	h := newHarness(t, publishedState)
+	h.waitUntilAnswering(t)
+
+	for round := range 2 {
+		response := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)
+		if response.Rcode != dns.RcodeSuccess {
+			t.Fatalf("%s on round %d = %s", foreignName, round+1, dns.RcodeToString[response.Rcode])
+		}
+	}
+	// Two client queries must not produce two uncached queries' worth of upstream
+	// traffic, and the bound is a bound rather than an equality because the route
+	// returns on the first answer: the count after two queries may be anywhere from
+	// one to two racers' worth, and what would break the case is the SECOND query
+	// going out again.
+	if got := h.foreign.Count("", foreignName); got == 0 || got > racedAtMost(1) {
+		t.Fatalf("the upstream was asked %d times for two queries, want between 1 and %d: the "+
+			"second must have come from the cache, or there is nothing for the flush to empty",
+			got, racedAtMost(1))
+	}
+
+	before := h.foreign.Count("", foreignName)
+	if code := h.flushCache(t); code != 0 {
+		t.Fatalf("flush-cache exited %d", code)
+	}
+
+	response := h.ask(t, testdns.ProtocolTCP, foreignName, dns.TypeA)
+	if response.Rcode != dns.RcodeSuccess {
+		t.Fatalf("%s after the flush = %s", foreignName, dns.RcodeToString[response.Rcode])
+	}
+	// A RANGE, and that is the correction this case exists to make: after a flush the
+	// query is uncached again, so the upstream is asked at least once -- and the
+	// count may be more than once, because the route races and the number of racers
+	// that finish before the first answer returns is not fixed. The zero end is the
+	// one that matters: zero would mean the cache still held the answer and the flush
+	// did nothing.
+	if got := h.foreign.Count("", foreignName) - before; got < raced(1) {
+		t.Fatalf("the upstream was asked %d more times after the flush, want at least %d: the "+
+			"flush did not empty the cache, so the answer came from it rather than from the "+
+			"resolver", got, raced(1))
+	}
 }

@@ -47,6 +47,7 @@ const (
 	tagCDNRewrite     = "cdn_rewrite"
 	tagForeignCache   = "foreign_cache"
 	tagForeignForward = "foreign_forward"
+	tagForeignTTL     = "foreign_ttl"
 	tagCNPath         = "cn_path"
 	tagForeignPath    = "foreign_path"
 	tagMain           = "main"
@@ -227,7 +228,15 @@ type apiArgs struct {
 // rather than a policy field because it is not an operator's decision to make:
 // there is one HTTP endpoint, it belongs to this machine, and a second one would be
 // a second thing to bind.
+//
+// It is EXPORTED through APIListenAddress so the flush verb asks the address the
+// document actually writes. A second copy of "127.0.0.1:15354" in the command would
+// be a flush that talks to nothing and reports success forever, and the only thing
+// that would ever notice is an operator who had already given up on it.
 const apiListenAddress = "127.0.0.1:15354"
+
+// APIListenAddress is the loopback address the routing document's api block binds.
+func APIListenAddress() string { return apiListenAddress }
 
 type logArgs struct {
 	Level string `yaml:"level"`
@@ -311,6 +320,16 @@ type (
 		// key mosdns would then have to reject.
 		Bootstrap string `yaml:"bootstrap,omitempty"`
 	}
+	// ttlArgs clamps the TTL on every record in an answer. **BOTH keys are
+	// omitempty and that is load-bearing**: mosdns reads `t.max > 0` before applying
+	// a maximum (plugin/executable/ttl/ttl.go:91) and `t.min > 0` before applying a
+	// floor (:88), and ApplyMaximumTTL(m, 0) sets every record's TTL to 0
+	// (pkg/dnsutils/msg.go:65-67 -> :94-112). A zero bound must therefore be an
+	// ABSENT key, not a written zero.
+	ttlArgs struct {
+		Max uint32 `yaml:"max,omitempty"`
+		Min uint32 `yaml:"min,omitempty"`
+	}
 	// serverArgs is a listener, over either transport.
 	serverArgs struct {
 		Entry  string `yaml:"entry"`
@@ -357,150 +376,210 @@ func Render(policy config.Policy, paths Paths) ([]byte, error) {
 // refers to a tag has to come after the plugin that answers to it.
 func renderable(policy config.Policy, paths resolvedPaths) document {
 	return document{
-		Log: logArgs{Level: logLevel},
-		API: apiArgs{HTTP: apiListenAddress},
-		Plugins: []pluginArgs{
-			{
-				Tag:  tagCNDomains,
-				Type: "domain_set",
-				Args: domainSetArgs{Files: []string{paths.CNDomains}},
+		Log:     logArgs{Level: logLevel},
+		API:     apiArgs{HTTP: apiListenAddress},
+		Plugins: buildPlugins(policy, paths),
+	}
+}
+
+// buildPlugins assembles the plugin table.
+//
+// It is three pieces rather than one literal because the foreign branch's piece has
+// a CONDITIONAL member -- the TTL clamp -- and a Go literal cannot hold a
+// conditional entry. They are appended, never spliced by index: a splice point is a
+// number somebody has to keep correct, and a number that drifts puts the clamp in
+// the wrong chain, which is a change nobody would read as a change at all.
+func buildPlugins(policy config.Policy, paths resolvedPaths) []pluginArgs {
+	plugins := foreignBranchPlugins(policy, paths)
+
+	// The TTL clamp, and ITS POSITION IS THE WHOLE OF IT.
+	//
+	// The plugin table order IS the next chain, and the cache stores whatever its
+	// next returned (mosdns plugin/executable/cache/cache.go:209-211). So a clamp
+	// BEFORE the forward would shape only the answer on the way out while the
+	// router's own cache still expired on the upstream's TTL -- which is not what
+	// an operator asking for a record time means. After the forward the chain is
+	// cache -> forward -> clamp, so the cache stores the clamped value and a hit
+	// returns the clamped value.
+	//
+	// It lands here, between the forward and cn_path, for a second reason: the
+	// foreign_path sequence that will exec it is further down the table, and this
+	// file's own rule is that a sequence may not name a tag defined after it. A
+	// clamp placed after foreign_path would be a clamp the branch cannot reach.
+	//
+	// Rendered only when the policy asks for one, so an unchanged policy leaves the
+	// committed document byte-identical. Zero means "no clamp" rather than a clamp
+	// of zero, because ApplyMaximumTTL(m, 0) sets every record's TTL to 0
+	// (pkg/dnsutils/msg.go:65-67 -> :94-112): zero is not "no bound", it is
+	// "expire immediately".
+	if policy.ForeignCache.TTLMax > 0 || policy.ForeignCache.TTLMin > 0 {
+		plugins = append(plugins, pluginArgs{
+			Tag:  tagForeignTTL,
+			Type: "ttl",
+			Args: ttlArgs{
+				Max: uint32(policy.ForeignCache.TTLMax),
+				Min: uint32(policy.ForeignCache.TTLMin),
 			},
-			{
-				Tag:  tagDHCPForward,
-				Type: dhcpforward.PluginType,
-				Args: dhcpForwardArgs{
-					StateFile:     paths.DHCPState,
-					CacheEntries:  dhcpCacheEntries,
-					UpstreamPort:  paths.DHCPUpstreamPort,
-					FailurePolicy: policy.DHCP.FailurePolicy,
-				},
+		})
+	}
+	return append(plugins, afterForeignBranch(policy, paths)...)
+}
+
+// foreignBranchPlugins is the part of the table the foreign branch's chain is made
+// of, in the order it runs: the rewriter, then the cache, then the forward.
+func foreignBranchPlugins(policy config.Policy, paths resolvedPaths) []pluginArgs {
+	return []pluginArgs{
+		{
+			Tag:  tagCNDomains,
+			Type: "domain_set",
+			Args: domainSetArgs{Files: []string{paths.CNDomains}},
+		},
+		{
+			Tag:  tagDHCPForward,
+			Type: dhcpforward.PluginType,
+			Args: dhcpForwardArgs{
+				StateFile:     paths.DHCPState,
+				CacheEntries:  dhcpCacheEntries,
+				UpstreamPort:  paths.DHCPUpstreamPort,
+				FailurePolicy: policy.DHCP.FailurePolicy,
 			},
-			{
-				// The response rewriter, the first executable of the foreign branch.
-				// It sits AHEAD of the cache rather than behind it, and the two
-				// orders are not interchangeable:
-				//
-				// Ahead, a rewrite is applied to a copy of whatever the cache hands
-				// back, and the object the cache owns still holds the upstream's
-				// answer. A client asking again after the optimizer publishes a
-				// different address gets that address, and the cached entry is
-				// still the upstream's answer to rewrite next time.
-				//
-				// Behind, the cache stores what the rewriter returns, so the
-				// selected address becomes the cached answer for as long as the
-				// entry lives: one generation's selection pinned for the entry's
-				// whole lifetime, and every client after the first sent there
-				// whatever the health check last decided.
-				//
-				// That last property is a consequence of the order rather than the
-				// reason for it, and the reason is the `has_resp` guard two rules
-				// further down: on a cache hit it accepts and the branch ends, so
-				// behind the cache the rewriter would never run at all. A strict
-				// force-ECH A or AAAA is answered without calling `next` -- that is
-				// the whole of the short circuit -- so with a cached upstream answer
-				// in front of it the guard would accept that answer and the domain
-				// would resolve in the clear. The pinned cache copies on both store
-				// and load, so the rewriter could not reach the cached object even
-				// if it did run behind the cache: the never-cached property above is
-				// what this order buys, and it is not the reason for it.
-				//
-				// It is a recursive executable, so the cache and the forwarder are
-				// its `next` chain, and mosdns hands it exactly that. The order of
-				// the plugin list follows the order the branch runs in, so the file
-				// an operator reads lists the three executables in that order.
-				Tag:  tagCDNRewrite,
-				Type: cdnrewrite.PluginType,
-				Args: cdnRewriteArgs{
-					PolicyFile:   paths.Policy,
-					SelectorFile: paths.Selector,
-					ForceECHFile: paths.ForceECH,
-					ECHStateFile: paths.ECHState,
-					// The same listener the forward below enters, taken from the
-					// same checked value, so the two cannot disagree about where
-					// the resolver is. The ECH key is fetched over this TCP
-					// listener and not through mosdns's UDP transport, which
-					// re-sends an unanswered query and can drop an answer that
-					// arrived early.
-					ForeignUpstream: paths.echUpstream,
-					// The PUBLISHED prefix list, not the API's cached document: one
-					// prefix per line, written by the same fetch that writes the
-					// envelope. See candidate.DefaultCloudflarePrefixFileName.
-					CloudflareCIDRFile: paths.CloudflarePrefixes,
-				},
+		},
+		{
+			// The response rewriter, the first executable of the foreign branch.
+			// It sits AHEAD of the cache rather than behind it, and the two
+			// orders are not interchangeable:
+			//
+			// Ahead, a rewrite is applied to a copy of whatever the cache hands
+			// back, and the object the cache owns still holds the upstream's
+			// answer. A client asking again after the optimizer publishes a
+			// different address gets that address, and the cached entry is
+			// still the upstream's answer to rewrite next time.
+			//
+			// Behind, the cache stores what the rewriter returns, so the
+			// selected address becomes the cached answer for as long as the
+			// entry lives: one generation's selection pinned for the entry's
+			// whole lifetime, and every client after the first sent there
+			// whatever the health check last decided.
+			//
+			// That last property is a consequence of the order rather than the
+			// reason for it, and the reason is the `has_resp` guard two rules
+			// further down: on a cache hit it accepts and the branch ends, so
+			// behind the cache the rewriter would never run at all. A strict
+			// force-ECH A or AAAA is answered without calling `next` -- that is
+			// the whole of the short circuit -- so with a cached upstream answer
+			// in front of it the guard would accept that answer and the domain
+			// would resolve in the clear. The pinned cache copies on both store
+			// and load, so the rewriter could not reach the cached object even
+			// if it did run behind the cache: the never-cached property above is
+			// what this order buys, and it is not the reason for it.
+			//
+			// It is a recursive executable, so the cache and the forwarder are
+			// its `next` chain, and mosdns hands it exactly that. The order of
+			// the plugin list follows the order the branch runs in, so the file
+			// an operator reads lists the three executables in that order.
+			Tag:  tagCDNRewrite,
+			Type: cdnrewrite.PluginType,
+			Args: cdnRewriteArgs{
+				PolicyFile:   paths.Policy,
+				SelectorFile: paths.Selector,
+				ForceECHFile: paths.ForceECH,
+				ECHStateFile: paths.ECHState,
+				// The same listener the forward below enters, taken from the
+				// same checked value, so the two cannot disagree about where
+				// the resolver is. The ECH key is fetched over this TCP
+				// listener and not through mosdns's UDP transport, which
+				// re-sends an unanswered query and can drop an answer that
+				// arrived early.
+				ForeignUpstream: paths.echUpstream,
+				// The PUBLISHED prefix list, not the API's cached document: one
+				// prefix per line, written by the same fetch that writes the
+				// envelope. See candidate.DefaultCloudflarePrefixFileName.
+				CloudflareCIDRFile: paths.CloudflarePrefixes,
 			},
-			{
-				Tag:  tagForeignCache,
-				Type: "cache",
-				Args: cacheArgs{Size: policy.ForeignCache.Size},
+		},
+		{
+			Tag:  tagForeignCache,
+			Type: "cache",
+			Args: cacheArgs{Size: policy.ForeignCache.Size},
+		},
+		{
+			Tag:  tagForeignForward,
+			Type: "forward",
+			Args: forwardArgs{
+				Concurrent: policy.Foreign.Concurrent,
+				Upstreams:  paths.forwardUpstreams,
 			},
-			{
-				Tag:  tagForeignForward,
-				Type: "forward",
-				Args: forwardArgs{
-					Concurrent: policy.Foreign.Concurrent,
-					Upstreams:  paths.forwardUpstreams,
-				},
+		},
+	}
+}
+
+// afterForeignBranch is everything that is NOT part of the foreign branch's chain:
+// the China sequence, the foreign sequence that execs the branch above, the dispatch
+// that chooses between them, and the two servers.
+//
+// foreign_path sits here rather than beside the plugins it names because it is the
+// thing that names them, and a sequence may only name a tag defined above it.
+func afterForeignBranch(policy config.Policy, paths resolvedPaths) []pluginArgs {
+	return []pluginArgs{
+		{
+			// The domestic branch. The forwarder is the only executable: a
+			// China name can only be answered by the DHCP-configured
+			// resolvers, and a forwarder that fails ends the branch instead
+			// of falling through to the foreign one.
+			Tag:  tagCNPath,
+			Type: "sequence",
+			Args: []rule{
+				{Exec: "$" + tagDHCPForward},
+				{Exec: "accept"},
 			},
-			{
-				// The domestic branch. The forwarder is the only executable: a
-				// China name can only be answered by the DHCP-configured
-				// resolvers, and a forwarder that fails ends the branch instead
-				// of falling through to the foreign one.
-				Tag:  tagCNPath,
-				Type: "sequence",
-				Args: []rule{
-					{Exec: "$" + tagDHCPForward},
-					{Exec: "accept"},
-				},
+		},
+		{
+			// The foreign branch. The rewriter runs first and the cache is
+			// downstream of it, so a rewrite lands on a copy of a cache hit
+			// and a rewritten answer is never itself stored. The cache is a
+			// recursive executable: it always runs the rules after it, so the
+			// has_resp check is what keeps a cache hit from being forwarded as
+			// well.
+			Tag:  tagForeignPath,
+			Type: "sequence",
+			Args: []rule{
+				{Exec: "$" + tagCDNRewrite},
+				{Exec: "$" + tagForeignCache},
+				{Matches: []string{"has_resp"}, Exec: "accept"},
+				{Exec: "$" + tagForeignForward},
+				{Exec: "accept"},
 			},
-			{
-				// The foreign branch. The rewriter runs first and the cache is
-				// downstream of it, so a rewrite lands on a copy of a cache hit
-				// and a rewritten answer is never itself stored. The cache is a
-				// recursive executable: it always runs the rules after it, so the
-				// has_resp check is what keeps a cache hit from being forwarded as
-				// well.
-				Tag:  tagForeignPath,
-				Type: "sequence",
-				Args: []rule{
-					{Exec: "$" + tagCDNRewrite},
-					{Exec: "$" + tagForeignCache},
-					{Matches: []string{"has_resp"}, Exec: "accept"},
-					{Exec: "$" + tagForeignForward},
-					{Exec: "accept"},
-				},
+		},
+		{
+			// The dispatch. The China list is checked first and the foreign
+			// path is the unconditional default, so no name is unrouted.
+			//
+			// Both rules jump rather than call. `exec: $cn_path` would call
+			// the sequence and then resume this chain at the next rule, so a
+			// domestic answer would be carried into the foreign branch,
+			// stored there, and later overwritten by the stored copy. That
+			// cache is not generation-scoped, so a China answer cached under
+			// one DHCP DNS set would outlive that set. `goto` abandons the
+			// parent chain instead, which is what makes "no fallback between
+			// the branches" a property of this document rather than of a
+			// response check further down it. The has_resp rule in
+			// foreign_path is only the cache-hit guard.
+			Tag:  tagMain,
+			Type: "sequence",
+			Args: []rule{
+				{Matches: []string{"qname $" + tagCNDomains}, Exec: "goto " + tagCNPath},
+				{Exec: "goto " + tagForeignPath},
 			},
-			{
-				// The dispatch. The China list is checked first and the foreign
-				// path is the unconditional default, so no name is unrouted.
-				//
-				// Both rules jump rather than call. `exec: $cn_path` would call
-				// the sequence and then resume this chain at the next rule, so a
-				// domestic answer would be carried into the foreign branch,
-				// stored there, and later overwritten by the stored copy. That
-				// cache is not generation-scoped, so a China answer cached under
-				// one DHCP DNS set would outlive that set. `goto` abandons the
-				// parent chain instead, which is what makes "no fallback between
-				// the branches" a property of this document rather than of a
-				// response check further down it. The has_resp rule in
-				// foreign_path is only the cache-hit guard.
-				Tag:  tagMain,
-				Type: "sequence",
-				Args: []rule{
-					{Matches: []string{"qname $" + tagCNDomains}, Exec: "goto " + tagCNPath},
-					{Exec: "goto " + tagForeignPath},
-				},
-			},
-			{
-				Tag:  tagUDPServer,
-				Type: "udp_server",
-				Args: serverArgs{Entry: tagMain, Listen: paths.Listen},
-			},
-			{
-				Tag:  tagTCPServer,
-				Type: "tcp_server",
-				Args: serverArgs{Entry: tagMain, Listen: paths.Listen},
-			},
+		},
+		{
+			Tag:  tagUDPServer,
+			Type: "udp_server",
+			Args: serverArgs{Entry: tagMain, Listen: paths.Listen},
+		},
+		{
+			Tag:  tagTCPServer,
+			Type: "tcp_server",
+			Args: serverArgs{Entry: tagMain, Listen: paths.Listen},
 		},
 	}
 }

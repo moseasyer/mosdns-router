@@ -20,6 +20,7 @@ import (
 	"mosdns-router/internal/candidate"
 	"mosdns-router/internal/config"
 	"mosdns-router/internal/filelock"
+	"mosdns-router/internal/mosdnsconfig"
 	"mosdns-router/internal/optimizer"
 	"mosdns-router/internal/prober"
 	"mosdns-router/internal/rules"
@@ -96,6 +97,10 @@ type services struct {
 	// check can be handed an upstream that answers, refuses, or never answers,
 	// without a network and without a DNS server.
 	newUpstream func(addr string, opt upstream.Opt) (upstream.Upstream, error)
+	// flushBaseURL is the router's own API address. It is a field so the flush can
+	// be pointed at an httptest server; production derives it from the routing
+	// document's api block, which is what makes the two unable to disagree.
+	flushBaseURL string
 }
 
 // productionServicesWith is productionServices with the two boundaries the
@@ -134,6 +139,7 @@ func productionServices() services {
 		newUpstream: func(addr string, opt upstream.Opt) (upstream.Upstream, error) {
 			return upstream.NewUpstream(addr, opt)
 		},
+		flushBaseURL: "http://" + mosdnsconfig.APIListenAddress(),
 	}
 }
 

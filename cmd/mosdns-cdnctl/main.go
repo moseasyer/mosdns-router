@@ -80,6 +80,8 @@ func runWithContext(ctx context.Context, args []string, stdout, stderr io.Writer
 		return runCDNPin(ctx, args[1:], stdout, stderr, services)
 	case "unpin":
 		return runCDNUnpin(args[1:], stdout, stderr, services)
+	case "flush-cache":
+		return runFlushCache(args[1:], stdout, stderr, services)
 	case "check-upstream":
 		return runCheckUpstream(args[1:], stdout, stderr, services)
 	case "health-check":

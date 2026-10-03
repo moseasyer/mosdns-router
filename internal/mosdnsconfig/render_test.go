@@ -95,6 +95,14 @@ type renderedDHCPForward struct {
 	FailurePolicy string `yaml:"failure_policy"`
 }
 
+// ttlBlock is the clamp's argument set. Both keys are optional in the document, so
+// this type says nothing about which ones are present -- which is the point of
+// checking the VALUES rather than the keys.
+type ttlBlock struct {
+	Max uint32 `yaml:"max"`
+	Min uint32 `yaml:"min"`
+}
+
 type renderedCache struct {
 	Size     int    `yaml:"size"`
 	DumpFile string `yaml:"dump_file"`
@@ -1842,5 +1850,135 @@ func TestTheForeignListenerIsDerivedRatherThanConfigured(t *testing.T) {
 	}
 	if got := argsOf[renderedForward](t, seam.entry(t, tagForeignForward)).Upstreams[0].Addr; got != injected {
 		t.Fatalf("an injected listener of %q produced a forward entering %q", injected, got)
+	}
+}
+
+// --- the cache's record time ---
+
+// **The trap this case exists for.** mosdns's ApplyMaximumTTL(m, 0) sets EVERY
+// record's TTL to 0 (pkg/dnsutils/msg.go:65-67 -> :94-112, the clamp at :101-104)
+// -- zero is not "no bound", it is "expire immediately". So a zero max must render
+// NO clamp at all rather than a clamp with a zero bound, and it must keep the
+// committed document byte-identical.
+func TestATtlClampIsNotRenderedWhenThePolicyAsksForNone(t *testing.T) {
+	for _, mutate := range []func(*config.Policy){
+		func(p *config.Policy) { p.ForeignCache.TTLMax = 0 },
+		func(p *config.Policy) { p.ForeignCache.TTLMin = 0 },
+		func(p *config.Policy) { p.ForeignCache.TTLMax = 0; p.ForeignCache.TTLMin = 0 },
+	} {
+		value := config.Defaults()
+		mutate(&value)
+		document := mustRenderPolicy(t, value)
+		if strings.Contains(string(document), tagForeignTTL) {
+			t.Fatalf("a policy asking for no clamp rendered a %s plugin:\n%s", tagForeignTTL, document)
+		}
+	}
+}
+
+// The clamp goes AFTER the forward, and the position is the whole of it: the
+// plugin table order IS the next chain, and the cache stores whatever its next
+// returned. A clamp before the forward would shape only the answer on the way out
+// while the router's own cache still expired on the upstream's TTL.
+func TestATtlClampIsRenderedAfterTheForwardSoTheCacheStoresIt(t *testing.T) {
+	value := config.Defaults()
+	value.ForeignCache.TTLMax = 300
+	parsed := decodeRendered(t, mustRenderPolicy(t, value))
+	names := tags(parsed)
+	forward, clamp := -1, -1
+	for index, name := range names {
+		switch name {
+		case tagForeignForward:
+			forward = index
+		case tagForeignTTL:
+			clamp = index
+		}
+	}
+	if clamp < 0 {
+		t.Fatalf("foreign_cache.ttl_max = 300 rendered no %s plugin", tagForeignTTL)
+	}
+	if clamp < forward {
+		t.Fatalf("%s is at %d, before %s at %d. The plugin table order IS the next chain, "+
+			"and the cache stores whatever its next returned: a clamp before the forward "+
+			"would only shape the answer on the way out while the router's own cache still "+
+			"expired on the upstream's TTL", tagForeignTTL, clamp, tagForeignForward, forward)
+	}
+}
+
+// And it is before the CN sequence, because the branch ends at the forward's answer
+// and a clamp the branch never runs is a clamp that does nothing.
+func TestATtlClampIsInsideTheForeignBranch(t *testing.T) {
+	value := config.Defaults()
+	value.ForeignCache.TTLMax = 300
+	parsed := decodeRendered(t, mustRenderPolicy(t, value))
+	names := tags(parsed)
+	clamp, cnPath := -1, -1
+	for index, name := range names {
+		switch name {
+		case tagForeignTTL:
+			clamp = index
+		case tagCNPath:
+			cnPath = index
+		}
+	}
+	if clamp < 0 || cnPath < 0 {
+		t.Fatalf("the document has no %s or no %s: %v", tagForeignTTL, tagCNPath, names)
+	}
+	if clamp > cnPath {
+		t.Fatalf("%s is at %d, after %s at %d: the foreign branch ends on the forward's "+
+			"answer, so a clamp after that runs on nothing", tagForeignTTL, clamp, tagCNPath, cnPath)
+	}
+}
+
+// Both keys are omitted rather than written zero, because mosdns reads `max > 0`
+// before applying a maximum (ttl.go:91). A written `min: 0` would happen to work --
+// ttl.go:88 guards on `t.min > 0` too -- but only by accident of the guard order, and
+// a reader of the document would conclude a floor of zero was asked for.
+func TestAZeroBoundIsOmittedRatherThanWritten(t *testing.T) {
+	value := config.Defaults()
+	value.ForeignCache.TTLMax = 120
+	parsed := decodeRendered(t, mustRenderPolicy(t, value))
+	block := string(mustRenderPolicy(t, value))
+	// **The check is on the DOCUMENT TEXT, not on the decoded value, and that
+	// distinction is the whole case.** `min: 0` decodes into the same 0 as an absent
+	// key, so a test that decodes and compares values cannot tell the two apart --
+	// it passed against the very mutation it exists to forbid. What differs is the
+	// KEY, and mosdns reads the key's absence (`if t.min > 0`, ttl.go:88), so the key
+	// is what has to be asserted.
+	_, before, _ := strings.Cut(block, "- tag: "+tagForeignTTL)
+	clamp, _, _ := strings.Cut(before, "- tag:")
+	if strings.Contains(clamp, "min:") {
+		t.Errorf("a zero ttl_min was written out as a key:\n%s\nmosdns reads `t.min > 0` "+
+			"before applying a floor (ttl.go:88), so the value would be inert and the "+
+			"document would claim a bound the router is not applying", clamp)
+	}
+	if !strings.Contains(clamp, "max: 120") {
+		t.Errorf("ttl_max = 120 was not written:\n%s", clamp)
+	}
+	args := argsOf[ttlBlock](t, parsed.entry(t, tagForeignTTL))
+	if args.Max != 120 {
+		t.Errorf("the clamp says max = %d, want the policy's 120", args.Max)
+	}
+}
+
+// And with BOTH set, both are written -- the case that proves the omitempty is not
+// simply dropping everything.
+func TestBothBoundsAreWrittenWhenBothAreAsked(t *testing.T) {
+	value := config.Defaults()
+	value.ForeignCache.TTLMax = 300
+	value.ForeignCache.TTLMin = 30
+	parsed := decodeRendered(t, mustRenderPolicy(t, value))
+	args := argsOf[ttlBlock](t, parsed.entry(t, tagForeignTTL))
+	if args.Max != 300 || args.Min != 30 {
+		t.Fatalf("the clamp says max=%d min=%d, want max=300 min=30", args.Max, args.Min)
+	}
+}
+
+func TestTheCacheSizeComesFromThePolicy(t *testing.T) {
+	value := config.Defaults()
+	value.ForeignCache.Size = 77
+	parsed := decodeRendered(t, mustRenderPolicy(t, value))
+	if got := argsOf[renderedCache](t, parsed.entry(t, tagForeignCache)).Size; got != 77 {
+		t.Fatalf("the cache size is %d, want the policy's 77: it was a render constant "+
+			"writing 1024 and this is the change that makes it the operator's", got)
 	}
 }
