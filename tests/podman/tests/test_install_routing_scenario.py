@@ -41,6 +41,9 @@ import test_command  # noqa: E402
 import report  # noqa: E402
 from podman import Podman  # noqa: E402
 
+# This repository's root, for the committed document the fixture renders.
+REPO = Path(__file__).resolve().parents[3]
+
 PodmanTestCase = test_command.PodmanTestCase
 
 VERSION = "24.04"
@@ -154,6 +157,43 @@ def dnsmasq_query_line(name, client=None, query_type="A"):
     return f"dnsmasq[1]: query[{query_type}] {name} from {client or DOMESTIC_LISTENER}"
 
 
+def rendered_document(upstreams=None):
+    """An installed routing document, in the shape the renderer writes.
+
+    **Read from the repository's own `configs/mosdns.yaml`, not typed.** That file is
+    the committed output of the Go renderer -- `TestCommittedMosdnsConfigIsExactly`
+    TheRenderedDefault` compares it byte for byte and regenerates it from the code --
+    so it is what a real install writes, and a hand-written fixture would be a
+    document shape no install ever produces. A fixture that typed the document would
+    let the section under test pass against a fiction.
+
+    `upstreams` replaces the forward's block, for the case that needs a document
+    which does NOT name the second upstream.
+    """
+    document = (REPO / "configs" / "mosdns.yaml").read_text(encoding="utf-8")
+    if upstreams is None:
+        return document
+    # A case that wants a different upstream list replaces the forward's block,
+    # which is the only part of the document the section reads.
+    lines = document.splitlines()
+    out, inside = [], False
+    for line in lines:
+        if line.strip().startswith("- tag: foreign_forward"):
+            inside = True
+        elif inside and line.strip().startswith("- tag:"):
+            inside = False
+        if not inside:
+            out.append(line)
+    block = ["  - tag: foreign_forward", "    type: forward", "    args:",
+             "      concurrent: 2"]
+    for addr in upstreams:
+        block.append(f"      - addr: {addr}")
+    spliced = "\n".join(out).rstrip("\n")
+    return spliced.replace(
+        "  - tag: cn_path", "\n".join(block) + "\n  - tag: cn_path", 1
+    ) + "\n"
+
+
 def routing_rules(**overrides):
     """Every answer a cell whose two branches are distinguishable needs.
 
@@ -210,7 +250,27 @@ def routing_rules(**overrides):
             ]
         ) + "\n",
         "answer": "198.51.100.7",
+        # The installed routing document, in the shape the renderer writes. The
+        # second upstream is the one this cell cannot reach, and the section under
+        # test reads it back out of here rather than trusting the policy.
+        "rendered_document": rendered_document(),
+        # **And the router's log naming that upstream.** This is the only evidence
+        # in the cell that the dead upstream was asked at all: nothing receives
+        # those queries, so no counter reports them, and mosdns logs a Warn per
+        # failure. A log without this line is the `concurrent: 1` configuration,
+        # which is the one the section exists to be different from.
     }
+    # Read from `overrides`, NOT from `answers`: the flag decides what goes INTO the
+    # router log, and the log is built before `answers.update(overrides)` runs. A
+    # first version popped it out of `answers`, which held the default, so
+    # `dead_upstream_warned=False` was applied after the log had already been written
+    # -- and the case that exists to prove the cell refuses a router that never tried
+    # the second upstream passed against a fixture that always added the line.
+    if overrides.pop("dead_upstream_warned", True):
+        answers["router_log"] = answers["router_log"] + (
+            "2026-10-04T00:00:00.000+0800\tWARN\tforeign_forward\tupstream error"
+            f'\t{{"upstream": "{routing.SECOND_UPSTREAM}", "error": "context deadline exceeded"}}\n'
+        )
     # The domestic mock is the DHCP/DNS router, whose evidence is its own log
     # rather than a counters document -- dnsmasq is a package on the locked
     # release, not this project's code, and the plan's Task 3 built it that way.
@@ -244,6 +304,13 @@ def routing_rules(**overrides):
         # and needs the *other* mock's answer to stay as it is.
         {"match": ["exec", FOREIGN, "cat", routing.COUNTERS_PATH],
          "stdout": answers["foreign"]},
+        # -- the installed routing document, and the router's own evidence that
+        # it TRIED the upstream this cell cannot reach ------------------------
+        # Read from the INSTALLED document rather than from the policy: the
+        # document is what the router loaded, so a policy the renderer dropped an
+        # entry from would otherwise be measured as a working two-upstream route.
+        {"match": ["exec", TARGET, "cat", "/etc/mosdns/mosdns.yaml"],
+         "stdout": answers["rendered_document"]},
         {"match": ["logs", ROUTER], "stdout": answers["router_log"]},
         # -- what the answers were, read from inside the target -------------
         {"match": ["exec", TARGET, "cat", routing.PUBLISHED_CN_LIST],
@@ -453,7 +520,24 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
             f"{asked_client}",
         )
         asked_target = [line for line in self.asked_in(fake, TARGET) if "dig" in line]
-        self.assertEqual(len(asked_target), 4, f"the target was asked {asked_target}")
+        # **The count is of the SPLIT, not of every query the scenario makes.** The
+        # section that measures a dead second upstream asks one more question after
+        # the split, and a literal total here would make adding a measurement look
+        # like a change to what is being measured.
+        #
+        # What is held is the shape: one question per name per transport, from the
+        # vantage point that can ask, and the extra query after the split.
+        split_queries = [line for line in asked_target if FOREIGN_NAME in line or CHINA_NAME in line]
+        self.assertGreaterEqual(
+            len(split_queries), 4,
+            f"the target was asked {asked_target}, which does not contain a question per "
+            f"name per transport for the split",
+        )
+        self.assertEqual(
+            asked_target,
+            split_queries + [line for line in asked_target if line not in split_queries],
+            "the queries must be the split's queries and then the post-split ones",
+        )
 
     def test_the_record_says_which_vantage_points_were_measured(self):
         """A reader of the evidence document has to be able to tell that the client
@@ -555,7 +639,16 @@ class TheClientCannotReachALoopbackOnlyRouterTest(RoutingScenarioHarness):
             (CLIENT, TARGET_ADDRESS),
         ):
             asked = [line for line in self.asked_in(fake, container) if "dig" in line]
-            self.assertEqual(len(asked), 4, f"{container} was asked {asked}")
+            # **Every query, not a fixed number of them.** The claim this case makes
+            # is about the ADDRESS each question was addressed to, and a literal count
+            # made it a claim about how many questions the scenario happens to ask --
+            # so adding the measurement of a dead second upstream turned it red for
+            # no reason the case was written to catch.
+            self.assertGreaterEqual(
+                len(asked), 4,
+                f"{container} was asked {asked}, which is fewer questions than the split "
+                f"needs -- one per name per transport",
+            )
             for line in asked:
                 self.assertIn(
                     f"@{address} -p 53", line,
@@ -1734,6 +1827,131 @@ class RoutingScenarioShapeTest(unittest.TestCase):
                     "asserting something about IPv6 -- which 22.04, 24.04 and 26.04 differ in "
                     "and which this scenario does not otherwise exercise",
                 )
+
+
+class ADeadSecondUpstreamStillAnswersTest(RoutingScenarioHarness):
+    """The claim `concurrent: 2` exists for, measured where it can only be measured.
+
+    Everything else in this file can be measured on a host with a route to the
+    internet. This cannot: the second upstream the shipped policy names is a DoQ
+    endpoint on the public internet, and the matrix cell has no route off its own
+    bridge. So the cell is the only place where "one upstream is unreachable and the
+    query is still answered" can be observed against the shipped configuration.
+
+    **And the unreachable upstream is not measured by a counter, because nothing
+    receives its queries.** mosdns logs a Warn naming the upstream it could not
+    reach, and that line is the only evidence in this cell that it was asked at all.
+    The counter measures the other half -- that the query was still answered by the
+    upstream that CAN be reached -- and the two together are the claim.
+    """
+
+    def test_the_query_is_answered_even_though_the_second_upstream_is_dead(self):
+        _fake, result = self.run_scenario()
+        # "passed", not "incomplete": the whole point of the classification above is
+        # that the client vantage point is filed as a required skip and the REST still
+        # runs. A cell that reported `incomplete` here would be a cell that measured
+        # nothing, which is the defect the classification was written to prevent.
+        self.assertEqual(
+            result.status, "passed",
+            f"the routing cell measured the split and the dead upstream and reported "
+            f"{result.status}: {result.detail}",
+        )
+        record = self.record(result)
+        self.assertIn(
+            routing.FOREIGN_ANSWER, record.get("answer_after_dead_upstream", ""),
+            f"after the router tried and failed to reach {routing.SECOND_UPSTREAM} the "
+            f"foreign name answered {record.get('answer_after_dead_upstream')!r}, which does "
+            f"not carry the foreign branch's answer. Racing two upstreams exists so that one "
+            f"unreachable upstream does not stop the query",
+        )
+
+    def test_the_dead_upstream_is_recorded_as_having_been_tried(self):
+        """The half that makes the case worth anything.
+
+        Asserting only "the query succeeded" would pass against a document with ONE
+        upstream -- and one upstream is exactly the configuration this change moves
+        away from. So the record has to say the second upstream was dialled, and the
+        only thing in this cell that can say it is the router's own log.
+        """
+        _fake, result = self.run_scenario()
+        record = self.record(result)
+        self.assertTrue(
+            record.get("dead_upstream_was_tried"),
+            "the record does not say the second upstream was tried, so this cell cannot "
+            "tell a racing route from a single-upstream one -- which is the only thing it "
+            "was added to measure",
+        )
+        self.assertIn(
+            routing.SECOND_UPSTREAM, record.get("router_log_for_upstreams", ""),
+            "the record says the upstream was tried but carries no log line naming it",
+        )
+
+    def test_the_installed_document_must_name_both_upstreams(self):
+        """The precondition, and it is refused rather than passed over.
+
+        A document with one upstream would make every assertion above pass while
+        measuring nothing: the query would succeed, and the log would never name the
+        second upstream. So the cell first checks the installed document names it --
+        read from the INSTALLED file, because that is what the router loaded, and a
+        policy the renderer dropped an entry from is the failure this catches.
+        """
+        _fake, result = self.run_scenario()
+        record = self.record(result)
+        self.assertIn(
+            routing.SECOND_UPSTREAM, record.get("rendered_upstreams", []),
+            f"the installed routing document names {record.get('rendered_upstreams')}, which "
+            f"does not include {routing.SECOND_UPSTREAM}. This cell measures a route that "
+            f"races two upstreams; a document with one measures something else",
+        )
+
+    def test_a_document_without_the_second_upstream_is_refused_not_passed(self):
+        """**The mutation, as a case.** This is what makes the section above a
+        measurement rather than a comment: the same document minus its second
+        upstream must be REFUSED by the cell.
+
+        Without this case the section could pass on a cell whose document never named
+        the second upstream, and the reader of a green report would have no way to
+        tell which configuration was measured.
+        """
+        rules = routing_rules()
+        rules.insert(
+            0,
+            {"match": ["exec", TARGET, "cat", "/etc/mosdns/mosdns.yaml"],
+             "stdout": rendered_document(upstreams=["tcp://127.0.0.1:15353"])},
+        )
+        _fake, result = self.run_scenario(rules=rules)
+        self.assertEqual(
+            result.status, "failed",
+            "a cell whose installed document names no second upstream was reported as "
+            f"{result.status}, so a green report cannot be told apart from one that "
+            f"measured a single-upstream route",
+        )
+        self.assertIn(
+            routing.SECOND_UPSTREAM, result.detail,
+            f"the refusal does not name the upstream it wanted: {result.detail}",
+        )
+
+    def test_a_router_that_never_tried_the_second_upstream_is_refused(self):
+        """**The other mutation, as a case.** This is `concurrent: 1` wearing the
+        same document: the router answers, the log never mentions the second
+        upstream, and every "the query succeeded" assertion still passes.
+
+        So the cell must refuse, because the thing it is here to measure did not
+        happen. Without this case the section would be satisfied by a router that
+        asked exactly one upstream -- which is the default mosdns ships and the one
+        this change deliberately moved away from.
+        """
+        _fake, result = self.run_scenario(dead_upstream_warned=False)
+        self.assertEqual(
+            result.status, "failed",
+            "a router that never mentioned the second upstream was reported as "
+            f"{result.status}. Asking one upstream and asking two look identical from the "
+            f"answer alone, which is why this is refused rather than passed",
+        )
+        self.assertIn(
+            routing.SECOND_UPSTREAM, result.detail,
+            f"the refusal does not name the upstream it expected to see tried: {result.detail}",
+        )
 
 
 if __name__ == "__main__":

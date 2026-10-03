@@ -158,6 +158,19 @@ TEST_SUFFIX = "test"
 # foreign branch's meaning rests on it -- a name the China set matched would go
 # down the *domestic* branch, and the cell's two counters would agree for a
 # reason nobody could read.
+# The SECOND foreign upstream the shipped policy names. It exists so a DNSCrypt
+# outage is not a total loss of the foreign branch, and in this cell it is DEAD:
+# the network has no route off its own bridge, so a DoQ endpoint on the internet
+# cannot answer here. That is not a defect to fix -- it is the condition the
+# `concurrent` assertions below measure against, and a cell that quietly gained a
+# route would make them pass for the wrong reason.
+#
+# It is written here rather than read out of the policy so that a change to the
+# policy's upstream list cannot silently turn this into a different measurement.
+# The rendered document is read back below and checked for this address, so the two
+# cannot drift apart quietly: if the policy stops naming it, the cell says so.
+SECOND_UPSTREAM = "quic://dns.quad9.net:853"
+
 FOREIGN_TEST_NAME = f"foreign-routing.{TEST_SUFFIX}"
 # The China name is NOT a literal. It is read out of the published list, so it is
 # a name this project's own configuration routes domestically. The placeholder is
@@ -954,6 +967,58 @@ def build_scenario(
                 "arrival came from something else -- a different listener, a different path, or "
                 "a resolver that is not the one the router is configured to use",
             )
+            # -- 8. one upstream dead, and the query still answered ---------
+            # **This is the section the whole `concurrent: 2` change exists for,
+            # and it is here rather than in the unit suite because the thing it
+            # claims cannot be measured anywhere else: that a route which races two
+            # upstreams still answers when one of them cannot be reached at all.**
+            #
+            # The precondition is MEASURED, not assumed. Everything above proves the
+            # foreign branch works, which is consistent both with "the second
+            # upstream was tried and failed" and with "the second upstream was never
+            # tried". Those are different configurations and the difference is the
+            # whole of `concurrent`, so it is read out of the router's own log:
+            # mosdns logs a Warn naming the upstream it could not reach, and that
+            # line is the only evidence in this cell that the second upstream was
+            # asked at all -- nothing receives those queries, so no counter can
+            # report them.
+            document["rendered_upstreams"] = rendered_upstreams(
+                try_read(target, "cat", "/etc/mosdns/mosdns.yaml")
+            )
+            _require(
+                SECOND_UPSTREAM in document["rendered_upstreams"],
+                f"the installed routing document names {document['rendered_upstreams']}, which "
+                f"does not include {SECOND_UPSTREAM}. This cell is the measurement of a "
+                "two-upstream route racing, and a document with one upstream measures "
+                "something else entirely -- so the cell says so rather than passing on "
+                "a configuration it did not set out to test",
+            )
+            document["router_log_for_upstreams"] = router_log(podman, router)
+            tried_dead_one = SECOND_UPSTREAM in document["router_log_for_upstreams"]
+            document["dead_upstream_was_tried"] = tried_dead_one
+            _require(
+                tried_dead_one,
+                "the router's log does not mention "
+                f"{SECOND_UPSTREAM} at all. The document names that upstream and "
+                "`concurrent: 2` asks two of them per query, so it must have been dialled and "
+                "must have failed -- and this cell has no route off its bridge, so a failure is "
+                "expected. A log that never names it means the second upstream was not asked, "
+                "which is the configuration `concurrent: 1` produces and the one this cell "
+                "exists to be different from",
+            )
+            # And the query that raced it still succeeded -- which is the claim.
+            # It is asked AFTER the counters above are read, so its arrival cannot be
+            # mistaken for theirs.
+            after_dead = ask(target, foreign_name, FOREIGN_TRANSPORT, TARGET_LOCAL_ADDRESS)
+            document["answer_after_dead_upstream"] = after_dead
+            _require(
+                FOREIGN_ANSWER in after_dead,
+                f"{foreign_name!r} after the router tried and failed to reach "
+                f"{SECOND_UPSTREAM} = {after_dead!r}, which does not carry the foreign "
+                f"branch's answer {FOREIGN_ANSWER}. The whole point of racing two upstreams is "
+                "that one unreachable upstream does not stop the query, and this is where that "
+                "is measured",
+            )
             _require(
                 foreign_name not in document["domestic_counters"],
                 f"the foreign test name {foreign_name!r} reached the DOMESTIC listener "
@@ -1067,6 +1132,27 @@ def build_scenario(
     return run_scenario
 
 
+def rendered_upstreams(document: str) -> list[str]:
+    """Every `addr:` the installed routing document's forward carries, in order.
+
+    Read from the INSTALLED document rather than from the policy, because the
+    document is what the router actually loaded: a policy that names an upstream the
+    renderer dropped would otherwise be measured as a working two-upstream route.
+    """
+    addresses = []
+    inside = False
+    for line in document.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- tag: foreign_forward"):
+            inside = True
+            continue
+        if inside and stripped.startswith("- tag:"):
+            break
+        if inside and stripped.startswith("- addr:"):
+            addresses.append(stripped.split("- addr:", 1)[1].strip().strip("\"'"))
+    return addresses
+
+
 def router_log(podman, container) -> str:
     """`podman logs <container>`, with a podman failure carried as text.
 
@@ -1133,6 +1219,7 @@ __all__ = [
     "foreign_counters",
     "matches_china_set",
     "published_cn_domains",
+    "rendered_upstreams",
     "router_log",
     "router_queries",
 ]
