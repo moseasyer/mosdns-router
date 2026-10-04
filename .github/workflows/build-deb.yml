@@ -26,7 +26,11 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  # read for checkout; write because this workflow publishes a Release, and a
+  # release is a tag on the default branch plus an asset. A workflow that builds a
+  # package and hands it over as a zip in a run page makes every consumer do the
+  # version bookkeeping themselves; the Release is where the version lives.
+  contents: write
 
 jobs:
   deb:
@@ -226,3 +230,97 @@ jobs:
           name: mosdns-router-deb
           path: build/*.deb
           if-no-files-found: error
+
+      # Runs LAST, so the assertions above gate it: a release is the one artifact
+      # somebody installs without reading a log, and it must not exist for a build
+      # whose version, conffiles or loopback assertions failed.
+      - name: the package, as a Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          want=$(sed -n 's/^PACKAGE_VERSION=//p' scripts/build-deb.sh)
+          deb="build/mosdns-router_${want}_amd64.deb"
+          sha=$(sha256sum "$deb" | cut -d' ' -f1)
+          rev=$(dpkg-deb --fsys-tarfile "$deb" \
+            | tar -xO ./usr/share/doc/mosdns-router/BUILD-MANIFEST \
+            | sed -n 's/^revision: *//p')
+          test -n "$want" && test -f "$deb" && test -n "$rev"
+
+          # A tag push releases under the tag that was pushed. A manual run has no
+          # tag, so it releases under the PACKAGE VERSION -- which is the fact the
+          # release is about, and which makes the download URL say what it is
+          # instead of being "latest".
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="v${want}"
+          fi
+
+          # A tag is a claim about one commit. If the tag exists and names a
+          # different commit, this refuses rather than retagging it: a Release
+          # whose download URL silently changes contents is worse than no Release,
+          # and the operator can see the collision in the log and decide.
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            remote=$(git ls-remote --tags origin "refs/tags/${tag}" | cut -f1 | head -1)
+            if [ "$remote" != "$(git rev-parse HEAD)" ]; then
+              echo "tag ${tag} already names ${remote}, and this build is $(git rev-parse HEAD)."
+              echo "Refusing to move a tag a Release may already point at."
+              exit 1
+            fi
+          fi
+
+          notes=$(cat <<TXT
+          Built by [the build-deb workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.job.run_id }})
+          from commit [\`${rev:0:12}\`](${{ github.server_url }}/${{ github.repository }}/commit/${rev}).
+
+          | | |
+          |---|---|
+          | Version | \`${want}\` |
+          | Architecture | \`amd64\` |
+          | Built from | \`${rev}\` |
+          | sha256 | \`${sha}\` |
+
+          ### Before installing it
+
+          This package takes the machine's DNS over: it points NetworkManager at
+          \`127.0.0.1:53\`. Install it on a VM or a disposable machine, not on the
+          one whose only remote access depends on working DNS.
+
+          \`dpkg -i\` leaves the package **half-configured** when \`postinst\` refuses
+          the transaction, which is a normal outcome rather than a broken package.
+          If you see it, do NOT run \`dpkg --configure mosdns-router\` — that retries
+          the transaction while DNS may already point at a resolver that is not
+          running. \`mosdns-cdnctl emergency-rollback\` restores DNS, does not consult
+          the preflight, and works on exactly the machine whose install died.
+
+          ### Verifying it did what it claims
+
+          A name resolving does not prove it took the foreign branch — the domestic
+          resolver answers the same names. The decisive check is to break the foreign
+          leg and watch the domestic one keep working, with the watchdog stopped first
+          so it does not roll the machine back mid-test:
+
+              sudo systemctl stop mosdns-watchdog.timer mosdns-watchdog.service
+              sudo systemctl stop dnscrypt-proxy
+              dig +short @127.0.0.1 -p 53 www.google.com   # timeout or SERVFAIL
+              dig +short @127.0.0.1 -p 53 baidu.com        # still answers
+              sudo systemctl start dnscrypt-proxy
+          TXT
+          )
+          # The heredoc above is indented inside run: |, so strip that indentation
+          # or every release note starts with spaces.
+          notes=$(printf '%s\n' "$notes" | sed 's/^          //')
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release ${tag} exists; replacing its asset and leaving its notes alone."
+            gh release upload "$tag" "$deb" --clobber
+          else
+            gh release create "$tag" "$deb" --target "$(git rev-parse HEAD)" \
+              --title "mosdns-router ${want}" --notes "$notes"
+          fi
+
+          echo "--- $tag"
+          gh release view "$tag" --json url,tagName --jq '"release: \(.url)"'
+          echo "download: ${{ github.server_url }}/${{ github.repository }}/releases/download/${tag}/$(basename "$deb")"
