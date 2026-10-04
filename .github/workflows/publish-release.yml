@@ -233,6 +233,11 @@ jobs:
           )
           notes=$(printf '%s\n' "$notes" | sed 's/^          //')
 
+          echo "MARK A: viewing $TAG"
+          gh release view "$TAG" --repo "$REPO" --json tagName 2>&1 | head -3 || true
+          echo "MARK B: token identity"
+          gh auth status 2>&1 | head -6
+          echo "MARK C: creating $TAG at $rev"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             # Same immutability rule as before, on the same reasoning: a Release is
             # fixed per commit. Re-publishing the same commit would replace the asset
