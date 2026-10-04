@@ -1,0 +1,188 @@
+# PUBLISHES A BUILT PACKAGE AS A RELEASE.
+#
+# This is the step that was missing, and its absence is why build-deb.yml used to do
+# it too. Publishing has to be a CHOICE made about a build somebody looked at, and
+# "build and publish in one run" cannot express that: the Release was whatever the
+# last run produced, and there was no moment at which a person decided.
+#
+# So this workflow builds nothing. It takes the ID of a build run, downloads THAT
+# run's artifact, and publishes it. Three consequences worth stating:
+#
+#   - The choice is an argument. "Promote run 37211000000" is a decision somebody
+#     made; the build workflow publishing itself was not.
+#   - This run appears in the Actions list, so the publishing is as visible and as
+#     auditable as the building. There is no path to a Release that is not a run.
+#   - It does NOT rebuild. A Release built from a fresh compile is not the package
+#     you chose, it is a different package that happens to come from the same commit
+#     -- BUILD_TIME goes into the linker, so two builds of one commit differ. It
+#     downloads the artifact and re-checks it.
+#
+# It re-runs scripts/assert-deb.sh rather than trusting the build run. The build run
+# ran the same script, but a run that asserts nothing about what it is about to
+# publish is a run that republishes whatever it was handed.
+
+name: publish-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "The build-deb run whose artifact to publish (from its URL)"
+        required: true
+        type: string
+      tag:
+        description: "Release tag, e.g. v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  # write to create the tag and the Release; actions:read to download the artifact.
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: publish a built package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: the source, and its tags
+        uses: actions/checkout@v5
+        with:
+          # Full history because the tag this creates has to point at a commit, and
+          # a commit the artifact records. A shallow clone cannot resolve either.
+          fetch-depth: 0
+
+      - name: the built package, from that run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p pkg
+          if ! gh run download "$RUN_ID" --repo "$REPO" --name mosdns-router-deb --dir pkg; then
+            echo "No mosdns-router-deb artifact on run ${RUN_ID}." >&2
+            echo "Check the run id, and check that the run SUCCEEDED -- a failed" >&2
+            echo "build uploads nothing to promote." >&2
+            exit 1
+          fi
+          find pkg -name '*.deb' -type f
+
+      - name: the same assertions the build ran
+        # Not a formality. The point of promoting a chosen artifact is that it is
+        # the package that was inspected, so it is re-checked here against the same
+        # script, from the repository at the tag's commit.
+        run: |
+          set -euo pipefail
+          deb=$(find pkg -name '*.deb' -type f | head -1)
+          test -n "$deb"
+          sh scripts/assert-deb.sh "$deb"
+          sha256sum "$deb"
+          dpkg-deb --info "$deb" | sed -n '1,12p'
+
+      - name: publish it, or refuse to
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          # github.run_id, not github.job.run_id: the latter is not a valid context
+          # property and rendered EMPTY, which put a bare ".../actions/runs/" in the
+          # release notes -- a link to the list rather than to the run.
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          deb=$(find pkg -name '*.deb' -type f | head -1)
+          want=$(sed -n 's/^PACKAGE_VERSION=//p' scripts/build-deb.sh)
+          sha=$(sha256sum "$deb" | cut -d' ' -f1)
+          rev=$(sh scripts/assert-deb.sh "$deb" | tail -1)
+          test -n "$rev" -a -n "$sha" -a -n "$want"
+
+          # A Release is a claim about one commit, and the commit is the one the
+          # PACKAGE was built from -- not the branch head, which may have moved on
+          # since the build ran. So the tag is created at the artifact's revision,
+          # and that is checked rather than assumed.
+          git fetch -q origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            tagged=$(git rev-list -n1 "refs/tags/${TAG}")
+            if [ "$tagged" != "$rev" ]; then
+              echo "tag ${TAG} names ${tagged}, and this package was built from ${rev}." >&2
+              echo "Refusing to move a tag a Release may already point at, and" >&2
+              echo "refusing to publish one package under another commit's tag." >&2
+              echo "Use a new tag, or promote the build of ${tagged}." >&2
+              exit 1
+            fi
+            echo "tag ${TAG} already names this commit."
+          fi
+
+          notes=$(cat <<TXT
+          Promoted from [build run ${RUN_ID}](${SOURCE_RUN_URL}) by
+          [this workflow](${RUN_URL}), which built nothing and re-checked
+          everything: the assertions in \`scripts/assert-deb.sh\` ran against the
+          downloaded artifact, so this is the package that run produced and not a
+          fresh compile of the same commit.
+
+          | | |
+          |---|---|
+          | Version | \`${want}\` |
+          | Architecture | \`amd64\` |
+          | Built from | \`${rev}\` |
+          | sha256 | \`${sha}\` |
+
+          The sha256 above is of the file behind the link below. Re-running the
+          build produces different bytes -- \`BUILD_TIME\` goes into the linker -- so
+          compare against the notes, never against an older build of the same commit.
+
+          ### Before installing it
+
+          This package takes the machine's DNS over: it points NetworkManager at
+          \`127.0.0.1:53\`. Install it on a VM or a disposable machine, not on the
+          one whose only remote access depends on working DNS.
+
+          \`dpkg -i\` leaves the package **half-configured** when \`postinst\` refuses
+          the transaction, which is a normal outcome rather than a broken package.
+          If you see it, do NOT run \`dpkg --configure mosdns-router\` -- that retries
+          the transaction while DNS may already point at a resolver that is not
+          running. \`mosdns-cdnctl emergency-rollback\` restores DNS, does not consult
+          the preflight, and works on exactly the machine whose install died.
+
+          ### Verifying it did what it claims
+
+          A name resolving does not prove it took the foreign branch -- the domestic
+          resolver answers the same names. The decisive check is to break the foreign
+          leg and watch the domestic one keep working, with the watchdog stopped
+          first so it does not roll the machine back mid-test:
+
+              sudo systemctl stop mosdns-watchdog.timer mosdns-watchdog.service
+              sudo systemctl stop dnscrypt-proxy
+              dig +short @127.0.0.1 -p 53 www.google.com   # timeout or SERVFAIL
+              dig +short @127.0.0.1 -p 53 baidu.com        # still answers
+              sudo systemctl start dnscrypt-proxy
+          TXT
+          )
+          notes=$(printf '%s\n' "$notes" | sed 's/^          //')
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Same immutability rule as before, on the same reasoning: a Release is
+            # fixed per commit. Re-publishing the same commit would replace the asset
+            # with different bytes and leave these notes quoting a file that is gone,
+            # and a checksum that stops matching is worse than no checksum.
+            existing=$(gh release view "$TAG" --repo "$REPO" --json body --jq '.body' \
+              | sed -n 's/^| Built from | `\([0-9a-f]*\)` |$/\1/p' | head -1)
+            if [ "$existing" = "$rev" ]; then
+              echo "Release ${TAG} already publishes ${rev:0:12}; nothing to do."
+            else
+              echo "Release ${TAG} publishes ${existing:-an unknown commit}; replacing asset AND notes."
+              gh release upload "$TAG" "$deb" --repo "$REPO" --clobber
+              gh release edit "$TAG" --repo "$REPO" --notes "$notes"
+            fi
+          else
+            gh release create "$TAG" "$deb" --repo "$REPO" --target "$rev" \
+              --title "mosdns-router ${want}" --notes "$notes"
+          fi
+
+          echo "--- ${TAG}"
+          gh release view "$TAG" --repo "$REPO" --json url --jq '.url'
+          echo "download: https://github.com/${REPO}/releases/download/${TAG}/$(basename "$deb")"
