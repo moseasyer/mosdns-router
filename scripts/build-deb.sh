@@ -8,7 +8,7 @@
 # happens inside a staging root, and the only thing that leaves it is a .deb file
 # and a printed path.
 #
-#   scripts/build-deb.sh                     build ./build/mosdns-router_0.1.0_amd64.deb
+#   scripts/build-deb.sh                     build ./build/mosdns-router_0.2.0_amd64.deb
 #   scripts/build-deb.sh --stage DIR         build only the staging root, and stop
 #   scripts/build-deb.sh --arch arm64        build for the other supported release
 #
@@ -27,7 +27,7 @@ PACKAGE=mosdns-router
 # the first version of this script called both `VERSION`, so a `VERSION=` the Makefile
 # passed in was silently ignored and the shipped binary's version was whatever this
 # line said rather than the revision the Makefile had computed.
-PACKAGE_VERSION=0.1.0
+PACKAGE_VERSION=0.2.0
 BUILD=build
 STAGE=
 STAGE_ONLY=
