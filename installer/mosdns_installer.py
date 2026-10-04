@@ -312,6 +312,12 @@ MANAGED_BY_VALUE = "mosdns-router"
 # conflicting installation would already hold.
 DNS_PORT = 53
 RESOLVER_PORT = 15353
+# The address both of those ports are bound on. The port check asks whether a
+# foreign socket is in the way of THIS bind, and the answer is about the address
+# as much as the port: a listener on 192.168.122.1:53 is a different socket from
+# 127.0.0.1:53, and binding one does not fail because the other exists. See
+# _blocks_our_bind for why that distinction was worth a bug report.
+BIND_ADDRESS = "127.0.0.1"
 RESOLVER_UNIT = "dnscrypt-proxy.service"
 ROUTER_UNIT = "mosdns-router.service"
 # The four timers, named on their own because an uninstall stops them first and
@@ -944,7 +950,13 @@ def _holders(listeners: str) -> List[Holder]:
     right.
 
     A scope suffix is stripped (`127.0.0.53%lo:53`) because which interface a
-    loopback socket is bound to is not what this check decides. `ss` names every
+    loopback socket is bound to is not what this check decides; the ADDRESS is, and
+    check_ports reads it -- but the scope id is noise for that question, since
+    `%lo` names the loopback interface and `127.0.0.53` already says that. Dropping
+    the address itself, which an earlier version of this function's docstring
+    endorsed, is what refused a machine with a virtualisation stack on it: libvirt's
+    dnsmasq holds the bridge's own address, not the loopback. See
+    _blocks_our_bind. `ss` names every
     process sharing a socket, so all of them are kept: a socket that resolved holds
     alongside a foreign process is not resolved's alone. A line with no process
     column at all keeps no owners, which is what `ss` prints for a socket this user
@@ -1091,6 +1103,66 @@ def _describe_owners(holder: Holder) -> str:
     )
 
 
+def _blocks_our_bind(address: str) -> bool:
+    """Whether a listener on ``address`` is in the way of binding ``BIND_ADDRESS``.
+
+    THE ANSWER IS ABOUT THE ADDRESS, NOT THE PORT, and getting that wrong refused
+    a real machine. A host with a virtualisation stack and a container runtime
+    failed to install with "port 53 is already held": libvirt's dnsmasq holds
+    192.168.122.1:53 -- the virtual bridge's own address -- and this package binds
+    127.0.0.1:53 and nothing else. Those are two different sockets. The bind
+    cannot fail, no query can be answered by both, and a check that refuses it
+    refuses every machine with a VM on it.
+
+    So the rule is "does this bind cover the loopback address we bind", and the
+    rows that decide it:
+
+      0.0.0.0, *, ::        a wildcard covers every address including ours. This
+                            is what a container runtime publishing a DNS port
+                            looks like, and it really would fail the bind --
+                            refusing it is correct, not over-cautious.
+      127.0.0.0/8           the loopback interface. 127.0.0.53 is not strictly
+                            covered by 127.0.0.1 on Linux -- they are two
+                            addresses on one interface and both binds succeed --
+                            but resolved's stub is 127.0.0.53 and a foreign
+                            process answering beside it is two answers for one
+                            query, which is the case this check exists for. So
+                            loopback is refused for the two-answers reason as well
+                            as the bind reason, and the two reasons are not
+                            confused for one another in the message.
+      ::1                   the whole of IPv6 loopback, by equality. ::2 and up
+                            are reserved and ::10.0.0.1 is a global address, so a
+                            prefix test here admits the case the test exists to
+                            catch, in the permissive direction.
+      anything else         a routable or link-local address. Not in the way.
+
+    An address that does not parse as an address at all is treated as blocking.
+    That is the direction to be wrong in: a holder this function cannot read is a
+    holder nobody can reason about, and `ss` prints an address for every socket, so
+    an unparseable one means the input is not what this function was written for.
+    """
+    candidate = address.strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if candidate in ("", "*", "0.0.0.0", "::"):
+        return True
+    if candidate == "::1":
+        return True
+    if candidate.startswith("127."):
+        # Not a string test: "127.example.com" starts with "127." and is not an
+        # address, and admitting it would admit whatever else begins that way.
+        try:
+            ipaddress.IPv4Address(candidate)
+        except ValueError:
+            return True
+        return True
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return True
+    return False
+
+
 def check_ports(root: Path, run: CommandRunner, report: Preflight) -> None:
     """Refuse a DNS or resolver port held by anything this install does not own.
 
@@ -1104,6 +1176,13 @@ def check_ports(root: Path, run: CommandRunner, report: Preflight) -> None:
     Every other holder of either port is refused, and the refusal names the
     process, because "port 53 is taken" sends an operator hunting when the answer
     is one `ss` away.
+
+    "Every other holder" is scoped to the ones actually in the way. The port alone
+    does not decide it -- the ADDRESS does, because this package binds
+    127.0.0.1 and a listener on the virtual bridge's 192.168.122.1:53 is a
+    different socket. Refusing those refused a real machine with a VM on it; they
+    are now a note instead. A holder on the loopback or on a wildcard is still
+    refused, which is the case the check is for.
     """
     completed = _ok(run, ("ss", "-H", "-lntup"))
     if completed is None:
@@ -1123,8 +1202,17 @@ def check_ports(root: Path, run: CommandRunner, report: Preflight) -> None:
             if pid is not None:
                 own_pids[pid] = unit
     occupied = set()
+    elsewhere = []
     for holder in claimed:
         if _is_exempt(holder, resolved_pid, own_pids):
+            continue
+        if not _blocks_our_bind(holder.address):
+            # Recorded, not refused. The bind is unaffected, so refusing would be
+            # wrong; but something on this machine is answering DNS on a routable
+            # address that this install did not put there, and the DHCP bridge
+            # publishes whatever NetworkManager is using -- so an operator who
+            # wants to know what is resolving their foreign names needs this line.
+            elsewhere.append(holder)
             continue
         holder_of = "the router" if holder.port == DNS_PORT else "the resolver"
         report.refuse(
@@ -1134,6 +1222,13 @@ def check_ports(root: Path, run: CommandRunner, report: Preflight) -> None:
             "will not take DNS over from a service it did not install"
         )
         occupied.add(holder.port)
+    for holder in elsewhere:
+        report.note(
+            f"{holder.protocol} port {holder.port} is held on {holder.address} by "
+            f"{_describe_owners(holder)}, which is not {BIND_ADDRESS} and so does not block "
+            "this package's bind; it is named because a resolver on this machine that this "
+            "install did not put there is not something this install can vouch for"
+        )
     for port in sorted(occupied):
         report.mark_occupied(port)
     report.note(

@@ -233,6 +233,11 @@ SHARED_IPV6_LISTENER_LINE = (
 RESOLVED_PID = "39"
 ROUTER_PID = "41"
 RESOLVER_PID = "42"
+# The address this package binds both of its ports on, named from the installer so a
+# change to it is a change to what the port check is comparing against. The tests
+# below quote it in their failure messages, so a wrong constant here would make a
+# passing test explain itself in the wrong terms.
+BIND_ADDRESS = installer.BIND_ADDRESS
 
 # The subcommands that change something. A --check-only run reaching any of them
 # would have mutated the machine it was asked to inspect, and a test that only
@@ -873,6 +878,100 @@ class PortTests(PreflightFixture):
     though the address is the stub's own.
     """
 
+    def test_a_holder_on_a_routable_address_is_not_in_the_way(self):
+        # THE MEASURED FAILURE: a machine with a virtualisation stack and a
+        # container runtime refused the install with "port 53 is already held",
+        # and a clean machine accepted it. libvirt's dnsmasq holds
+        # 192.168.122.1:53 -- the virtual bridge's own address -- and this
+        # package binds 127.0.0.1:53 and nothing else. Those are two different
+        # sockets: the bind cannot fail, and no query can be answered by both.
+        #
+        # The check compared the PORT and ignored the ADDRESS, which the Holder
+        # already carried and which _holders' own docstring said was deliberately
+        # discarded ("which interface a loopback socket is bound to is not what
+        # this check decides"). It is exactly what this check has to decide.
+        problems = " ".join(
+            self.answered({SS_LISTENERS: self.listener(53, address="192.168.122.1")}).problems()
+        )
+        self.assertNotIn(
+            "already held",
+            problems,
+            "a foreign resolver on the virtual bridge is a different socket from "
+            "127.0.0.1:53 and must not refuse the install",
+        )
+
+    def test_a_wildcard_holder_of_53_is_still_refused(self):
+        # The row that makes the address check a check rather than a blanket
+        # acceptance. 0.0.0.0:53 COVERS 127.0.0.1:53, so the bind really would
+        # fail -- this is what a container runtime publishing a DNS port looks
+        # like, and refusing it is the correct answer, not an over-cautious one.
+        #
+        # It is here because the fix above could have been written as "only refuse
+        # an exact 127.0.0.1 holder", which passes the first test and waves this
+        # one through.
+        for address in ("0.0.0.0", "*", "[::]"):
+            with self.subTest(address=address):
+                self.setUp()
+                problems = " ".join(
+                    self.answered({SS_LISTENERS: self.listener(53, address=address)}).problems()
+                )
+                self.assertIn(
+                    "already held",
+                    problems,
+                    f"a wildcard holder on {address} covers the loopback bind and "
+                    "has to be refused",
+                )
+
+    def test_the_loopback_holders_that_do_cover_the_bind_are_all_refused(self):
+        # Every form of "bound to the loopback" the address can take, because the
+        # test above proves the permissive direction and this proves the strict one
+        # is not satisfied by comparing whole strings. 127.0.0.1 is what this
+        # package binds; the rest of 127/8 is the same interface for this purpose;
+        # ::1 is the whole of IPv6 loopback and needs no prefix test, because
+        # ::2 and up are reserved and ::10.0.0.1 is global.
+        for address in ("127.0.0.1", "127.0.0.53", "127.0.1.1", "::1", "[::1]"):
+            with self.subTest(address=address):
+                self.setUp()
+                problems = " ".join(
+                    self.answered({SS_LISTENERS: self.listener(53, address=address)}).problems()
+                )
+                self.assertIn(
+                    "already held",
+                    problems,
+                    f"a holder on {address} covers 127.0.0.1:53 and has to be refused",
+                )
+
+    def test_the_same_address_rule_applies_to_the_resolver_port(self):
+        # The rule is about the address, not about port 53 being special. The
+        # resolver binds 127.0.0.1:15353, so a foreign socket on 15353 somewhere
+        # routable is equally not in the way -- and one on the loopback is equally
+        # in it.
+        off = " ".join(
+            self.answered({SS_LISTENERS: self.listener(15353, address="10.8.0.1")}).problems()
+        )
+        self.assertNotIn("already held", off, "a routable holder of 15353 is a different socket")
+        self.setUp()
+        on = " ".join(
+            self.answered({SS_LISTENERS: self.listener(15353, address="127.0.0.1")}).problems()
+        )
+        self.assertIn("already held", on, "a loopback holder of 15353 is the resolver's own bind")
+
+    def test_a_routable_holder_is_still_reported_as_a_note(self):
+        # Not refused, but not silent either. Something else on this machine
+        # answering DNS on a routable address is worth an operator knowing: the
+        # DHCP bridge publishes whatever NetworkManager is using, and a resolver
+        # the install did not put there is exactly the kind of thing whose answer
+        # this project cannot vouch for. Refusing would be wrong (the bind is
+        # unaffected); saying nothing would lose the only signal there was.
+        report = self.answered({SS_LISTENERS: self.listener(53, address="192.168.122.1")})
+        notes = " ".join(report.notes())
+        self.assertIn(
+            "192.168.122.1",
+            notes,
+            "a foreign resolver on a routable address has to be named even though "
+            "it does not block the install",
+        )
+
     def test_accepts_the_stub_listener_a_stock_machine_already_has(self):
         # The captured `ss` answer from a real machine, byte for byte. A fixture
         # written by hand is how the last version of this check came to read the
@@ -1029,13 +1128,27 @@ class PortTests(PreflightFixture):
         # and up are reserved, and a global address beginning `::1` is a global
         # address. A prefix test answers "yes" to `::10.0.0.1` and `::1abc`, and
         # the direction it is wrong in is the permissive one -- this is the check
-        # that refuses a listener on something routable, so a prefix that admits a
-        # global address waves through the case the address exists to catch.
+        # that keeps a listener on something routable from being waved through as
+        # if it were the stub, so a prefix that admits a global address waves
+        # through the case the address exists to catch.
         #
         # The 4-in-6 rows are here for the same reason and in both directions: a
         # v4-mapped loopback is the same loopback in the other spelling and is
         # exempt, and a v4-mapped *global* address is not, which falls out of the
         # same equality rather than out of a special case.
+        #
+        # WHAT "NOT ACCEPTED" NOW MEANS, AND WHY THIS GATE IS NOT WEAKENED BY IT:
+        # the False rows used to assert the socket was REFUSED. They now assert it
+        # is REPORTED and not exempted, because refusing it WAS the bug -- a
+        # resolved on a routable address does not hold 127.0.0.1:53, so the bind
+        # succeeds and the install has no reason to stop. The property this test
+        # exists for is untouched: the exemption is still keyed on loopback,
+        # `::10.0.0.1` and `fe80::1` are still not the stub, and the address is
+        # still named rather than passing silently. What changed is the
+        # CONSEQUENCE of not being the stub -- a note instead of a wall -- and
+        # _blocks_our_bind is what decides that now, with its own truth table in
+        # test_a_holder_on_a_routable_address_is_not_in_the_way and its wildcards in
+        # test_a_wildcard_holder_of_53_is_still_refused.
         for address, accepted in (
             ("127.0.0.1", True),
             ("127.0.0.53", True),
@@ -1063,11 +1176,25 @@ class PortTests(PreflightFixture):
                         self.good_runner({SS_LISTENERS: line}),
                         f"resolved on {address}, which is loopback, was refused",
                     )
-                else:
-                    problems = " ".join(self.answered({SS_LISTENERS: line}).problems())
-                    self.assertIn(
-                        "53", problems, f"resolved on {address} is not the stub this install keeps"
-                    )
+                    continue
+                # Asserted on the note AND on the absence of a refusal, because
+                # either alone is satisfied by the wrong implementation: a check
+                # that reported nothing at all would pass the second, and one that
+                # refused everything would pass neither.
+                report = self.answered({SS_LISTENERS: line})
+                reported = " ".join(report.notes()) + " " + " ".join(report.problems())
+                self.assertIn(
+                    address,
+                    reported,
+                    f"resolved on {address} is not the stub this install keeps and has "
+                    "to be named in the report",
+                )
+                self.assertNotIn(
+                    "already held",
+                    " ".join(report.problems()),
+                    f"resolved on {address} does not hold {BIND_ADDRESS}, so refusing the "
+                    "install over it refuses a machine that can install it",
+                )
 
     def test_a_socket_with_no_process_column_is_refused_on_a_shared_address(self):
         # `ss` prints no process column for a socket this user may not read, and
@@ -1099,17 +1226,30 @@ class PortTests(PreflightFixture):
         # on any address. A resolved process listening on a routable address is
         # not the stub this install replaces, and treating it as one would skip
         # the very check the address exists to make.
-        problems = " ".join(
-            self.answered(
-                {
-                    SS_LISTENERS: self.ss_line(
-                        "tcp", "LISTEN", "192.0.2.53:53", 4096, "systemd-resolve", RESOLVED_PID
-                    )
-                }
-            ).problems()
+        #
+        # It is REPORTED rather than REFUSED, and that is the fix rather than a
+        # weakening: 192.0.2.53 is not 127.0.0.1, the bind this install performs is
+        # unaffected, and refusing here is what made a machine with a virtualisation
+        # stack report "port 53 is already held". The gate's own subject -- not
+        # being the stub -- is asserted by the address being named in the report.
+        report = self.answered(
+            {
+                SS_LISTENERS: self.ss_line(
+                    "tcp", "LISTEN", "192.0.2.53:53", 4096, "systemd-resolve", RESOLVED_PID
+                )
+            }
         )
+        reported = " ".join(report.notes()) + " " + " ".join(report.problems())
         self.assertIn(
-            "192.0.2.53", problems, "resolved on a non-loopback address is not the stub this install keeps"
+            "192.0.2.53",
+            reported,
+            "resolved on a non-loopback address is not the stub this install keeps",
+        )
+        self.assertNotIn(
+            "already held",
+            " ".join(report.problems()),
+            "resolved on a routable address does not hold the loopback bind, so it "
+            "must not refuse the install",
         )
 
     def test_reports_a_holder_it_cannot_identify(self):
