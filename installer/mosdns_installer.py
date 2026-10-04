@@ -334,9 +334,22 @@ def _hold_control_lock(root: Path):
     lock would remove that guarantee for the length of an install while still
     reporting that it held it.
 
-    **A transaction that cannot take the lock changes nothing**, so this raises
-    :class:`InstallRefused` and the caller's own rollback path runs -- which
-    finds no undos registered, because nothing was done.
+    **A transaction that cannot take the lock changes nothing it cannot undo**, so
+    this raises :class:`InstallRefused` and the caller's own rollback path runs.
+
+    That rollback is NOT a no-op, and this paragraph used to say it was -- "which
+    finds no undos registered, because nothing was done". By the time the transaction
+    reaches this lock it has already written
+    ``/var/lib/mosdns/installer/network-manager-backup.json``, published a DHCP
+    generation, and called ``_enable`` for every unit of this package's own that was
+    not already enabled -- each of which registers an undo. So a refused lock rolls
+    all of that back, and that is the correct outcome rather than an unfortunate one:
+    a transaction that cannot exclude the watchdog and a control centre should not
+    leave half of itself behind either.
+
+    The sentence was wrong in the direction that matters most for reading it: an
+    operator told "nothing was done" concludes there is nothing to clean up, and the
+    rollback that actually runs is invisible from this function.
     """
     try:
         with _try_control_lock(root, create=True):

@@ -11,7 +11,12 @@ mosdns\-router \- the machine's DNS router, on loopback only
 .BR mosdns\-router (8)
 is the resolver this package makes a machine's own. It binds
 .B 127.0.0.1:53
-on UDP and TCP and nothing else, and it is started by
+on UDP and TCP, and nothing else on any other address; it also opens a second
+loopback listener, on
+.B 127.0.0.1:15354
+with no address outside the loopback, which is where
+.BR "mosdns\-cdnctl" (1)
+asks it to drop the foreign cache. It is started by
 .BR mosdns\-router.service (5).
 The routing document it reads is
 .IR /etc/mosdns/mosdns.yaml ,
@@ -339,9 +344,25 @@ and
 each
 .BR root:mosdns\-router " 2770"
 with a default ACL granting the group
-.BR rwx .
-One group serves two service users, because a default ACL grants by group and
-per\-service groups would let only one of them replace the other's files.
+.BR rwx ,
+and it is the one exception that matters:
+.B /run/mosdns
+is
+.B 2750
+with no ACL, because only
+.BR root
+writes it \(em the NetworkManager dispatcher that runs the DHCP bridge is a
+dispatcher script, so it runs as root \(em and a group
+.B w
+on that directory would let any member of
+.BR mosdns\-router
+unlink and replace
+.IR dhcp-upstreams.json ,
+since unlink and rename are decided by the directory rather than by the mode of
+the file inside it. One group serves two service users under
+.IR /var/lib/mosdns ,
+because a default ACL grants by group and per\-service groups would let only one of
+them replace the other's files.
 .B /var/lib/mosdns
 is provisioned by the package's
 .B postinst
