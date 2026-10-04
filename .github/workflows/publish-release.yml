@@ -169,10 +169,45 @@ jobs:
             exit 1
           fi
 
+          # THE COMMIT MUST BE THE DEFAULT BRANCH HEAD, and this is the third
+          # reason a publish here can fail, discovered the hard way.
+          #
+          # GitHub's REST documentation for "Create a release" says: if the commit
+          # named by target_commitish "adds or modifies any file under
+          # .github/workflows/ relative to the repository's default branch, the
+          # authenticating token must be authorized to modify workflows. Otherwise
+          # the endpoint returns 404, and -- the sentence that cost six runs here --
+          # "some authentication paths surface 403 Resource not accessible by
+          # integration instead". GITHUB_TOKEN cannot be authorized for it.
+          #
+          # So a build from any commit that is not the branch head cannot be
+          # published once anything under .github/workflows/ has changed since.
+          # That is exactly the shape of a normal afternoon: build, push a fix to
+          # the workflow, try to publish the build you already had. v0.2.0 was
+          # published precisely because its build WAS the head at the time.
+          #
+          # Checked here, with the reason, because the API's own answer is a 403 that
+          # names no cause and a workflow permission block that has nothing to do
+          # with it. Three permission shapes were tried against this repository's
+          # token before this turned out to be the actual constraint.
+          head=$(git rev-parse HEAD)
+          if [ "$rev" != "$head" ]; then
+            echo "the artifact was built from ${rev:0:12} and the default branch head is" >&2
+            echo "${head:0:12}." >&2
+            echo >&2
+            echo "GitHub will not let GITHUB_TOKEN create a release whose target commit" >&2
+            echo "differs from the default branch in anything under .github/workflows/," >&2
+            echo "and it answers 403 Resource not accessible by integration rather than" >&2
+            echo "saying so. Rebuild from the current head and publish that." >&2
+            echo >&2
+            echo "Alternatively promote the build of ${head:0:12} if one already exists:" >&2
+            echo "  gh run list --repo $REPO --workflow build-deb.yml" >&2
+            exit 1
+          fi
+
           # A Release is a claim about one commit, and the commit is the one the
-          # PACKAGE was built from -- not the branch head, which may have moved on
-          # since the build ran. So the tag is created at the artifact's revision,
-          # and that is checked rather than assumed.
+          # PACKAGE was built from -- which the check above has just established is
+          # also the branch head. The tag is created at that commit.
           git fetch -q origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
             tagged=$(git rev-list -n1 "refs/tags/${TAG}")
