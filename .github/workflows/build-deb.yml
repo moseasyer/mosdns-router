@@ -314,8 +314,29 @@ jobs:
           notes=$(printf '%s\n' "$notes" | sed 's/^          //')
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release ${tag} exists; replacing its asset and leaving its notes alone."
-            gh release upload "$tag" "$deb" --clobber
+            # A Release is immutable per commit, and the check is on the COMMIT
+            # rather than on the asset's digest. Re-running this workflow builds
+            # different bytes every time -- BUILD_TIME goes into the linker -- so a
+            # digest comparison would replace the asset on every run and leave the
+            # notes quoting a sha256 of a file that is no longer there. The first
+            # version of this step did exactly that: it clobbered unconditionally,
+            # and the release page's own checksum became a lie after one re-run.
+            #
+            # So: same commit means the published Release already IS this build and
+            # there is nothing to do. A different commit means the Release is a
+            # genuinely different package, and then both the asset and the notes move
+            # together so they cannot disagree.
+            existing=$(gh release view "$tag" --json body --jq '.body' \
+              | sed -n 's/^| Built from | `\([0-9a-f]*\)` |$/\1/p' | head -1)
+            if [ "$existing" = "$rev" ]; then
+              echo "Release ${tag} already publishes this commit (${rev:0:12}); leaving it alone."
+              echo "A re-run builds different bytes because BUILD_TIME goes into the linker,"
+              echo "and replacing the asset would leave these notes quoting a file that is gone."
+            else
+              echo "Release ${tag} publishes ${existing:-an unknown commit}; replacing asset AND notes."
+              gh release upload "$tag" "$deb" --clobber
+              gh release edit "$tag" --notes "$notes"
+            fi
           else
             gh release create "$tag" "$deb" --target "$(git rev-parse HEAD)" \
               --title "mosdns-router ${want}" --notes "$notes"
