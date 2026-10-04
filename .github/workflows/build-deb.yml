@@ -1,0 +1,165 @@
+# Builds the Debian package on GitHub's own runners and uploads it as an artifact.
+#
+# WHY A WORKFLOW FOR SOMETHING `scripts/build-deb.sh` ALREADY DOES: this machine is
+# not the machine the package is tested on, and a package that only one machine can
+# produce is a package only one machine can vouch for. The build itself is the same
+# script, with the same pinned Go, the same pinned dnscrypt-proxy archive digest and
+# the same `--root-owner-group` no-root rule; nothing here is a second build path.
+#
+# WHAT THIS IS NOT: it does not test the package. `make verify` is the project's
+# gate, and it is deliberately not run here -- `test-installer` has a pre-existing
+# failure that asserts one systemd version and this runner carries another, and a
+# red workflow that a known-bad assertion caused teaches the reader to ignore red.
+# The gates below are the ones measured green on a clean checkout.
+
+name: build-deb
+
+on:
+  # On demand, which is how a package about to be installed on another machine gets
+  # built. Pushing a commit does not rebuild it: the .deb is not consumed by this
+  # repository, so rebuilding on every commit would spend runner minutes producing
+  # an artifact nobody downloads.
+  workflow_dispatch:
+  # A tag is the shape of "this commit is a package". A release is cut from one, so
+  # that is where a rebuild belongs.
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: the package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: the source, and its tags
+        uses: actions/checkout@v4
+        with:
+          # scripts/build-deb.sh puts `git describe --tags --always` into the
+          # binary's build identity. A shallow checkout has no tags, so that would
+          # silently become a bare short SHA and every build would claim to be the
+          # same anonymous revision.
+          fetch-depth: 0
+
+      - name: the pinned Go
+        uses: actions/setup-go@v5
+        with:
+          # go.mod carries `go 1.25.8` and the build script refuses anything else
+          # with "Go 1.25.8 is required, found ... in ...". Reading the version
+          # from go.mod rather than repeating it here means the two cannot drift.
+          go-version-file: go.mod
+          cache: true
+
+      - name: the render needs a private view of /
+        # scripts/build-deb.sh renders the two documents through bwrap so the
+        # rendering is for the INSTALLED layout, and it refuses to build without
+        # it rather than rendering for the wrong paths. bwrap needs a user
+        # namespace; this runner allows one, and `apparmor_restrict_unprivileged_
+        # userns` does not stop it here or on the runner.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+
+      - name: gates that are green on a clean checkout
+        run: |
+          set -euo pipefail
+          # gofmt over `git ls-files` rather than over `.`, because `.` also walks
+          # whatever build cache a developer left in the tree.
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:"; echo "$unformatted"; exit 1
+          fi
+          go vet ./...
+          go test ./...
+
+      - name: the build carries its identity
+        # A build that injects no metadata ships a router that reports
+        # dev/unknown/unknown, and that is indistinguishable from a build that was
+        # never the reviewed one. This is `make verify-build-info`.
+        run: make verify-build-info
+
+      - name: the package
+        # The dnscrypt-proxy archive is downloaded by the script rather than
+        # committed, and its digest is verified against
+        # packaging/debian/dnscrypt-proxy.sha256 before anything is built from it.
+        # Letting the script do the download is the point: a workflow that
+        # vendored the archive would be a second source for a file the build
+        # already trusts, and a second source is a second thing to re-verify.
+        run: sh scripts/build-deb.sh
+
+      - name: the package says what it must say
+        # Not "the build succeeded". These are the facts a consumer of this .deb
+        # depends on, each of which has been false at least once in this
+        # repository's history.
+        run: |
+          set -euo pipefail
+
+          # The version in the file name, the control field and scripts/build-deb.sh
+          # are one value. They were 0.1.0 and 0.2.0 in the same tree until a build
+          # was actually run, and nothing in the test suite caught it.
+          want=$(sed -n 's/^PACKAGE_VERSION=//p' scripts/build-deb.sh)
+          test -n "$want"
+          deb="build/mosdns-router_${want}_amd64.deb"
+          test -f "$deb" || { echo "no $deb"; ls build/; exit 1; }
+          got=$(dpkg-deb --field "$deb" Version)
+          test "$got" = "$want" || { echo "control says $got, build script says $want"; exit 1; }
+
+          # All seven are conffiles so an upgrade asks before replacing a file a
+          # person changed. dpkg reads this from DEBIAN/conffiles.
+          conffiles=$(dpkg-deb -e "$deb" /tmp/ctl >/dev/null 2>&1; cat /tmp/ctl/conffiles)
+          for f in /etc/mosdns/mosdns.yaml /etc/mosdns/dnscrypt-proxy.toml \
+                   /etc/mosdns/policy.yaml /etc/mosdns/force-ech-domains.txt \
+                   /etc/mosdns/cloudflare.txt /etc/mosdns/cloudfront-domains.yaml \
+                   /etc/mosdns/watchdog.yaml; do
+            grep -qx "$f" <<<"$conffiles" || { echo "$f is not a conffile"; exit 1; }
+          done
+
+          # A maintainer script that is not executable is a package whose install
+          # silently does nothing on some dpkg versions. dpkg-deb writes the member
+          # names as "./postinst", so this reads the control tar once rather than
+          # extracting it three times.
+          modes=$(dpkg-deb --ctrl-tarfile "$deb" | tar -tv | grep -E ' \./(postinst|prerm|postrm)$' || true)
+          test "$(wc -l <<<"$modes")" -eq 3 || { echo "a maintainer script is missing:"; echo "$modes"; exit 1; }
+          while read -r line; do
+            case "$line" in
+              -*x*) ;;
+              *) echo "not executable: $line"; exit 1 ;;
+            esac
+          done <<<"$modes"
+
+          # The routing document declares itself generated, which is what tells an
+          # operator to edit the policy instead. A package whose document lost that
+          # header would send the next edit to a file the next render overwrites.
+          dpkg-deb --fsys-tarfile "$deb" | tar -xO ./etc/mosdns/mosdns.yaml \
+            | head -5 | grep -q "Generated by internal/mosdnsconfig.Render" \
+            || { echo "the shipped routing document does not declare itself generated"; exit 1; }
+
+          # Every listener this router opens is on the loopback and nowhere
+          # else, and it binds nothing on a wildcard. This reads EVERY key that
+          # binds rather than the one that happened to be first: a gate written
+          # against `listen:` alone passes a document whose api block binds
+          # 0.0.0.0, and this package's first HTTP listener is exactly that key.
+          doc=$(dpkg-deb --fsys-tarfile "$deb" | tar -xO ./etc/mosdns/mosdns.yaml)
+          binds=$(grep -nE '^[[:space:]]*(listen|http|bind|address)[[:space:]]*:' <<<"$doc" || true)
+          test -n "$binds" || { echo "the shipped document binds nothing at all"; exit 1; }
+          bad=$(grep -vE ':[[:space:]]*(127\.0\.0\.1|\[::1\]|::1|localhost)(:[0-9]+)?[[:space:]]*$' <<<"$binds" || true)
+          test -z "$bad" || { echo "a listener is not on the loopback:"; echo "$bad"; exit 1; }
+          # The API listener exists. Without this a renderer that dropped the api
+          # block would leave the loopback assertion with nothing to check, and a
+          # gate that passes because it examined nothing is the failure mode this
+          # assertion exists to prevent.
+          grep -qE '^[[:space:]]*http[[:space:]]*:[[:space:]]*(127\.0\.0\.1|\[::1\])' <<<"$doc" \
+            || { echo "the shipped document has no loopback API listener"; exit 1; }
+
+          sha256sum "$deb"
+          dpkg-deb --info "$deb" | sed -n '1,12p'
+
+      - name: the package, as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosdns-router-deb
+          path: build/*.deb
+          if-no-files-found: error

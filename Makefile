@@ -199,7 +199,10 @@ verify-build-info: build
 # nmcli, and no maintainer script is executed, so running it cannot change the
 # machine it runs on. `scripts/build-deb.sh` builds the staging root, renders the
 # two routing documents through the control tool the package itself installs, and
-# writes build/mosdns-router_0.1.0_<arch>.deb from it.
+# writes build/mosdns-router_<PACKAGE_VERSION>_<arch>.deb from it. The version is
+# PACKAGE_VERSION in scripts/build-deb.sh and nowhere else; this comment used to
+# spell out 0.1.0 as a literal, which is how it stayed true after the package moved
+# to 0.2.0 and the script moved with it.
 #
 # GO and the archive location are passed through rather than read out of the
 # environment, so `make -n package` prints the same command a run would use -- and

@@ -4,6 +4,12 @@
 __pycache__/
 *.pyc
 
+# A private GOCACHE for the review gates on this machine. It is 1.3GB of build
+# cache and it is not the project's; `git add -A` reaching it would take the
+# repository with it. Ignored rather than deleted because deleting it makes the
+# next gate run recompile everything from scratch.
+.gocache-review/
+
 # The compiled command, named as the module's main package path. `go build
 # ./cmd/mosdns-cdnctl` writes it into the working directory, and without this an
 # accidental build leaves a 29MB binary in `git status` where it reads as a change
