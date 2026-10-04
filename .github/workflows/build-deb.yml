@@ -221,7 +221,7 @@ jobs:
           dpkg-deb --info "$deb" | sed -n '1,12p'
 
       - name: the package, as an artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: mosdns-router-deb
           path: build/*.deb
