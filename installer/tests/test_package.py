@@ -151,11 +151,18 @@ RANGES_SNAPSHOT_LOCK = DATA_DIRECTORY + "/cloudflare-ranges.lock.json"
 PUBLISHED_RANGES_CACHE = "/var/lib/mosdns/lists/cloudflare-ips.json"
 PUBLISHED_PREFIX_LIST = "/var/lib/mosdns/lists/cloudflare-prefixes.txt"
 
-# The four directories the package provisions. The mode is 2770 and the reason
-# is load-bearing: with an extended ACL present the mode's group field IS the
-# group-class mask, so 2750 would cap the group at r-x and no service identity
-# could create, replace or lock a state file. The first three survive a reboot
-# and are in the package; the fourth is on a tmpfs and belongs to tmpfiles.d.
+# The four directories the package provisions. The first three are 2770 and the
+# reason is load-bearing: with an extended ACL present the mode's group field IS the
+# group-class mask, so 2750 would cap the group at r-x and no service identity could
+# create, replace or lock a state file. They survive a reboot and are in the package.
+#
+# The fourth is on a tmpfs, belongs to tmpfiles.d, and is 2750 with no ACL -- the one
+# exception, because only root writes it. The bridge that publishes into it is a
+# NetworkManager dispatcher script, so it runs as root; it is not mosdns-router-cdn,
+# which is what the old comment here and the old 2770 were both derived from. The
+# group write was not unused: unlink and rename are decided by this directory rather
+# than by the mode of the file inside it, so at 2770 any member of mosdns-router could
+# replace dhcp-upstreams.json and redirect every domestic query.
 STATE_DIRECTORIES = (
     "/var/lib/mosdns",
     "/var/lib/mosdns/runtime",
@@ -163,6 +170,9 @@ STATE_DIRECTORIES = (
     "/run/mosdns",
 )
 PACKAGED_STATE_DIRECTORIES = STATE_DIRECTORIES[:3]
+# The one directory that is provisioned without a default ACL, named so the checks
+# below read as a rule rather than as a special case buried in a loop.
+RUN_STATE_DIRECTORY = "/run/mosdns"
 
 # The whole mode table. A mode here is the ONLY mode the file may have, so a file
 # made too permissive and a file made too restrictive both fail.
@@ -496,7 +506,7 @@ def route_provider_findings(root, documents, inventory=None):
 # The metadata that was decided, read back out of packaging/debian/control.
 CONTROL_FIELDS = {
     "Package": "mosdns-router",
-    "Version": "0.2.0",
+    "Version": "0.2.1",
     "Section": "net",
     "Priority": "optional",
 }
@@ -2356,9 +2366,18 @@ def tmpfiles_findings(text):
     """Every way the tmpfiles entry can fail to recreate the same directory.
 
     The properties are read rather than assumed because ``/run`` is a tmpfs: the
-    group, the setgid bit and the default ACL postinst sets are all gone after a
-    reboot, so this entry is the only thing that puts them back, and an entry that
-    names the directory without the group is a directory the bridge cannot write.
+    group, the setgid bit and any ACL are all gone after a reboot, so this entry is
+    the only thing that puts them back.
+
+    ``/run/mosdns`` is 2750 with NO ACL, and that is the assertion this function
+    exists to make. It used to require 2770 plus a default ``g::rwx`` on the strength
+    of "the dispatcher publishes ``dhcp-upstreams.json`` as ``mosdns-router-cdn`` and
+    needs directory ``w``". The dispatcher runs as root, so the bridge is not
+    ``mosdns-router-cdn`` and needs no group write, and every unit's
+    ``ReadWritePaths`` says nothing unprivileged writes this directory at all. The
+    permission it was buying was not unused -- it was the one that lets any member of
+    ``mosdns-router`` unlink and replace the DHCP generation, since unlink and rename
+    are decided by this directory rather than by the mode of the file inside it.
     """
     findings = []
     entries = tmpfiles_lines(text)
@@ -2369,15 +2388,25 @@ def tmpfiles_findings(text):
     if not creating:
         findings.append("/run/mosdns is never created on a boot")
     for kind, _path, fields in creating:
-        if fields[:3] != ["2770", "root", STATE_GROUP_NAME]:
+        if fields[:3] != ["2750", "root", STATE_GROUP_NAME]:
             findings.append(
                 f"the /run/mosdns line is {' '.join([kind] + fields)}, "
-                    f"want 2770 root {STATE_GROUP_NAME}"
+                    f"want 2750 root {STATE_GROUP_NAME}"
             )
     acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
-    if not acls:
-        findings.append("/run/mosdns is created with no ACL at all")
-    elif creating and entries.index(acls[0]) < entries.index(creating[0]):
+    for _kind, _path, fields in acls:
+        spec = " ".join(fields)
+        # Not "is there an ACL" but "does it widen the group": an ACL here can only
+        # take permission away from what 2750 already grants, and one that grants the
+        # group write hands back the replace primitive this directory does not have.
+        if "g::rwx" in spec or re.search(r"(^|[\s,])g:[^\s,]*:rwx", spec):
+            findings.append(
+                f"the /run/mosdns ACL is {spec!r}, which grants the group write. Nothing "
+                "unprivileged writes this directory, and a group write on it is the "
+                "permission that lets any member of that group replace dhcp-upstreams.json "
+                "whatever mode that file carries"
+            )
+    if creating and acls and entries.index(acls[0]) < entries.index(creating[0]):
         # The shipped order is mode first, then the ACL, and it is the same
         # load-bearing pair postinst gets wrong so easily: systemd-tmpfiles applies
         # the `d` line's mode and the `a` line's ACL, and an ACL narrowed by a later
@@ -2389,15 +2418,7 @@ def tmpfiles_findings(text):
             "written after the ACL and narrows the mask the ACL created -- the same defect "
             "postinst's own order exists to avoid"
         )
-    for _kind, _path, fields in acls:
-        spec = " ".join(fields)
-        if "g::rwx" not in spec:
-            findings.append(f"the /run/mosdns ACL is {spec!r}, with no group rwx")
-        if not re.search(r"(^|[\s,])d(?:efault)?:g::rwx($|[\s,])", spec):
-            findings.append(
-                f"the /run/mosdns ACL is {spec!r} and carries no DEFAULT group entry, so a file "
-                "one identity creates is not group-writable for the other"
-            )
+
     reaped = {entry[1] for entry in entries if entry[0] in ("r", "R")}
     for directory in ("/run/mosdns", "/var/lib/mosdns/runtime", "/etc/mosdns"):
         for suffix in ("*.tmp", ".*.tmp", "*.bak", ".*.bak"):
@@ -2499,7 +2520,12 @@ def provisioning_steps(text):
             for directory in STATE_DIRECTORIES:
                 if re.search(r"(^|[\s/'\"])" + re.escape(directory) + r"([\s'\"]|$)", command):
                     steps.append(("directory", directory))
-        if "setfacl" in command:
+        # A setfacl that GRANTS is a provisioning step; one that REMOVES is not, and
+        # counting it as one is how `setfacl -b -k /run/mosdns` -- the line that takes
+        # the ACL away again, which is the whole point of provisioning that directory
+        # without one -- read as a default ACL being granted. `-b` removes the access
+        # entries and `-k` the default ACL, so a line carrying either is a removal.
+        if "setfacl" in command and not re.search(r"setfacl[^\n]*\s-[bk]\b", command):
             # The same lookaround as the create above, and for the same reason:
             # `/var/lib/mosdns` is a PREFIX of `/var/lib/mosdns/runtime`, so a plain
             # substring test says the setfacl of the runtime directory also applies to
@@ -2651,10 +2677,25 @@ def order_findings(text):
     findings = []
     steps = provisioning_steps(text)
     for path in STATE_DIRECTORIES:
+        # /run/mosdns is the one directory that gets NO default ACL, and its absence is
+        # the assertion rather than a gap in the check. Only root writes it -- the
+        # NetworkManager dispatcher runs the bridge as root -- so an ACL here could only
+        # hand back the group write, and that write is what lets any member of
+        # mosdns-router unlink and replace dhcp-upstreams.json, since unlink and rename
+        # are decided by this directory rather than by the mode of the file in it.
+        wants_acl = path != RUN_STATE_DIRECTORY
         if ("directory", path) not in steps:
             findings.append(f"{path} is never created")
-        if ("default-acl", path) not in steps:
+        if wants_acl and ("default-acl", path) not in steps:
             findings.append(f"{path} is created with no default ACL for the service group")
+        if not wants_acl and any(
+            s == ("default-acl", path) for s in steps
+        ):
+            findings.append(
+                f"{path} is given a default ACL, which can only take permission back from the "
+                "mode and here would take back the right answer: nothing unprivileged writes "
+                "this directory"
+            )
         created = next((i for i, s in enumerate(steps) if s == ("directory", path)), None)
         acl = next((i for i, s in enumerate(steps) if s == ("default-acl", path)), None)
         if created is not None and acl is not None and acl < created:
@@ -2672,19 +2713,26 @@ def order_findings(text):
         # spelling found nothing in a postinst that provisions four directories
         # correctly.
         names = identities_from(text)
+        mode = "2750" if not wants_acl else "2770"
+        why = (
+            "2750 and not 2770, because 2750 caps the group at r-x and nothing "
+            "unprivileged writes this directory"
+            if not wants_acl
+            else "the mode is 2770 and not 2750, because 2750 caps the group at "
+            "r-x and a default ACL cannot restore what the mask removed"
+        )
         expected = (
             r"install\s+-d[^\n]*-o\s+root[^\n]*-g\s+"
             r"(?:\"\$STATE_GROUP\"|" + re.escape(names["group"]) + r")"
-            r"[^\n]*-m\s+2770[^\n]*" +
+            r"[^\n]*-m\s+" + mode + r"[^\n]*" +
             r"(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])"
         )
         if not re.search(expected, text):
             findings.append(
                 f"{path} is not created with `install -d -o root -g {names['group']} "
-                "-m 2770`; the mode is 2770 and not 2750, because 2750 caps the group at "
-                "r-x and a default ACL cannot restore what the mask removed"
+                f"-m {mode}`; {why}"
             )
-        if not re.search(
+        if wants_acl and not re.search(
             r"setfacl\s+-d\s+-m\s+g::rwx[^\n]*(?<![\w/.-])" + re.escape(path) + r"(?![\w/.-])",
             text,
         ):
@@ -4338,12 +4386,40 @@ class MaintainerScriptTests(_Staged):
         # Every one of the four directories is chowned, not just the parent. The
         # runtime and lists directories are where every published file lands, and a
         # parent-only chown leaves them on the old group.
+        #
+        # The CHGRP migration covers all four and the DEFAULT-ACL re-application covers
+        # three, and the difference is the point rather than an omission: /run/mosdns
+        # is 2750 with no ACL because only root writes it, so there is no ACL to
+        # re-apply -- and it instead gets its ACL removed and its mode re-asserted,
+        # which is what an upgrade from a 2770 /run/mosdns needs.
+        # The loop names ROOTS and `chgrp -R` does the recursion, so the assertion is
+        # that each directory lies under one of the loop's entries -- not that its own
+        # path appears in it. /var/lib/mosdns/runtime is not named anywhere in the
+        # script, and it does not have to be: the parent is chgrp-ed recursively.
+        trees = re.search(r"for tree in ([^\n]*)", run)
+        self.assertIsNotNone(trees, "the migration has no chgrp loop at all")
+        # The text has been through shell expansion, so the loop line still carries
+        # its `; do`. Cutting there matters: leaving them in put `/run/mosdns;` and
+        # `do` into the list, and a directory "under" `/run/mosdns;` is not under
+        # /run/mosdns -- which made the check report a migration that is correct.
+        roots = re.split(r"[;&]|\bdo\b", trees.group(1))
+        self.assertTrue(roots, "the chgrp loop names no tree")
         for directory in STATE_DIRECTORIES:
             with self.subTest(directory=directory):
+                self.assertTrue(
+                    any(directory == root or directory.startswith(root.rstrip("/") + "/")
+                        for root in roots),
+                    f"{directory} is under none of {roots}, so the migration leaves it on "
+                    "the old group",
+                )
+        for directory in STATE_DIRECTORIES:
+            if directory == RUN_STATE_DIRECTORY:
+                continue
+            with self.subTest(directory=directory, acl=True):
                 self.assertRegex(
                     run,
                     r'for directory in [^\n]*' + re.escape(directory),
-                    f"{directory} is not in the migration's list at all",
+                    f"{directory} is not in the ACL migration's list at all",
                 )
 
     def test_an_upgrade_hands_the_files_inside_the_state_tree_to_the_new_group(self):
@@ -4626,8 +4702,16 @@ class MaintainerScriptTests(_Staged):
         # And the pairs themselves, adjacent and in that order, one directory at a
         # time. `order_findings` is the reader that decides; this reads the same fact
         # directly, so a bug in the reader cannot quietly pass this whole test.
+        # The three that HAVE a default ACL, not all four: /run/mosdns is 2750 with
+        # none, because only root writes it. The adjacency property is about the pair
+        # `install -d` then `setfacl -d`, and a directory with only the first half has
+        # no pair to be adjacent in -- `steps[created + 1]` on it would read whatever
+        # command happens to come next, which is how this raised IndexError before the
+        # loop said which directory it was looking at.
         steps = provisioning_steps(POSTINST.read_text())
         for directory in STATE_DIRECTORIES:
+            if directory == RUN_STATE_DIRECTORY:
+                continue
             with self.subTest(directory=directory):
                 created = steps.index(("directory", directory))
                 self.assertEqual(
@@ -4891,8 +4975,11 @@ class MaintainerScriptTests(_Staged):
         # for the path itself finds the assignment and proves nothing about order.
         self.assertIn(f"INSTALLER={INSTALLER_SCRIPT}", text)
         self.assertIn('"$INSTALLER" install', text)
+        # /var/lib/mosdns rather than /run/mosdns: it is the one whose provisioning is
+        # `install -d` followed by `setfacl -d`, and the order question is about that
+        # pair. /run/mosdns has no default ACL to be late for.
         self.assertLess(
-            text.index("setfacl -d -m g::rwx /run/mosdns"),
+            text.index("setfacl -d -m g::rwx /var/lib/mosdns"),
             text.index('"$INSTALLER" install'),
             "postinst runs the install transaction before the state directories are provisioned",
         )
@@ -5441,7 +5528,17 @@ class TmpfilesTests(_Staged):
 
     def test_the_tmpfiles_entry_names_run_mosdns_with_the_provisioned_mode(self):
         """Asserted separately from the findings above, because the obligation the
-        plan states is a mode, a group and a default ACL rather than a directory."""
+        plan states is a mode and a group rather than a directory -- and because
+        /run/mosdns is the ONE entry that is 2750 with no ACL, which is a fact about
+        this entry and not about tmpfiles in general.
+
+        The ACL half is an assertion that there is NO widening one, not that there is
+        one. Only root writes this directory -- the NetworkManager dispatcher runs the
+        bridge as root, so it is not mosdns-router-cdn and needs no group write -- and
+        a group write here is the permission that lets any member of that group unlink
+        and replace dhcp-upstreams.json, because unlink and rename are decided by this
+        directory rather than by the mode of the file inside it.
+        """
         entries = tmpfiles_lines(self.read(TMPFILES_PATH))
         creating = [
             entry for entry in entries
@@ -5451,15 +5548,23 @@ class TmpfilesTests(_Staged):
         for kind, _path, fields in creating:
             with self.subTest(kind=kind):
                 self.assertEqual(
-                    fields[:3], ["2770", "root", STATE_GROUP_NAME],
+                    fields[:3], ["2750", "root", STATE_GROUP_NAME],
                     f"the /run/mosdns line is {' '.join([kind] + fields)}, "
-                    f"want 2770 root {STATE_GROUP_NAME}",
+                    f"want 2750 root {STATE_GROUP_NAME}",
                 )
-        acls = [entry for entry in entries if entry[1] == "/run/mosdns" and entry[0].startswith("a")]
-        self.assertTrue(acls, f"{TMPFILES_PATH} sets no ACL on /run/mosdns")
-        for _kind, _path, fields in acls:
+        for _kind, _path, fields in entries:
+            if _path != "/run/mosdns" or not _kind.startswith("a"):
+                continue
             with self.subTest(spec=" ".join(fields)):
-                self.assertIn("g::rwx", " ".join(fields))
+                spec = " ".join(fields)
+                self.assertNotIn(
+                    "g::rwx", spec,
+                    f"{TMPFILES_PATH} grants the group write on /run/mosdns: {spec!r}",
+                )
+                self.assertIsNone(
+                    re.search(r"(^|[\s,])g:[^\s,]*:rwx", spec),
+                    f"{TMPFILES_PATH} grants a named group rwx on /run/mosdns: {spec!r}",
+                )
 
 
 # --- the hook, the installer and the manual pages ----------------------------
@@ -5978,7 +6083,7 @@ class BuiltPackageTests(_Staged):
     def setUpClass(cls):
         super().setUpClass()
         cls.deb = os.path.join(
-            _SHARED["directory"], f"mosdns-router_0.2.0_{_built_architecture()}.deb"
+            _SHARED["directory"], f"mosdns-router_0.2.1_{_built_architecture()}.deb"
         )
         built = subprocess.run(
             ["dpkg-deb", "--root-owner-group", "--build", cls.root, cls.deb],
@@ -6768,35 +6873,53 @@ class ControlTests(unittest.TestCase):
             postinst=broken,
         )
 
-    def test_a_tmpfiles_entry_with_no_default_acl_is_reported(self):
+    def test_an_acl_that_widens_the_run_directory_is_reported(self):
+        # The mutation that matters for /run/mosdns is the OPPOSITE one: adding a
+        # group write that is not there. 2750 is what lets the group read and
+        # traverse; an ACL granting rwx hands back the replace primitive, and unlink
+        # and rename are decided by this directory rather than by the mode of the
+        # file inside it -- so this is the permission that lets any member of
+        # mosdns-router swap dhcp-upstreams.json for one of their own.
         good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
-        self.assertEqual(tmpfiles_findings(good), [], "the shipped entry does not pass its own check")
-        broken = re.sub(r"\bd:g::rwx\b", "g::rwx", good)
+        broken = good.replace(
+            "d /run/mosdns 2750 root mosdns-router -",
+            "d /run/mosdns 2750 root mosdns-router -\n"
+            "a /run/mosdns - - - - g::rwx,d:g::rwx",
+        )
         self.assertNotEqual(broken, good, "the mutation changed nothing")
         findings = tmpfiles_findings(broken)
         self.assertTrue(
-            any("DEFAULT group entry" in finding for finding in findings),
-            f"a /run/mosdns ACL with no default entry is not reported: {findings}",
+            any("grants the group write" in finding for finding in findings),
+            f"an ACL that hands the group write back on /run/mosdns is not reported: {findings}",
         )
 
-    def test_a_reversed_tmpfiles_entry_is_reported(self):
+    def test_a_reversed_tmpfiles_acl_entry_is_reported(self):
         """The `a` line before the `d` line is the same load-bearing pair the postinst
         order is about, and nothing held it: a check that asked "is there an ACL" would
-        pass an entry that creates the directory with no ACL at all."""
+        pass an entry that creates the directory with no ACL at all.
+
+        The mutation ADDS an ACL line rather than moving a shipped one. /run/mosdns has
+        no ACL and must not have one, so there is nothing to reverse there any more --
+        which is why this used to fail with StopIteration on `next(...)`, an error that
+        reads like a broken test rather than like a removed subject. The order property
+        under test still holds for any ACL that is present, and that is what this builds.
+        """
         good = (REPO / "packaging" / "tmpfiles.d" / "mosdns-router.conf").read_text()
         lines = [line for line in good.splitlines() if line]
         create = next(index for index, line in enumerate(lines) if line.startswith("d "))
-        acl = next(index for index, line in enumerate(lines) if line.startswith("a "))
-        self.assertLess(create, acl, "the shipped entry does not have the order it should")
-        lines[create], lines[acl] = lines[acl], lines[create]
+        # Placed BEFORE the `d` line, which is the defect: systemd-tmpfiles writes the
+        # mode after the ACL, and a chmod narrows the mask the ACL created.
+        reversed_lines = lines[:create] + ["a /run/mosdns - - - - g::r-x"] + lines[create:]
+        text = "\n".join(reversed_lines) + "\n"
+        self.assertTrue(
+            any("BEFORE" in finding for finding in tmpfiles_findings(text)),
+            f"an ACL line before the one that creates the directory is not named: "
+            f"{tmpfiles_findings(text)}",
+        )
         self.assertMethodFails(
             TmpfilesTests,
             "test_the_tmpfiles_entry_recreates_run_mosdns_with_the_same_properties",
-            staged={TMPFILES_PATH: "\n".join(lines) + "\n"},
-        )
-        self.assertTrue(
-            any("BEFORE" in finding for finding in tmpfiles_findings("\n".join(lines))),
-            "the reversed order is not named by the reader",
+            staged={TMPFILES_PATH: text},
         )
 
     def test_a_space_separated_acl_is_reported(self):

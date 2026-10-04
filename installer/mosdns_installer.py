@@ -166,14 +166,66 @@ STATE_GROUP = "mosdns-router"
 # nothing, and setgid is set so a new file takes this group rather than its
 # creator's. The four are checked separately and reported separately, because an
 # operator fixing one of them has to know which one is wrong.
-STATE_MODE = "2770"
+# The mode EACH directory must have, because they are not all the same and a
+# single constant for the four is what made the next paragraph wrong.
+#
+# The three under /var/lib/mosdns are written by both service identities --
+# mosdns-router writes ech-state.json, the optimizer writes the selector -- so the
+# group needs rwx, and a file created by one has to be replaceable by the other.
+#
+# /run/mosdns has ONE writer and it is root: the NetworkManager dispatcher script
+# that runs mosdns_dhcp_bridge. This file gave that directory 2770 and said why --
+# "the DHCP bridge publishes as mosdns-router-cdn and needs directory w" -- and the
+# premise was false in both halves. NetworkManager runs dispatcher scripts as root,
+# so the bridge is not mosdns-router-cdn; and the mode was provisioned from
+# postinst and tmpfiles.d on the strength of that sentence rather than from what
+# each unit's ReadWritePaths says, which is that nothing unprivileged writes
+# /run/mosdns at all. mosdns-router.service names only /var/lib/mosdns/runtime,
+# mosdns-cdn-health.service the same, mosdns-cdn-optimizer the same plus
+# /var/lib/mosdns/lists, mosdns-list-check.service nothing, and
+# mosdns-watchdog.service only /run/mosdns/watchdog.
+#
+# The group write was a privilege nobody needed, and it cost the most expensive
+# thing it could. Unlink and rename are decided by the CONTAINING directory and not
+# by the file's own mode, so a 0640 root:mosdns-router dhcp-upstreams.json is
+# still deletable and still replaceable by any member of that group -- which is the
+# same reason /run/mosdns/watchdog exists as a separate 0700 root:root directory,
+# and the same reasoning applied there and not here. At 2750 the group gets r-x:
+# enough to read and traverse, which is all a reader needs, and not enough to
+# replace.
 SETGID_BIT = 0o2000
-# The permission the group needs, on the directory and in the default ACL a new
-# file inherits. rwx rather than rw because the second identity has to be able to
-# *replace* a state file and to acquire the lock, and both need to create and
-# rename; the x on a file is a no-op, and on the directory it is what lets the
-# group reach the names inside it.
+STATE_DIRECTORY_MODES = {
+    STATE_DIRECTORY: "2770",
+    STATE_DIRECTORY + "/runtime": "2770",
+    STATE_DIRECTORY + "/lists": "2770",
+    "/run/mosdns": "2750",
+}
+# What the group needs on a directory, and in the default ACL a new file inherits.
+# rwx on the three /var/lib/mosdns directories because the second identity has to
+# be able to *replace* a state file and to acquire the lock, and both need to
+# create and rename; r-x on /run/mosdns because only root writes there. The x on a
+# file is a no-op, and on the directory it is what lets the group reach the names
+# inside it.
 STATE_GROUP_PERMISSIONS = "rwx"
+STATE_GROUP_READ_ONLY_PERMISSIONS = "r-x"
+# Read the expectation for one directory, so every check below asks the same
+# question the provisioning code answers rather than carrying its own copy.
+def _state_mode_for(path: str) -> str:
+    return STATE_DIRECTORY_MODES.get(path, STATE_DIRECTORY_MODES[STATE_DIRECTORY])
+
+def _state_group_for(path: str) -> str:
+    """The group permission this directory must have, in the ACL's spelling.
+
+    ``rwx`` or ``r-x``, which is the form the ACL checks compare and the form
+    getfacl prints. Derived from the mode so there is one answer and not two that
+    can disagree: the mode carries the bits, and the two spellings here and in
+    ACL_GROUP_PERMISSIONS are translations of it.
+    """
+    bits = int(_state_mode_for(path), 8) & 0o070
+    return "".join(
+        letter if bits & bit else "-"
+        for letter, bit in (("r", 0o040), ("w", 0o020), ("x", 0o010))
+    )
 
 # The control lock is created on first acquire by whichever of the two identities
 # wins the race, at this mode. Its absence on a fresh machine is the normal state;
@@ -1684,12 +1736,23 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
                     "takes its creator's group rather than this package's, so the other service "
                     "identity cannot read it however the ACL is set"
                 )
-            if mode_bits & 0o070 != 0o070:
+            want_group = int(_state_mode_for(path), 8) & 0o070
+            if mode_bits & 0o070 != want_group:
                 problems.append(
                     f"its mode is {mode}, so the group permission is {mode_bits & 0o070:03o} "
-                    f"rather than 070: this package's two identities share {STATE_GROUP!r} and "
-                    "both create and replace what is created in here, and a group that cannot "
-                    "write this directory cannot create a state file in it at all"
+                    f"rather than {want_group:03o}: "
+                    + (
+                        "this package's two identities share " + repr(STATE_GROUP)
+                        + " and both create and replace what is created in here, and a group "
+                        "that cannot write this directory cannot create a state file in it at all"
+                        if want_group == 0o070
+                        else "only root writes this directory -- the NetworkManager dispatcher "
+                        "runs the bridge as root -- so the group needs to read and traverse it "
+                        "and nothing more. A group WRITE here is not a capability anything needs, "
+                        "and because unlink and rename are decided by this directory rather than "
+                        "by the mode of the file inside it, it is the permission that lets any "
+                        "member of " + repr(STATE_GROUP) + " replace a state file wholesale"
+                    )
                 )
             if mode_bits & 0o700 != 0o700:
                 problems.append(
@@ -1711,19 +1774,19 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
             )
         else:
             access_mask, access_group = _acl_group_class(acl, default=False)
-            if STATE_GROUP_PERMISSIONS not in access_group:
+            if _state_group_for(path) not in access_group:
                 problems.append(
                     f"its access ACL gives the group {access_group or 'nothing'} "
-                    f"(mask {access_mask or 'none'}) rather than {STATE_GROUP_PERMISSIONS!r}: "
+                    f"(mask {access_mask or 'none'}) rather than {_state_group_for(path)!r}: "
                     "this is the permission that decides whether a service identity can create, "
                     "replace and lock anything in this directory, and when the ACL carries a "
                     "named entry the mask is what the kernel applies -- so the mode above can "
                     "read rwx for the group while the group still cannot write here"
                 )
             default_mask, default_group = _acl_group_class(acl, default=True)
-            if STATE_GROUP_PERMISSIONS not in default_group:
+            if _state_group_for(path) not in default_group:
                 problems.append(
-                    f"its default ACL does not grant the group {STATE_GROUP_PERMISSIONS!r} "
+                    f"its default ACL does not grant the group {_state_group_for(path)!r} "
                     f"(grants {default_group or 'nothing'}, mask {default_mask or 'none'}, "
                     f"{acl.split()!r}): the mode says what the directory permits today and says "
                     "nothing about what a file created in it will get, and without the ACL a "
@@ -1742,7 +1805,8 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
                 f"{path} is not the state directory this package can use: it is {mode} "
                 f"{owner}:{group}, and "
                 + "; ".join(problems)
-                + f". The package provisions it at {STATE_MODE} {STATE_OWNER}:{STATE_GROUP} with "
+                + f". The package provisions it at {_state_mode_for(path)} "
+                f"{STATE_OWNER}:{STATE_GROUP} with "
                 f"a default ACL granting the group {STATE_GROUP_PERMISSIONS!r}, and preflight "
                 "reports that rather than applying it: it changes nothing it was asked to look at"
             )

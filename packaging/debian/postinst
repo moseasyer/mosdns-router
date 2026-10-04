@@ -261,7 +261,17 @@ done
 # one that states the grant and a directory from before the rename is one this
 # script cannot have inspected. See the STEP 2 header for why a directory carried by
 # a renamed group is the case that needed fixing rather than the ACL.
-for directory in /var/lib/mosdns /var/lib/mosdns/runtime /var/lib/mosdns/lists /run/mosdns; do
+# /run/mosdns is NOT in this list, and its absence is the point rather than an
+# oversight: it is 2750 with no default ACL, because only root writes it. The
+# default ACL has to be removed as well as not re-applied -- a directory carrying
+# one from before this change would keep granting the group the write through it,
+# and `install -d`'s chmod does not touch an extended ACL.
+if [ -d /run/mosdns ]; then
+	setfacl -b -k /run/mosdns
+	chmod 2750 /run/mosdns
+fi
+
+for directory in /var/lib/mosdns /var/lib/mosdns/runtime /var/lib/mosdns/lists; do
 	if [ -d "$directory" ]; then
 		setfacl -d -m g::rwx "$directory"
 	fi
@@ -314,8 +324,22 @@ setfacl -d -m g::rwx /var/lib/mosdns/runtime
 install -d -o root -g "$STATE_GROUP" -m 2770 /var/lib/mosdns/lists
 setfacl -d -m g::rwx /var/lib/mosdns/lists
 
-install -d -o root -g "$STATE_GROUP" -m 2770 /run/mosdns
-setfacl -d -m g::rwx /run/mosdns
+# 2750 and no default ACL, and this is the ONE directory in this step that is
+# neither. It is a narrowing rather than an oversight, and the reason the other
+# three are 2770 does not hold here: those are written by both service identities,
+# and this one is written by exactly one writer, which is root. The bridge is a
+# NetworkManager dispatcher script, so it runs as root; it is not mosdns-router-cdn,
+# which is what the comment above this step used to say and what this mode was
+# provisioned from. Every unit's ReadWritePaths was read to confirm it: nothing
+# unprivileged writes /run/mosdns at all.
+#
+# It cost more than it was worth. Unlink and rename are decided by this directory
+# rather than by the mode of the file inside it, so at 2770 a member of the
+# mosdns-router group could replace dhcp-upstreams.json wholesale -- whatever mode
+# that file carried -- and redirect every domestic query from the next one on. That
+# is the same reason /run/mosdns/watchdog exists as a separate 0700 root:root
+# directory, and the same reasoning was applied there and not here.
+install -d -o root -g "$STATE_GROUP" -m 2750 /run/mosdns
 
 # ...and the ONE directory in this step that is not 2770 root:$STATE_GROUP with a
 # default ACL: the resolver watchdog's failure record, in a directory of its own.

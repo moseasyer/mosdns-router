@@ -126,7 +126,34 @@ STATE_GROUP = "mosdns-router"
 # not the directory's own. That is what creates a mask: an entry for the owning
 # group is redundant, and one for the owning group would leave the mask wide.
 ANOTHER_GID = 4242
-STATE_MODE = "2770"
+# The mode of a /var/lib/mosdns state directory, kept as a name because most cases
+# here are about those three. /run/mosdns is 2750 and the reason is in the installer
+# next to the mapping; the tests that care read STATE_DIRECTORY_MODES directly.
+STATE_MODE = installer.STATE_DIRECTORY_MODES[installer.STATE_DIRECTORY]
+STATE_DIRECTORY_MODES = installer.STATE_DIRECTORY_MODES
+# What the group needs on each directory, asked of the installer rather than written
+# out here, so a fixture that builds "the shape the package provisions" is built from
+# the same answer the check compares against.
+STATE_GROUP_PERMISSION_FOR = {
+    relative: installer._state_group_for(relative) for relative in STATE_DIRECTORIES
+}
+
+
+class _Unset:
+    """Distinguishes "argument not given" from an explicit ``None``.
+
+    The fixture derives a directory's default ACL from the installer when neither
+    ``mode`` nor ``acl`` is given, and a test that wants NO ACL at all has to be able
+    to say so. A plain ``None`` default cannot be both, and conflating them made
+    ``acl=None`` mean "derive" -- so the case that exists to check a missing ACL
+    built one instead.
+    """
+
+    def __repr__(self):
+        return "<unset>"
+
+
+UNSET = _Unset()
 # The control lock is a file, created on first acquire by whichever of the two
 # identities wins the race, at this mode. A pre-existing one at any other mode is
 # a file this package did not create.
@@ -434,7 +461,7 @@ class PreflightFixture(unittest.TestCase):
     def unmark(self):
         self.rooted(MANAGED_BY).unlink()
 
-    def build_state_directories(self, mode=STATE_MODE, acl="g::rwx", access=None):
+    def build_state_directories(self, mode=UNSET, acl=UNSET, access=None):
         """Create the four state directories with real modes and real ACLs.
 
         The mode is applied *last*, because that is the order the interesting
@@ -449,18 +476,36 @@ class PreflightFixture(unittest.TestCase):
 
         ``access`` is an optional *access* ACL entry, which is what creates the
         mask.
+
+        ``mode=None`` means the mode the PACKAGE PROVIONS for each directory, read
+        from the installer's own mapping so this fixture and the code under test
+        cannot disagree about what correct looks like. Passing a string still
+        forces one mode onto all four, which is what the cases that are about a
+        wrong mode want.
         """
         for relative in STATE_DIRECTORIES:
             path = self.rooted(relative)
             path.mkdir(parents=True, exist_ok=True)
-            if acl is None:
+            # Per iteration, into a LOCAL: the parameter cannot be reassigned here
+            # without the second directory inheriting the first one's value, which is
+            # how every directory ended up with /var/lib/mosdns's ACL.
+            default_acl = (
+                f"g::{STATE_GROUP_PERMISSION_FOR[relative]}"
+                if acl is UNSET and mode is UNSET
+                else acl
+            )
+            if default_acl is UNSET:
+                default_acl = None
+            if default_acl is None:
                 # -k drops the default ACL, -b the extended access entries.
                 subprocess.run(["setfacl", "-b", "-k", str(path)], check=True)
             else:
-                setfacl(path, acl)
+                setfacl(path, default_acl)
             if access is not None:
                 setfacl(path, access, default=False)
-            path.chmod(int(mode, 8))
+            path.chmod(
+                int(STATE_DIRECTORY_MODES[relative] if mode is UNSET else mode, 8)
+            )
 
     @staticmethod
     def stat_answer(mode, owner=STATE_OWNER, group=STATE_GROUP, kind=stat.S_IFDIR):
@@ -473,9 +518,11 @@ class PreflightFixture(unittest.TestCase):
         """
         return f"{mode} {owner} {group} {kind | int(mode, 8):x}"
 
-    def state_stat_answers(self, mode=STATE_MODE, owner=STATE_OWNER, group=STATE_GROUP):
+    def state_stat_answers(self, mode=UNSET, owner=STATE_OWNER, group=STATE_GROUP):
         return {
-            STAT_FIELDS + (str(self.rooted(relative)),): self.stat_answer(mode, owner, group)
+            STAT_FIELDS + (str(self.rooted(relative)),): self.stat_answer(
+                STATE_DIRECTORY_MODES[relative] if mode is UNSET else mode, owner, group
+            )
             for relative in STATE_DIRECTORIES
         }
 
@@ -1719,15 +1766,22 @@ class StateDirectoryTests(PreflightFixture):
         # The control: the same named access entry with the mode the package
         # provisions, so the mask is rwx and the group can write. Without this, a
         # scan that reported every mask as a problem would satisfy the test above.
-        self.build_state_directories(mode=STATE_MODE, access=f"g:{ANOTHER_GID}:rwx")
+        self.build_state_directories(access=f"g:{ANOTHER_GID}:rwx")
         for relative in STATE_DIRECTORIES:
             acl = subprocess.run(
                 ["getfacl", "-c", "-p", str(self.rooted(relative))], capture_output=True, text=True
             ).stdout
+            # The mask the control needs is the one that DIRECTORY needs, not rwx
+            # everywhere: the fixture chmods after setting the ACL -- which is the
+            # order the access-mask cases depend on -- so a 2750 directory comes out
+            # with mask::r-x whatever named entry it was given. Asserting rwx here
+            # would be asserting that /run/mosdns is group-writable.
             self.assertIn(
-                "mask::rwx", acl, f"{relative} does not have the permissive mask the control needs"
+                f"mask::{STATE_GROUP_PERMISSION_FOR[relative]}",
+                acl,
+                f"{relative} does not have the mask its own group permission needs",
             )
-        self.assertPasses(self.good_runner(self.state_stat_answers(mode=STATE_MODE)))
+        self.assertPasses(self.good_runner(self.state_stat_answers()))
 
     def test_reports_a_directory_with_the_right_mode_and_no_acl(self):
         # The case the design exists for, and the one a mode check passes.
@@ -1822,15 +1876,21 @@ class StateDirectoryTests(PreflightFixture):
         # provisioned mode is in the table as the case that must be accepted. The
         # default ACL the package provisions is in place throughout, so what is
         # under test is the mode.
+        # Every mode here is wrong for EVERY directory, which is what lets one loop
+        # cover all four: a mode that is too tight or too wide is too tight or too
+        # wide whichever directory it lands on. The provisioned modes are not in
+        # this list because they are no longer one value -- they are checked by
+        # test_accepts_the_provisioned_mode_of_every_directory below, which is where
+        # a per-directory expectation belongs.
         for mode, why in (
             ("1770", "no setgid"),
             ("4770", "setuid, and no setgid"),
-            ("2750", "the group cannot write"),
+            ("2750", "the group cannot write, which is right for /run/mosdns and wrong for the rest"),
             ("2700", "the group can neither write nor list"),
             ("2570", "the owner cannot write"),
             ("2775", "readable by every local user"),
             ("2777", "writable by every local user"),
-            (STATE_MODE, "the mode the package provisions"),
+            ("0700", "no group access at all, which is the watchdog record's mode"),
         ):
             with self.subTest(mode=mode, why=why):
                 self.setUp()
@@ -1839,9 +1899,61 @@ class StateDirectoryTests(PreflightFixture):
                 accepted = report.problems() == []
                 self.assertEqual(
                     accepted,
-                    mode == STATE_MODE,
-                    f"a directory at {mode} ({why}) "
-                    + ("should have been accepted" if mode == STATE_MODE else "was accepted"),
+                    False,
+                    f"a directory at {mode} ({why}) was accepted",
+                )
+
+    def test_the_run_directory_does_not_give_the_group_a_write_it_cannot_use(self):
+        # THE PROPERTY, stated once so a future edit to the mapping has to argue
+        # with it. Unlink and rename are decided by the CONTAINING directory, not by
+        # the mode of the file inside it, so a 0640 root:mosdns-router
+        # dhcp-upstreams.json is still deletable and still replaceable by any member
+        # of that group. At 2770 on /run/mosdns, the two service identities could
+        # therefore replace the DHCP generation wholesale and redirect every domestic
+        # query -- and the reason the directory was group-writable, "the DHCP bridge
+        # publishes as mosdns-router-cdn and needs directory w", was false: the
+        # bridge is a NetworkManager dispatcher script and runs as root.
+        #
+        # Nothing unprivileged writes /run/mosdns. Every unit's ReadWritePaths was
+        # read to establish that: mosdns-router.service names only
+        # /var/lib/mosdns/runtime, the health check the same, the optimizer that plus
+        # /var/lib/mosdns/lists, the list check nothing, and the watchdog only
+        # /run/mosdns/watchdog.
+        self.assertEqual(
+            installer.STATE_DIRECTORY_MODES["/run/mosdns"],
+            "2750",
+            "/run/mosdns must not give the group write: it is the permission that lets "
+            "any member of the group replace a state file no matter what mode the "
+            "file itself carries",
+        )
+        self.assertEqual(
+            installer._state_group_for("/run/mosdns"),
+            "r-x",
+            "the group needs to read and traverse /run/mosdns and nothing more",
+        )
+        # And the three that DO need it keep it, so this is a narrowing rather than
+        # a blanket loosening: the optimizer replaces the selector the router reads.
+        for relative in ("/var/lib/mosdns", "/var/lib/mosdns/runtime", "/var/lib/mosdns/lists"):
+            with self.subTest(directory=relative):
+                self.assertEqual(
+                    installer._state_group_for(relative),
+                    "rwx",
+                    f"{relative} is written by both service identities, so the group write "
+                    "is what lets one replace what the other wrote",
+                )
+
+    def test_accepts_the_provisioned_mode_of_every_directory(self):
+        # The positive control the loop above lost when the modes stopped being one
+        # value, and it is per-directory on purpose: a check that demanded rwx of
+        # /run/mosdns would be demanding back the group write that this change took
+        # away, and a check that demanded r-x of /var/lib/mosdns/runtime would break
+        # the optimizer's ability to replace the selector the router reads.
+        for relative in STATE_DIRECTORIES:
+            with self.subTest(directory=relative):
+                self.setUp()
+                self.assertPasses(
+                    self.good_runner(self.state_stat_answers()),
+                    f"{relative} at its own provisioned mode was refused",
                 )
 
     def test_reports_a_state_path_that_is_not_a_directory(self):
@@ -1899,9 +2011,20 @@ class StateDirectoryTests(PreflightFixture):
         for relative in STATE_DIRECTORIES:
             with self.subTest(directory=relative):
                 self.setUp()
-                setfacl(self.rooted(relative), "g::r-x")
+                # Broken in the direction that is WRONG FOR THIS DIRECTORY, which is
+                # not the same string for all four: the three /var/lib/mosdns trees
+                # need the group to be able to write, and /run/mosdns needs it not
+                # to. Handing them all r-x used to break the first three; handing
+                # them all rwx would break only the fourth and quietly stop testing
+                # the other three.
+                wrong = "rwx" if STATE_GROUP_PERMISSION_FOR[relative] == "r-x" else "r-x"
+                setfacl(self.rooted(relative), f"g::{wrong}")
                 report = self.preflight()
-                self.assertTrue(report.problems(), f"a {relative} with a group ACL of r-x was accepted")
+                self.assertTrue(
+                    report.problems(),
+                    f"a {relative} whose group ACL is {wrong} was accepted, and that is the "
+                    "wrong ACL for it",
+                )
                 # Each refusal opens with the path it is about, so the set of paths
                 # named is exact -- a substring would not do, because three of the
                 # four are prefixes of the fourth's parent.
