@@ -81,13 +81,36 @@ jobs:
         # never the reviewed one. This is `make verify-build-info`.
         run: make verify-build-info
 
+      - name: the resolver source the build refuses to fetch for itself
+        # scripts/build-deb.sh does NOT download the dnscrypt-proxy archive. It
+        # checks for one and, finding none, prints the curl command to seed it and
+        # exits. That is the right shape for a script that must not silently reach
+        # the network, and it means a clean runner has to be seeded before the build
+        # can start. This step is the seeding; it is not a second source of trust.
+        #
+        # The version and the URL are read out of the build script rather than
+        # written here, so the two cannot drift, and the URL is assembled with the
+        # same variable the script declares.
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^DNSCRYPT_VERSION=//p' scripts/build-deb.sh)
+          url=$(sed -n 's|^DNSCRYPT_SOURCE_URL=||p' scripts/build-deb.sh)
+          test -n "$ver" && test -n "$url"
+          url=${url//\$DNSCRYPT_VERSION/$ver}
+          echo "seeding $url"
+          mkdir -p build
+          curl -fsSL --retry 3 -o "build/dnscrypt-proxy-${ver}.tar.gz" "$url"
+          # The pin file documents that it is meant for exactly this command, and
+          # running it here means the log names the digest that was expected rather
+          # than leaving the failure inside the build script. The build script
+          # verifies the same archive again before it extracts anything; this is
+          # the earlier of the two checks, not the only one.
+          (cd build && sha256sum -c ../packaging/debian/dnscrypt-proxy.sha256)
+
       - name: the package
-        # The dnscrypt-proxy archive is downloaded by the script rather than
-        # committed, and its digest is verified against
-        # packaging/debian/dnscrypt-proxy.sha256 before anything is built from it.
-        # Letting the script do the download is the point: a workflow that
-        # vendored the archive would be a second source for a file the build
-        # already trusts, and a second source is a second thing to re-verify.
+        # The archive is downloaded above and verified against
+        # packaging/debian/dnscrypt-proxy.sha256 by the build script itself before
+        # anything is built from it.
         run: sh scripts/build-deb.sh
 
       - name: the package says what it must say
