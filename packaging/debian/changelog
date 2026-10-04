@@ -1,3 +1,20 @@
+mosdns-router (0.2.1) unstable; urgency=medium
+
+  * No change to the shipped program. The package contents are identical to
+    0.2.0; what moved is how a Release is produced.
+  * Publishing is now a separate, explicit workflow that takes the ID of a build
+    run and promotes THAT artifact. build-deb.yml used to build and publish in one
+    run, so a Release was whatever the last run produced and nothing was ever
+    selected. There is still no path to a Release that is not a run in the Actions
+    list.
+  * The release tag must now equal the package version. A release tagged v0.2.1
+    carrying a package whose control field says 0.2.0 was possible and was a trap
+    for whoever installed it.
+  * The artifact assertions moved into scripts/assert-deb.sh so the build and the
+    publish step run the same ones, rather than two copies that would drift.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
 mosdns-router (0.2.0) unstable; urgency=medium
 
   * The foreign route is configurable. policy.yaml gains `foreign.upstreams`, a
