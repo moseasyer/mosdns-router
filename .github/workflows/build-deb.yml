@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: the source, and its tags
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # scripts/build-deb.sh puts `git describe --tags --always` into the
           # binary's build identity. A shallow checkout has no tags, so that would
@@ -45,7 +45,7 @@ jobs:
           fetch-depth: 0
 
       - name: the pinned Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           # go.mod carries `go 1.25.8` and the build script refuses anything else
           # with "Go 1.25.8 is required, found ... in ...". Reading the version
@@ -56,12 +56,52 @@ jobs:
       - name: the render needs a private view of /
         # scripts/build-deb.sh renders the two documents through bwrap so the
         # rendering is for the INSTALLED layout, and it refuses to build without
-        # it rather than rendering for the wrong paths. bwrap needs a user
-        # namespace; this runner allows one, and `apparmor_restrict_unprivileged_
-        # userns` does not stop it here or on the runner.
+        # it rather than rendering for the wrong paths.
+        #
+        # bwrap needs a user namespace, and this runner does not grant an
+        # unprivileged one -- measured, not assumed: the first run of this workflow
+        # failed with `bwrap: setting up uid map: Permission denied` and then
+        # `mosdns-cdnctl render refused`. The development machine runs the same
+        # build with the same restriction set to 1 and bwrap works there, so
+        # "the runner allows one" was a guess and it was wrong.
+        #
+        # So this DETECTS, REPAIRS, and then VERIFIES, in that order, and each
+        # repair is tried only if bwrap still fails. The verification is the point:
+        # a step that installs bubblewrap and moves on reports success on a runner
+        # where the build is still going to fail three steps later.
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap
+
+          echo "apparmor module: $( [ -d /sys/module/apparmor ] && echo loaded || echo absent )"
+          echo "apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+          if unshare -Ur true 2>/dev/null; then
+            echo "unprivileged user namespace: works"
+          else
+            echo "unprivileged user namespace: refused"
+          fi
+
+          works() { bwrap --ro-bind / / --chdir / /bin/true >/dev/null 2>&1; }
+
+          if ! works; then
+            echo "--- bwrap refused; lifting the AppArmor restriction on unprivileged user namespaces"
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            works || {
+              echo "--- still refused; granting bwrap an AppArmor profile that allows userns"
+              printf '/usr/bin/bwrap flags=(unconfined) {\n  userns,\n}\n' \
+                | sudo tee /etc/apparmor.d/bwrap-userns-allow >/dev/null
+              sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-allow || true
+              works || {
+                echo "bwrap cannot create a user namespace on this runner, and this build"
+                echo "refuses to render documents for the wrong layout. Failing here is the"
+                echo "honest outcome; the fix is a runner with user namespaces, not a skip."
+                bwrap --ro-bind / / --chdir / /bin/true || true
+                exit 1
+              }
+            }
+          fi
+          echo "bwrap: works"
 
       - name: gates that are green on a clean checkout
         run: |
@@ -181,7 +221,7 @@ jobs:
           dpkg-deb --info "$deb" | sed -n '1,12p'
 
       - name: the package, as an artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: mosdns-router-deb
           path: build/*.deb
