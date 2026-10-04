@@ -841,8 +841,23 @@ def non_loopback(text):
 
 
 def yaml_listen_addresses(text):
-    """The ``listen:`` values of a routing document, which is where it binds."""
-    return re.findall(r"^\s*listen:\s*(\S+)\s*$", text, flags=re.MULTILINE)
+    """Every address a routing document binds, from every key that binds one.
+
+    **And `api.http` is one of those keys now, which this reader did not see.**
+    The reader matched only `^\s*listen:`, so a document whose `api.http` was
+    `0.0.0.0:15354` -- a wildcard bind on this package's first HTTP listener --
+    still reported every address as loopback, and the gate stayed green on a
+    configuration that would expose the cache's flush endpoint to the network.
+
+    The pattern is the union rather than a second function for the new key,
+    because the question this gate asks is "does this document bind anything
+    off-host", and a reader that enumerates the KEYS rather than the bindings
+    is one key behind forever. mosdns's own names for the two are `listen:` on a
+    server plugin and `http:` under `api:` (coremain/mosdns.go:67).
+    """
+    addresses = re.findall(r"^\s*listen:\s*(\S+)\s*$", text, flags=re.MULTILINE)
+    addresses += re.findall(r"^\s*http:\s*(\S+)\s*$", text, flags=re.MULTILINE)
+    return addresses
 
 
 def toml_listen_addresses(text):
@@ -1352,13 +1367,42 @@ class ShippedConfigListenerTests(unittest.TestCase):
     """
 
     def test_the_routing_document_binds_loopback_53_on_udp_and_tcp(self):
+        """The DNS listeners are 127.0.0.1:53 on both transports, and EVERY address
+        this document binds is loopback.
+
+        **The second half is the one this case did not used to have, and it is the
+        half that matters now.** It asserted an exact list, so adding the `api` block
+        made it fail -- but the failure was about the LIST, not about a wildcard bind,
+        and an exact list is a second copy of the document that has to be edited every
+        time the document gains a listener. The claim worth holding is that no address
+        here is off-host, and that claim now covers `api.http` too because
+        `yaml_listen_addresses` reads it.
+        """
         text = (CONFIG_DIR / "mosdns.yaml").read_text(encoding="utf-8")
+        addresses = yaml_listen_addresses(text)
+
+        # The DNS pair itself, exactly -- that is the document's own claim and it is
+        # two entries because mosdns has one server plugin per transport.
         self.assertEqual(
-            yaml_listen_addresses(text),
+            [address for address in addresses if address.endswith(":53")],
             ["127.0.0.1:53", "127.0.0.1:53"],
-            "the routing document's two servers are the machine's only DNS listeners and "
-            "both are loopback; a wildcard or a bare port here is a resolver on the LAN",
+            "the routing document's DNS servers must be 127.0.0.1:53 on both transports: a "
+            "wildcard or a bare port here is a resolver on the LAN",
         )
+
+        # And the whole set, with the reason each one may be there. 15354 is the api
+        # block, which exists so the cache plugin's own flush endpoint is reachable;
+        # it is loopback and unprivileged like every other listener here.
+        for address in addresses:
+            with self.subTest(address=address):
+                host = address.rsplit(":", 1)[0]
+                self.assertTrue(
+                    host.startswith("127.") or host == "::1",
+                    f"the routing document binds {address}, which is not loopback. Every "
+                    f"listener this package configures is loopback-only, and the api block "
+                    f"is no exception: a wildcard bind there would expose the cache's flush "
+                    f"endpoint to the network",
+                )
 
     def test_the_routing_document_forwards_to_exactly_the_enabled_upstreams(self):
         """The routing document's forward IS the policy's enabled upstream entries.

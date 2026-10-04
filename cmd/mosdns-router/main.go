@@ -15,6 +15,7 @@ import (
 	// rewrites the addresses and the HTTPS records a response hands to a client.
 	_ "mosdns-router/plugin/executable/cdn_rewrite"
 	_ "mosdns-router/plugin/executable/dhcp_forward"
+	_ "mosdns-router/plugin/executable/ttl_clamp"
 )
 
 func init() {

@@ -253,7 +253,17 @@ var ErrNoECHSource = errors.New(
 // list, after ValidateOneUpstream has run over every entry.
 func ValidateForeignUpstreams(upstreams []ForeignUpstream) error {
 	if len(upstreams) == 0 {
-		return fmt.Errorf("foreign.upstreams must name at least one upstream")
+		// **The refusal states the SHAPE, not just the absence.** `policy.yaml` is
+		// a dpkg conffile, so an operator who customised it keeps their copy across
+		// an upgrade -- and the first message this produced for such a file was
+		// "foreign.upstreams must name at least one upstream", which names a key
+		// the operator has never heard of and says nothing about what to write.
+		// A refusal an operator cannot act on is a refusal that sends them to the
+		// source.
+		return fmt.Errorf("foreign.upstreams must name at least one upstream. If this policy was " +
+			"written before the foreign route became configurable, it has no `foreign.upstreams` key " +
+			"at all: add the two lines the shipped policy carries, which route through the packaged " +
+			"DNSCrypt resolver and one DoQ endpoint. See mosdns-cdnctl(1) under \"The foreign route\"")
 	}
 	enabled := 0
 	dnscrypt := 0

@@ -25,6 +25,11 @@ import (
 	"mosdns-router/internal/optimizer"
 	"mosdns-router/internal/state"
 	"mosdns-router/internal/testdns"
+	// The clamp is this project's own plugin, and an instance has to know its type
+	// or the document is refused with `plugin type ttl_clamp not defined` -- which
+	// is the defect the plugin exists to fix, so the loadability test below would
+	// reproduce it rather than catch it.
+	_ "mosdns-router/plugin/executable/ttl_clamp"
 )
 
 // The expectations below are stated literally, and decoded by this test into its
@@ -1142,15 +1147,26 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	// offset (forward.go:265-267). Two upstreams and concurrent 2 means it picks
 	// both, whichever offset it starts from -- so the count is `concurrent`, not
 	// len(upstreams) times concurrent.
+	//
+	// **A RANGE, and this is the correction that made the suite stop depending on the
+	// scheduler.** The route launches `concurrent` queries and RETURNS ON THE FIRST
+	// NON-ERROR ANSWER (mosdns forward.go:302-319), abandoning the others wherever
+	// they are -- so one client query reaches the mock once or twice depending on
+	// which goroutine wins. This asserted exactly `concurrent` and was measured
+	// failing 6 runs in 20; the same correction is applied in tests/integration.
+	//
+	// What the case still holds, and what is worth holding, is the transport: TCP
+	// only, and never UDP. A udp:// upstream in the list would be routable and would
+	// break the ECH fetch, which shares this branch.
 	concurrent := config.Defaults().Foreign.Concurrent
 	if len(config.Defaults().Foreign.Upstreams) < concurrent {
 		t.Fatalf("this case needs at least `concurrent` upstreams; the default route has %d and "+
 			"concurrent is %d", len(config.Defaults().Foreign.Upstreams), concurrent)
 	}
-	raced := concurrent
-	if count := foreign.Count(testdns.ProtocolTCP, foreignDomain); count != raced {
-		t.Errorf("the foreign resolver received %d queries for %s over tcp, want %d: one per racer "+
-			"per upstream for concurrent=%d", count, foreignDomain, raced, concurrent)
+	if count := foreign.Count(testdns.ProtocolTCP, foreignDomain); count < 1 || count > concurrent {
+		t.Errorf("the foreign resolver received %d queries for %s over tcp, want between 1 and "+
+			"%d: one uncached query asks at least one upstream and at most `concurrent` of them",
+			count, foreignDomain, concurrent)
 	}
 	if count := foreign.Count(testdns.ProtocolUDP, foreignDomain); count != 0 {
 		t.Errorf("the foreign resolver received %d queries for %s over udp, want 0: the UDP transport "+
@@ -1167,9 +1183,15 @@ func TestRenderedConfigLoadsInAMosdnsInstance(t *testing.T) {
 	if got := addressesIn(t, ask(t, listenAddress, foreignDomain)); len(got) != 1 || got[0] != "203.0.113.10" {
 		t.Errorf("the repeated %s = %v, want the cached answer [203.0.113.10]", foreignDomain, got)
 	}
-	if count := foreign.Count("", foreignDomain); count != raced {
-		t.Errorf("the foreign resolver received %d queries for %s in total, want %d: the repeated query "+
-			"must come from the cache and add NO upstream query at all", count, foreignDomain, raced)
+	// The cache claim, and it is the deterministic one: the SECOND query added no
+	// upstream query at all. The total is bounded rather than equal for the same
+	// reason the count above is -- the first query's racers finish
+	// nondeterministically -- and the zero end is what would break: a total of zero
+	// would mean the first query never went out either.
+	if count := foreign.Count("", foreignDomain); count < 1 || count > concurrent {
+		t.Errorf("the foreign resolver received %d queries for %s in total, want between 1 and "+
+			"%d: the repeated query must come from the cache and add NO upstream query at all",
+			count, foreignDomain, concurrent)
 	}
 
 	instance.CloseWithErr(nil)
@@ -1981,4 +2003,171 @@ func TestTheCacheSizeComesFromThePolicy(t *testing.T) {
 		t.Fatalf("the cache size is %d, want the policy's 77: it was a render constant "+
 			"writing 1024 and this is the change that makes it the operator's", got)
 	}
+}
+
+// **This is the gate the first draft of the clamp was missing, and it exists
+// because a reviewer found the defect that the other clamp tests could not see.**
+//
+// Every other case in this file about `foreign_ttl` asserts TABLE POSITION or
+// DOCUMENT TEXT. That is enough to catch a clamp in the wrong place, and not enough
+// to catch a clamp that no mosdns would run -- which is what was shipped:
+//
+//   - the type was mosdns's own `ttl`, which registers only an exec quick-setup
+//     (plugin/executable/ttl/ttl.go:37) and no `coremain.RegNewPluginFunc`, so a
+//     standalone entry of that type is refused with `plugin type ttl not defined`;
+//   - and even once loadable, nothing exec'd it, because `forward` is a plain
+//     Executable that sets the response and returns.
+//
+// So this hands each shape to a REAL mosdns instance and requires it to start. The
+// cases above cannot do that, because a document can be perfectly well-formed,
+// correctly ordered and still be one the router refuses.
+//
+// **And it is a table over every shape the renderer can emit**, because the defect
+// lived in a shape no test rendered: max-only, min-only, and both.
+func TestEveryShapeTheRendererCanEmitLoadsInMosdns(t *testing.T) {
+	shapes := []struct {
+		name   string
+		policy func(*config.Policy)
+	}{
+		{"the default, no clamp", func(*config.Policy) {}},
+		{"a maximum alone", func(p *config.Policy) { p.ForeignCache.TTLMax = 300 }},
+		{"a minimum alone", func(p *config.Policy) { p.ForeignCache.TTLMin = 30 }},
+		{"both bounds", func(p *config.Policy) {
+			p.ForeignCache.TTLMax = 300
+			p.ForeignCache.TTLMin = 30
+		}},
+		{"a minimum above the maximum", func(p *config.Policy) {
+			p.ForeignCache.TTLMax = 300
+			p.ForeignCache.TTLMin = 900
+		}},
+		{"one second upstream", func(p *config.Policy) {
+			p.Foreign.Upstreams = append(p.Foreign.Upstreams, config.ForeignUpstream{
+				Kind: config.UpstreamKindUpstream, Name: "extra", Addr: "tls://dns.quad9.net:853",
+			})
+		}},
+		{"a DoH upstream", func(p *config.Policy) {
+			p.Foreign.Upstreams = []config.ForeignUpstream{
+				{Kind: config.UpstreamKindDNSCrypt, Name: "packaged"},
+				{Kind: config.UpstreamKindUpstream, Name: "doh",
+					Addr: "https://dns.quad9.net/dns-query"},
+			}
+		}},
+		{"a udp upstream, which is routable", func(p *config.Policy) {
+			p.Foreign.Upstreams = []config.ForeignUpstream{
+				{Kind: config.UpstreamKindDNSCrypt, Name: "packaged"},
+				{Kind: config.UpstreamKindUpstream, Name: "plain", Addr: "udp://9.9.9.9:853"},
+			}
+		}},
+		{"a clamp and a second upstream together", func(p *config.Policy) {
+			p.ForeignCache.TTLMax = 300
+			p.Foreign.Upstreams = append(p.Foreign.Upstreams, config.ForeignUpstream{
+				Kind: config.UpstreamKindUpstream, Name: "extra", Addr: "tls://dns.quad9.net:853",
+			})
+		}},
+	}
+	// The paths are temporary ones with a mock listener, because ProductionPaths()
+	// names the INSTALLED layout: an instance started on it refuses to read
+	// /var/lib/mosdns/lists/cn-domains.txt, so every row would fail for a reason
+	// that has nothing to do with the shape under test.
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			foreign := startForeignMock(t)
+			paths, _ := temporaryPaths(t, "tcp://"+foreign.Address())
+			policy := config.Defaults()
+			shape.policy(&policy)
+			document, err := Render(policy, paths)
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			if loadMosdns(t, decodeMosdnsConfig(t, document)) == nil {
+				t.Fatal("mosdns returned no instance")
+			}
+		})
+	}
+}
+
+// And the clamp is EXEC'd, not merely present. This is the half a loadability test
+// cannot see: a document that loads and never runs the clamp is a working router
+// with a feature that does nothing.
+//
+// The forward's answer is queried through a real instance and the TTL is read back,
+// so this is the only assertion that can tell a clamp from a comment.
+func TestTheClampChangesTheAnswerTheRouterReturns(t *testing.T) {
+	foreign := startForeignMock(t)
+	paths, listenAddress := temporaryPaths(t, "tcp://"+foreign.Address())
+	policy := config.Defaults()
+	// BELOW the mock's own TTL of 30, and that is the whole point of choosing it:
+	// a maximum bounds from above and does nothing to a record already under it, so
+	// a bound of 45 would pass vacuously -- the clamp would be in the document, not
+	// exec'd, and the answer would still carry the mock's 30.
+	policy.ForeignCache.TTLMax = 10
+	document, err := Render(policy, paths)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	loadMosdns(t, decodeMosdnsConfig(t, document))
+	for round := range 2 {
+		response := ask(t, listenAddress, foreignDomain)
+		if response.Rcode != dns.RcodeSuccess {
+			t.Fatalf("round %d: %s", round+1, dns.RcodeToString[response.Rcode])
+		}
+		for _, record := range response.Answer {
+			if ttl := record.Header().Ttl; ttl != 10 {
+				t.Fatalf("round %d: %s carries TTL %d, want the policy's 10. The clamp is in "+
+					"the document but nothing execs it -- mosdns runs only what a sequence "+
+					"names, and a plugin that is merely rendered does nothing forever",
+					round+1, record.Header().Name, ttl)
+			}
+		}
+	}
+}
+
+// **The invariant that closes the loop, and the one the loadability table cannot
+// express on its own.**
+//
+// A table that renders and starts each shape proves the renderer and the plugin
+// AGREE. It does not prove either is right: this change's first draft rendered
+// mosdns's own `ttl`, both sides agreed on the string, and the document was refused
+// with `plugin type ttl not defined` -- because that plugin registers only an exec
+// quick-setup and never calls `coremain.RegNewPluginFunc` (measured:
+// plugin/executable/ttl/ttl.go:37, against cache.go:55 and forward.go:45).
+//
+// Mutating the plugin's `PluginType` constant does not catch it either: the plugin
+// then registers under the wrong name and both sides still agree. So this reads the
+// type OUT of the rendered document and asks the loader directly -- the one question
+// that has exactly one right answer and no way for a wrong pair to satisfy it.
+func TestTheClampTypeTheDocumentCarriesIsOneTheLoaderKnows(t *testing.T) {
+	policy := config.Defaults()
+	policy.ForeignCache.TTLMax = 300
+	document := mustRenderPolicy(t, policy)
+
+	// The type is read from the document rather than from the constant, because
+	// reading the constant is the mistake: it asks whether the code agrees with
+	// itself instead of whether the document would load.
+	typeName := ""
+	for _, line := range strings.Split(string(document), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "- tag: "+tagForeignTTL {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "type: ") && typeName == "" && seenClampTag(document, tagForeignTTL) {
+			typeName = strings.Trim(strings.TrimPrefix(trimmed, "type: "), `"'`)
+		}
+	}
+	if typeName == "" {
+		t.Fatalf("the clamp entry carries no type:\\n%s", document)
+	}
+	if _, known := coremain.GetPluginType(typeName); !known {
+		t.Fatalf("the document's clamp carries type %q, which the loader does not know, so "+
+			"a router started on this document is refused with `plugin type %s not defined`. A "+
+			"plugin type this project owns is registered with coremain.RegNewPluginFunc; "+
+			"mosdns's own `ttl` is not, because it registers only an exec quick-setup",
+			typeName, typeName)
+	}
+}
+
+// seenClampTag says whether the document has the clamp entry at all, so the scan
+// above collects the type of THAT entry rather than the first `type:` in the file.
+func seenClampTag(document []byte, tag string) bool {
+	return strings.Contains(string(document), "- tag: "+tag)
 }

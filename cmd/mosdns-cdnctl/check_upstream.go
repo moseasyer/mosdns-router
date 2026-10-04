@@ -57,7 +57,7 @@ type upstreamCheckResult struct {
 // Exit status is about REACHABILITY and nothing else: 0 when every enabled entry
 // answered, 3 when at least one did not. It never writes and never locks.
 func runCheckUpstream(args []string, stdout, stderr io.Writer, services services) int {
-	options, err := parseCheckUpstreamOptions(stderr, args)
+	options, err := parseCheckUpstreamOptions(stderr, args, services.documents.Policy)
 	if err != nil {
 		writeCLIError(stderr, "check-upstream: %v", err)
 		return exitInvalidCLI
@@ -116,14 +116,22 @@ type checkUpstreamOptions struct {
 	policy string
 }
 
-func parseCheckUpstreamOptions(stderr io.Writer, args []string) (checkUpstreamOptions, error) {
+func parseCheckUpstreamOptions(stderr io.Writer, args []string, policy string) (checkUpstreamOptions, error) {
 	flags := flag.NewFlagSet("check-upstream", flag.ContinueOnError)
 	// The flag set writes its own diagnostics to stderr rather than discarding
 	// them, so `-h` reaches the operator.
 	flags.SetOutput(stderr)
 	var options checkUpstreamOptions
 	flags.BoolVar(&options.all, "all", false, "check every enabled entry")
-	policyPath := flags.String("policy", "", "path to the policy the route is configured in")
+	// **The installed policy's own path is the default, and that is not a
+	// convenience.** An earlier version defaulted to the empty string and handed
+	// that to config.Load, so `check-upstream --all` -- the invocation the manual
+	// documents and the one a control centre's "is it up?" button would make --
+	// answered `open policy: open : no such file or directory` and exited 3. Every
+	// other verb defaults to the installed document (render/validate read
+	// documents.Policy, the CDN verbs read defaultPolicyPath), and a verb whose
+	// only documented invocation does not work is a verb nobody has run.
+	policyPath := flags.String("policy", policy, "path to the policy the route is configured in")
 	if err := flags.Parse(args); err != nil {
 		return checkUpstreamOptions{}, err
 	}

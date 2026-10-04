@@ -36,6 +36,7 @@ import (
 
 	cdnrewrite "mosdns-router/plugin/executable/cdn_rewrite"
 	dhcpforward "mosdns-router/plugin/executable/dhcp_forward"
+	ttlclamp "mosdns-router/plugin/executable/ttl_clamp"
 )
 
 // The tags the rendered document uses. The two servers and the three sequences
@@ -176,6 +177,14 @@ type Paths struct {
 // file layout: read-only configuration under /etc, the rule list the updater
 // rewrites under /var/lib, and the DHCP bridge's published state on the tmpfs
 // under /run.
+// The clamp's plugin type is referenced here as well as where it is rendered, so
+// that a change to the rendered name is a change the compiler can see rather than
+// one that leaves an import behind. It is the kind of line that looks redundant and
+// is not: a mutation script that changes the one rendered use would otherwise fail
+// to build, and a build failure reads as "no failures" to any check that counts
+// test failures.
+var _ = ttlclamp.PluginType
+
 func ProductionPaths() Paths {
 	return Paths{
 		Policy:             "/etc/mosdns/policy.yaml",
@@ -415,7 +424,7 @@ func buildPlugins(policy config.Policy, paths resolvedPaths) []pluginArgs {
 	if policy.ForeignCache.TTLMax > 0 || policy.ForeignCache.TTLMin > 0 {
 		plugins = append(plugins, pluginArgs{
 			Tag:  tagForeignTTL,
-			Type: "ttl",
+			Type: ttlclamp.PluginType,
 			Args: ttlArgs{
 				Max: uint32(policy.ForeignCache.TTLMax),
 				Min: uint32(policy.ForeignCache.TTLMin),
@@ -513,6 +522,43 @@ func foreignBranchPlugins(policy config.Policy, paths resolvedPaths) []pluginArg
 	}
 }
 
+// foreignPathRules is the foreign branch's sequence, with the clamp exec'd where it
+// has to be exec'd.
+//
+// **Being in the plugin table is not enough.** mosdns runs nothing a sequence does
+// not exec: `forward` is a plain Executable that sets the response and returns
+// (mosdns plugin/executable/forward/forward.go:198-204), so a clamp merely RENDERED
+// sits in the document doing nothing forever. That was the defect in this change's
+// first draft, and the tests beside it did not catch it because they asserted table
+// position and text.
+//
+// The rule goes BETWEEN the forward and the final accept, and the position is the
+// whole of it:
+//
+//   - the cache is exec'd above, and a cache's `next` is the REST of the sequence
+//     after it, so what the cache stores on a miss is what this rule returns -- the
+//     CLAMPED answer. A clamp before the cache would shape only the answer on the
+//     way out, and the router's own cache would still expire on the upstream's TTL,
+//     which is not what "the cache record time" means to an operator.
+//   - on a cache HIT the `has_resp` rule accepts and the branch ends, so this does
+//     not run twice: the stored value was clamped when it was stored.
+//
+// The rule is CONDITIONAL for the same reason the plugin is: a document naming
+// `$foreign_ttl` with no such plugin is refused by the loader, so a policy that
+// asks for no clamp would get a document that cannot start.
+func foreignPathRules(policy config.Policy) []rule {
+	rules := []rule{
+		{Exec: "$" + tagCDNRewrite},
+		{Exec: "$" + tagForeignCache},
+		{Matches: []string{"has_resp"}, Exec: "accept"},
+		{Exec: "$" + tagForeignForward},
+	}
+	if policy.ForeignCache.TTLMax > 0 || policy.ForeignCache.TTLMin > 0 {
+		rules = append(rules, rule{Exec: "$" + tagForeignTTL})
+	}
+	return append(rules, rule{Exec: "accept"})
+}
+
 // afterForeignBranch is everything that is NOT part of the foreign branch's chain:
 // the China sequence, the foreign sequence that execs the branch above, the dispatch
 // that chooses between them, and the two servers.
@@ -542,13 +588,7 @@ func afterForeignBranch(policy config.Policy, paths resolvedPaths) []pluginArgs 
 			// well.
 			Tag:  tagForeignPath,
 			Type: "sequence",
-			Args: []rule{
-				{Exec: "$" + tagCDNRewrite},
-				{Exec: "$" + tagForeignCache},
-				{Matches: []string{"has_resp"}, Exec: "accept"},
-				{Exec: "$" + tagForeignForward},
-				{Exec: "accept"},
-			},
+			Args: foreignPathRules(policy),
 		},
 		{
 			// The dispatch. The China list is checked first and the foreign
@@ -867,16 +907,15 @@ func resolveForeignRoute(resolved *resolvedPaths, policy config.Policy, listener
 	// document that races the packaged resolver against a DoQ endpoint whose
 	// behaviour nothing in this project can observe is worse than one that offers
 	// both, in an order a reader can follow.
-	if config.ECHSource(policy.Foreign.Upstreams, listener) != "" {
-		packaged := false
-		for _, entry := range policy.Foreign.Upstreams {
-			if entry.IsEnabled() && entry.Kind == config.UpstreamKindDNSCrypt {
-				packaged = true
-				break
-			}
-		}
-		if packaged {
+	// Computed ONCE and used twice: the source decides whether the packaged entry is
+	// in the route, and it IS the answer written into the rewriter's arguments. The
+	// first version called it three times, and guarded the whole block on a call
+	// whose result the inner loop already established.
+	source := config.ECHSource(policy.Foreign.Upstreams, listener)
+	for _, entry := range policy.Foreign.Upstreams {
+		if entry.IsEnabled() && entry.Kind == config.UpstreamKindDNSCrypt && source != "" {
 			resolved.forwardUpstreams = append(resolved.forwardUpstreams, upstreamArgs{Addr: listener})
+			break
 		}
 	}
 	for _, entry := range policy.Foreign.Upstreams {
@@ -896,19 +935,22 @@ func resolveForeignRoute(resolved *resolvedPaths, policy config.Policy, listener
 			Bootstrap: bootstrap,
 		})
 	}
+	// **Reaching either refusal below is a FAULT, not the default configuration.**
+	// The first version's comment here said the opposite -- "that is the DEFAULT
+	// configuration, not a fault" -- and then returned an error three lines later.
+	// The enabled-dnscrypt case is handled above, where the listener is added, so an
+	// empty list here means no enabled entry of either kind reached the route.
 	if len(resolved.forwardUpstreams) == 0 {
-		// The policy validated, so this means the dnscrypt entry is the route and
-		// it is on. That is the DEFAULT configuration, not a fault.
 		return config.ErrNoECHSource
 	}
-	resolved.echUpstream = config.ECHSource(policy.Foreign.Upstreams, listener)
-	if resolved.echUpstream == "" {
+	if source == "" {
 		// config.Validate refuses this policy before it reaches here, so an empty
-		// source at this point means the caller handed a policy that was never
-		// validated. Refusing it here is what keeps the renderer from producing a
-		// document whose ECH fetch silently has nowhere to go.
+		// source means the caller handed a policy that was never validated. This is
+		// what keeps the renderer from producing a document whose ECH fetch
+		// silently has nowhere to go.
 		return config.ErrNoECHSource
 	}
+	resolved.echUpstream = source
 	return nil
 }
 

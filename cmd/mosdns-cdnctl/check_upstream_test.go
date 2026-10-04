@@ -296,3 +296,71 @@ func checkServices(t *testing.T, answers map[string]checkAnswer) services {
 		},
 	}
 }
+
+// **The bug this exists for.** Every other case in this file builds its `services`
+// with an injected `loadPolicy`, which is why they all passed while the verb itself
+// could not run: `flags.String("policy", "", ...)` handed the empty string to
+// config.Load, so the only invocation the manual documents -- `check-upstream --all`
+// with no path -- answered `open policy: open : no such file or directory`.
+//
+// This case starts from `productionServices()` and overrides ONLY the network
+// boundary, which is the whole of what a check needs replaced. Everything else --
+// the policy path, the document layout -- is production's, and a broken default in
+// any of it shows up here rather than on an operator's machine.
+func TestTheDocumentedInvocationReadsTheInstalledPolicyByDefault(t *testing.T) {
+	var asked string
+	services := productionServices()
+	services.newUpstream = func(addr string, _ upstream.Opt) (upstream.Upstream, error) {
+		asked = addr
+		return &checkFake{rcode: "NOERROR"}, nil
+	}
+
+	// The policy the verb will read is the one that is installed, named by the same
+	// document layout every other verb uses.
+	if services.documents.Policy == "" {
+		t.Fatal("productionServices() carries no policy path, so the verb has nothing to " +
+			"default to and every documented invocation would fail")
+	}
+
+	var stdout, stderr bytes.Buffer
+	// The exit is not asserted here: this host has no installed policy, so the read
+	// itself is what fails. What is asserted is that the failure NAMES THE INSTALLED
+	// PATH rather than an empty one, which is the difference between "this machine has
+	// no policy" and "this verb is broken".
+	code := runCheckUpstream([]string{"--all"}, &stdout, &stderr, services)
+	if code == exitSuccess {
+		t.Skip("this machine has an installed policy at the default path; the default is " +
+			"exercised for real there and this case has nothing left to check")
+	}
+	if !strings.Contains(stderr.String(), services.documents.Policy) {
+		t.Fatalf("the failure does not name the installed policy path %q, so it is a failure "+
+			"to read a real file rather than a verb with no default: %s",
+			services.documents.Policy, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "open policy: open :") {
+		t.Fatalf("the verb passed an empty path to config.Load, which is the defect: %s",
+			stderr.String())
+	}
+	if asked != "" {
+		t.Fatalf("the verb dialled %q before it had a policy to read", asked)
+	}
+}
+
+// An explicit --policy still wins over the default, which is the whole point of the
+// flag and the reason it is not simply removed.
+func TestAnExplicitPolicyPathOverridesTheDefault(t *testing.T) {
+	var read string
+	services := productionServices()
+	services.loadPolicy = func(path string) (config.Policy, error) {
+		read = path
+		return config.Defaults(), nil
+	}
+	services.newUpstream = func(addr string, _ upstream.Opt) (upstream.Upstream, error) {
+		return &checkFake{rcode: "NOERROR"}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	runCheckUpstream([]string{"--all", "--policy", "/somewhere/else.yaml"}, &stdout, &stderr, services)
+	if read != "/somewhere/else.yaml" {
+		t.Fatalf("the verb read %q, want the path it was given", read)
+	}
+}

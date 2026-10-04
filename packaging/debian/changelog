@@ -1,3 +1,26 @@
+mosdns-router (0.2.0) unstable; urgency=medium
+
+  * The foreign route is configurable. policy.yaml gains `foreign.upstreams`, a
+    list of the packaged DNSCrypt resolver and/or mosdns-dialed upstreams in any
+    scheme mosdns accepts, plus `foreign.concurrent` (default 2) and a
+    `foreign_cache` block carrying the cache size and an optional record-time
+    bound. The routing document derives its forward list from it, and the ECH key
+    is fetched over TCP through whichever enabled entry can carry it -- a policy
+    with no such entry is refused by name rather than rendered.
+  * NEW VERB: `mosdns-cdnctl check-upstream` reports whether each enabled entry
+    can be dialled and can answer, and `mosdns-cdnctl flush-cache` empties the
+    router's foreign answer cache through the cache plugin's own endpoint.
+  * BREAKING, and it is the kind an operator has to act on: a policy.yaml that
+    predates `foreign.upstreams` no longer validates, and the refusal says what
+    to add. policy.yaml is a conffile, so a customised copy survives the upgrade
+    and the router will not start against it until `foreign.upstreams` is added --
+    the two lines the shipped policy carries restore the previous behaviour.
+  * The routing document gains an `api` block on 127.0.0.1:15354, which is what
+    makes the cache plugin's own flush endpoint reachable. It is loopback and
+    unprivileged, like every other listener this package configures.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 04 Oct 2026 00:00:00 +0000
+
 mosdns-router (0.1.0) unstable; urgency=medium
 
   * First packaged release: the DNS router, the DNSCrypt foreign resolver, the

@@ -496,7 +496,7 @@ def route_provider_findings(root, documents, inventory=None):
 # The metadata that was decided, read back out of packaging/debian/control.
 CONTROL_FIELDS = {
     "Package": "mosdns-router",
-    "Version": "0.1.0",
+    "Version": "0.2.0",
     "Section": "net",
     "Priority": "optional",
 }
@@ -5978,7 +5978,7 @@ class BuiltPackageTests(_Staged):
     def setUpClass(cls):
         super().setUpClass()
         cls.deb = os.path.join(
-            _SHARED["directory"], f"mosdns-router_0.1.0_{_built_architecture()}.deb"
+            _SHARED["directory"], f"mosdns-router_0.2.0_{_built_architecture()}.deb"
         )
         built = subprocess.run(
             ["dpkg-deb", "--root-owner-group", "--build", cls.root, cls.deb],
