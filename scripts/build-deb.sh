@@ -548,6 +548,15 @@ done
 #                   rejects a space-separated Architecture field. A binary labelled
 #                   with a name it does not have is worse than a missing label.
 #
+# A third field is COMPUTED rather than copied for the opposite reason: Version was a
+# hardcoded line in packaging/debian/control as well as PACKAGE_VERSION here, so the
+# file name and the control field were two sources that had to be edited together and
+# nothing made that necessary. It was changed by hand and the two diverged, and the
+# build produced a file called 0.2.1 whose control field said 0.2.0. scripts/assert-deb.sh
+# caught it on the first run after the bump, which is the only reason this is a note
+# rather than a post-mortem. The comment above this block claimed PACKAGE_VERSION was
+# "the one in the control file and the file name", and it was not true until now.
+#
 # Neither insertion may leave a blank line behind it: a blank line ENDS a stanza in a
 # Debian control file, so an inserted line followed by one is two stanzas, and dpkg
 # reports the second as a package with no Package field. The field goes immediately
@@ -555,6 +564,7 @@ done
 installed_size=$(du -sk --apparent-size "$STAGE" | cut -f1)
 {
 	sed -e 's/^Architecture:.*/Architecture: '"$ARCH"'/' \
+		-e 's/^Version:.*/Version: '"$PACKAGE_VERSION"'/' \
 		-e '/^Description:/i Installed-Size: '"$installed_size" \
 		packaging/debian/control
 } >"$STAGE/DEBIAN/control"

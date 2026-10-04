@@ -217,5 +217,13 @@ package:
 		VERSION='$(VERSION)' REVISION='$(REVISION)' BUILD_TIME='$(BUILD_TIME)' \
 		sh $(PACKAGE_SCRIPT)
 
-verify: test test-integration test-installer verify-build-info package
+# What the built package SAYS, as opposed to whether the build exited zero. These
+# are the assertions the CI publish step runs against a downloaded artifact, and
+# they belong here too: a version that exists in two places can diverge, and it did,
+# and the only thing that noticed was a CI run a minute and a half after the bump.
+# The cost of finding that out locally instead is one make target.
+verify-package: package
+	@sh scripts/assert-deb.sh build/mosdns-router_$$(sed -n 's/^PACKAGE_VERSION=//p' $(PACKAGE_SCRIPT))_$$(dpkg --print-architecture).deb
+
+verify: test test-integration test-installer verify-build-info verify-package
 	@$(GO) vet -mod=readonly ./...
