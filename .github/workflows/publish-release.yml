@@ -82,6 +82,19 @@ jobs:
           sha256sum "$deb"
           dpkg-deb --info "$deb" | sed -n '1,12p'
 
+      - name: what this token can actually do
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "repo permissions as this token sees them:"
+          gh api "repos/${REPO}" --jq '.permissions' 2>&1 | head -12
+          echo "releases readable:"
+          gh api "repos/${REPO}/releases" --jq 'length' 2>&1 | head -3
+          echo "can this token read its own workflow permissions?"
+          gh api "repos/${REPO}/actions/permissions/workflow" --jq . 2>&1 | head -3
+
       - name: publish it, or refuse to
         # EVERY variable the notes template interpolates has to be here. `env:` is
         # per-step, not per-job: RUN_ID lived only on the download step, and the
