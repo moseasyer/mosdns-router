@@ -35,15 +35,22 @@ on:
         required: true
         type: string
 
-# NO workflow-level permissions on purpose. The two jobs need DISJOINT scopes -- one
-# reads an artifact, the other writes a Release -- and this repository's GITHUB_TOKEN
-# answered `403 Resource not accessible by integration` on the releases API while it
-# could read that same list. A workflow-level block declaring `contents: write` plus
-# `actions: read` was not honoured; the run that did create a release had
-# `contents: write` alone. Rather than keep guessing which scope offended it, each
-# scope now goes to the one job that needs it, which is the smaller permission surface
-# anyway: the job that downloads an artifact cannot create a tag, and the job that
-# creates a tag cannot read artifacts from other runs.
+# `contents: write`, and nothing else, at the WORKFLOW level -- which is the exact
+# shape of the one run whose GITHUB_TOKEN did create a release (build-deb.yml at
+# 3746e2f). Two other shapes were tried against this repository's token and both were
+# refused with `403 Resource not accessible by integration` on the releases API while
+# the same token could READ that list: a workflow-level block with `contents: write`
+# plus `actions: read`, and a job-level `contents: write` with no workflow-level block.
+# Both were reasonable and neither worked, so this matches what is known to have
+# worked rather than what reads best.
+#
+# The `fetch` job narrows itself at job level, which is how the download scope is kept
+# out of the job that creates a tag: a job-level block REPLACES the workflow-level one,
+# so naming only `contents: read` and `actions: read` there leaves the publishing job
+# with the write above and nothing else.
+permissions:
+  contents: write
+
 jobs:
   fetch:
     name: fetch the built package
