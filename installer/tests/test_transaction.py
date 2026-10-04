@@ -180,6 +180,16 @@ STATE_DIRECTORIES = (
     "/var/lib/mosdns/lists",
     "/run/mosdns",
 )
+# The shape the package provisions for each, asked of the installer rather than written
+# out here, so this fixture and the check under test cannot disagree about what correct
+# looks like. /run/mosdns is 2750 with the group at r-x: only root writes it, and the
+# NetworkManager dispatcher that runs the bridge is root.
+STATE_DIRECTORY_MODES = {
+    relative: installer.STATE_DIRECTORY_MODES[relative] for relative in STATE_DIRECTORIES
+}
+STATE_GROUP_PERMISSION_FOR = {
+    relative: installer._state_group_for(relative) for relative in STATE_DIRECTORIES
+}
 # The shared control lock, its mode, and the owner and group preflight requires
 # it to have. The transaction now TAKES this lock -- it is the exclusion that
 # stops the resolver watchdog firing an emergency rollback underneath a running
@@ -659,12 +669,20 @@ class TransactionFixture(unittest.TestCase):
         link.symlink_to("/run/systemd/resolve/stub-resolv.conf")
         return link
 
-    def build_state_directories(self, mode="2770"):
+    def build_state_directories(self, mode=None):
+        """Create the four state directories at the shape the package provisions.
+
+        Per directory, from the installer's own mapping: /run/mosdns is 2750 with a
+        group ACL of r-x and no group write, because only root writes it. This fixture
+        used to give all four 2770 and g::rwx, which made every test in this file fail
+        at preflight with a refusal about /run/mosdns -- 125 of them, all downstream
+        of one hardcoded mode.
+        """
         for relative in STATE_DIRECTORIES:
             path = self.rooted(relative)
             path.mkdir(parents=True, exist_ok=True)
-            setfacl(path, "g::rwx")
-            path.chmod(int(mode, 8))
+            setfacl(path, "g::" + STATE_GROUP_PERMISSION_FOR[relative])
+            path.chmod(int(mode or STATE_DIRECTORY_MODES[relative], 8))
 
     def force_ech(self, *domains):
         """Write the operator's force-ECH list, comment lines and all."""
@@ -948,7 +966,10 @@ class TransactionFixture(unittest.TestCase):
         for unit in PROJECT_UNITS:
             self.returncodes[("systemctl", "is-active", unit)] = 3
         for relative in STATE_DIRECTORIES:
-            answers[STAT_FIELDS + (str(self.rooted(relative)),)] = f"2770 root mosdns-router {stat.S_IFDIR | 0o2770:x}"
+            mode = STATE_DIRECTORY_MODES[relative]
+            answers[STAT_FIELDS + (str(self.rooted(relative)),)] = (
+                f"{mode} root mosdns-router {stat.S_IFDIR | int(mode, 8):x}"
+            )
         # The control lock, stat-able. The transaction now TAKES this lock (it is
         # the exclusion that stops the resolver watchdog acting underneath an
         # install), so a test that runs the transaction twice leaves a real lock
