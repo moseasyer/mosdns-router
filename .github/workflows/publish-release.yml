@@ -35,17 +35,25 @@ on:
         required: true
         type: string
 
-permissions:
-  # write to create the tag and the Release; actions:read to download the artifact.
-  contents: write
-  actions: read
-
+# NO workflow-level permissions on purpose. The two jobs need DISJOINT scopes -- one
+# reads an artifact, the other writes a Release -- and this repository's GITHUB_TOKEN
+# answered `403 Resource not accessible by integration` on the releases API while it
+# could read that same list. A workflow-level block declaring `contents: write` plus
+# `actions: read` was not honoured; the run that did create a release had
+# `contents: write` alone. Rather than keep guessing which scope offended it, each
+# scope now goes to the one job that needs it, which is the smaller permission surface
+# anyway: the job that downloads an artifact cannot create a tag, and the job that
+# creates a tag cannot read artifacts from other runs.
 jobs:
-  publish:
-    name: publish a built package
+  fetch:
+    name: fetch the built package
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      revision: ${{ steps.read.outputs.revision }}
     steps:
       - name: the source, and its tags
         uses: actions/checkout@v5
@@ -70,10 +78,42 @@ jobs:
           fi
           find pkg -name '*.deb' -type f
 
+      - name: re-upload it as this run's own artifact
+        # The next job cannot read another run's artifacts -- that is `actions: read`
+        # and this job deliberately does not have write, so it cannot be the one that
+        # creates the Release. Handing the bytes over as an artifact of THIS run is how
+        # the two disjoint scopes meet, and it copies rather than rebuilds: the package
+        # promoted is the package the chosen run produced.
+        uses: actions/upload-artifact@v7
+        with:
+          name: fetched
+          path: pkg/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: publish a built package
+    needs: fetch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: the source, and its tags
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: the package the fetch job brought
+        uses: actions/download-artifact@v6
+        with:
+          name: fetched
+          path: pkg
+
       - name: the same assertions the build ran
-        # Not a formality. The point of promoting a chosen artifact is that it is
-        # the package that was inspected, so it is re-checked here against the same
-        # script, from the repository at the tag's commit.
+        # Not a formality. The point of promoting a chosen artifact is that it is the
+        # package that was inspected, so it is re-checked here against the same script,
+        # from the repository at the tag's commit. And it is re-checked in THIS job
+        # because this job is the one about to make the bytes installable by somebody.
         run: |
           set -euo pipefail
           deb=$(find pkg -name '*.deb' -type f | head -1)
@@ -81,19 +121,6 @@ jobs:
           sh scripts/assert-deb.sh "$deb"
           sha256sum "$deb"
           dpkg-deb --info "$deb" | sed -n '1,12p'
-
-      - name: what this token can actually do
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
-          echo "repo permissions as this token sees them:"
-          gh api "repos/${REPO}" --jq '.permissions' 2>&1 | head -12
-          echo "releases readable:"
-          gh api "repos/${REPO}/releases" --jq 'length' 2>&1 | head -3
-          echo "can this token read its own workflow permissions?"
-          gh api "repos/${REPO}/actions/permissions/workflow" --jq . 2>&1 | head -3
 
       - name: publish it, or refuse to
         # EVERY variable the notes template interpolates has to be here. `env:` is
