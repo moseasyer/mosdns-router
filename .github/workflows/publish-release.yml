@@ -83,10 +83,18 @@ jobs:
           dpkg-deb --info "$deb" | sed -n '1,12p'
 
       - name: publish it, or refuse to
+        # EVERY variable the notes template interpolates has to be here. `env:` is
+        # per-step, not per-job: RUN_ID lived only on the download step, and the
+        # notes template reads ${RUN_ID}, so the publish step died on
+        # "RUN_ID: unbound variable" under `set -u` -- after downloading, after
+        # asserting, and after spending a runner on it. The value is repeated here
+        # rather than promoted to the job's env because a step that names what it
+        # reads is easier to check against what the step does.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.run_id }}
           # github.run_id, not github.job.run_id: the latter is not a valid context
           # property and rendered EMPTY, which put a bare ".../actions/runs/" in the
           # release notes -- a link to the list rather than to the run.
