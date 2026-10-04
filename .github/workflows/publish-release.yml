@@ -100,6 +100,20 @@ jobs:
           rev=$(sh scripts/assert-deb.sh "$deb" | tail -1)
           test -n "$rev" -a -n "$sha" -a -n "$want"
 
+          # The tag and the package version are one fact, not two conventions that
+          # happen to agree. A release tagged v0.2.1 carrying a package whose control
+          # field says 0.2.0 is a trap for whoever installs it next, and the check
+          # costs one line. PACKAGE_VERSION is what the package says; the tag is
+          # what somebody typed; this makes the second one answer to the first.
+          if [ "$TAG" != "v${want}" ]; then
+            echo "This package's version is ${want}, so its release tag is v${want}," >&2
+            echo "not ${TAG}. Either use v${want}, or change PACKAGE_VERSION in" >&2
+            echo "scripts/build-deb.sh and rebuild -- a tag is a claim about which" >&2
+            echo "version this is, and it should not be able to disagree with the" >&2
+            echo "package it names." >&2
+            exit 1
+          fi
+
           # A Release is a claim about one commit, and the commit is the one the
           # PACKAGE was built from -- not the branch head, which may have moved on
           # since the build ran. So the tag is created at the artifact's revision,
