@@ -1682,6 +1682,40 @@ def _acl_group_class(acl: str, default: bool):
     return mask, [entry if mask is None else _masked(entry, mask) for entry in entries]
 
 
+def _acl_grants(entries, required: str) -> bool:
+    """Whether ``entries`` give this package's group at least ``required``.
+
+    AT LEAST, and that is the whole point. The comparison used to be string
+    equality against one entry -- ``required in entries`` -- which asks "is one of
+    the entries exactly this", so a directory whose ACL granted the group ``rwx``
+    where only ``r-x`` is required was REFUSED. That is a machine strictly more
+    permissive than the one the package provisions, and it works; refusing it is
+    refusing a machine that works.
+
+    A process in the group gets the union of every entry that matches it, so the
+    question is whether each required letter appears in at least one entry. A
+    required letter that appears nowhere is the failure.
+    """
+    return all(any(letter in entry for entry in entries) for letter in required)
+
+
+def _acl_widens(entries, ceiling: str) -> bool:
+    """Whether ``entries`` grant this package's group a bit ``ceiling`` does not.
+
+    The mirror of _acl_grants, and asked of the other half of the ACL. Where the
+    group can write the directory the default half must be at least what the
+    directory needs; where the group cannot, the default half must be no WIDER than
+    the directory, because a default ACL is the only thing that decides the
+    permissions of files created inside it.
+    """
+    return any(
+        letter in entry
+        for entry in entries
+        for letter in "rwx"
+        if letter not in ceiling
+    )
+
+
 def _masked(permissions: str, mask: str) -> str:
     """The permissions a mask actually grants, in the letters getfacl would print."""
     if len(permissions) != 3 or len(mask) != 3:
@@ -1786,25 +1820,64 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
                 "replace in it, and what a file created in it will be, are both unknown"
             )
         else:
+            required = _state_group_for(path)
             access_mask, access_group = _acl_group_class(acl, default=False)
-            if _state_group_for(path) not in access_group:
+            if not _acl_grants(access_group, required):
                 problems.append(
                     f"its access ACL gives the group {access_group or 'nothing'} "
-                    f"(mask {access_mask or 'none'}) rather than {_state_group_for(path)!r}: "
+                    f"(mask {access_mask or 'none'}) rather than {required!r}: "
                     "this is the permission that decides whether a service identity can create, "
                     "replace and lock anything in this directory, and when the ACL carries a "
                     "named entry the mask is what the kernel applies -- so the mode above can "
                     "read rwx for the group while the group still cannot write here"
                 )
+            # The default half answers a DIFFERENT question from the access half, and
+            # asking it the access half's question is what refused every machine.
+            #
+            # A default ACL is REQUIRED where something unprivileged creates files in
+            # this directory, because without it a file one identity creates comes out
+            # with the creating process's umask and the other identity cannot replace
+            # it. "Something unprivileged creates files here" is the same fact as the
+            # group being able to write the directory, so the requirement is read off
+            # the mode and there is no second table.
+            #
+            # Where the group CANNOT write, no such creator exists and a default ACL is
+            # optional -- /run/mosdns is provisioned at 2750 with no ACL at all,
+            # because the NetworkManager dispatcher that publishes into it runs as
+            # root. Demanding one there refuses the machine the package itself
+            # provisions, which is what the Podman matrix found on 22.04, 24.04 and
+            # 26.04 at once.
+            #
+            # But optional is not "unrestricted": a default ACL WIDER than the
+            # directory is a widening nobody chose. `default:group::rwx` makes a
+            # root-created file group-writable, and a member of the group can then
+            # rewrite that file IN PLACE -- the directory denying unlink and rename
+            # stops them replacing it, not editing it. So the half is required to be
+            # no wider than the access half, which is the property, and "at least the
+            # required permissions" is the wrong question to ask of it.
             default_mask, default_group = _acl_group_class(acl, default=True)
-            if _state_group_for(path) not in default_group:
-                problems.append(
-                    f"its default ACL does not grant the group {_state_group_for(path)!r} "
-                    f"(grants {default_group or 'nothing'}, mask {default_mask or 'none'}, "
-                    f"{acl.split()!r}): the mode says what the directory permits today and says "
-                    "nothing about what a file created in it will get, and without the ACL a "
-                    "file one identity creates comes out group-unwritable for the other"
-                )
+            if "w" in required:
+                if not _acl_grants(default_group, required):
+                    problems.append(
+                        f"its default ACL gives the group {default_group or 'nothing'} "
+                        f"(mask {default_mask or 'none'}) rather than {required!r}, and it has "
+                        "no default entries at all where the group can write this directory: "
+                        "the mode says what the directory permits today and says nothing about "
+                        "what a file created in it will get, and without the default half a file "
+                        "one identity creates comes out group-unwritable for the other"
+                    )
+            else:
+                wider = _acl_widens(default_group, required)
+                if wider:
+                    problems.append(
+                        f"its default ACL gives the group {default_group or 'nothing'} "
+                        f"(mask {default_mask or 'none'}), which is wider than the "
+                        f"{required!r} this directory itself grants: a default ACL decides the "
+                        "permissions of the files created in here, and a group-writable file is a "
+                        "file any member of the group can rewrite in place -- denying unlink and "
+                        "rename in the directory stops them replacing it, not editing it. This "
+                        "directory has no unprivileged creator, so it needs no default ACL at all"
+                    )
         if problems:
             # The stat values go in the message whether or not they are the
             # problem. An operator fixing one of these has to confirm the others
@@ -1819,9 +1892,21 @@ def check_state_directories(root: Path, run: CommandRunner, report: Preflight) -
                 f"{owner}:{group}, and "
                 + "; ".join(problems)
                 + f". The package provisions it at {_state_mode_for(path)} "
-                f"{STATE_OWNER}:{STATE_GROUP} with "
-                f"a default ACL granting the group {STATE_GROUP_PERMISSIONS!r}, and preflight "
-                "reports that rather than applying it: it changes nothing it was asked to look at"
+                f"{STATE_OWNER}:{STATE_GROUP}"
+                + (
+                    f" with a default ACL granting the group "
+                    f"{_state_group_for(path)!r}"
+                    if "w" in _state_group_for(path)
+                    # Said as it is rather than as a shape this package stopped
+                    # provisioning. A refusal that names a default ACL here would
+                    # send an operator to set one, and the next install would refuse
+                    # it again for the very thing they had just been told to do.
+                    else ", and with no ACL at all: nothing unprivileged writes this "
+                    "directory, so there is no file whose group permissions a default "
+                    "ACL would have to decide"
+                )
+                + ", and preflight reports that rather than applying it: it changes "
+                "nothing it was asked to look at"
             )
 
 

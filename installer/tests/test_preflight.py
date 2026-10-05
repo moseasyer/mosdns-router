@@ -477,6 +477,23 @@ class PreflightFixture(unittest.TestCase):
         ``access`` is an optional *access* ACL entry, which is what creates the
         mask.
 
+        **The shape this builds by default is NOT the shape the package provisions,
+        and that is deliberate.** It gives every state directory a default ACL built
+        from ``_state_group_for``, so /run/mosdns gets ``default:group::r-x`` -- a
+        directory the package has never created, since 12184e8 gave it no ACL at
+        all. The reason is that the cases here are about one property at a time and
+        want every other property already correct, and a uniform rule is easier to
+        reason about than a per-directory one.
+
+        The gate for the provisioned shape is
+        ``test_accepts_the_machine_this_package_actually_provisions``, which builds it
+        from the installer's own provisioning table rather than from this function.
+        It is the case that was missing when the Podman matrix found that preflight
+        refused a machine the package itself creates, with all 116 of these passing:
+        the suite agreed with its own fixture and the fixture described a machine
+        that does not exist. A new case that is about a real installation should
+        reach for that one, not for this default.
+
         ``mode=None`` means the mode the PACKAGE PROVIONS for each directory, read
         from the installer's own mapping so this fixture and the code under test
         cannot disagree about what correct looks like. Passing a string still
@@ -1713,6 +1730,143 @@ class StateDirectoryTests(PreflightFixture):
     member of the directory's own group cannot create a file in a 2750 directory
     at all, which is why the provisioned mode is 2770 and not 2750.
     """
+
+    def test_accepts_the_machine_this_package_actually_provisions(self):
+        """The regression the Podman matrix found, and the gate that was missing.
+
+        ``/run/mosdns`` is provisioned at 2750 with NO ACL -- no default ACL, no
+        extended access entries -- because nothing unprivileged writes it: the
+        NetworkManager dispatcher that publishes into it runs as root. That is a
+        deliberate decision, recorded in packaging/tmpfiles.d where the ACL line's
+        absence is called load-bearing.
+
+        This suite modelled the opposite machine. STATE_GROUP_PERMISSION_FOR is
+        derived from the installer's own ``_state_group_for``, and build_state_directories
+        gave EVERY state directory a default ACL built from it, so /run/mosdns was
+        handed ``default:group::r-x`` -- a directory the package has never created.
+        Every other case in this class then agreed with the fixture, which is why
+        450 tests were green on a machine where the install refuses.
+
+        So the case builds the machine from the installer's own provisioning table
+        rather than from a uniform rule, and /run/mosdns gets no ACL because that is
+        what the package provisions. It is the same shape as every other
+        ``assertPasses`` here and it is the one that was missing.
+        """
+        for relative in STATE_DIRECTORIES:
+            path = self.rooted(relative)
+            path.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["setfacl", "-b", "-k", str(path)], check=True)
+            path.chmod(int(installer._state_mode_for(relative), 8))
+            # Only a directory whose group can WRITE needs a default ACL, because only
+            # such a directory has an unprivileged creator whose files have to come out
+            # group-usable. That is the installer's own question, asked here of the
+            # fixture rather than of the code, so the fixture cannot drift from the
+            # provisioning it is modelling.
+            if "w" in installer._state_group_for(relative):
+                setfacl(path, f"g::{installer._state_group_for(relative)}")
+        self.assertPasses(
+            message="the machine this package provisions was refused, so the install "
+            "cannot complete on any release",
+        )
+
+    def test_a_directory_the_group_can_write_still_needs_its_default_acl(self):
+        """The other half, so the case above is not a permission slip.
+
+        /var/lib/mosdns/runtime is 2770 with the group writable, which means the two
+        service identities create files in it, and a file's group permissions come
+        from the directory's default ACL. Dropping that ACL leaves a state file one
+        identity creates group-unwritable for the other, and the mode still reads
+        2770 -- the check has to read the ACL to see it.
+        """
+        subprocess.run(
+            ["setfacl", "-b", "-k", str(self.rooted("/var/lib/mosdns/runtime"))],
+            check=True,
+        )
+        problems = " ".join(self.preflight().problems())
+        self.assertRegex(
+            problems,
+            r"(?i)acl",
+            "a group-writable state directory with no default ACL has to be refused: the mode "
+            "reads correct and the failure it causes is in the permissions of the files created "
+            "inside it, which the mode does not describe",
+        )
+
+    def test_a_default_acl_as_wide_as_the_directory_is_accepted(self):
+        """The other side of the same rule, so the fix is not just "require nothing".
+
+        /run/mosdns needs the group at r-x. A default ACL granting exactly r-x is no
+        wider than the directory, so it is accepted -- it decides the permissions of
+        files created in there and grants nothing the directory does not already.
+
+        This is the case the old exact-equality comparison got RIGHT by accident, and
+        the case my first attempt at this fix got wrong: dropping the check on this
+        directory wholesale also stopped reporting the widening above it, which is
+        the one thing about /run/mosdns's default ACL that matters.
+        """
+        self.build_state_directories()
+        run_path = self.rooted("/run/mosdns")
+        subprocess.run(["setfacl", "-b", "-k", str(run_path)], check=True)
+        setfacl(run_path, f"g::{installer._state_group_for('/run/mosdns')}")
+        run_path.chmod(0o2750)
+        self.assertPasses(
+            message="a default ACL no wider than the directory was refused, so an operator who "
+            "had set one correctly was sent to remove a setting that was doing no harm"
+        )
+
+    def test_a_default_acl_wider_than_the_directory_is_refused(self):
+        """The widening, which is the reason this directory's default ACL is constrained
+        at all rather than simply unconstrained.
+
+        /run/mosdns at 2750 denies the group unlink and rename, so a group member
+        cannot REPLACE dhcp-upstreams.json. A `default:group::rwx` makes the file
+        itself group-writable, and editing a file in place needs no permission in the
+        directory at all. The 2750 decision is undone by a line in the default half
+        that the mode check cannot see.
+        """
+        self.build_state_directories()
+        run_path = self.rooted("/run/mosdns")
+        subprocess.run(["setfacl", "-b", "-k", str(run_path)], check=True)
+        setfacl(run_path, "g::rwx")
+        run_path.chmod(0o2750)
+        problems = " ".join(self.preflight().problems())
+        self.assertRegex(
+            problems,
+            r"/run/mosdns",
+            "a default ACL wider than the directory was accepted, which lets any member of the "
+            "group rewrite the file the dispatcher publishes in place",
+        )
+        self.assertRegex(
+            problems,
+            r"(?i)wider|more than",
+            "the refusal has to say the default ACL is WIDER, or an operator reads 'the ACL is "
+            "wrong' about a directory whose ACL is absent and sets one that is worse",
+        )
+
+    def test_a_missing_default_acl_message_says_which_half_is_missing(self):
+        """The message, because a refusal that misreports itself costs an hour.
+
+        It read "its default ACL does not grant the group 'r-x'" -- a permission
+        string sitting where a group belongs, so the sentence said the group was not
+        granted r-x while listing, two words later, an ACL that grants exactly that.
+        And it printed the WHOLE getfacl output as the default half's contents, which
+        is the access half; an operator reading it cannot tell which half is absent.
+        """
+        subprocess.run(
+            ["setfacl", "-b", "-k", str(self.rooted("/var/lib/mosdns/lists"))], check=True
+        )
+        problems = " ".join(self.preflight().problems())
+        self.assertRegex(
+            problems,
+            r"(?i)default acl",
+            "a missing default ACL has to be named as the default ACL",
+        )
+        # And the permission it requires has to be named as a permission.
+        self.assertRegex(
+            problems,
+            r"rwx",
+            "the refusal has to say which permission the group is missing, or an operator cannot "
+            "know what to set",
+        )
 
     def test_accepts_directories_provisioned_the_way_the_plan_says(self):
         self.assertPasses()
