@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"mosdns-router/internal/config"
 	"mosdns-router/internal/filelock"
 	"mosdns-router/internal/rules"
 )
@@ -50,6 +51,14 @@ type fakeOrigin struct {
 	archives map[string][]byte
 	status   int
 	requests []string
+	// onServe runs before each answer, so a case can make the origin answer
+	// differently the second time it is asked. Upstream moving during a run is not
+	// something a static fixture can otherwise express, and it is exactly the race the
+	// automatic refresh has to be immune to. It gets the request because "the third
+	// time it is asked for HEAD" is the only way to say WHEN upstream moved, and a
+	// hook that could only flip on the first request would move it before the run had
+	// measured anything -- which is a different scenario that passes either way.
+	onServe func(*fakeOrigin, *http.Request)
 }
 
 func newFakeOrigin(t *testing.T, head string, archives map[string][]byte) *fakeOrigin {
@@ -63,6 +72,9 @@ func newFakeOrigin(t *testing.T, head string, archives map[string][]byte) *fakeO
 
 func (o *fakeOrigin) serve(writer http.ResponseWriter, request *http.Request) {
 	o.requests = append(o.requests, request.URL.Path)
+	if o.onServe != nil {
+		o.onServe(o, request)
+	}
 	if o.status != http.StatusOK {
 		writer.WriteHeader(o.status)
 		return
@@ -975,6 +987,360 @@ func TestUpdateListsCheckWritesNoPartialReportWhenTheDriftedArchiveCannotBeRead(
 		t.Errorf("refusal does not name the commit it could not read an archive for: %q", stderr)
 	}
 	assertUnchanged(t, before, paths.dir, "")
+}
+
+// --- unattended refresh -------------------------------------------------
+
+// automaticPolicy writes a policy with the two switches set as asked, and the rest of
+// the reviewed defaults, so a case is about the switches and not about a policy it
+// had to invent.
+func automaticPolicy(t *testing.T, china, cloudflare bool) string {
+	t.Helper()
+	policy := config.Defaults()
+	policy.Lists.China.Automatic = china
+	policy.Lists.Cloudflare.Automatic = cloudflare
+	encoded, err := config.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// rulesOf builds a China list with n expressions in it, for the cases about how many
+// rules an incoming list has.
+func rulesOf(n int) []byte {
+	var list bytes.Buffer
+	for index := 0; index < n; index++ {
+		fmt.Fprintf(&list, "domain:host%05d.example.cn\n", index)
+	}
+	return list.Bytes()
+}
+
+// With both switches off, --automatic must do exactly what --check did. The shipped
+// default has to behave identically to the mode it replaces, or turning the feature
+// on and off changes the machine's behaviour rather than its configuration.
+func TestAutomaticWithBothSwitchesOffIsTheCheck(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOrigin(t, lockedCommit, map[string][]byte{
+		lockedCommit: sourceArchive(t, lockedCommit, "domain:first.cn\n"),
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, false, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--automatic with both switches off exited %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "up-to-date:") {
+		t.Errorf("the daily report lost its drift line:\n%s", stdout)
+	}
+	// Nothing was written. Not the pair, not the archive -- an archive taken on a run
+	// that refreshed nothing is a rollback target that was never about to be replaced.
+	if _, err := rules.ReadPrevious(paths.previousLock); err == nil {
+		t.Error("a run that refreshed nothing left an archive")
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != lockedCommit {
+		t.Errorf("the pin moved to %s with both switches off", lock.Commit)
+	}
+}
+
+// The report is produced either way. A machine that has the switches on should not
+// stop being told what its pin is, because that report is the only place the answer
+// is written down at all.
+func TestAutomaticStillReportsDriftWhenItRefreshes(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, true, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--automatic with lists.china.automatic on exited %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "up-to-date:") {
+		t.Errorf("the drift line is gone once the switch is on:\n%s", stdout)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != remoteCommit {
+		t.Errorf("lists.china.automatic was on and the pin stayed at %s", lock.Commit)
+	}
+	archived, err := rules.ReadPrevious(paths.previousLock)
+	if err != nil {
+		t.Fatalf("the refresh left no rollback target: %v", err)
+	}
+	if archived.Commit != lockedCommit {
+		t.Errorf("the archive names %s, want the pin that was current (%s)", archived.Commit, lockedCommit)
+	}
+}
+
+// The two switches are two switches. Cloudflare's ranges choose an edge; data/cn
+// chooses which names take the foreign branch. Turning on the cheap one must not
+// open the expensive one.
+func TestAutomaticHonoursEachSwitchSeparately(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, false, true),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock,
+		"--ranges-cache", filepath.Join(paths.dir, "ranges"))
+	if code != exitSuccess {
+		t.Fatalf("--automatic with lists.cloudflare.automatic on exited %d (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "published-prefix-list:") {
+		t.Errorf("the ranges were not published:\n%s", stdout)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != lockedCommit {
+		t.Errorf("the China list was re-pinned to %s with lists.china.automatic off", lock.Commit)
+	}
+	if _, err := rules.ReadPrevious(paths.previousLock); err == nil {
+		t.Error("refreshing only the ranges left an archive of the China pin")
+	}
+}
+
+// Review Focus, class 1. An upstream commit whose data/cn is a fraction of its former
+// size VERIFIES -- it really is the upstream document -- and would send far more names
+// down the foreign branch than anybody reviewed. The guard refuses and says so; the
+// operator can then publish that commit deliberately, having read the diff.
+func TestAListThatShrinksSharplyIsRefused(t *testing.T) {
+	paths := newListPaths(t)
+	published := rulesOf(200)
+	publishPair(t, paths, lockedCommit, published)
+	// Upstream now publishes one rule where this machine has two hundred.
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, "domain:first.cn\n"),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, true, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code == exitSuccess {
+		t.Fatal("a list that fell from 200 rules to 1 was published")
+	}
+	if !strings.Contains(stderr, "fewer rules") {
+		t.Errorf("the refusal does not say what it noticed: %q", stderr)
+	}
+	lock, list, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != lockedCommit {
+		t.Errorf("the refused list was published anyway, moving the pin to %s", lock.Commit)
+	}
+	if !bytes.Equal(list, published) {
+		t.Error("the refused list replaced the published one")
+	}
+	// And no archive: the refusal happened before anything was written, so there is
+	// no rollback target to be had and none is claimed.
+	if _, err := rules.ReadPrevious(paths.previousLock); err == nil {
+		t.Error("a refused refresh left an archive")
+	}
+}
+
+// A real curation commit removes a few rules and must NOT trip the guard, or the
+// guard is just a way of never updating -- which is the same as being off with more
+// machinery attached.
+func TestASmallReductionIsPublished(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(1000))
+	// 980 of 1000: a 2% reduction, comfortably clear of the threshold, because a case
+	// balanced exactly on a boundary passes for the wrong reason when the boundary
+	// moves by one.
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(980))),
+	})
+
+	code, _, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, true, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("a 2%% reduction was refused: %s", stderr)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != remoteCommit {
+		t.Errorf("the reduced list was not published, the pin is still %s", lock.Commit)
+	}
+}
+
+// Review Focus, class 5. A machine with no route out runs this daily. It must fail,
+// it must say so, and it must leave the pin and the archive exactly as they were.
+func TestAFailedAutomaticRunTouchesNothing(t *testing.T) {
+	paths := newListPaths(t)
+	published := rulesOf(200)
+	publishPair(t, paths, lockedCommit, published)
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+	})
+	origin.status = http.StatusInternalServerError
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, true, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code == exitSuccess {
+		t.Fatalf("a run that could not reach upstream reported success:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "unexpected status") {
+		t.Errorf("the failure is not in the report: %q", stderr)
+	}
+	lock, list, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != lockedCommit {
+		t.Errorf("the pin changed on a failed run: %s -> %s", lockedCommit, lock.Commit)
+	}
+	if !bytes.Equal(list, published) {
+		t.Error("the list changed on a failed run")
+	}
+	if _, err := rules.ReadPrevious(paths.previousLock); err == nil {
+		t.Error("a failed run left an archive, so a rollback would land on a commit that " +
+			"was only ever about to be replaced")
+	}
+}
+
+// The guard measured one commit, so the publication has to be that commit.
+//
+// Upstream publishes a healthy list, and then -- while this run is working -- moves
+// to a commit whose list has collapsed. If the refresh re-resolved HEAD after
+// measuring, the size check would have applied to one commit and the publication to
+// another, so upstream moving during the run would publish an unmeasured list through
+// the very mechanism built to prevent that. The run therefore has to end up on the
+// commit it measured, and on nothing else.
+func TestTheAutomaticRefreshPublishesTheCommitItMeasured(t *testing.T) {
+	paths := newListPaths(t)
+	published := rulesOf(200)
+	publishPair(t, paths, lockedCommit, published)
+	measured := remoteCommit
+	collapsed := "3333333333333333333333333333333333333333"
+	origin := newFakeOrigin(t, measured, map[string][]byte{
+		measured:  sourceArchive(t, measured, string(rulesOf(200))),
+		collapsed: sourceArchive(t, collapsed, "domain:only.cn\n"),
+	})
+	// Upstream answers `measured` for its first three resolutions of HEAD and
+	// `collapsed` from the fourth on. Three is the drift report's two plus the
+	// refresh's one, so `measured` is what this run measures; the fourth answer only
+	// reaches a caller that resolves AGAIN after having decided what to publish.
+	//
+	// The count is anchored to the code and that is stated rather than hidden. Two
+	// earlier anchors were tried and both failed the same way -- they fired during the
+	// drift report, so the thing that got measured was already the collapsed commit and
+	// both implementations refused. A case whose scenario depends on this number
+	// staying 3 says so in a comment; if the report's resolution count changes, this
+	// gate fails loudly rather than quietly testing nothing.
+	//
+	// The flip takes effect on the request that sets it, because the origin answers
+	// from the field after the hook runs. Getting that backwards makes the FIRST
+	// resolution the collapsed one, which is how the first attempt at this case
+	// refused a run that was doing exactly the right thing.
+	resolutions := 0
+	origin.onServe = func(o *fakeOrigin, request *http.Request) {
+		if !strings.HasSuffix(request.URL.Path, "/commits/HEAD") {
+			return
+		}
+		resolutions++
+		if resolutions >= 4 {
+			o.head = collapsed
+		}
+	}
+	code, _, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", automaticPolicy(t, true, false),
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitSuccess {
+		t.Fatalf("--automatic exited %d (stderr: %s)", code, stderr)
+	}
+	lock, list, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit == collapsed {
+		t.Fatalf("published %s, which nothing measured: its list has 1 rule where %d were published",
+			collapsed, countListRules(published))
+	}
+	if lock.Commit != measured {
+		t.Errorf("published %s, want the commit that was measured (%s)", lock.Commit, measured)
+	}
+	// And the list that is published is the measured commit's, not the collapsed one.
+	if got := countListRules(list); got != countListRules(published) {
+		t.Errorf("the published list holds %d rules, want the measured commit's %d",
+			got, countListRules(published))
+	}
+}
+
+// A policy that cannot be loaded stops the run before anything is fetched. The
+// policy is what says whether to refresh, so a run that could not read it has no
+// business resolving a commit.
+func TestAutomaticRefusesAPolicyItCannotLoad(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, rulesOf(200))
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
+	})
+	policy := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(policy, []byte("schema_version: 1\nschedule: \"5pm\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := runCLI(t, origin.services(), "--automatic",
+		"--policy", policy,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
+	if code != exitInvalidCLI {
+		t.Fatalf("--automatic with an invalid policy exited %d, want %d (stderr: %s)",
+			code, exitInvalidCLI, stderr)
+	}
+	if len(origin.requests) != 0 {
+		t.Errorf("a run that could not read the policy still reached the remote: %v", origin.requests)
+	}
+}
+
+// --automatic is a mode, not a modifier: it cannot be combined with another one.
+func TestAutomaticRefusesToBeCombinedWithAnotherMode(t *testing.T) {
+	for _, args := range [][]string{
+		{"--automatic", "--check"},
+		{"--automatic", "--pin-remote", "HEAD"},
+		{"--automatic", "--refresh-ranges"},
+	} {
+		if _, err := parseUpdateListOptions(io.Discard, append(args, "--policy", "/etc/mosdns/policy.yaml")); err == nil {
+			t.Errorf("%v was accepted, and two modes at once is two publishers", args)
+		}
+	}
+	if options, err := parseUpdateListOptions(io.Discard, []string{"--automatic"}); err != nil {
+		t.Fatalf("--automatic alone was refused: %v", err)
+	} else if !options.automatic {
+		t.Error("--automatic did not select its mode")
+	}
 }
 
 func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing.T) {

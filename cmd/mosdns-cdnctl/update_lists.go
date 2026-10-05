@@ -232,7 +232,17 @@ func readUserCandidates(path string) ([]candidate.Candidate, error) {
 const defaultPreviousLockPath = "/var/lib/mosdns/lists/source-lock.previous.json"
 
 type updateListOptions struct {
-	check         bool
+	check bool
+	// automatic is the mode a scheduled run uses: report drift, then refresh what the
+	// policy says to refresh. It is a mode rather than a flag on --check because the
+	// two differ in what they may do -- one writes and one does not -- and a flag that
+	// changed that would be a flag whose name understated it.
+	automatic bool
+	// policy is where --automatic reads what to refresh. It defaults to the installed
+	// policy, which is the file the rest of this package renders from, so a scheduled
+	// run and a hand-run render cannot disagree about what the machine is configured
+	// to do.
+	policy        string
 	pinRemote     string
 	refreshRanges bool
 	sourceLock    string
@@ -282,6 +292,8 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	// the half that says whether the prefix list the rewriter refuses to start
 	// without is actually on disk, and the man page inherits this string rather
 	// than a second copy of it.
+	automatic := flags.Bool("automatic", false, "act on the policy's lists.china.automatic and lists.cloudflare.automatic: always report drift, and then refresh what the policy says to refresh, which by default is nothing at all. The mode a scheduled run uses")
+	policy := flags.String("policy", defaultPolicyPath, "path to the policy YAML file, read by --automatic to decide what to refresh")
 	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
 	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
 	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
@@ -300,16 +312,16 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 		return updateListOptions{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	modes := 0
-	for _, selected := range []bool{*check, *pinRemote != "", *refreshRanges} {
+	for _, selected := range []bool{*automatic, *check, *pinRemote != "", *refreshRanges} {
 		if selected {
 			modes++
 		}
 	}
 	switch {
 	case modes == 0:
-		return updateListOptions{}, errors.New("one of --check, --pin-remote HEAD or --refresh-ranges is required")
+		return updateListOptions{}, errors.New("one of --automatic, --check, --pin-remote HEAD or --refresh-ranges is required")
 	case modes > 1:
-		return updateListOptions{}, errors.New("--check, --pin-remote and --refresh-ranges are mutually exclusive")
+		return updateListOptions{}, errors.New("--automatic, --check, --pin-remote and --refresh-ranges are mutually exclusive")
 	}
 	// HEAD is normalized to the empty string here rather than carried, so there is
 	// one question in the code -- "which commit did the caller name?" -- instead of a
@@ -323,6 +335,7 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 			pinRef, selectedPin)
 	}
 	for _, path := range []struct{ name, value string }{
+		{"--policy", *policy},
 		{"--source-lock", *sourceLock},
 		{"--list-file", *listFile},
 		{"--previous-lock", *previousLock},
@@ -338,6 +351,8 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	}
 	return updateListOptions{
 		check:            *check,
+		automatic:        *automatic,
+		policy:           *policy,
 		pinRemote:        selectedPin,
 		refreshRanges:    *refreshRanges,
 		sourceLock:       *sourceLock,
@@ -380,6 +395,8 @@ func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer
 		return exitInvalidCLI
 	}
 	switch {
+	case options.automatic:
+		return runAutomaticLists(ctx, options, stdout, stderr, services)
 	case options.check:
 		return runCheckLists(ctx, options, stdout, stderr, services)
 	case options.refreshRanges:
@@ -586,6 +603,128 @@ func digestOfDocument(body []byte) string {
 // the published pair is read again, so a pair that changed or was broken while
 // the download was in flight is refused rather than overwritten, and only then is
 // the new pair written.
+// runAutomaticLists is the mode a scheduled run uses. It is a mode of its own rather
+// than a flag on --check because the two may do different things: this one writes,
+// that one documents that it writes nothing.
+//
+// The order is the design. The drift report is produced first and unconditionally,
+// because it is the only place this machine's answer about its own source is written
+// down, and a machine that has turned unattended refreshing on must not thereby stop
+// being told. Then exactly what the policy says to refresh is refreshed, which by
+// default is nothing at all: with both switches off this function does precisely what
+// --check did, so turning the feature on and off changes the configuration rather than
+// the machine.
+// ruleCount renders a rule count as the sentence an operator reads, with the plural
+// right. It is here rather than inline because the refusal is quoted in a man page and
+// a message that says "1 rules" is a message nobody believes.
+func ruleCount(count int) string {
+	if count == 1 {
+		return "1 rule"
+	}
+	return fmt.Sprintf("%d rules", count)
+}
+
+func runAutomaticLists(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	// Loaded before anything is fetched, and refused before anything is written. The
+	// policy is what says whether to refresh, so a run that could not read it has no
+	// business resolving a commit -- and a policy that does not parse is an operator
+	// typo, not a condition to refresh anyway with the old settings.
+	policy, err := config.Load(options.policy)
+	if err != nil {
+		writeCLIError(stderr, "update-lists --automatic: %v", err)
+		return exitInvalidCLI
+	}
+
+	if code := runCheckLists(ctx, options, stdout, stderr, services); code != exitSuccess {
+		return code
+	}
+	if policy.Lists.China.Automatic {
+		if code := refreshChinaList(ctx, options, stdout, stderr, services); code != exitSuccess {
+			return code
+		}
+	}
+	if policy.Lists.Cloudflare.Automatic {
+		refreshed := options
+		refreshed.refreshRanges = true
+		if code := runRefreshRanges(ctx, refreshed, stdout, stderr, services); code != exitSuccess {
+			return code
+		}
+	}
+	return exitSuccess
+}
+
+// refreshChinaList re-pins the China list unattended, and refuses a list that has
+// collapsed.
+//
+// The digest cannot catch this. An upstream commit whose data/cn is a fraction of its
+// former size verifies perfectly, because it really is the upstream document -- what
+// it changes is how many names take the foreign branch, and nobody reviewed that. So a
+// collapse is refused, loudly, with both counts in the message, and nothing is
+// written: publishing that commit afterwards is then one deliberate command an
+// operator runs having read the diff.
+//
+// The threshold is 95% retained. A hand-curated list does lose domains now and then,
+// and a guard that trips on that is a guard that means never updating -- which is the
+// same as leaving the switch off, with more machinery and a false promise.
+//
+// Everything that can fail happens before anything is written: the pair is read, the
+// remote is resolved, the archive is fetched and converted, and only then is the size
+// compared. A machine with no route out therefore fails without having touched the
+// pin, the list, or the rollback archive.
+func refreshChinaList(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
+	// Retained as a fraction of the published rule count. It is a fraction and not a
+	// difference because a list of 8000 rules and a list of 200 are not comparable by
+	// subtraction, and a fixed count would refuse the second for the wrong reason.
+	const minimumRetained = 0.95
+
+	pinned, current, _, err := rules.ReadPublishedPair(options.sourceLock, options.listFile)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	published := countListRules(current)
+
+	client := services.newHTTPClient()
+	resolved, err := rules.ResolveHEAD(ctx, client, rules.Repository)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+	if resolved.Commit == pinned.Commit {
+		// Already there. Nothing to do and nothing to say beyond the fact, because
+		// re-downloading and re-publishing an identical commit is how a daily job
+		// turns a no-op into wear on the disk the machine is running from.
+		writeReportLine(stdout, "china-list: already at %s\n", pinned.Commit)
+		return exitSuccess
+	}
+	_, list, err := rules.Download(ctx, client, resolved)
+	if err != nil {
+		writeCLIError(stderr, "update-lists: %v", err)
+		return exitStateUnavailable
+	}
+
+	incoming := countListRules(list)
+	if published > 0 && float64(incoming) < float64(published)*minimumRetained {
+		writeCLIError(stderr,
+			"update-lists: refusing %s: it has %s where the published list has %s -- "+
+				"fewer rules than a curated list loses in one commit, which is a mistake "+
+				"upstream made rather than a change anybody reviewed here. Nothing was changed. "+
+				"Read the diff, then publish that commit deliberately with "+
+				"`mosdns-cdnctl update-lists --pin-remote %s`.",
+			resolved.Commit, ruleCount(incoming), ruleCount(published), resolved.Commit)
+		return exitStateUnavailable
+	}
+
+	// Publish the commit that was MEASURED, not whatever HEAD has become since. This
+	// is the whole reason the guard is not advisory: re-resolving here would mean the
+	// size check applied to one commit and the publication applied to another, so
+	// upstream moving during the run would publish an unmeasured list through the
+	// mechanism built to prevent exactly that.
+	pinned_ := options
+	pinned_.pinRemote = resolved.Commit
+	return runPinRemote(ctx, pinned_, stdout, stderr, services)
+}
+
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	client := services.newHTTPClient()
 	// No option means HEAD, and HEAD means the repository's current default-branch

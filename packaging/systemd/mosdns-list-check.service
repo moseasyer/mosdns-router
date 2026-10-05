@@ -1,20 +1,27 @@
-# The daily list check: mosdns-cdnctl update-lists --check.
+# The daily list work: mosdns-cdnctl update-lists --automatic.
 #
-# It reports whether the China domain list this router reads is still the one the
-# reviewed source publishes, and it writes nothing at all. It is not a silent
-# update and it is not allowed to become one: nothing here accepts a rules change,
-# because an accepted change is a change nobody reviewed. The report is the whole
-# output, and an operator applies a change with `update-lists --pin-remote HEAD`
-# by hand.
+# It ALWAYS reports whether the China domain list this router reads is still the one
+# the reviewed source publishes -- that report is the only place this machine's
+# answer about its own source is written down. Then it refreshes exactly what
+# /etc/mosdns/policy.yaml says to refresh, which by default is nothing at all.
 #
-# That is why this unit is the shortest of the five. No ReadWritePaths at all,
-# because the command takes no lock and writes no file; no UMask, because it
-# creates nothing for a umask to apply to; and an empty capability bounding set,
-# because it makes two HTTPS requests and needs nothing else. It is still the
-# identity that can read the published list, which is why it runs as mosdns-cdn:
-# the list and the lock that describes it are mode 0640 root:mosdns.
+# Both switches are off in the shipped policy, and that is the decision rather than
+# an omission: data/cn is curated by hand, so ANY upstream commit moves the split
+# between domestic and foreign names, and accepting one unattended is a routing
+# change nobody reviewed. An operator who has decided they want that trade sets
+# lists.china.automatic in the policy; lists.cloudflare.automatic is a separate
+# switch because refreshing which CDN edge an answer is rewritten to is a much
+# smaller thing than changing which names take the foreign branch.
 #
-# It is Type=oneshot, it is not enabled, and its timer starts it.
+# What it can write is bounded by ReadWritePaths below, and it takes the control
+# lock for as long as a publication takes -- which is why SuccessExitStatus=4 is
+# here now. The lock is what stops this job from publishing a pair while the router
+# is being reconfigured, and a daily job that finds the lock held is a daily job
+# that did the right thing.
+#
+# It is Type=oneshot, it is not enabled, and its timer starts it. The TIMER is
+# generated from the policy's schedule by `mosdns-cdnctl render`; this service is
+# not generated, and the two are edited separately for that reason.
 
 # VERSION FLOOR: systemd 249, the oldest supported release (Ubuntu 22.04). The
 # newest directive in this file is ProtectProc= and ProcSubset=, both 247. A
@@ -25,7 +32,7 @@
 # floor is a container run -- the spec's isolation testing, not this file.
 
 [Unit]
-Description=Daily check: has the pinned China domain list moved upstream?
+Description=Daily list work: report drift, and refresh what the policy says to refresh
 Documentation=man:mosdns-cdnctl(1)
 After=network.target
 
@@ -33,25 +40,38 @@ After=network.target
 Type=oneshot
 User=mosdns-router-cdn
 Group=mosdns-router
-ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl update-lists --check
+ExecStart=/usr/lib/mosdns-router/mosdns-cdnctl update-lists --automatic
 # At most two requests against a 60-second client timeout each, so the 90-second
 # default for a oneshot would cut a slow origin off before it could report that it
 # was slow.
 TimeoutStartSec=180
-# No SuccessExitStatus here, and that is the decision rather than an omission.
-# This command takes no lock, so the control-lock exit the other two units excuse
-# is unreachable, and its exit 3 is a run that produced no report at all --
-# including the documented transient, a check that caught a publication in flight.
-# The job of this unit is its report, and a daily report-only job that failed is
-# information rather than noise: an operator sees one failed day and asks why,
-# which is the outcome the check exists to produce.
+# Exit 4 is the control lock being held. This unit takes that lock now, so the exit
+# is reachable, and excusing it is the difference between "the daily job skipped
+# because the router was being reconfigured" and "the daily job failed" -- which is
+# the outcome this whole feature has to be able to produce honestly.
+SuccessExitStatus=4
+#
+# Exit 3 is NOT excused. A run that produced no report at all is information rather
+# than noise, including the documented transient of a check that caught a
+# publication in flight: an operator sees one failed day and asks why, and that is
+# the outcome the drift report exists to produce.
 CapabilityBoundingSet=
 
-# The same sandbox as the other four. This command reads two documents under /etc
-# and two under the state directories, makes HTTPS requests, and holds no lock for
-# longer than a request takes. It uses no temporary file, no device, no kernel
-# setting, no process list and no namespace, and it changes no identity, no clock
-# and no real-time priority.
+# What it may write. Two directories, both the ones this package's own state
+# directories, and nothing under /etc -- which is why the policy is read and never
+# rewritten by this job: a scheduled job that could edit the configuration that
+# tells it what to do is a job that can eventually tell itself to do anything.
+ReadWritePaths=/var/lib/mosdns/lists /var/lib/mosdns/runtime
+#
+# A umask, because it creates files now. 0007, the same as the other two units that
+# write, so the files it publishes are as private as the ones they publish.
+UMask=0007
+
+# The same sandbox as the other four. This command reads the policy and two documents
+# under /etc, reads and writes the state directories above, makes HTTPS requests, and
+# holds a lock for as long as a publication takes. It uses a temporary file beside
+# each file it replaces, no device, no kernel setting, no process list and no
+# namespace, and it changes no identity, no clock and no real-time priority.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true

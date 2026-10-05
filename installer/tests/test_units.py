@@ -195,7 +195,13 @@ WRITE_TABLE = {
     ROUTER: (RUNTIME_DIR,),
     OPTIMIZER: (RUNTIME_DIR, LISTS_DIR),
     HEALTH: (RUNTIME_DIR,),
-    LIST_CHECK: (),
+    # No longer empty. The unit runs `update-lists --automatic`, which reads the
+    # policy and -- only when the policy says so -- publishes a China list, an
+    # archive of the outgoing pin and a prefix list. That is two state directories
+    # and nothing else; the row is the one the optimizer's already was, because the
+    # identity and the directories are, and it is written out so that adding a write
+    # here without granting it, or granting one nothing writes, both fail.
+    LIST_CHECK: (RUNTIME_DIR, LISTS_DIR),
     DNSCRYPT: (),
     # One file, on the tmpfs: the consecutive-failure record, in a root-owned
     # subdirectory of its own rather than in /run/mosdns. The row is derived from
@@ -462,17 +468,22 @@ UNIT_DIRECTIVES = {
             ("Type", "oneshot"),
             ("User", IDENTITIES[LIST_CHECK][0]),
             ("Group", IDENTITIES[LIST_CHECK][1]),
-            ("ExecStart", f"{CDNCTL_BINARY} update-lists --check"),
-            # `update-lists --check` makes at most two HTTP requests against a
-            # 60 s client timeout each, so 90 s would cut a slow origin off before
-            # it could say it was slow.
+            ("ExecStart", f"{CDNCTL_BINARY} update-lists --automatic"),
+            # `--automatic` makes the same two requests as `--check` and then, when
+            # the policy says so, two more per refresh, so the budget is the 180 s
+            # the other two state-writing units get rather than the two requests the
+            # old read-only command made.
             ("TimeoutStartSec", "180"),
-            # No SuccessExitStatus here. This command takes no lock, so exit 4 is
-            # unreachable, and its exit 3 is a run that produced no report at all --
-            # including the documented transient, a check that caught a publication
-            # in flight. The whole job of this unit is its report, and a daily
-            # report-only job that failed is information rather than noise.
+            # Exit 4 is the control lock being held, and this unit takes that lock
+            # now, so the exit is reachable and has to be excused: a daily job that
+            # skipped because the router was being reconfigured is not a failed day.
+            # Exit 3 is still NOT excused -- a run that produced no report at all is
+            # information, including the documented transient of a check that caught
+            # a publication in flight.
+            ("SuccessExitStatus", "4"),
             ("CapabilityBoundingSet", ""),
+            ("ReadWritePaths", f"{LISTS_DIR} {RUNTIME_DIR}"),
+            ("UMask", "0007"),
         )
         + SANDBOX
         + (
@@ -1155,10 +1166,12 @@ class UnitTextTests(unittest.TestCase):
                 name: tuple(directive_value(parsed(name), "Service", "SuccessExitStatus"))
                 for name in (OPTIMIZER, HEALTH, LIST_CHECK)
             },
-            {OPTIMIZER: ("4",), HEALTH: ("4",), LIST_CHECK: ()},
+            {OPTIMIZER: ("4",), HEALTH: ("4",), LIST_CHECK: ("4",)},
             "exit 4 is the control lock the CLI itself reports as 'the other one got there "
             "first'; every other non-zero exit, including a refusal to publish, fails the "
-            "unit, and the list check excuses nothing because it takes no lock at all",
+            "unit. The list work excuses it now because it publishes and publishing takes "
+            "the lock -- the row it used to carry was empty for the same reason this "
+            "unit's used to be, and both facts changed together",
         )
 
     def test_the_health_unit_also_asks_whether_the_local_resolver_resolves(self):
@@ -2266,33 +2279,62 @@ class WriteSetEvidenceTests(unittest.TestCase):
         self.assertEqual(os.path.dirname(ECH_STATE), RUNTIME_DIR)
         self.assertEqual(os.path.dirname(DHCP_STATE), RUN_DIR)
 
-    def test_the_list_check_reads_the_pinned_pair_and_writes_nothing(self):
-        # The reason this unit names no writable directory at all: the command it
-        # runs reads two documents, compares the commit they describe with the one
-        # upstream publishes, and writes nothing. A unit that acquired a writable
-        # directory for it would be granting write access to buy a report.
+    def test_the_list_work_refreshes_only_what_the_policy_asks_for(self):
+        # This unit used to be named for a fact that has changed: it ran
+        # `update-lists --check`, which wrote nothing, and its writable-directory
+        # table was empty because of that rather than because of a decision. It now
+        # runs `update-lists --automatic`, which writes when the policy says so.
+        #
+        # What replaces the old invariant is not "it writes nothing" -- it is two
+        # claims that are both falsifiable and neither of which is about how many
+        # writes there are:
+        #
+        #   1. The DRIFT REPORT still writes nothing, so the part of the job that
+        #      runs unconditionally cannot be the part that mutates the machine.
+        #   2. The writes are bounded by the two state directories the package
+        #      provisions, and by nothing under /etc -- a scheduled job that could
+        #      edit the configuration that tells it what to do is a job that can
+        #      eventually tell itself to do anything.
         source = (REPO / "cmd" / "mosdns-cdnctl" / "update_lists.go").read_text(encoding="utf-8")
-        self.assertEqual(
-            self._writable(LIST_CHECK),
-            [],
-            "update-lists --check writes no file and takes no lock, so this unit grants nothing",
-        )
         for path in (CN_LIST, SOURCE_LOCK):
             self.assertEqual(
                 os.path.dirname(path),
                 LISTS_DIR,
-                f"the list check reads {path}, and the lists directory is where the package "
+                f"the list work reads {path}, and the lists directory is where the package "
                 "provisions it",
             )
-        # The one function that implements --check, and what it does with the pair.
+
+        # 1. The report path is still read-only.
         body = source.split("func runCheckLists", 1)[1].split("\nfunc ", 1)[0]
         for absent in ("acquireLock", "WriteReplacement", "WriteJSON", "os.Create", "rules.Publish"):
             self.assertNotIn(
                 absent,
                 body,
-                f"runCheckLists now contains {absent!r}, so it is no longer a check: whatever it "
-                "does, this unit's writable-directory table and its exit-code policy are wrong",
+                f"runCheckLists now contains {absent!r}, so the drift report is no longer "
+                "read-only; it is the part of this unit that runs whatever the policy says, "
+                "and an operator who turns every switch off must still get a job that "
+                "cannot touch the machine",
             )
+
+        # 2. The grant is the two state directories and nothing else -- and this
+        #    asserts the unit's own grant rather than the table, so the table and the
+        #    unit cannot agree with each other while both are wrong.
+        self.assertEqual(
+            sorted(self._writable(LIST_CHECK)),
+            sorted((LISTS_DIR, RUNTIME_DIR)),
+            "update-lists --automatic publishes into the two state directories and reads "
+            "everything else; a third writable path is a capability nobody decided on",
+        )
+        service = (REPO / "packaging" / "systemd" / "mosdns-list-check.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f"ExecStart={CDNCTL_BINARY} update-lists --automatic",
+            service,
+            "this unit's whole sandbox is sized around which command it runs, so a unit "
+            "still running --check while the write table grants it two state directories "
+            "is granting access to buy a report",
+        )
 
     def test_the_bridge_is_a_row_of_the_table_with_no_unit(self):
         # The DHCP bridge is the fourth writer of the project's state and the only
