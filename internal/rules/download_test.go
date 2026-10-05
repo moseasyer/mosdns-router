@@ -528,7 +528,7 @@ func TestResolveCommitReturnsTheReviewedDefaultBranchCommit(t *testing.T) {
 	archive := fixtureArchive(t)
 	remote := newFakeRemote(t, fixtureCommit, archive)
 
-	lock, err := ResolveCommit(context.Background(), remote.client, Repository)
+	lock, err := ResolveCommit(context.Background(), remote.client, Repository, "")
 	if err != nil {
 		t.Fatalf("ResolveCommit: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestResolveCommitRefusesAResponseThatIsNotAFortyHexCommit(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			remote := newFakeRemote(t, test.commit, archive)
-			lock, err := ResolveCommit(context.Background(), remote.client, Repository)
+			lock, err := ResolveCommit(context.Background(), remote.client, Repository, "")
 			if err == nil {
 				t.Fatalf("ResolveCommit accepted %q and returned %+v", test.commit, lock)
 			}
@@ -608,7 +608,7 @@ func TestResolveCommitRefusesARemoteFailure(t *testing.T) {
 			remote.status = test.status
 			remote.commitBody = test.commitBody
 			remote.rawBody = test.rawBody
-			if _, err := ResolveCommit(context.Background(), remote.client, Repository); err == nil {
+			if _, err := ResolveCommit(context.Background(), remote.client, Repository, ""); err == nil {
 				t.Fatal("ResolveCommit accepted a failing remote")
 			} else if !strings.Contains(err.Error(), test.wantSub) {
 				t.Fatalf("error = %v, want it to mention %q", err, test.wantSub)
@@ -650,7 +650,7 @@ func TestResolveHEADRefusesAnotherRepository(t *testing.T) {
 		if _, err := ResolveHEAD(context.Background(), remote.client, repository); err == nil {
 			t.Errorf("ResolveHEAD accepted repository %q", repository)
 		}
-		if _, err := ResolveCommit(context.Background(), remote.client, repository); err == nil {
+		if _, err := ResolveCommit(context.Background(), remote.client, repository, ""); err == nil {
 			t.Errorf("ResolveCommit accepted repository %q", repository)
 		}
 	}
@@ -702,7 +702,7 @@ func TestDownloadRefusesACancelledRequest(t *testing.T) {
 	if _, _, err := Download(ctx, remote.client, pinnedLock(t, archive)); err == nil {
 		t.Fatal("Download ignored a cancelled context")
 	}
-	if _, err := ResolveCommit(ctx, remote.client, Repository); err == nil {
+	if _, err := ResolveCommit(ctx, remote.client, Repository, ""); err == nil {
 		t.Fatal("ResolveCommit ignored a cancelled context")
 	}
 	if _, err := ResolveHEAD(ctx, remote.client, Repository); err == nil {

@@ -168,10 +168,16 @@ func sha256Hex(b []byte) string {
 
 // listPaths is where a test's command writes, and what it then inspects.
 type listPaths struct {
-	dir          string
-	sourceLock   string
-	listFile     string
-	controlLock  string
+	dir         string
+	sourceLock  string
+	listFile    string
+	controlLock string
+	// previousLock is the archive a pin writes the outgoing pin to. It is a field of
+	// the fixture because the production default is /var/lib/mosdns/lists, and a test
+	// that ran a pin without overriding it tried to write there -- which is the same
+	// mistake render's fixtures made with /usr/lib/systemd/system, and the reason this
+	// fixture hands every path to the command rather than letting it pick one.
+	previousLock string
 	lockContents func() []byte
 	listContents func() []byte
 }
@@ -184,6 +190,7 @@ func newListPaths(t *testing.T) listPaths {
 		sourceLock:   filepath.Join(dir, "source-lock.json"),
 		listFile:     filepath.Join(dir, "cn-domains.txt"),
 		controlLock:  filepath.Join(dir, "control.lock"),
+		previousLock: filepath.Join(dir, "source-lock.previous.json"),
 		lockContents: func() []byte { return mustReadFile(t, filepath.Join(dir, "source-lock.json")) },
 		listContents: func() []byte { return mustReadFile(t, filepath.Join(dir, "cn-domains.txt")) },
 	}
@@ -311,7 +318,7 @@ func TestUpdateListsCheckReportsAnUnchangedSourceWithoutFetchingTheArchive(t *te
 	origin := newFakeOrigin(t, lockedCommit, map[string][]byte{lockedCommit: sourceArchive(t, lockedCommit, firstInstallArchive)})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--check",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
@@ -342,7 +349,7 @@ func TestUpdateListsCheckReportsDriftWithTheRemoteArchiveDigest(t *testing.T) {
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: archive})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--check",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
@@ -414,7 +421,7 @@ func TestUpdateListsCheckRefusesToRunWithoutAValidPinnedPair(t *testing.T) {
 			origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive)})
 
 			code, stdout, stderr := runCLI(t, origin.services(), "--check",
-				"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+				"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 			if code != exitStateUnavailable {
 				t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
 			}
@@ -441,7 +448,7 @@ func TestUpdateListsPinRemotePublishesTheListAndItsLock(t *testing.T) {
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: archive})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
@@ -494,7 +501,7 @@ func TestUpdateListsPinRemoteReplacesAnInstalledPair(t *testing.T) {
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: archive})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitSuccess {
 		t.Fatalf("--pin-remote exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
 	}
@@ -508,8 +515,20 @@ func TestUpdateListsPinRemoteReplacesAnInstalledPair(t *testing.T) {
 	if bytes.Equal(list, previous) {
 		t.Fatal("the previous list is still published")
 	}
-	if state := snapshot(t, paths.dir); len(state) != 3 {
-		t.Fatalf("published directory holds %v, want the pair and the control lock", names(state))
+	// Four files, not three: the archive is written by every pin and is named in the
+	// gate rather than excluded from it, because a pin that stopped writing it would
+	// otherwise still satisfy "the pair and the control lock" and the rollback would
+	// quietly stop existing.
+	if state := snapshot(t, paths.dir); len(state) != 4 {
+		t.Fatalf("published directory holds %v, want the pair, the control lock and the archive",
+			names(state))
+	}
+	archived, err := rules.ReadPrevious(paths.previousLock)
+	if err != nil {
+		t.Fatalf("the pin wrote no readable archive: %v", err)
+	}
+	if archived.Commit == remoteCommit {
+		t.Error("the archive names the commit this run just published, which is not a rollback target")
 	}
 	if !strings.Contains(stdout, "pinned-commit: "+remoteCommit) {
 		t.Errorf("pin report does not name the accepted commit:\n%s", stdout)
@@ -580,7 +599,7 @@ func TestUpdateListsPinRemoteKeepsTheInstalledPairOnEveryFailure(t *testing.T) {
 			before := snapshotWithout(t, paths.dir, filepath.Base(paths.controlLock))
 
 			code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
-				"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+				"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 			if code == exitSuccess {
 				t.Fatalf("pin reported success although it could not publish:\n%s", stdout)
 			}
@@ -598,6 +617,256 @@ func TestUpdateListsPinRemoteKeepsTheInstalledPairOnEveryFailure(t *testing.T) {
 	}
 }
 
+// The reason this change exists: --pin-remote could only name upstream's current
+// HEAD, so once a commit nobody reviewed was accepted there was no way back to the
+// one this machine was on yesterday.
+func TestPinRemoteNamesTheCommitItWillPublish(t *testing.T) {
+	options, err := parseUpdateListOptions(io.Discard, []string{"--pin-remote", lockedCommit})
+	if err != nil {
+		t.Fatalf("--pin-remote %s was refused: %v", lockedCommit, err)
+	}
+	if options.pinRemote != lockedCommit {
+		t.Errorf("--pin-remote did not keep the commit: %q", options.pinRemote)
+	}
+}
+
+// HEAD still means HEAD, and it is normalized to the empty string so there is one
+// place in the code that asks "which commit?" rather than two that disagree about
+// what the empty value means.
+func TestPinRemoteStillAcceptsTheLiteralHEAD(t *testing.T) {
+	options, err := parseUpdateListOptions(io.Discard, []string{"--pin-remote", "HEAD"})
+	if err != nil {
+		t.Fatalf("the documented --pin-remote HEAD was refused: %v", err)
+	}
+	if options.pinRemote != "" {
+		t.Errorf("--pin-remote HEAD left %q in the options, want the empty value that means HEAD", options.pinRemote)
+	}
+}
+
+// Anything that is neither HEAD nor a full commit is refused on the command line,
+// before a request is made: a branch, a tag, an abbreviated commit and HEAD~1 all
+// name a moving target or a form this package does not verify, and accepting any of
+// them would put a ref where the lock records a commit.
+func TestPinRemoteRefusesSomethingThatIsNeitherHEADNorACommit(t *testing.T) {
+	for _, ref := range []string{"main", "master", "v0.2.0", "HEAD~1", "zzzzzzzz", "1111111111"} {
+		t.Run(ref, func(t *testing.T) {
+			options, err := parseUpdateListOptions(io.Discard, []string{"--pin-remote", ref})
+			if err == nil {
+				t.Fatalf("--pin-remote %q was accepted as %q", ref, options.pinRemote)
+			}
+			if !strings.Contains(err.Error(), "--pin-remote") {
+				t.Errorf("the refusal does not name the flag: %v", err)
+			}
+		})
+	}
+	// The empty value is refused too, and by a different rule: it selects no mode at
+	// all, so the diagnostic is about the missing mode rather than about the ref. It
+	// is listed here because both are refusals and an operator should not be able to
+	// tell from the exit code that one of them was a mistake about the value.
+	if options, err := parseUpdateListOptions(io.Discard, []string{"--pin-remote", ""}); err == nil {
+		t.Errorf("--pin-remote with an empty value selected the mode %+v", options)
+	}
+}
+
+// Naming a commit publishes THAT commit even when it is not the remote's HEAD. The
+// rollback path is the whole use, and a rollback that published the current HEAD
+// would move the machine forward instead of back.
+func TestPinRemotePublishesTheNamedCommitRatherThanTheRemoteHead(t *testing.T) {
+	paths := newListPaths(t)
+	olderArchive := sourceArchive(t, lockedCommit, "domain:older.cn\n")
+	newerArchive := sourceArchive(t, remoteCommit, firstInstallArchive)
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		lockedCommit: olderArchive,
+		remoteCommit: newerArchive,
+	})
+
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", lockedCommit,
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", filepath.Join(paths.dir, "previous.json"))
+	if code != exitSuccess {
+		t.Fatalf("pinning a named commit exited %d (stderr: %s)", code, stderr)
+	}
+	lock, _, found, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil || !found {
+		t.Fatalf("published pair: found=%v err=%v", found, err)
+	}
+	if lock.Commit != lockedCommit {
+		t.Fatalf("published %s, want the named %s -- a rollback that moved forward is not a rollback",
+			lock.Commit, lockedCommit)
+	}
+	if lock.SHA256 != sha256Hex(olderArchive) {
+		t.Errorf("the lock records archive %s, which is the other commit's", lock.SHA256)
+	}
+	if !strings.Contains(stdout, "pinned-commit: "+lockedCommit) {
+		t.Errorf("the report does not name the commit it published:\n%s", stdout)
+	}
+	// And it did not ask the API where HEAD is. A named commit needs no resolution
+	// round trip, and one that needed it would fail on a machine that can reach the
+	// archive host but not the API -- which is the situation an operator doing this
+	// is most likely to be in.
+	if origin.fetched(origin.commitPath()) {
+		t.Errorf("pinning a named commit asked the API for HEAD: %v", origin.requests)
+	}
+}
+
+// Review Focus, class 2: the archive must name the pin that was CURRENT when this run
+// started, not one an earlier run left behind. A stale archive is worse than none,
+// because the operator believes they are rolling back to a commit they chose and
+// lands on a different one.
+func TestPublishingArchivesThePinThatWasCurrent(t *testing.T) {
+	paths := newListPaths(t)
+	installed := []byte("domain:previous.cn\n")
+	publishPair(t, paths, lockedCommit, installed)
+	previous := filepath.Join(paths.dir, "previous.json")
+	stale := rules.SourceLock{
+		SchemaVersion: 1,
+		Repository:    rules.Repository,
+		Commit:        "3333333333333333333333333333333333333333",
+		SHA256:        sha256Hex([]byte("an archive from a run nobody remembers")),
+		ListSHA256:    sha256Hex([]byte("domain:stale.cn\n")),
+		Entry:         rules.Entry,
+	}
+	encoded, err := stale.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(previous, encoded, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", previous)
+	if code != exitSuccess {
+		t.Fatalf("pin exited %d (stderr: %s)", code, stderr)
+	}
+
+	archived, err := rules.ReadPrevious(previous)
+	if err != nil {
+		t.Fatalf("no readable archive after a successful publish: %v", err)
+	}
+	if archived.Commit != lockedCommit {
+		t.Errorf("the archive names %s, want the pin that was current (%s); a rollback would "+
+			"land on a commit the operator did not choose", archived.Commit, lockedCommit)
+	}
+	if archived.ListSHA256 != sha256Hex(installed) {
+		t.Errorf("the archive records list %s, which is not the list that was installed",
+			archived.ListSHA256)
+	}
+}
+
+// The archive is written BEFORE the publish, so a publish that fails leaves an
+// archive naming a commit that really was current -- which is exactly what an
+// operator rolling back after a failed unattended refresh needs. Archived after, a
+// failed publish would leave the archive naming the pin that was about to be replaced
+// by a change that never landed.
+func TestAFailedPublishLeavesThePinAndTheArchiveIntact(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this case makes a directory unwritable to fail the publication, which " +
+			"does not stop root")
+	}
+	paths := newListPaths(t)
+	installed := []byte("domain:previous.cn\n")
+	publishPair(t, paths, lockedCommit, installed)
+	// The list lives in a directory of its own, because a read-only directory is how
+	// this case fails the publication and only the publication: a missing directory
+	// would fail the pair check first and never reach a publish.
+	listDir := filepath.Join(paths.dir, "readonly")
+	if err := os.Mkdir(listDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	listFile := filepath.Join(listDir, "cn-domains.txt")
+	if err := os.WriteFile(listFile, installed, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+	// Taken away BEFORE the run. ReadPublishedPair has to succeed -- it is what proves
+	// there is an outgoing pair worth protecting -- and only the publication may fail,
+	// so the directory is made unwritable once the files are already in it. Chmod after
+	// the run would test nothing: it was the first attempt at this case and it passed
+	// a pin that had published successfully.
+	if err := os.Chmod(listDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(listDir, 0o755) })
+
+	previous := paths.previousLock
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", previous)
+	if code == exitSuccess {
+		t.Fatalf("pin reported success with the publication failing: %s", stdout)
+	}
+	// It is the PUBLICATION that failed here, not the archive, so the refusal names
+	// the list. The case where the archive is what fails is the next one, and it
+	// asserts the same thing about the other file: a refusal an operator cannot map
+	// to a file is a refusal they cannot act on.
+	if !strings.Contains(stderr, listFile) {
+		t.Errorf("the refusal does not name the file it could not write: %q", stderr)
+	}
+	// The archive was written before the publish, so it exists and names the pin that
+	// really was current. That is the whole claim: after a failed publish, an operator
+	// can still get back to where they were.
+	archived, err := rules.ReadPrevious(previous)
+	if err != nil {
+		t.Fatalf("a failed publish left no readable archive: %v", err)
+	}
+	if archived.Commit != lockedCommit {
+		t.Errorf("the archive names %s, want the pin that was current (%s)", archived.Commit, lockedCommit)
+	}
+	after, _, found, err := rules.ReadPublishedPair(paths.sourceLock, listFile)
+	if err != nil || !found {
+		t.Fatalf("the pair is unreadable after a failed publish: found=%v err=%v", found, err)
+	}
+	if after.Commit != lockedCommit {
+		t.Errorf("a failed publish moved the pin from %s to %s", lockedCommit, after.Commit)
+	}
+	if got := string(mustReadFile(t, listFile)); got != string(installed) {
+		t.Errorf("a failed publish changed the list:\n%s", got)
+	}
+}
+
+// An archive that cannot be written stops the pin rather than being skipped. The
+// alternative -- publish, and lose the rollback target -- is the one outcome this
+// whole mechanism exists to prevent, and it is unrecoverable afterwards: once the
+// old lock is replaced there is no record of it anywhere.
+func TestAFailedArchiveRefusesRatherThanPublishing(t *testing.T) {
+	paths := newListPaths(t)
+	publishPair(t, paths, lockedCommit, []byte("domain:previous.cn\n"))
+	// A directory where the archive file goes: the rename onto it cannot succeed, and
+	// it fails the same way whatever uid the suite runs as.
+	previous := filepath.Join(paths.dir, "previous.json")
+	if err := os.Mkdir(previous, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+		remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive),
+	})
+	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
+		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock, "--previous-lock", previous)
+	if code == exitSuccess {
+		t.Fatalf("pin reported success although it kept no rollback target: %s", stdout)
+	}
+	if !strings.Contains(stderr, previous) {
+		t.Errorf("the refusal does not name the archive it could not write: %q", stderr)
+	}
+	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lock.Commit != lockedCommit {
+		t.Errorf("the pin moved to %s although the archive failed, so the previous pin is gone", lock.Commit)
+	}
+}
+
 func TestUpdateListsPinRemoteReportsAPublicationFailureInsteadOfSuccess(t *testing.T) {
 	// A pin that verified its source and then could not write the pair has to say
 	// so. Reporting an accepted commit for a list that was never published is the
@@ -608,7 +877,7 @@ func TestUpdateListsPinRemoteReportsAPublicationFailureInsteadOfSuccess(t *testi
 	listFile := filepath.Join(paths.dir, "not-installed", "cn-domains.txt")
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
-		"--source-lock", paths.sourceLock, "--list-file", listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitStateUnavailable {
 		t.Fatalf("pin with an unwritable list exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
 	}
@@ -643,7 +912,7 @@ func TestUpdateListsPinRemoteFailsWithExitFourWhileTheControlLockIsHeld(t *testi
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{remoteCommit: sourceArchive(t, remoteCommit, firstInstallArchive)})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitLockHeld {
 		t.Fatalf("pin under a held lock exit = %d, want %d (stderr: %s)", code, exitLockHeld, stderr)
 	}
@@ -672,7 +941,7 @@ func TestUpdateListsTakesTheControlLockOnlyAfterTheSourceIsVerified(t *testing.T
 	t.Cleanup(func() { _ = held.Close() })
 
 	code, _, stderr := runCLI(t, origin.services(), "--pin-remote", "HEAD",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code == exitLockHeld {
 		t.Fatalf("pin reported the held lock although it never reached publication: %s", stderr)
 	}
@@ -695,7 +964,7 @@ func TestUpdateListsCheckWritesNoPartialReportWhenTheDriftedArchiveCannotBeRead(
 	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{lockedCommit: sourceArchive(t, lockedCommit, firstInstallArchive)})
 
 	code, stdout, stderr := runCLI(t, origin.services(), "--check",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 	if code != exitStateUnavailable {
 		t.Fatalf("--check exit = %d, want %d (stderr: %s)", code, exitStateUnavailable, stderr)
 	}
@@ -718,10 +987,14 @@ func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing
 	}{
 		{name: "no mode", args: []string{}},
 		{name: "both modes", args: []string{"--check", "--pin-remote", "HEAD"}},
+		// A full commit is NOT in this table: it is accepted, because publishing a
+		// named commit is how a pin accepted by mistake is undone. See
+		// TestPinRemotePublishesTheNamedCommitRatherThanTheRemoteHead. What stays
+		// refused is every REF that is not HEAD, because a ref names a moving target
+		// and the lock records a commit.
 		{name: "ref instead of HEAD", args: []string{"--pin-remote", "refs/heads/master"}},
 		{name: "branch instead of HEAD", args: []string{"--pin-remote", "master"}},
 		{name: "tag instead of HEAD", args: []string{"--pin-remote", "v1.0.0"}},
-		{name: "commit instead of HEAD", args: []string{"--pin-remote", lockedCommit}},
 		{name: "empty ref", args: []string{"--pin-remote", ""}},
 		{name: "unknown flag", args: []string{"--check", "--force"}},
 		{name: "unknown flag with a value", args: []string{"--check", "--repository", rules.Repository}},
@@ -742,7 +1015,7 @@ func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing
 
 			args := append([]string{}, test.args...)
 			if !containsPathFlag(args) {
-				args = append(args, "--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock)
+				args = append(args, "--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock)
 			}
 			code, stdout, stderr := runCLI(t, origin.services(), args...)
 			if code != exitInvalidCLI {
@@ -767,7 +1040,7 @@ func TestUpdateListsRejectsInvalidCommandLinesWithoutTouchingAnything(t *testing
 func containsPathFlag(args []string) bool {
 	for _, arg := range args {
 		switch arg {
-		case "--source-lock", "--list-file", "--control-lock", "--repository", "--force":
+		case "--source-lock", "--list-file", "--control-lock", "--previous-lock", "--repository", "--force":
 			return true
 		}
 	}
@@ -910,7 +1183,7 @@ func TestUpdateListsContextIsCancelledWhenTheCommandIsGivenACancelledContext(t *
 
 	var stdout, stderr bytes.Buffer
 	code := runWithContext(ctx, []string{"update-lists", "--check",
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock}, &stdout, &stderr, origin.services())
+		"--source-lock", paths.sourceLock, "--list-file", paths.listFile, "--control-lock", paths.controlLock, "--previous-lock", paths.previousLock}, &stdout, &stderr, origin.services())
 	if code == exitSuccess {
 		t.Fatalf("check reported success for a cancelled update:\n%s", stdout.String())
 	}

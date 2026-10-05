@@ -136,17 +136,37 @@ func (l SourceLock) validatePinnedSource() error {
 	return nil
 }
 
-// ResolveCommit resolves the commit the repository publishes for its default
-// branch, through the fixed GitHub API endpoint, and returns a lock pinned to it
-// with no digests: it has read a commit, not an archive. It performs one
-// request, so a check that finds the locked commit unchanged never downloads an
-// archive at all.
-func ResolveCommit(ctx context.Context, client *http.Client, repository string) (SourceLock, error) {
+// ResolveCommit resolves the commit the repository publishes for ref, and returns a
+// lock pinned to it with no digests: it has read a commit, not an archive.
+//
+// An empty ref or the literal HEAD is the repository's current default-branch commit,
+// read through the fixed GitHub API endpoint -- one request, so a check that finds the
+// locked commit unchanged never downloads an archive at all.
+//
+// A full 40-character commit is that commit, and costs NO request. That is not only
+// cheaper: it is what makes a rollback possible on a machine that can reach the archive
+// host but not the API, which is a machine that cannot answer "what is HEAD today" and
+// so cannot be told where to go back to. The commit names itself, and the archive
+// fetch that follows is what refuses it if the repository has never published it.
+//
+// Anything else -- a branch, a tag, an abbreviated commit, HEAD~1 -- is refused here.
+// A ref names a moving target or a form this package does not verify, and the lock
+// records a commit: accepting one would put something in the lock that is not the
+// thing the lock says it is.
+func ResolveCommit(ctx context.Context, client *http.Client, repository, ref string) (SourceLock, error) {
 	if repository != Repository {
 		return SourceLock{}, fmt.Errorf("repository %q is not the reviewed source %q", repository, Repository)
 	}
 	if client == nil {
 		return SourceLock{}, errors.New("an HTTP client is required to resolve the remote commit")
+	}
+	if named, ok := normalizeCommitRef(ref); ok {
+		return SourceLock{
+			SchemaVersion: schemaVersion,
+			Repository:    Repository,
+			Commit:        named,
+			Entry:         Entry,
+		}, nil
 	}
 	endpoint := apiBaseURL + "/repos/" + Repository + "/commits/HEAD"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -193,12 +213,16 @@ func ResolveCommit(ctx context.Context, client *http.Client, repository string) 
 	}, nil
 }
 
-// ResolveHEAD resolves the current default-branch commit and downloads that
-// commit's source archive to compute the archive digest, which is what a lock
-// has to record before the archive can be verified. The returned lock has no
-// list digest: nothing has been converted yet.
-func ResolveHEAD(ctx context.Context, client *http.Client, repository string) (SourceLock, error) {
-	resolved, err := ResolveCommit(ctx, client, repository)
+// ResolvePinned resolves ref and downloads that commit's source archive to compute
+// the archive digest, which is what a lock has to record before the archive can be
+// verified. The returned lock has no list digest: nothing has been converted yet.
+//
+// The digest is recorded HERE rather than left to Download so that it is the digest of
+// the archive this run read, not of one a later run reads. A lock whose digest is
+// computed during the download it is verifying is a lock that verifies nothing: the
+// archive it is checked against is whatever arrived.
+func ResolvePinned(ctx context.Context, client *http.Client, repository, ref string) (SourceLock, error) {
+	resolved, err := ResolveCommit(ctx, client, repository, ref)
 	if err != nil {
 		return SourceLock{}, err
 	}
@@ -208,6 +232,33 @@ func ResolveHEAD(ctx context.Context, client *http.Client, repository string) (S
 	}
 	resolved.SHA256 = digestHex(archive)
 	return resolved, nil
+}
+
+// ResolveHEAD resolves the repository's current default-branch commit and its archive
+// digest. It is ResolvePinned with no ref, and it is named separately because the two
+// callers mean different things by it: the drift check is asking "has upstream moved
+// on from what this machine pinned", and a pin naming a commit is asking for that
+// commit. Only the first is a question about now.
+func ResolveHEAD(ctx context.Context, client *http.Client, repository string) (SourceLock, error) {
+	return ResolvePinned(ctx, client, repository, "")
+}
+
+// normalizeCommitRef reports the commit ref names, and whether it named one at all.
+//
+// It repeats the shape ParseSourceLock requires of a commit rather than exporting that
+// check, because that one answers a different question -- "is this string usable as a
+// commit in a lock" -- and a ref that has passed it has not been validated as a ref.
+func normalizeCommitRef(ref string) (string, bool) {
+	trimmed := strings.TrimSpace(ref)
+	if len(trimmed) != 40 {
+		return "", false
+	}
+	for index := 0; index < len(trimmed); index++ {
+		if !strings.ContainsRune("0123456789abcdef", rune(trimmed[index])) {
+			return "", false
+		}
+	}
+	return trimmed, true
 }
 
 // Download fetches the source archive of a fully pinned lock, verifies its

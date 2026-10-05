@@ -226,15 +226,25 @@ func readUserCandidates(path string) ([]candidate.Candidate, error) {
 }
 
 // updateListOptions are the parsed command line of update-lists.
+// defaultPreviousLockPath sits beside the lock it archives, because the two are one
+// fact in two states. A previous pin stored anywhere else is a previous pin nobody
+// finds, and this is the file an operator is told to look at after a bad refresh.
+const defaultPreviousLockPath = "/var/lib/mosdns/lists/source-lock.previous.json"
+
 type updateListOptions struct {
 	check         bool
 	pinRemote     string
 	refreshRanges bool
 	sourceLock    string
 	listFile      string
-	controlLock   string
-	rangesURL     string
-	rangesCache   string
+	// previousLock is where the outgoing pin is archived, before the new one replaces
+	// it. It is a field rather than a constant used at the one place it is read,
+	// because a test that exercises the archive has to be able to point it somewhere
+	// that is not this project's installation.
+	previousLock string
+	controlLock  string
+	rangesURL    string
+	rangesCache  string
 	// pinnedRanges and pinnedRangesLock are the snapshot a package ships and the
 	// lock beside it. They are paths of this project's own installation for the
 	// reason the other range paths are, and they are the two that make an
@@ -273,10 +283,11 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	// without is actually on disk, and the man page inherits this string rather
 	// than a second copy of it.
 	check := flags.Bool("check", false, "report whether the pinned source has changed, and report the published Cloudflare ranges read from disk without requesting them; writes nothing and takes no lock. It cannot publish a missing prefix list: that is what --refresh-ranges is for")
-	pinRemote := flags.String("pin-remote", "", "accept the current reviewed default-branch commit and publish it")
+	pinRemote := flags.String("pin-remote", "", "publish the named commit: HEAD for the current reviewed default-branch commit, or a full 40-character commit to publish that one instead -- which is how a pin accepted by mistake is undone")
 	refreshRanges := flags.Bool("refresh-ranges", false, "fetch the published Cloudflare ranges and publish their prefix list; measures nothing and spends no bandwidth budget, so it is the mode an installation runs before the router starts")
 	sourceLock := flags.String("source-lock", defaultSourceLockPath, "path to the source lock")
 	listFile := flags.String("list-file", defaultListFilePath, "path to the converted list")
+	previousLock := flags.String("previous-lock", defaultPreviousLockPath, "path the outgoing pin is archived to before a new one replaces it, so a pin accepted by mistake can be published again")
 	controlLock := flags.String("control-lock", defaultControlLockPath, "path to the shared control lock")
 	rangesURL := flags.String("ranges-url", candidate.DefaultCloudflareBaseURL, "the published Cloudflare range document")
 	rangesCache := flags.String("ranges-cache", candidate.DefaultCloudflareCachePath, "where the published range document is cached; its prefix list is written beside it")
@@ -299,12 +310,22 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 		return updateListOptions{}, errors.New("one of --check, --pin-remote HEAD or --refresh-ranges is required")
 	case modes > 1:
 		return updateListOptions{}, errors.New("--check, --pin-remote and --refresh-ranges are mutually exclusive")
-	case *pinRemote != "" && *pinRemote != pinRef:
-		return updateListOptions{}, fmt.Errorf("--pin-remote accepts only %s, not %q", pinRef, *pinRemote)
+	}
+	// HEAD is normalized to the empty string here rather than carried, so there is
+	// one question in the code -- "which commit did the caller name?" -- instead of a
+	// literal compared in the parser and a different assumption in the runner.
+	selectedPin := strings.TrimSpace(*pinRemote)
+	if selectedPin == pinRef {
+		selectedPin = ""
+	}
+	if selectedPin != "" && !isFullCommit(selectedPin) {
+		return updateListOptions{}, fmt.Errorf("--pin-remote accepts %s or a full 40-character commit, not %q",
+			pinRef, selectedPin)
 	}
 	for _, path := range []struct{ name, value string }{
 		{"--source-lock", *sourceLock},
 		{"--list-file", *listFile},
+		{"--previous-lock", *previousLock},
 		{"--control-lock", *controlLock},
 		{"--ranges-url", *rangesURL},
 		{"--ranges-cache", *rangesCache},
@@ -317,16 +338,35 @@ func parseUpdateListOptions(diagnostics io.Writer, args []string) (updateListOpt
 	}
 	return updateListOptions{
 		check:            *check,
-		pinRemote:        *pinRemote,
+		pinRemote:        selectedPin,
 		refreshRanges:    *refreshRanges,
 		sourceLock:       *sourceLock,
 		listFile:         *listFile,
+		previousLock:     *previousLock,
 		controlLock:      *controlLock,
 		rangesURL:        *rangesURL,
 		rangesCache:      *rangesCache,
 		pinnedRanges:     *pinnedRanges,
 		pinnedRangesLock: *pinnedRangesLock,
 	}, nil
+}
+
+// isFullCommit reports whether ref is a complete commit id: forty lower-case hex
+// characters, nothing shorter and nothing longer.
+//
+// Lower case because that is what ParseSourceLock requires of a lock's commit and
+// therefore what a lock carrying this string can be read back as. Accepting an
+// abbreviation would mean accepting a string no lock in this package can hold.
+func isFullCommit(ref string) bool {
+	if len(ref) != 40 {
+		return false
+	}
+	for index := 0; index < len(ref); index++ {
+		if !strings.ContainsRune("0123456789abcdef", rune(ref[index])) {
+			return false
+		}
+	}
+	return true
 }
 
 func runUpdateLists(ctx context.Context, args []string, stdout, stderr io.Writer, services services) int {
@@ -393,7 +433,7 @@ func runCheckLists(ctx context.Context, options updateListOptions, stdout, stder
 	// an API outage while the files it is reporting about are perfectly fine.
 	reportRanges(&report, options, services.now())
 
-	remote, err := rules.ResolveCommit(ctx, client, rules.Repository)
+	remote, err := rules.ResolveCommit(ctx, client, rules.Repository, "")
 	if err != nil {
 		// The half of this report that was read off the disk goes out on the
 		// failure path, and this is why. It needed no request, and the machine
@@ -548,7 +588,11 @@ func digestOfDocument(body []byte) string {
 // the new pair written.
 func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr io.Writer, services services) int {
 	client := services.newHTTPClient()
-	resolved, err := rules.ResolveHEAD(ctx, client, rules.Repository)
+	// No option means HEAD, and HEAD means the repository's current default-branch
+	// commit. A 40-character commit means that commit, which is how a pin accepted by
+	// mistake is undone: the rollback has to be able to name where it is going back
+	// to, and "whatever upstream says now" is not an answer to that question.
+	resolved, err := rules.ResolvePinned(ctx, client, rules.Repository, options.pinRemote)
 	if err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
@@ -574,6 +618,21 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
 	}
+	// Archived before the publish and replaced by it, and the order is the mechanism:
+	// once the new lock is renamed into place the old one no longer exists anywhere,
+	// so an archive taken afterwards records the commit that was just accepted rather
+	// than the one this machine was on. Taken before, a publish that fails leaves an
+	// archive naming a commit that really was current -- the one an operator
+	// recovering from a failed unattended refresh needs.
+	//
+	// A failure here stops the pin rather than being warned about. Publishing without
+	// an archive is the one outcome this cannot be recovered from: the rollback target
+	// is destroyed by the very operation that needed it.
+	if err := rules.Archive(options.previousLock, options.sourceLock); err != nil {
+		writeCLIError(stderr, "update-lists: archive the outgoing pin, so publishing would leave "+
+			"no way back: %v", err)
+		return exitStateUnavailable
+	}
 	if err := rules.Publish(options.sourceLock, options.listFile, pinned, list); err != nil {
 		writeCLIError(stderr, "update-lists: %v", err)
 		return exitStateUnavailable
@@ -584,6 +643,7 @@ func runPinRemote(ctx context.Context, options updateListOptions, stdout, stderr
 	writeReportLine(stdout, "pinned-list-sha256: %s\n", pinned.ListSHA256)
 	writeReportLine(stdout, "pinned-rules: %d\n", countListRules(list))
 	writeReportLine(stdout, "published-source-lock: %s\n", options.sourceLock)
+	writeReportLine(stdout, "archived-previous-source-lock: %s\n", options.previousLock)
 	writeReportLine(stdout, "published-list: %s\n", options.listFile)
 	return exitSuccess
 }
