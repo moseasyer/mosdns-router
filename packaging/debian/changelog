@@ -1,3 +1,35 @@
+mosdns-router (0.3.0) unstable; urgency=medium
+
+  * policy.yaml's `schedule` now changes when the daily list work runs. It was
+    validated as HH:MM and read by nothing, while the timer that actually decided
+    carried a hardcoded OnCalendar, so an operator who changed the policy got no
+    change at all. The timer is now rendered from the policy and systemd is
+    reloaded as part of writing it. The default moves from 03:00 to 03:30, which is
+    the time the hardcoded timer was already using, so making the field real did not
+    also move the machine half an hour earlier.
+  * Two new switches, both off: lists.china.automatic and lists.cloudflare.automatic.
+    They are separate because the risks differ -- Cloudflare's ranges choose which
+    CDN edge an answer is rewritten to, data/cn decides which names take the
+    foreign branch at all, so bundling them would mean opening the cheap one opens
+    the expensive one. The China list's refresh refuses a list that has lost more
+    than 5% of its rules, and leaves everything published untouched when it does.
+  * `update-lists --pin-remote` now takes an optional commit, and archives the
+    outgoing pin to source-lock.previous.json before publishing. Until now a pin
+    accepted by mistake could not be undone, because the command could only name
+    upstream's current HEAD. A publication that cannot be archived now stops rather
+    than proceeding without a rollback target.
+  * `mosdns-cdnctl render` publishes the generated timer into
+    /usr/lib/systemd/system and reloads systemd. It takes --unit-out for the
+    directory, which is separate from --out because systemd does not read units from
+    the document directory.
+  * The daily list work is no longer a report-only unit: it runs the new
+    `--automatic` mode, so it may publish. Its sandbox is sized for that --
+    ReadWritePaths for the two state directories, a umask, and exit 4 excused,
+    because publishing takes the control lock and a daily job that skipped because
+    the router was being reconfigured is not a failed day.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
 mosdns-router (0.2.1) unstable; urgency=medium
 
   * No change to the shipped program. The package contents are identical to

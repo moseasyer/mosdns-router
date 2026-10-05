@@ -58,11 +58,36 @@ the gateway runs, what measures and publishes the CDN address in service, and wh
 proves that address is still good. Three of its five jobs are started by timers
 rather than by a person, and one of them is root\-only by design.
 .SS render
-Loads a policy, renders both generated documents through the same renderers this
-repository reviewed, and publishes them as a pair: the routing document first and
-the resolver document second, each staged, flushed and renamed into place, with
-the previous one kept until the pair is complete. A policy that cannot be loaded
-or cannot be validated is reported as one error and nothing is published.
+Loads a policy, renders all three generated files through the same renderers this
+repository reviewed, and publishes them: the two documents as a pair \(em the
+routing document first and the resolver document second, each staged, flushed and
+renamed into place, with the previous one kept until the pair is complete \(em and
+then the systemd timer, staged and renamed the same way. A policy that cannot be
+loaded or cannot be validated is reported as one error and nothing is published.
+.PP
+The timer is published into
+.IR /usr/lib/systemd/system/mosdns-list\-check.timer ,
+because that is where systemd reads it, and it is not published beside the
+documents: a timer in
+.I /etc/mosdns
+would be a file no reader looks at. Its
+.B OnCalendar
+is generated from the policy's
+.BR schedule ,
+so this command is how a changed schedule takes effect, and
+.B systemctl daemon\-reload
+runs as part of writing it rather than as a step you have to remember. If the
+reload fails the command says so and still exits zero, because everything on disk
+is then correct and a non\-zero exit would send you looking for a render failure
+that did not happen.
+.PP
+.B \-\-unit\-out
+names the directory the timer is published into, and render creates it. It is a
+separate flag from
+.B \-\-out
+because the two files go to different places, and one flag meaning \"the output
+directory\" for two directories is how a machine ends up with a policy that says
+one hour and a timer that fires at another.
 .PP
 The policy path it is given is the path both published documents NAME, so rendering
 a policy somewhere other than
@@ -80,7 +105,46 @@ so the command still exits zero; what it adds is the disagreement between a poli
 nobody applied and a document the router is running. A directory with no document
 in it is an installation that has not rendered yet and is not reported as stale.
 .SS update\-lists
-Three mutually exclusive modes, and each is a mode rather than a flag on the others:
+Four mutually exclusive modes, and each is a mode rather than a flag on the
+others: they write different things, and a flag that changed that would be a flag
+whose name understated it.
+.TP
+.B \-\-automatic
+The mode the scheduled run uses, and the one
+.BR mosdns\-list\-check.service (8)
+executes. It always produces the drift report \em that report is the only place
+this machine's answer about its own source is written down, so a machine with
+unattended refreshing turned on must not thereby stop being told \em and then
+refreshes exactly what
+.I /etc/mosdns/policy.yaml
+says to refresh, which by default is nothing at all. With both switches off it does
+precisely what
+.B \-\-check
+did, so turning the feature on and off changes the configuration rather than the
+machine. It is not a modifier on
+.BR \-\-check ,
+so it cannot be combined with any of the other three.
+.br
+The two switches are separate because the risks are not the same kind.
+.B lists.cloudflare.automatic
+refreshes which CDN edge an answer is rewritten to;
+.B lists.china.automatic
+decides which names take the foreign branch at all. Bundling them would mean
+opening the cheap one opens the expensive one. Both are off in the shipped policy:
+.B data/cn
+is curated by hand, so any upstream commit moves the split, and accepting one
+unattended is a routing change nobody reviewed.
+.br
+The China refresh refuses a list that has lost more than 5% of its rules, and says
+both counts when it does. The digest cannot catch this, because a commit whose
+list is a fraction of its former size verifies perfectly \em it really is the
+upstream document. The refusal leaves the pin, the list and the rollback archive
+exactly as they were, so publishing that commit afterwards is one deliberate
+command an operator runs having read the diff. The threshold is not a refusal to
+ever update: a curated list does lose domains now and then.
+.br
+Everything that can fail happens before anything is written, so a machine with no
+route out fails without having touched the pin, the list or the archive.
 .TP
 .B \-\-check
 Reports whether the pinned source has moved, and reports the published ranges read
@@ -98,10 +162,33 @@ output left empty, because a machine with no route to the internet is exactly th
 machine whose China\-list request fails.
 .TP
 .B \-\-pin\-remote\ \fIHEAD\fR
-Re\-pins the China domain list to the source's default branch and publishes the
-list and the lock that describes it. An operator runs this by hand after reading
-what the daily check reported; nothing applies a change automatically, because an
-accepted change is a change nobody reviewed.
+.br
+.B \-\-pin\-remote\ \fICOMMIT\fR
+Re\-pins the China domain list and publishes the list and the lock that describes
+it. With
+.B HEAD
+\(the default, and the documented invocation) it takes the source's current
+default\-branch commit. With a full 40\-character commit it publishes that commit
+instead, which is how a pin accepted by mistake is undone: the rollback has to be
+able to name where it is going back to, and \"whatever upstream says now\" is not
+an answer to that question. A branch, a tag, an abbreviated commit and
+.B HEAD~1
+are all refused at the command line rather than after a request \em the lock
+records a commit, and none of those is one.
+.br
+Before publishing, the outgoing lock is archived to
+.I /var/lib/mosdns/lists/source-lock.previous.json
+and is then replaced by the new one. That order is the mechanism rather than a
+detail: the moment the new lock is renamed into place the old one exists nowhere,
+so an archive taken afterwards would record the commit that was just accepted
+instead of the one this machine was on. Taken before, a publication that fails
+leaves an archive naming a commit that really was current \em the one you need
+after a failed unattended refresh.
+.br
+An archive that cannot be written stops the publication rather than being warned
+about. Publishing without one is the only outcome here that is unrecoverable: the
+rollback target is destroyed by the very operation that needed it. A lock that is
+not there at all is not that case \em it is the first pin.
 .TP
 .B \-\-refresh\-ranges
 Fetches the published ranges and publishes their prefix list. Measures nothing and

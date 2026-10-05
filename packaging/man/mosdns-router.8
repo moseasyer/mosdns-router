@@ -235,6 +235,40 @@ before replacing an operator's
 Its own comments say what a rollback restores and what it does not, because an
 operator who has read only this file has to be able to learn that.
 .TP
+.I /usr/lib/systemd/system/mosdns\-list\-check.timer
+The daily list work's schedule. GENERATED, and it says so in its own header: it is
+rendered from the policy's
+.B schedule
+by
+.BR "mosdns\-cdnctl render" (1),
+which reloads systemd as part of writing it. Edit the policy, not this file \em a
+hand edit here is overwritten by the next render, which is what its header says.
+.PP
+This file is the reason
+.B schedule
+in
+.I /etc/mosdns/policy.yaml
+is a field rather than a comment. It was validated as HH:MM and read by nothing,
+while this timer carried a hardcoded
+.BR OnCalendar ,
+so an operator who changed the policy got no change at all \em and a field that is
+silently ignored is worse than no field, because the file claimed the machine's
+schedule was in it. The default is
+.BR 03:30 ,
+which is the time the hardcoded timer was already using, so making the field real
+did not also move the machine half an hour earlier.
+.PP
+The work the timer starts does two things, and which of them happens is the policy's
+decision rather than the unit's: it always reports whether the pinned China domain
+list has moved, and it refreshes what
+.B lists.china.automatic
+and
+.B lists.cloudflare.automatic
+say to refresh. Both default off, for reasons the
+.BR "mosdns\-cdnctl" (1)
+page gives. The unit's own header says which sandbox it runs in, and that sandbox is
+sized around the fact that it may publish.
+.TP
 .I /etc/mosdns/mosdns.yaml
 The routing document. Generated; a conffile, so an upgrade asks before replacing
 it. Regenerate it with

@@ -510,10 +510,25 @@ def route_provider_findings(root, documents, inventory=None):
 
 
 
+# The version, read out of the build script rather than written here. Two literals for
+# one version is how a release ships a control file and a .deb that disagree, and the
+# gate that would catch it has to be able to disagree with the build too -- otherwise
+# it can only ever confirm itself. Everything else in CONTROL_FIELDS is a decision, and
+# stays written out.
+def _package_version():
+    for line in BUILD_SCRIPT.read_text(encoding="utf-8").splitlines():
+        if line.startswith("PACKAGE_VERSION="):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError("scripts/build-deb.sh no longer sets PACKAGE_VERSION=... on its own line")
+
+
+PACKAGE_VERSION = _package_version()
+
+
 # The metadata that was decided, read back out of packaging/debian/control.
 CONTROL_FIELDS = {
     "Package": "mosdns-router",
-    "Version": "0.2.1",
+    "Version": PACKAGE_VERSION,
     "Section": "net",
     "Priority": "optional",
 }
@@ -6138,7 +6153,7 @@ class BuiltPackageTests(_Staged):
     def setUpClass(cls):
         super().setUpClass()
         cls.deb = os.path.join(
-            _SHARED["directory"], f"mosdns-router_0.2.1_{_built_architecture()}.deb"
+            _SHARED["directory"], f"mosdns-router_{PACKAGE_VERSION}_{_built_architecture()}.deb"
         )
         built = subprocess.run(
             ["dpkg-deb", "--root-owner-group", "--build", cls.root, cls.deb],
