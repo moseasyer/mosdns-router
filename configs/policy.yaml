@@ -5,7 +5,12 @@
 # byte, so a hand edit here is an edit the project stops being able to explain.
 # Change Defaults(), or render a policy of your own somewhere else.
 schema_version: 1
-schedule: "03:00"
+schedule: "03:30"
+lists:
+  china:
+    automatic: false
+  cloudflare:
+    automatic: false
 foreign:
   default_provider: Quad9 Secure DNSCrypt v2
   ecs: false

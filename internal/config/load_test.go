@@ -10,7 +10,7 @@ import (
 )
 
 const validPolicyYAML = `schema_version: 1
-schedule: "03:00"
+schedule: "03:30"
 foreign:
   default_provider: Quad9 Secure DNSCrypt v2
   ecs: false
@@ -68,7 +68,7 @@ func TestDefaultsMatchApprovedSpec(t *testing.T) {
 	got := Defaults()
 	want := Policy{
 		SchemaVersion: 1,
-		Schedule:      "03:00",
+		Schedule:      "03:30",
 		Foreign: ForeignPolicy{
 			DefaultProvider: "Quad9 Secure DNSCrypt v2",
 			ECS:             false,
@@ -222,9 +222,9 @@ func TestLoadRejectsInvalidPolicyValues(t *testing.T) {
 		{name: "negative per candidate limit", old: "per_candidate_limit: 10485760", new: "per_candidate_limit: -1"},
 		{name: "zero daily budget", old: "daily_budget: 104857600", new: "daily_budget: 0"},
 		{name: "zero per candidate limit", old: "per_candidate_limit: 10485760", new: "per_candidate_limit: 0"},
-		{name: "invalid schedule hour", old: `schedule: "03:00"`, new: `schedule: "24:00"`},
-		{name: "invalid schedule minute", old: `schedule: "03:00"`, new: `schedule: "03:60"`},
-		{name: "schedule without zero padding", old: `schedule: "03:00"`, new: `schedule: "3:00"`},
+		{name: "invalid schedule hour", old: `schedule: "03:30"`, new: `schedule: "24:00"`},
+		{name: "invalid schedule minute", old: `schedule: "03:30"`, new: `schedule: "03:60"`},
+		{name: "schedule without zero padding", old: `schedule: "03:30"`, new: `schedule: "3:00"`},
 		{name: "unsupported ECH policy", old: "failure_policy: strict", new: "failure_policy: permissive"},
 		{name: "unsupported DHCP policy", old: "failure_policy: disable-current", new: "failure_policy: keep-stale"},
 		{name: "zero schema version", old: "schema_version: 1", new: "schema_version: 0"},
@@ -412,4 +412,75 @@ func writeYAML(t *testing.T, content string) string {
 		t.Fatalf("write fixture: %v", err)
 	}
 	return path
+}
+
+func TestTheDefaultPolicyRefreshesNothing(t *testing.T) {
+	policy := Defaults()
+	if policy.Lists.China.Automatic {
+		t.Error("china list automatic refresh is on by default; data/cn is curated and any " +
+			"upstream commit moves the split, so this must be an operator's explicit choice")
+	}
+	if policy.Lists.Cloudflare.Automatic {
+		t.Error("cloudflare range automatic refresh is on by default")
+	}
+}
+
+// The two are separate switches because the two are not the same kind of risk. One
+// switch would mean opening the low-risk action opens the high-risk one.
+func TestTheTwoSwitchesAreIndependent(t *testing.T) {
+	policy := Defaults()
+	policy.Lists.Cloudflare.Automatic = true
+	if policy.Lists.China.Automatic {
+		t.Error("turning the cloudflare refresh on also turned the china one on")
+	}
+	policy = Defaults()
+	policy.Lists.China.Automatic = true
+	if policy.Lists.Cloudflare.Automatic {
+		t.Error("turning the china refresh on also turned the cloudflare one on")
+	}
+}
+
+// An absent lists: group decodes to both-off rather than failing, because that is the
+// safe direction: a policy written before this field existed must keep working and
+// must not start refreshing anything.
+func TestAPolicyWithoutTheListsGroupLoads(t *testing.T) {
+	// The default policy with its lists: block cut out, rather than a hand-written
+	// minimal one: this is the shape of a policy an operator wrote before the field
+	// existed, and a minimal fixture would be refused for an unrelated missing key
+	// and prove nothing about lists.
+	encoded, err := Marshal(Defaults())
+	if err != nil {
+		t.Fatalf("marshal the defaults: %v", err)
+	}
+	var kept []string
+	skipping := false
+	for _, line := range strings.Split(string(encoded), "\n") {
+		if strings.HasPrefix(line, "lists:") {
+			skipping = true
+			continue
+		}
+		if skipping && (strings.HasPrefix(line, " ") || line == "") {
+			continue
+		}
+		skipping = false
+		kept = append(kept, line)
+	}
+	path := writeYAML(t, strings.Join(kept, "\n"))
+	policy, err := Load(path)
+	if err != nil {
+		t.Fatalf("a policy with no lists: group was refused: %v", err)
+	}
+	if policy.Lists.China.Automatic || policy.Lists.Cloudflare.Automatic {
+		t.Errorf("a policy with no lists: group decoded to %+v, and zero must mean both off",
+			policy.Lists)
+	}
+}
+
+// 03:30, not 03:00: the field has been decorative and 03:30 is what was actually
+// running, so the default states the truth rather than moving the machine.
+func TestTheDefaultScheduleIsTheTimeThatWasRunning(t *testing.T) {
+	if got := Defaults().Schedule; got != "03:30" {
+		t.Errorf("default schedule is %q, want 03:30 -- the value the hardcoded timer "+
+			"has been using, so making the field real does not also move the machine", got)
+	}
 }

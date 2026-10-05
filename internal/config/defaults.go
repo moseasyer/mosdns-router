@@ -85,7 +85,13 @@ var echDefaultSources = []string{
 func Defaults() Policy {
 	return Policy{
 		SchemaVersion: 1,
-		Schedule:      "03:00",
+		Schedule:      "03:30",
+		// Both false, and written out rather than left to the zero value so a
+		// reader of Defaults() can see the decision rather than infer it.
+		Lists: ListsPolicy{
+			China:      ChinaListPolicy{Automatic: false},
+			Cloudflare: CloudflareListPolicy{Automatic: false},
+		},
 		Foreign: ForeignPolicy{
 			DefaultProvider: "Quad9 Secure DNSCrypt v2",
 			ECS:             false,

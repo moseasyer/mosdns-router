@@ -24,12 +24,43 @@ const (
 type Policy struct {
 	SchemaVersion int           `yaml:"schema_version"`
 	Schedule      string        `yaml:"schedule"`
+	Lists         ListsPolicy   `yaml:"lists"`
 	Foreign       ForeignPolicy `yaml:"foreign"`
 	CDN           CDNPolicy     `yaml:"cdn"`
 	ECH           ECHPolicy     `yaml:"ech"`
 	DHCP          DHCPPolicy    `yaml:"dhcp"`
 	Cache         CachePolicy   `yaml:"cache"`
 	ForeignCache  ForeignCache  `yaml:"foreign_cache"`
+}
+
+// ListsPolicy is whether this package refreshes the two documents it fetches from
+// the internet on its own. It is two switches rather than one because the two are
+// not the same kind of risk: Cloudflare's ranges choose which CDN edge an answer is
+// rewritten to, while data/cn decides which names take the foreign branch at all, so
+// bundling them means opening the cheap one opens the expensive one.
+type ListsPolicy struct {
+	China      ChinaListPolicy      `yaml:"china"`
+	Cloudflare CloudflareListPolicy `yaml:"cloudflare"`
+}
+
+// ChinaListPolicy is unattended refresh of the pinned domain list. Off by default,
+// and the reason is a fact about the upstream document rather than a preference:
+// data/cn is curated by hand, so ANY commit to it moves the split, and accepting one
+// unattended is a routing change nobody reviewed. The switch exists because an
+// operator who has decided they want that trade can have it, not because it is a
+// good default.
+type ChinaListPolicy struct {
+	Automatic bool `yaml:"automatic"`
+}
+
+// CloudflareListPolicy is unattended refresh of the published Cloudflare address
+// ranges. Off by default for the same reason as every other fetch in this package:
+// the snapshot is pinned so that a document this project did not review cannot change
+// what the rewriter answers. The consequence of being wrong here is smaller than the
+// China list's -- these ranges never decide which names take which branch, only which
+// edge a rewritten answer points at.
+type CloudflareListPolicy struct {
+	Automatic bool `yaml:"automatic"`
 }
 
 type ForeignPolicy struct {
