@@ -1,3 +1,16 @@
+mosdns-router (0.3.1) unstable; urgency=medium
+
+  * Closing the response rewriter's ECH provider now WAITS for the background
+    refresher it stops, instead of signalling it and returning. A tick in flight
+    writes the state document, so a Close that returned early was a Close that said
+    "you may move this directory" to a goroutine about to write into it. The wait is
+    bounded by one fetch budget, because a tick carries its own timeout, so Close
+    cannot hang. Found as a CI test-teardown flake -- the testing framework removed a
+    temporary directory the refresher was still writing into -- and fixed as the
+    production defect it is rather than as the flake it showed up as.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
 mosdns-router (0.3.0) unstable; urgency=medium
 
   * policy.yaml's `schedule` now changes when the daily list work runs. It was
