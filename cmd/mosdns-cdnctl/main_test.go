@@ -101,7 +101,15 @@ func TestRunValidateSucceedsWithoutWriting(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"validate", "--policy", policyPath, "--documents", documents}, &stdout, &stderr); got != exitSuccess {
+	// runWith rather than run: `run` uses the production paths, and validate now also
+	// compares the generated systemd unit, so this case would have read whatever
+	// /usr/lib/systemd/system holds on the machine running the tests. This host has
+	// the package half-installed, so it really does hold one, and the case's subject
+	// -- "nothing is installed, so validate says nothing" -- would have been decided
+	// by the host rather than by the case.
+	boundary := productionServices()
+	boundary.documents.UnitDir = filepath.Join(dir, "systemd")
+	if got := runWith([]string{"validate", "--policy", policyPath, "--documents", documents}, &stdout, &stderr, boundary); got != exitSuccess {
 		t.Fatalf("validate exit = %d, want %d (stderr: %s)", got, exitSuccess, stderr.String())
 	}
 	if stdout.Len() != 0 || stderr.Len() != 0 {
@@ -525,6 +533,18 @@ func (f *cdnFixture) writeCandidates(t *testing.T, addresses ...string) {
 // the case's own. Everything else stays the real implementation, so the lock, the
 // publication and the conversion are exercised rather than replaced.
 func servicesFor(prober optimizer.Prober, set candidate.CandidateSet, moment time.Time) services {
+	// The unit directory is redirected out of /usr. `validate` now compares the
+	// generated unit as well as the two documents, and with the production path this
+	// fixture compared whatever /usr/lib/systemd/system happens to hold on the machine
+	// running the tests -- a live read of the host, which NO-HOST-MUTATION permits but
+	// a test may not depend on: the answer changes when the host's package changes.
+	documents := productionDocumentPaths()
+	// A path of this case's own, derived from the moment it already carries. A
+	// shared one made two tests interfere: one rendered a unit into it and the next
+	// -- whose subject is "nothing is installed, so validate says nothing" -- found
+	// it there and reported a stale document it had not installed.
+	documents.UnitDir = filepath.Join(os.TempDir(),
+		"mosdns-router-unit-under-test-"+moment.UTC().Format("20060102T150405.000000000"))
 	return services{
 		newHTTPClient: func() *http.Client { return &http.Client{Timeout: time.Second} },
 		acquireLock: func(path string) (func() error, error) {
@@ -534,9 +554,10 @@ func servicesFor(prober optimizer.Prober, set candidate.CandidateSet, moment tim
 			}
 			return lock.Close, nil
 		},
-		documents:   productionDocumentPaths(),
-		documentOps: defaultDocumentOps(),
-		newProber:   func() optimizer.Prober { return prober },
+		documents:     documents,
+		documentOps:   defaultDocumentOps(),
+		reloadSystemd: func() error { return nil },
+		newProber:     func() optimizer.Prober { return prober },
 		readCandidates: func(context.Context, candidateSource) (candidate.CandidateSet, error) {
 			return set, nil
 		},

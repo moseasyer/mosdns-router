@@ -74,6 +74,11 @@ type services struct {
 	// fetches over the network, and a fetch that ignored the context would make the
 	// collection phase of `test` uncancellable.
 	readCandidates func(context.Context, candidateSource) (candidate.CandidateSet, error)
+	// reloadSystemd makes systemd re-read its units. The render verb runs it after
+	// it writes the generated timer, so a schedule the operator changed takes effect
+	// in the same operation that changed it. It is a field so a test can say what a
+	// refused reload leaves behind instead of needing a systemd.
+	reloadSystemd func() error
 	// now is the clock. Every timestamp a report and a selector carry comes from
 	// it, so all of them are one reading in production.
 	now func() time.Time
@@ -130,6 +135,7 @@ func productionServices() services {
 		},
 		documents:      productionDocumentPaths(),
 		documentOps:    defaultDocumentOps(),
+		reloadSystemd:  reloadSystemd,
 		newProber:      func() optimizer.Prober { return networkProber{inner: prober.New(prober.Options{})} },
 		readCandidates: readOfficialAndUserCandidates,
 		now:            time.Now,

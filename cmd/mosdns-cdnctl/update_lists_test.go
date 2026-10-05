@@ -250,7 +250,18 @@ func snapshotWithout(t *testing.T, dir, except string) map[string][]byte {
 		if entry.Name() == except {
 			continue
 		}
-		contents, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		// Directories are walked rather than read. The render fixture publishes a
+		// systemd unit now, so the tree it snapshots has a subdirectory in it, and
+		// os.ReadFile on one is "is a directory" -- a failure that reads as the
+		// snapshot being broken when it is the tree that grew a level.
+		path := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			for name, contents := range snapshotTree(t, path) {
+				state[entry.Name()+"/"+name] = contents
+			}
+			continue
+		}
+		contents, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -906,4 +917,35 @@ func TestUpdateListsContextIsCancelledWhenTheCommandIsGivenACancelledContext(t *
 	if len(origin.requests) != 0 {
 		t.Errorf("cancelled check reached the remote: %v", origin.requests)
 	}
+}
+
+// snapshotTree is snapshotWithout for a subtree, keyed by the path below dir. It
+// exists because the fixture directories now contain a systemd subdirectory, and a
+// snapshot helper that cannot read one is a helper that reports every "validate
+// wrote nothing" case as a crash instead of as an answer.
+func snapshotTree(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	state := make(map[string][]byte)
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || path == dir {
+			return nil
+		}
+		contents, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		relative, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		state[relative] = contents
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
 }

@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"mosdns-router/internal/config"
 	"mosdns-router/internal/dnscrypt"
 	"mosdns-router/internal/mosdnsconfig"
+	"mosdns-router/internal/unitfile"
 )
 
 // A policy is inert until something renders it. The router reads two generated
@@ -58,6 +60,13 @@ type documentPaths struct {
 	// list, the DHCP state, the two endpoints. The command copies it, overwrites
 	// its Policy field with the policy actually read, and never writes the two
 	// files it names.
+	// Unit and UnitDir are where the generated systemd unit is published. The unit is
+	// NOT beside the documents because systemd does not read it from there: a policy
+	// that renders a unit to the wrong directory produces a machine whose policy and
+	// whose schedule disagree, and the disagreement is invisible until the timer fires
+	// at the old time.
+	Unit    string
+	UnitDir string
 	Routing mosdnsconfig.Paths
 }
 
@@ -70,14 +79,17 @@ func productionDocumentPaths() documentPaths {
 		Policy:   mosdnsconfig.ProductionPaths().Policy,
 		Mosdns:   "mosdns.yaml",
 		DNSCrypt: "dnscrypt-proxy.toml",
+		Unit:     unitfile.UnitName,
+		UnitDir:  "/usr/lib/systemd/system",
 		Routing:  mosdnsconfig.ProductionPaths(),
 	}
 }
 
 // renderOptions is the parsed command line of render.
 type renderOptions struct {
-	policy string
-	out    string
+	policy  string
+	out     string
+	unitOut string
 }
 
 // parseRenderOptions parses and validates the command line. Both paths default to
@@ -90,6 +102,9 @@ func parseRenderOptions(args []string, documents documentPaths) (renderOptions, 
 	flags.SetOutput(io.Discard)
 	policy := flags.String("policy", documents.Policy, "path to the policy YAML file")
 	out := flags.String("out", documents.Dir, "directory the generated documents are published into")
+	unitOut := flags.String("unit-out", documents.UnitDir,
+		"directory the generated systemd unit is published into; it is separate from "+
+			"--out because systemd does not read units from the document directory")
 	if err := flags.Parse(args); err != nil {
 		return renderOptions{}, err
 	}
@@ -99,12 +114,13 @@ func parseRenderOptions(args []string, documents documentPaths) (renderOptions, 
 	for _, path := range []struct{ name, value string }{
 		{"--policy", *policy},
 		{"--out", *out},
+		{"--unit-out", *unitOut},
 	} {
 		if strings.TrimSpace(path.value) == "" {
 			return renderOptions{}, fmt.Errorf("%s must not be empty", path.name)
 		}
 	}
-	return renderOptions{policy: *policy, out: *out}, nil
+	return renderOptions{policy: *policy, out: *out, unitOut: *unitOut}, nil
 }
 
 func runRender(args []string, stdout, stderr io.Writer, services services) int {
@@ -127,16 +143,52 @@ func runRender(args []string, stdout, stderr io.Writer, services services) int {
 		writeCLIError(stderr, "render: %v", err)
 		return exitStateUnavailable
 	}
-	if err := publishPairWithOps(options.out, documents, services.documentOps); err != nil {
+	if err := publishPairWithOps(options.out, documents[:2], services.documentOps); err != nil {
 		writeCLIError(stderr, "render: %v", err)
 		return exitStateUnavailable
 	}
 
+	// The unit goes through the same atomic publication as the documents -- staged
+	// file, fsync, rename -- because a unit half-written is a timer systemd cannot
+	// parse, and the one reader is systemd itself.
+	//
+	// The directory is created rather than assumed. --out is left alone: it has a
+	// gate of its own about being unwritable, and a render that creates the
+	// directory it was told to publish into would turn that gate into a mkdir with
+	// extra steps. --unit-out is new, it is a path an operator names rather than one
+	// this package installs, and "no such directory" from a renderer is an answer
+	// that sends them to mkdir by hand.
+	if err := os.MkdirAll(options.unitOut, 0o755); err != nil {
+		writeCLIError(stderr, "render: %v", err)
+		return exitStateUnavailable
+	}
+	unit := documentPair{documents[2]}
+	unit[0].Name = filepath.Base(documents[2].Name)
+	if err := publishPairWithOps(options.unitOut, unit, services.documentOps); err != nil {
+		writeCLIError(stderr, "render: %v", err)
+		return exitStateUnavailable
+	}
+
+	// Reloaded as part of writing it. A schedule the operator changed and did not get
+	// is the symptom the policy field's deadness produced in the first place, so the
+	// reload belongs to the operation rather than to a step somebody has to remember.
+	//
+	// Reported AFTER the documents were written rather than instead of them, and
+	// without failing the run: everything on disk is correct, and exiting non-zero
+	// would send an operator hunting a render failure that did not happen.
+	if err := services.reloadSystemd(); err != nil {
+		writeCLIError(stderr, "render: %s written; systemd was not reloaded, so it keeps the "+
+			"previous schedule until this is fixed or the machine reboots: %v",
+			filepath.Join(options.unitOut, unitfile.UnitName), err)
+	}
+
 	writeReportLine(stdout, "rendered-policy: %s\n", options.policy)
-	for _, document := range documents {
+	for _, document := range documents[:2] {
 		writeReportLine(stdout, "rendered-%s: %s\n", document.Report, filepath.Join(options.out, document.Name))
 		writeReportLine(stdout, "rendered-%s-sha256: %s\n", document.Report, digestOf(document.Contents))
 	}
+	writeReportLine(stdout, "rendered-unit: %s\n", filepath.Join(options.unitOut, unitfile.UnitName))
+	writeReportLine(stdout, "rendered-unit-sha256: %s\n", digestOf(documents[2].Contents))
 	return exitSuccess
 }
 
@@ -188,12 +240,16 @@ func pair(policy config.Policy, documents documentPaths, policyPath string) docu
 	rendered := documentPair{
 		{Report: "mosdns", Name: documents.Mosdns},
 		{Report: "dnscrypt", Name: documents.DNSCrypt},
+		{Report: "unit", Name: documents.Unit},
 	}
 	if rendered[0].Contents, rendered[0].Err = mosdnsconfig.Render(policy, routing); rendered[0].Err != nil {
 		rendered[0].Err = fmt.Errorf("%s: %w", documents.Mosdns, rendered[0].Err)
 	}
 	if rendered[1].Contents, rendered[1].Err = dnscrypt.Render(policy, dnscrypt.Defaults()); rendered[1].Err != nil {
 		rendered[1].Err = fmt.Errorf("%s: %w", documents.DNSCrypt, rendered[1].Err)
+	}
+	if rendered[2].Contents, rendered[2].Err = unitfile.Render(policy); rendered[2].Err != nil {
+		rendered[2].Err = fmt.Errorf("%s: %w", documents.Unit, rendered[2].Err)
 	}
 	return rendered
 }
@@ -266,8 +322,37 @@ func parseValidateOptions(args []string, documents documentPaths) (validateOptio
 func reportMismatches(stdout io.Writer, policy config.Policy, documents documentPaths, options validateOptions) error {
 	var report bytes.Buffer
 	installedAnything := false
-	for _, document := range pair(policy, documents, options.policy) {
-		path := filepath.Join(options.documents, document.Name)
+	// The two documents are compared in the document directory and the unit in the
+	// systemd one, because that is where each is published. The unit is not in this
+	// loop by accident: reading it out of the document directory reports it "not
+	// installed" on every machine, and reading it out of the file it names reports
+	// the directory as a file.
+	//
+	// The unit is checked at all because it is generated from the policy the same way
+	// the documents are. A machine whose policy says 05:15 and whose timer says
+	// 03:30 is exactly the state this change exists to end, and validate is where an
+	// operator looks before running render.
+	// where is the directory each generated file is published into. The two documents
+	// go to the document directory and the unit to the systemd one, because that is
+	// where each is written; reading either out of the other's directory reports it
+	// "not installed" on every machine, or reports the directory as a file.
+	//
+	// The unit is checked at all because it is generated from the policy exactly as
+	// the documents are. A machine whose policy says 05:15 and whose timer says 03:30
+	// is the state this change exists to end, and validate is where an operator looks
+	// before running render.
+	type placed struct {
+		document renderedDocument
+		dir      string
+	}
+	rendered := pair(policy, documents, options.policy)
+	checked := make([]placed, 0, len(rendered))
+	for _, document := range rendered[:2] {
+		checked = append(checked, placed{document, options.documents})
+	}
+	checked = append(checked, placed{rendered[2], documents.UnitDir})
+	for _, entry := range checked {
+		document, path := entry.document, filepath.Join(entry.dir, entry.document.Name)
 		published, err := os.ReadFile(filepath.Clean(path))
 		missing := errors.Is(err, os.ErrNotExist)
 		if err != nil && !missing {
@@ -297,4 +382,34 @@ func reportMismatches(stdout io.Writer, policy config.Policy, documents document
 		return fmt.Errorf("write the mismatch report: %w", err)
 	}
 	return nil
+}
+
+// reloadSystemd asks systemd to re-read its units.
+//
+// `systemctl` is invoked by absolute name and with an argv, never a shell string:
+// this runs from the render verb, which an operator may run as root, and a path
+// resolved through $PATH on a machine whose PATH an attacker can write is a way to
+// run their program as root.
+//
+// A missing systemctl is a refusal rather than a silent success. A render that wrote
+// a new schedule and could not tell systemd about it has left the machine describing
+// one thing and running another, and that is exactly the state this whole change
+// exists to end.
+func reloadSystemd() error {
+	const systemctl = "/usr/bin/systemctl"
+	if _, err := os.Stat(systemctl); err != nil {
+		return fmt.Errorf("%s is not there to reload systemd with: %w", systemctl, err)
+	}
+	completed := exec.Command(systemctl, "daemon-reload").Run()
+	if completed == nil {
+		return nil
+	}
+	var exit *exec.ExitError
+	if errors.As(completed, &exit) {
+		if message := strings.TrimSpace(string(exit.Stderr)); message != "" {
+			return errors.New(message)
+		}
+		return fmt.Errorf("systemctl daemon-reload exited %d", exit.ExitCode())
+	}
+	return completed
 }

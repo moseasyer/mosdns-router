@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"mosdns-router/internal/mosdnsconfig"
+	"mosdns-router/internal/unitfile"
 )
 
 // The render path is what gives a policy an effect: without it the two generated
@@ -47,11 +48,26 @@ func newInstalled(t *testing.T) installed {
 	documents := productionDocumentPaths()
 	documents.Dir = dir
 	documents.Policy = filepath.Join(dir, "policy.yaml")
+	// The systemd directory is redirected too. Without this the fixture carries the
+	// PRODUCTION path, and render -- which now publishes a unit as well as two
+	// documents -- tries to write /usr/lib/systemd/system on whatever machine the
+	// test runs on. It was refused by permissions here, which is the only reason this
+	// was a near miss rather than a host mutation: a test running as root would have
+	// written there.
+	documents.UnitDir = filepath.Join(dir, "usr/lib/systemd/system")
 	return installed{dir: dir, policy: documents.Policy, documents: documents}
 }
 
 func (i installed) services() services {
-	return services{documents: i.documents, documentOps: defaultDocumentOps()}
+	return services{
+		documents:   i.documents,
+		documentOps: defaultDocumentOps(),
+		// A stub, and it must be a stub: the production value shells out to
+		// systemctl, and a test that reached it would either reload this machine's
+		// systemd or fail on a machine that has none. A test that needs to see the
+		// call replace this field.
+		reloadSystemd: func() error { return nil },
+	}
 }
 
 // withPolicy writes the default policy to the installed policy path and returns
@@ -740,5 +756,89 @@ func TestValidateReadsTheInstalledDirectoryItWasGiven(t *testing.T) {
 	}
 	if strings.Contains(stdout, instance.path("mosdns.yaml")) {
 		t.Errorf("validate reported the installed document directory although --documents named another one:\n%s", stdout)
+	}
+}
+
+// The unit is published into the systemd directory, not beside the documents:
+// systemd does not read it from /etc/mosdns, and a policy that renders a unit to the
+// wrong directory produces a machine whose policy and whose schedule disagree,
+// invisibly, until the timer fires at the old time.
+func TestRenderPublishesTheUnitIntoTheSystemdDirectory(t *testing.T) {
+	instance := newInstalled(t)
+	instance.withPolicy(t, nil)
+
+	code, _, stderr := runRenderCLI(t, instance.services())
+	if code != exitSuccess {
+		t.Fatalf("render exit = %d, want %d (stderr: %s)", code, exitSuccess, stderr)
+	}
+
+	unit, err := os.ReadFile(filepath.Join(instance.documents.UnitDir, unitfile.UnitName))
+	if err != nil {
+		t.Fatalf("render published no unit: %v", err)
+	}
+	if !bytes.Contains(unit, []byte("OnCalendar=*-*-* 03:30:00")) {
+		t.Errorf("the published unit does not carry the policy's schedule:\n%s", unit)
+	}
+}
+
+// A changed schedule that systemd has not been told about is the exact symptom this
+// change exists to remove: the operator edited the policy, render succeeded, and
+// nothing moved.
+func TestRenderReloadsSystemdAfterWritingTheUnit(t *testing.T) {
+	instance := newInstalled(t)
+	instance.withPolicy(t, nil)
+	reloaded := false
+	services := instance.services()
+	services.reloadSystemd = func() error { reloaded = true; return nil }
+
+	if code, _, stderr := runRenderCLI(t, services); code != exitSuccess {
+		t.Fatalf("render exit = %d (stderr: %s)", code, stderr)
+	}
+	if !reloaded {
+		t.Error("render wrote the unit and did not reload systemd, so systemd keeps the old " +
+			"OnCalendar until reboot")
+	}
+}
+
+// A reload that fails is reported, and it is reported AFTER the documents were written
+// rather than instead of them: they are correct on disk, and refusing to say so would
+// send an operator looking for a failure that is not there.
+func TestAReloadFailureIsReportedAndTheDocumentsAreStillWritten(t *testing.T) {
+	instance := newInstalled(t)
+	instance.withPolicy(t, nil)
+	services := instance.services()
+	services.reloadSystemd = func() error { return errors.New("daemon-reload refused") }
+
+	code, _, stderr := runRenderCLI(t, services)
+	if code != exitSuccess {
+		t.Fatalf("a failed reload exited %d; the documents and the unit are correct and the "+
+			"reload is a separate thing that failed", code)
+	}
+	if !strings.Contains(stderr, "daemon-reload") {
+		t.Errorf("the report does not say the reload is what failed: %q", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(instance.dir, "mosdns.yaml")); err != nil {
+		t.Errorf("the documents were not written even though only the reload failed: %v", err)
+	}
+}
+
+// A unit that cannot be written is a render failure. A unit left describing the old
+// schedule while the policy says a new one is the two-sources problem again, and the
+// operation has to stop rather than report success.
+func TestAUnitThatCannotBeWrittenIsARefusal(t *testing.T) {
+	instance := newInstalled(t)
+	instance.withPolicy(t, nil)
+	unitDir := filepath.Join(instance.dir, "usr/lib/systemd/system")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("stage the unit directory: %v", err)
+	}
+	// A directory where the unit file needs to be: the rename onto it cannot succeed.
+	if err := os.MkdirAll(filepath.Join(unitDir, unitfile.UnitName), 0o755); err != nil {
+		t.Fatalf("stage the obstruction: %v", err)
+	}
+	instance.documents.UnitDir = unitDir
+
+	if code, _, _ := runRenderCLI(t, instance.services()); code == exitSuccess {
+		t.Error("render reported success with the unit unwritable")
 	}
 }
