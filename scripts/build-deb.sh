@@ -27,7 +27,7 @@ PACKAGE=mosdns-router
 # the first version of this script called both `VERSION`, so a `VERSION=` the Makefile
 # passed in was silently ignored and the shipped binary's version was whatever this
 # line said rather than the revision the Makefile had computed.
-PACKAGE_VERSION=0.3.1
+PACKAGE_VERSION=0.3.2
 BUILD=build
 STAGE=
 STAGE_ONLY=

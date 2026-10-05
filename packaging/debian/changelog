@@ -1,3 +1,26 @@
+mosdns-router (0.3.2) unstable; urgency=high
+
+  * The install no longer refuses a machine this package provisions. preflight
+    demanded a default ACL from every state directory, and /run/mosdns is
+    deliberately provisioned at 2750 with no ACL at all, so the install refused and
+    dpkg left the package half-configured -- on every release, since the change that
+    made /run/mosdns 2750 shipped in 0.2.0. Found by the Podman integration matrix,
+    which had been blocked until now, failing on 22.04, 24.04 and 26.04 at once.
+  * The default ACL's requirement is now two questions rather than one. Where the
+    group can write the directory it must still grant the group at least what the
+    directory needs, because an unprivileged creator exists there. Where the group
+    cannot, no default ACL is required -- but one that is WIDER than the directory is
+    still refused: `default:group::rwx` on a 2750 directory makes a root-created file
+    group-writable, and rewriting a file in place needs no permission in the directory.
+  * An ACL granting more than the requirement is no longer refused for not matching
+    it exactly, and the two refusals now say which half of the ACL is at fault and
+    whether it is missing or too wide. The old wording read "its default ACL does not
+    grant the group 'r-x'" while listing, two words later, an ACL that grants exactly
+    that, and printed the whole getfacl output as the default half's contents when it
+    was printing the access half.
+
+ -- mosdns-router maintainers <mosdns-router@localhost>  Sun, 05 Oct 2026 00:00:00 +0000
+
 mosdns-router (0.3.1) unstable; urgency=medium
 
   * Closing the response rewriter's ECH provider now WAITS for the background
