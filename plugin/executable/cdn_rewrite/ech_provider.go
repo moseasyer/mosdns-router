@@ -208,6 +208,16 @@ type echProvider struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+	// refresherDone is closed by refreshLoop on its way out, and Close waits for it.
+	// It is nil when no refresher was started, and a wait on a nil channel blocks
+	// for ever, so the wait is guarded rather than left to a caller to know.
+	//
+	// Without it Close returned while a tick could still be in flight, and a tick
+	// PUBLISHES: it writes the state document. So Close returned, the caller removed
+	// or replaced the state directory, and the refresher wrote into it afterwards.
+	// That is a test-teardown flake where it was noticed, and on a real machine it is
+	// a Close that does not mean what it says while a goroutine is still writing.
+	refresherDone chan struct{}
 }
 
 // newECHProvider builds the provider and its client. Every refusal it makes is a
@@ -289,12 +299,16 @@ func (e *echProvider) startRefreshing() {
 	if e.refreshEvery <= 0 {
 		return
 	}
+	e.refresherDone = make(chan struct{})
 	go e.refreshLoop()
 }
 
 func (e *echProvider) refreshLoop() {
 	ticker := time.NewTicker(e.refreshEvery)
 	defer ticker.Stop()
+	// Closed LAST, after the deferred ticker stop, so a waiter that unblocks here
+	// knows the loop has finished rather than that it is finishing.
+	defer close(e.refresherDone)
 	for {
 		select {
 		case <-e.closed:
@@ -969,11 +983,21 @@ type publishedKey struct {
 
 // Close releases the client. It is idempotent, and a Config call that arrives
 // after it is refused rather than dialling a client that is gone.
+// Close stops the refresher and WAITS for it.
+//
+// The wait is the point, and it is bounded rather than open-ended: a tick in flight
+// is inside fetchOnce, which carries its own timeout, so this returns after at most
+// one fetch budget. It cannot hang, and it is the only way Close can mean "the
+// refresher has stopped" to a caller that is about to move the state directory out
+// from under it -- which is exactly what an unload and a test teardown both do.
 func (e *echProvider) Close() error {
 	var err error
 	e.closeOnce.Do(func() {
 		close(e.closed)
 		err = e.client.Close()
+		if e.refresherDone != nil {
+			<-e.refresherDone
+		}
 	})
 	return err
 }

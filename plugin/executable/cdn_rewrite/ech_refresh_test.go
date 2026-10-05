@@ -51,6 +51,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -488,6 +489,72 @@ func TestThePluginStartsTheBackgroundRefresher(t *testing.T) {
 
 	// No Exec, no Config, no client query: only the tick the plugin started.
 	waitForRefresh(t, h.upstream, 1)
+}
+
+// Close has to mean the refresher has STOPPED, not that it has been asked to.
+//
+// A tick in flight publishes -- it writes the state document -- so a Close that
+// returns while one is running is a Close that says "you may move this directory"
+// to a goroutine that is about to write into it. This case was added because of a
+// test-teardown flake on a CI machine, where the testing framework removed a
+// temporary directory while the refresher was still writing into it and the message
+// ("directory not empty") named nothing about the cause.
+func TestCloseWaitsForTheRefresherToStop(t *testing.T) {
+	const slowFetch = 150 * time.Millisecond
+	entered := make(chan struct{}, 1)
+	answer := rotationAnswer(t, map[string][]byte{echSourceFirst: echFixture(t)})
+	// A fetch that is slow but BOUNDED, which is what a real one is -- it carries its
+	// own timeout. An unbounded one would make this case deadlock against a Close that
+	// waits correctly: the tick cannot finish until something releases it, and the
+	// only thing that releases it would be the Close that is waiting for it.
+	var finished atomic.Int64
+	blocking := func(question dns.Question) (*dns.Msg, error) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		time.Sleep(slowFetch)
+		finished.Add(1)
+		return answer(question)
+	}
+	provider, _, _ := backgroundHarness(t, []string{echSourceFirst}, blocking, time.Hour)
+	// Started by hand, the way the plugin's Config does it. The harness deliberately
+	// does not start it, so a case about the refresher has to say it wants one.
+	provider.startRefreshing()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the refresher never reached the upstream, so there is no tick to wait for")
+	}
+
+	if err := provider.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The assertion is that the fetch had FINISHED by the time Close returned, not
+	// that no further fetch happened. That is the property, and it is falsifiable in
+	// both directions: a Close that waits returns after the tick, so the count is 1;
+	// a Close that only signals returns in microseconds, the tick is still sleeping,
+	// and the count is 0.
+	if got := finished.Load(); got != 1 {
+		t.Errorf("a fetch that was in flight when Close was called had finished %d times by the "+
+			"time Close returned, want 1: Close has to WAIT for the refresher to stop, because a "+
+			"tick publishes, and a caller that moves the state directory on a Close that has only "+
+			"signalled races a write into a directory that is going away", got)
+	}
+}
+
+// Close twice is still once: the second call must not panic on a closed channel,
+// and it must still be a call that returns only when the refresher has stopped.
+func TestCloseTwiceIsStillSafe(t *testing.T) {
+	provider, _, _ := backgroundHarness(t, []string{echSourceFirst},
+		rotationAnswer(t, map[string][]byte{echSourceFirst: echFixture(t)}), time.Hour)
+	if err := provider.Close(); err != nil {
+		t.Fatalf("the first Close: %v", err)
+	}
+	if err := provider.Close(); err != nil {
+		t.Errorf("the second Close: %v", err)
+	}
 }
 
 // --- helpers these cases use that the harness above does not ---
