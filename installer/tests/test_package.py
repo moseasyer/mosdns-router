@@ -215,7 +215,14 @@ ALLOWED_PREFIXES = (
 # The paths the build generates rather than copies. A staged path is either a
 # manifest destination or one of these, and both lists are here so that a path
 # appearing in neither is a failure rather than a surprise.
+# The generated systemd timer. It is here for the same reason the two routing
+# documents are: its contents are derived from the policy, so a copy in the
+# repository and a rendered one can disagree, and only the rendered one describes
+# this machine's schedule.
+LIST_TIMER = UNIT_DIRECTORY + "/mosdns-list-check.timer"
+
 GENERATED = set(ROUTING_DOCUMENTS) | {
+    LIST_TIMER,
     BUILD_MANIFEST,
     DEBIAN + "/control",
     DEBIAN + "/conffiles",
@@ -2764,7 +2771,7 @@ def order_findings(text):
 RENDER_IN_PRIVATE_ROOT = r"""
 set -eu
 stage='%(stage)s'
-mkdir -p "$stage/etc/mosdns"
+mkdir -p "$stage/etc/mosdns" "$stage/usr/lib/systemd/system"
 cp '%(policy)s' "$stage/etc/mosdns/policy.yaml"
 if ! command -v bwrap >/dev/null 2>&1; then
 	echo "bwrap (the bubblewrap package) is required to render for the installed layout:" >&2
@@ -2772,8 +2779,14 @@ if ! command -v bwrap >/dev/null 2>&1; then
 	echo "anything being written to this host's /etc" >&2
 	exit 1
 fi
-exec bwrap --ro-bind / / --bind "$stage/etc" /etc --chdir / \
-	'%(cdnctl)s' render --policy /etc/mosdns/policy.yaml --out /etc/mosdns
+# The staging /usr is bound as well as the staging /etc. The renderer publishes the
+# generated systemd unit into /usr/lib/systemd/system, so without this the render
+# resolves --unit-out against the HOST's /usr -- which is how this test suite tried to
+# create a file in the machine's systemd directory, and would have succeeded on a
+# machine where that directory is writable.
+exec bwrap --ro-bind / / --bind "$stage/etc" /etc --bind "$stage/usr" /usr --chdir / \
+	'%(cdnctl)s' render --policy /etc/mosdns/policy.yaml --out /etc/mosdns \
+	--unit-out /usr/lib/systemd/system
 """
 
 
@@ -3611,6 +3624,40 @@ class PayloadTests(_Staged):
 class ShippedDocumentTests(_Staged):
     """The documents, and the claim that they are what this project reviewed."""
 
+    def test_the_packaged_timer_is_the_one_this_repository_reviewed(self):
+        """The staged render writes the documents into /etc and the unit into /usr, so
+        the unit is the one generated file whose staging path is not beside the
+        documents. A build that shipped the repository's copy unchanged would package a
+        timer describing whatever schedule the repository last had, and nothing would
+        notice: the documents are compared against a fresh render, the unit is compared
+        against a repository file, and a stale unit is a machine that runs the list work
+        at the wrong hour with a policy that says otherwise.
+        """
+        packaged = self.read(LIST_TIMER)
+        committed = (REPO / "packaging" / "systemd" / "mosdns-list-check.timer").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            packaged,
+            committed,
+            "the packaged timer is not the repository's copy, so this package ships a "
+            "schedule the repository did not review",
+        )
+        # And it names the hour this repository's policy says, read from the policy the
+        # package installs rather than from a literal. A literal here would pass on the
+        # day the default changes and fail on no other day.
+        policy = self.read(CONFIG_DIRECTORY + "/policy.yaml")
+        schedule = next(
+            line.split(":", 1)[1].strip().strip('"')
+            for line in policy.splitlines()
+            if line.startswith("schedule:")
+        )
+        self.assertIn(
+            f"OnCalendar=*-*-* {schedule}:00",
+            packaged,
+            f"the packaged timer does not run at the policy's {schedule}",
+        )
+
     def test_the_two_routing_documents_are_a_fresh_production_render(self):
         """Byte equality against a render run now, from the policy the package
         installs, for the installed layout.
@@ -3630,9 +3677,16 @@ class ShippedDocumentTests(_Staged):
                 Path(self.root) / CDNCTL_BINARY.lstrip("/"),
             )
             self.assertEqual(status, 0, f"a production render exited {status}")
-            for document in ROUTING_DOCUMENTS:
+            # Where each generated file lands inside the scratch: the two documents in
+            # /etc/mosdns and the unit in /usr/lib/systemd/system, which is the whole
+            # reason render grew --unit-out rather than publishing everything beside the
+            # documents.
+            for document, rendered in (
+                *((d, Path(scratch) / "etc" / "mosdns" / Path(d).name) for d in ROUTING_DOCUMENTS),
+                (LIST_TIMER, Path(scratch) / "usr" / "lib" / "systemd" / "system" / Path(LIST_TIMER).name),
+            ):
                 with self.subTest(document=document):
-                    fresh = Path(scratch) / "etc" / "mosdns" / Path(document).name
+                    fresh = rendered
                     self.assertTrue(fresh.is_file(), f"the render published no {fresh.name}")
                     self.assertEqual(
                         self.read(document),
@@ -3645,6 +3699,7 @@ class ShippedDocumentTests(_Staged):
             (CONFIG_DIRECTORY + "/mosdns.yaml", "configs/mosdns.yaml"),
             (CONFIG_DIRECTORY + "/dnscrypt-proxy.toml", "configs/dnscrypt-proxy.toml"),
             (CONFIG_DIRECTORY + "/policy.yaml", "configs/policy.yaml"),
+            (LIST_TIMER, "packaging/systemd/mosdns-list-check.timer"),
             (CHINA_LIST, "configs/cn-domains.txt"),
             (SOURCE_LOCK, "configs/source-lock.json"),
         ):

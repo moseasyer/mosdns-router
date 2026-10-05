@@ -418,15 +418,23 @@ done
 # production render, and the package-content test re-renders and compares.
 render_log=$(mktemp)
 scratch_paths="$scratch_paths $render_log"
-if ! "$BWRAP" --ro-bind / / --bind "$STAGE/etc" /etc --chdir / \
+# The staging /usr is bound too, and that is the whole reason this render can publish
+# a unit at all: without it the renderer's --unit-out resolves to the HOST's
+# /usr/lib/systemd/system, which is read-only here and would be the real thing on a
+# machine where it is not. The documents need only the /etc bind because /etc/mosdns
+# is where they are published; the unit is published into /usr, so /usr has to be
+# this package's copy rather than the host's.
+if ! "$BWRAP" --ro-bind / / --bind "$STAGE/etc" /etc --bind "$STAGE/usr" /usr --chdir / \
 	"$verifier_dir/mosdns-cdnctl" render \
-	--policy /etc/mosdns/policy.yaml --out /etc/mosdns >"$render_log" 2>&1; then
+	--policy /etc/mosdns/policy.yaml --out /etc/mosdns \
+	--unit-out /usr/lib/systemd/system >"$render_log" 2>&1; then
 	cat "$render_log" >&2
 	die "mosdns-cdnctl render refused, so this package has no routing documents to ship.
      The message above is the renderer's own."
 fi
 sed 's/^/build-deb.sh: /' "$render_log"
-chmod 644 "$STAGE/etc/mosdns/mosdns.yaml" "$STAGE/etc/mosdns/dnscrypt-proxy.toml"
+chmod 644 "$STAGE/etc/mosdns/mosdns.yaml" "$STAGE/etc/mosdns/dnscrypt-proxy.toml" \
+	"$STAGE/usr/lib/systemd/system/mosdns-list-check.timer"
 
 # The resolver is asked whether it accepts the document it is about to run, because
 # `-check` is its command mode: it loads the configuration, validates it, and exits
