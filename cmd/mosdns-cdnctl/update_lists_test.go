@@ -1093,23 +1093,41 @@ func TestAutomaticStillReportsDriftWhenItRefreshes(t *testing.T) {
 // The two switches are two switches. Cloudflare's ranges choose an edge; data/cn
 // chooses which names take the foreign branch. Turning on the cheap one must not
 // open the expensive one.
+//
+// It uses the range fixture rather than the China-list one, and that is not a style
+// choice. The China fixture's client rewrites every request to one server, so a
+// refresh of the ranges reaches the GitHub origin's handler and 404s -- and then the
+// pinned snapshot this package SHIPS stands in, at /usr/share/mosdns-router. On a
+// machine with the package installed that made the case pass, and on a clean checkout
+// it failed, which is exactly what the CI run this case was written for turned up.
+// The range fixture serves both hosts and the snapshot paths are the fixture's own,
+// so the case is about the two switches on every machine.
 func TestAutomaticHonoursEachSwitchSeparately(t *testing.T) {
-	paths := newListPaths(t)
-	publishPair(t, paths, lockedCommit, rulesOf(200))
-	origin := newFakeOrigin(t, remoteCommit, map[string][]byte{
+	paths := newRangePaths(t)
+	publishPair(t, paths.listPaths(), lockedCommit, rulesOf(200))
+	ranges := newRangeOrigin(t)
+	github := newFakeOrigin(t, remoteCommit, map[string][]byte{
 		remoteCommit: sourceArchive(t, remoteCommit, string(rulesOf(200))),
 	})
 
-	code, stdout, stderr := runCLI(t, origin.services(), "--automatic",
+	var stdout, stderr bytes.Buffer
+	code := runWith(append([]string{"update-lists", "--automatic",
 		"--policy", automaticPolicy(t, false, true),
-		"--source-lock", paths.sourceLock, "--list-file", paths.listFile,
-		"--control-lock", paths.controlLock, "--previous-lock", paths.previousLock,
-		"--ranges-cache", filepath.Join(paths.dir, "ranges"))
+		"--previous-lock", filepath.Join(paths.dir, "source-lock.previous.json")},
+		refreshArgs(paths)...), &stdout, &stderr, ranges.services(github.client))
 	if code != exitSuccess {
-		t.Fatalf("--automatic with lists.cloudflare.automatic on exited %d (stderr: %s)", code, stderr)
+		t.Fatalf("--automatic with lists.cloudflare.automatic on exited %d (stderr: %s)",
+			code, stderr.String())
 	}
-	if !strings.Contains(stdout, "published-prefix-list:") {
-		t.Errorf("the ranges were not published:\n%s", stdout)
+	published, err := os.ReadFile(paths.prefixList)
+	if err != nil {
+		t.Fatalf("the ranges were not published: %v", err)
+	}
+	if want := "104.16.0.0/22\n172.64.0.0/21\n"; string(published) != want {
+		t.Errorf("published prefix list = %q, want %q", published, want)
+	}
+	if !strings.Contains(stdout.String(), "published-prefix-list:") {
+		t.Errorf("the report does not say the ranges were published:\n%s", stdout.String())
 	}
 	lock, _, _, err := rules.ReadPublishedPair(paths.sourceLock, paths.listFile)
 	if err != nil {
@@ -1118,7 +1136,7 @@ func TestAutomaticHonoursEachSwitchSeparately(t *testing.T) {
 	if lock.Commit != lockedCommit {
 		t.Errorf("the China list was re-pinned to %s with lists.china.automatic off", lock.Commit)
 	}
-	if _, err := rules.ReadPrevious(paths.previousLock); err == nil {
+	if _, err := rules.ReadPrevious(filepath.Join(paths.dir, "source-lock.previous.json")); err == nil {
 		t.Error("refreshing only the ranges left an archive of the China pin")
 	}
 }
